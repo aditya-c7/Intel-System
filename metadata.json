@@ -1,0 +1,8 @@
+{
+  "name": "intel-system",
+  "description": "First-party visitor identification, browser signal normalization, server-side IP geolocation, and transparent risk telemetry system built from scratch.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
