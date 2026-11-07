@@ -24,10 +24,10 @@ const MAX_Y_MS = 600;
 const FIVE_MINUTES_MS = 5 * 60 * 1000; // 300,000 ms rolling five-minute timeline
 const SAMPLE_INTERVAL_MS = 1500; // 1.5s RTT measurement interval
 
-// 10-second full speed analysis (5s Download + 5s Upload) followed by a 3-second pause before repeating
+// 10-second full speed analysis (5s Download + 5s Upload) followed by a 10-second cooldown pause before repeating
 const DOWNLOAD_PHASE_DURATION_MS = 5000; // 5.0 seconds active download analysis
 const UPLOAD_PHASE_DURATION_MS = 5000; // 5.0 seconds active upload analysis
-const PAUSE_AFTER_TEST_MS = 3000; // 3.0 seconds pause after the 10s test completes
+const PAUSE_AFTER_TEST_MS = 10000; // 10.0 seconds cooldown pause after the 10s test completes
 const ODOMETER_UPDATE_INTERVAL_MS = 250; // Smooth 250ms live odometer updates
 const CONCURRENT_STREAMS = 4;
 
@@ -381,7 +381,8 @@ export function NetworkStabilityPanel() {
             });
 
             if (!resp.ok) {
-              break;
+              await new Promise((r) => setTimeout(r, 150));
+              continue;
             }
 
             if (resp.body && typeof resp.body.getReader === 'function') {
@@ -415,11 +416,14 @@ export function NetworkStabilityPanel() {
 
             // Pace very fast connections so the 5-second analysis window sustains smoothly without exhausting the cap early
             const remainingTimeMs = DOWNLOAD_PHASE_DURATION_MS - (performance.now() - phaseStartPerf);
-            if (reqDur < 90 && remainingTimeMs > 120 && !phaseAbort.signal.aborted) {
-              await new Promise((r) => setTimeout(r, 70));
+            if (reqDur < 120 && remainingTimeMs > 140 && !phaseAbort.signal.aborted) {
+              await new Promise((r) => setTimeout(r, 100));
             }
           } catch {
-            break;
+            if (phaseAbort.signal.aborted || masterSignal.aborted) {
+              break;
+            }
+            await new Promise((r) => setTimeout(r, 150));
           }
         }
       };
@@ -428,6 +432,12 @@ export function NetworkStabilityPanel() {
         await Promise.all(
           Array.from({ length: CONCURRENT_STREAMS }, (_, idx) => streamWorker(idx))
         );
+        const elapsedMs = performance.now() - phaseStartPerf;
+        if (elapsedMs < DOWNLOAD_PHASE_DURATION_MS && !masterSignal.aborted) {
+          await new Promise((r) =>
+            setTimeout(r, Math.max(0, DOWNLOAD_PHASE_DURATION_MS - elapsedMs))
+          );
+        }
       } finally {
         clearInterval(uiInterval);
         clearTimeout(phaseEndTimer);
@@ -638,12 +648,15 @@ export function NetworkStabilityPanel() {
             serverConfirmedBytes += confirmedBytes;
 
             const remainingTimeMs = UPLOAD_PHASE_DURATION_MS - (performance.now() - phaseStartPerf);
-            if (reqDur < 90 && remainingTimeMs > 120 && !phaseAbort.signal.aborted) {
-              await new Promise((r) => setTimeout(r, 70));
+            if (reqDur < 120 && remainingTimeMs > 140 && !phaseAbort.signal.aborted) {
+              await new Promise((r) => setTimeout(r, 100));
             }
           } catch {
             inFlightProgressBytes = Math.max(0, inFlightProgressBytes - chunkProgressCounted);
-            break;
+            if (phaseAbort.signal.aborted || masterSignal.aborted) {
+              break;
+            }
+            await new Promise((r) => setTimeout(r, 150));
           }
         }
       };
@@ -652,6 +665,12 @@ export function NetworkStabilityPanel() {
         await Promise.all(
           Array.from({ length: CONCURRENT_STREAMS }, (_, idx) => uploadWorker(idx))
         );
+        const elapsedMs = performance.now() - phaseStartPerf;
+        if (elapsedMs < UPLOAD_PHASE_DURATION_MS && !masterSignal.aborted) {
+          await new Promise((r) =>
+            setTimeout(r, Math.max(0, UPLOAD_PHASE_DURATION_MS - elapsedMs))
+          );
+        }
       } finally {
         clearInterval(uiInterval);
         clearTimeout(phaseEndTimer);

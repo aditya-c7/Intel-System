@@ -23,7 +23,6 @@ const SESSION_EXPIRATION_MS = SESSION_TIMEOUT_MINUTES * 60 * 1000;
 
 const HMAC_SECRET =
   process.env.VISITOR_HMAC_SECRET ||
-  process.env.GEMINI_API_KEY ||
   'intel-system-first-party-hmac-secret-2026';
 
 const SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES = 512 * 1024 * 1024; // 512 MB max budget so fast connections can sustain full 5s download
