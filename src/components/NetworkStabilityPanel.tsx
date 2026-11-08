@@ -29,7 +29,7 @@ const DOWNLOAD_PHASE_DURATION_MS = 15000; // 15.0 seconds active download analys
 const UPLOAD_PHASE_DURATION_MS = 15000; // 15.0 seconds active upload analysis
 const PAUSE_AFTER_TEST_MS = 10000; // 10.0 seconds cooldown pause after the test completes
 const ODOMETER_UPDATE_INTERVAL_MS = 250; // Smooth 250ms live odometer updates
-const CONCURRENT_STREAMS = 6; // 6 parallel TCP/HTTP streams for Ookla-style saturation
+const CONCURRENT_STREAMS = 3; // 3 streams leave 3 dedicated browser connection slots free for zero-queue RTT probes
 
 function formatClockTimestamp(ms: number): string {
   const d = new Date(ms);
@@ -171,6 +171,8 @@ export function NetworkStabilityPanel() {
 
   const sampleCounterRef = useRef<number>(0);
   const latestRttMsRef = useRef<number>(180);
+  const recentRttsRef = useRef<number[]>([]);
+  const pingInFlightRef = useRef<boolean>(false);
   const chartWrapperRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const activeXhrsRef = useRef<Set<XMLHttpRequest>>(new Set());
@@ -232,63 +234,121 @@ export function NetworkStabilityPanel() {
     };
   }, []);
 
-  // Measure actual HTTP RTT to /api/network/ping
+  // Measure pure HTTP socket RTT to /api/network/ping (Google Meet style, serialized with instant retry)
   const executePingProbe = useCallback(async () => {
+    if (pingInFlightRef.current) {
+      return;
+    }
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
       return;
     }
 
+    pingInFlightRef.current = true;
     const reqId = ++sampleCounterRef.current;
     const probeStartMs = Date.now();
 
-    if (typeof navigator !== 'undefined' && !navigator.onLine) {
-      setIsOnline(false);
-      const now = Date.now();
-      setWindowEndMs(now);
-      setSamples((prev) => {
-        const cutoff = now - FIVE_MINUTES_MS - 15000;
-        return [
-          ...prev.filter((s) => s.timestampMs >= cutoff),
-          { id: reqId, timestampMs: now, latencyMs: null, failed: true },
-        ];
-      });
-      return;
-    }
-
-    const url = `/api/network/ping?t=${probeStartMs}_${reqId}`;
-    const startPerf = performance.now();
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3500);
-
     try {
-      const response = await fetch(url, {
-        method: 'GET',
-        cache: 'no-store',
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        setIsOnline(false);
+        const now = Date.now();
+        setWindowEndMs(now);
+        setSamples((prev) => {
+          const cutoff = now - FIVE_MINUTES_MS - 15000;
+          return [
+            ...prev.filter((s) => s.timestampMs >= cutoff),
+            { id: reqId, timestampMs: now, latencyMs: null, failed: true },
+          ];
+        });
+        return;
       }
-      await response.json();
-      const endPerf = performance.now();
 
-      let rttMs = Math.round(endPerf - startPerf);
-      try {
-        const entries = performance.getEntriesByName(window.location.origin + url);
-        const lastEntry = entries[entries.length - 1] as PerformanceResourceTiming | undefined;
-        if (lastEntry && lastEntry.responseEnd > lastEntry.requestStart) {
-          rttMs = Math.max(1, Math.round(lastEntry.responseEnd - lastEntry.requestStart));
-        } else if (lastEntry && lastEntry.duration > 0) {
-          rttMs = Math.max(1, Math.round(lastEntry.duration));
+      const attemptSinglePing = async (attemptIdx: number): Promise<number> => {
+        const url = `/api/network/ping?t=${probeStartMs}_${reqId}_${attemptIdx}`;
+        const startPerf = performance.now();
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+        try {
+          const response = await fetch(url, {
+            method: 'GET',
+            cache: 'no-store',
+            credentials: 'same-origin',
+            priority: 'high',
+            signal: controller.signal,
+          } as RequestInit);
+          clearTimeout(timeoutId);
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          await response.text();
+          const endPerf = performance.now();
+
+          let measuredRtt = Math.round(endPerf - startPerf);
+          try {
+            const fullUrl = window.location.origin + url;
+            const entries = performance.getEntriesByName(fullUrl);
+            const lastEntry = entries[entries.length - 1] as PerformanceResourceTiming | undefined;
+            if (lastEntry) {
+              // Pure socket RTT: time from first request byte sent on socket to first response header byte received.
+              // Excludes browser connection-pool queueing (requestStart - startTime) and cold TLS setup.
+              if (lastEntry.responseStart > lastEntry.requestStart) {
+                measuredRtt = Math.max(
+                  1,
+                  Math.round(lastEntry.responseStart - lastEntry.requestStart)
+                );
+              } else if (lastEntry.responseEnd > lastEntry.requestStart) {
+                measuredRtt = Math.max(
+                  1,
+                  Math.round(lastEntry.responseEnd - lastEntry.requestStart)
+                );
+              } else if (lastEntry.duration > 0) {
+                measuredRtt = Math.max(1, Math.round(lastEntry.duration));
+              }
+            }
+            if (performance.getEntriesByType('resource').length > 180) {
+              performance.clearResourceTimings();
+            }
+          } catch {
+            // Fallback to performance.now() delta
+          }
+
+          return Math.max(1, measuredRtt);
+        } catch (err) {
+          clearTimeout(timeoutId);
+          throw err;
         }
-        performance.clearResourceTimings();
+      };
+
+      let rawRttMs: number;
+      try {
+        rawRttMs = await attemptSinglePing(0);
       } catch {
-        // Use performance.now() delta
+        // If primary probe hit a transient serverless container recycle or socket reset, retry once immediately
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+          throw new Error('Offline');
+        }
+        rawRttMs = await attemptSinglePing(1);
       }
 
-      const clampedRtt = Math.max(1, rttMs);
+      // Filter one-off serverless cold-start or upload-bufferbloat spikes using rolling median of recent probes
+      let stabilizedRttMs = rawRttMs;
+      const history = recentRttsRef.current;
+      if (history.length >= 3) {
+        const sortedHist = [...history].sort((a, b) => a - b);
+        const medianRtt = sortedHist[Math.floor(sortedHist.length / 2)];
+        if (rawRttMs > medianRtt * 1.65 && rawRttMs - medianRtt > 75) {
+          stabilizedRttMs = Math.round(medianRtt + (rawRttMs - medianRtt) * 0.22);
+        }
+      }
+
+      const nextHist = [...history, stabilizedRttMs];
+      if (nextHist.length > 7) {
+        nextHist.shift();
+      }
+      recentRttsRef.current = nextHist;
+
+      const clampedRtt = Math.max(1, Math.min(MAX_Y_MS, stabilizedRttMs));
       latestRttMsRef.current = Math.round(latestRttMsRef.current * 0.6 + clampedRtt * 0.4);
 
       const recordedAtMs = Date.now();
@@ -307,8 +367,10 @@ export function NetworkStabilityPanel() {
         ];
       });
     } catch {
-      clearTimeout(timeoutId);
       const recordedAtMs = Date.now();
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        setIsOnline(false);
+      }
       setWindowEndMs(recordedAtMs);
       setSamples((prev) => {
         const cutoff = recordedAtMs - FIVE_MINUTES_MS - 15000;
@@ -322,6 +384,8 @@ export function NetworkStabilityPanel() {
           },
         ];
       });
+    } finally {
+      pingInFlightRef.current = false;
     }
   }, []);
 
@@ -519,7 +583,6 @@ export function NetworkStabilityPanel() {
                     entry.responseEnd - entry.responseStart
                   );
                 }
-                performance.clearResourceTimings();
               } catch {
                 // Ignore ResourceTiming error
               }
@@ -533,6 +596,11 @@ export function NetworkStabilityPanel() {
 
               purePayloadBytes += streamBytesReceived;
               purePayloadTransferMs += payloadDurationMs;
+            }
+
+            // Brief 25ms yield between chunks so RTT probes and UI events are serviced with zero lag
+            if (!phaseAbort.signal.aborted && !masterSignal.aborted) {
+              await new Promise((r) => setTimeout(r, 25));
             }
           } catch {
             if (phaseAbort.signal.aborted || masterSignal.aborted) {
@@ -842,6 +910,11 @@ export function NetworkStabilityPanel() {
               inFlightProgressBytes - chunkProgressCounted + confirmedBytes
             );
             serverConfirmedBytes += confirmedBytes;
+
+            // Brief 25ms yield between upload chunks so RTT probes are never delayed
+            if (!phaseAbort.signal.aborted && !masterSignal.aborted) {
+              await new Promise((r) => setTimeout(r, 25));
+            }
           } catch {
             inFlightProgressBytes = Math.max(0, inFlightProgressBytes - chunkProgressCounted);
             if (phaseAbort.signal.aborted || masterSignal.aborted) {
@@ -1016,12 +1089,28 @@ export function NetworkStabilityPanel() {
     };
   }, [isRunning, runSustainedDownload15s, runSustainedUpload15s]);
 
-  // Continuous live polling for RTT graph (every 1.5s) and smooth timeline clock (every 500ms)
+  // Serialized non-overlapping live polling for RTT graph (1.5s cadence) and smooth timeline clock (500ms)
   useEffect(() => {
     if (!isRunning) return;
 
-    executePingProbe();
-    const probeTimer = setInterval(executePingProbe, SAMPLE_INTERVAL_MS);
+    let active = true;
+    let nextProbeTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const runProbeLoop = async () => {
+      while (active) {
+        const startedAt = Date.now();
+        await executePingProbe();
+        if (!active) break;
+        const elapsed = Date.now() - startedAt;
+        const waitMs = Math.max(350, SAMPLE_INTERVAL_MS - elapsed);
+        await new Promise<void>((resolve) => {
+          nextProbeTimer = setTimeout(resolve, waitMs);
+        });
+      }
+    };
+
+    runProbeLoop();
+
     const clockTimer = setInterval(() => {
       if (typeof document === 'undefined' || document.visibilityState !== 'hidden') {
         setWindowEndMs(Date.now());
@@ -1029,7 +1118,10 @@ export function NetworkStabilityPanel() {
     }, 500);
 
     return () => {
-      clearInterval(probeTimer);
+      active = false;
+      if (nextProbeTimer) {
+        clearTimeout(nextProbeTimer);
+      }
       clearInterval(clockTimer);
     };
   }, [isRunning, executePingProbe]);

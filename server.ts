@@ -1257,13 +1257,16 @@ app.use((_req, res, next) => {
   next();
 });
 
-app.get('/api/network/ping', (_req, res) => {
+const handleNetworkPing = (_req: express.Request, res: express.Response) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
   res.setHeader('Timing-Allow-Origin', '*');
   res.status(200).json({ ok: true, serverTimestampMs: Date.now() });
-});
+};
+
+app.head('/api/network/ping', handleNetworkPing);
+app.get('/api/network/ping', handleNetworkPing);
 
 // Streaming Download Endpoint: 4 concurrent streams, non-compressible 64KB chunks
 app.get('/api/network/download', (req, res) => {
