@@ -19,13 +19,13 @@ var IS_SERVERLESS_RUNTIME = Boolean(
   process.env.VERCEL || process.env.VERCEL_ENV || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.NETLIFY
 );
 var HMAC_SECRET = process.env.VISITOR_HMAC_SECRET || "intel-system-first-party-hmac-secret-2026";
-var SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES = 512 * 1024 * 1024;
-var SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES = 256 * 1024 * 1024;
-var SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = 2 * 1024 * 1024;
-var SPEED_TEST_MAX_STREAM_UPLOAD_BYTES = 2 * 1024 * 1024;
-var SPEED_TEST_CONCURRENT_STREAMS = 4;
-var SPEED_TEST_TOKEN_TTL_MS = 60 * 1e3;
-var SPEED_TEST_STREAM_TIMEOUT_MS = 15 * 1e3;
+var SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES = 1024 * 1024 * 1024;
+var SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES = 512 * 1024 * 1024;
+var SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = 3584 * 1024;
+var SPEED_TEST_MAX_STREAM_UPLOAD_BYTES = 3584 * 1024;
+var SPEED_TEST_CONCURRENT_STREAMS = 8;
+var SPEED_TEST_TOKEN_TTL_MS = 120 * 1e3;
+var SPEED_TEST_STREAM_TIMEOUT_MS = 25 * 1e3;
 var HIGH_ENTROPY_64KB_CHUNK = crypto.randomBytes(65536);
 function createInMemoryDbAdapter() {
   const visitorsMap = /* @__PURE__ */ new Map();
@@ -976,7 +976,7 @@ app.get("/api/network/download", (req, res) => {
     return;
   }
   const ledger = verification.ledger;
-  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 2) {
+  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 6) {
     res.status(429).json({ error: "Concurrent stream limit exceeded for this speed test." });
     return;
   }
@@ -1073,7 +1073,7 @@ app.post("/api/network/upload", (req, res) => {
     return;
   }
   const ledger = verification.ledger;
-  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 2) {
+  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 6) {
     req.resume();
     res.status(429).json({ error: "Concurrent upload stream limit exceeded." });
     return;
@@ -1185,7 +1185,7 @@ app.post("/api/network/speed-test/init", (req, res) => {
       activeSpeedTests.delete(existingId);
       continue;
     }
-    if (!ledger.completed && nowMs < ledger.expiresAtMs && nowMs - ledger.createdAtMs < 2e4) {
+    if (!ledger.completed && nowMs < ledger.expiresAtMs && nowMs - ledger.createdAtMs < 45e3) {
       activeCount += 1;
       if (ledger.ipKey === ipKey) {
         activeIpCount += 1;
