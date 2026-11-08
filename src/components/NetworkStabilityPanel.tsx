@@ -234,7 +234,7 @@ export function NetworkStabilityPanel() {
     };
   }, []);
 
-  // Measure pure HTTP socket RTT to /api/network/ping (Google Meet style, serialized with instant retry)
+  // Measure pure HTTP socket RTT to /api/network/ping (serialized with instant retry)
   const executePingProbe = useCallback(async () => {
     if (pingInFlightRef.current) {
       return;

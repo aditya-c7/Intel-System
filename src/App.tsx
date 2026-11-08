@@ -614,10 +614,10 @@ export default function App() {
               </div>
             </div>
 
-            {/* 3. Main 2-Column Split: Left (Where & Network) | Right (Device & Session Summary) */}
-            <div className="grid grid-cols-1 lg:grid-cols-12 items-stretch">
-              {/* LEFT COLUMN (7 cols on lg+): Location Map + 2x2 Where & Network Grid */}
-              <div className="lg:col-span-7 flex flex-col justify-between border-b lg:border-b-0 lg:border-r border-[#E5E7EB]">
+            {/* 3. Main 2-Column Split (50% / 50% Equal Width): Left (Location & Network) | Right (Device & Session Summary) */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 items-stretch">
+              {/* LEFT COLUMN (50% width on lg+): Location Map + 2x2 Where & Network Grid */}
+              <div className="w-full flex flex-col justify-between border-b lg:border-b-0 lg:border-r border-[#E5E7EB] min-w-0">
                 <div className="px-4 sm:px-6 py-3 bg-[#FAFAFA] border-b border-[#E5E7EB] flex items-center justify-between gap-2">
                   <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-800">
                     <MapPin className="w-3.5 h-3.5 text-[#F05A28]" />
@@ -633,7 +633,7 @@ export default function App() {
                 {/* Interactive Leaflet Map */}
                 {activeVisit && (
                   <div className="flex-1 flex flex-col justify-between">
-                    <div className="border-b border-[#E5E7EB] h-[205px] sm:h-[225px]">
+                    <div className="border-b border-[#E5E7EB] h-[215px] sm:h-[235px]">
                       <LocationMap
                         latitude={activeLatitude}
                         longitude={activeLongitude}
@@ -730,8 +730,8 @@ export default function App() {
                 )}
               </div>
 
-              {/* RIGHT COLUMN (5 cols on lg+): Device & Session Summary (2-Column Visual Tile Grid) */}
-              <div className="lg:col-span-5 flex flex-col justify-between bg-white">
+              {/* RIGHT COLUMN (50% width on lg+): Device & Session Summary (2-Column Visual Tile Grid) */}
+              <div className="w-full flex flex-col justify-between bg-white min-w-0">
                 <div className="px-4 sm:px-6 py-3 bg-[#FAFAFA] border-b border-[#E5E7EB] flex items-center justify-between gap-2">
                   <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-800">
                     <Monitor className="w-3.5 h-3.5 text-[#2563EB]" />
@@ -742,10 +742,10 @@ export default function App() {
                   </span>
                 </div>
 
-                <div className="p-4 sm:p-5 flex-1 flex flex-col justify-center">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="p-4 sm:p-6 flex-1 flex flex-col justify-center">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 sm:gap-4 h-full auto-rows-fr">
                     {/* Tile 1: Browser */}
-                    <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
+                    <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
                       <div className="w-9 h-9 rounded-lg bg-blue-50/60 border border-blue-200 flex items-center justify-center shrink-0">
                         <Compass className="w-4 h-4 text-[#2563EB]" />
                       </div>
@@ -761,7 +761,7 @@ export default function App() {
                     </div>
 
                     {/* Tile 2: OS & Device */}
-                    <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
+                    <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
                       <div className="w-9 h-9 rounded-lg bg-emerald-50/60 border border-emerald-200 flex items-center justify-center shrink-0">
                         <Monitor className="w-4 h-4 text-emerald-600" />
                       </div>
@@ -780,7 +780,7 @@ export default function App() {
                     </div>
 
                     {/* Tile 3: Display */}
-                    <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
+                    <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
                       <div className="w-9 h-9 rounded-lg bg-orange-50/60 border border-[#E5E7EB] flex items-center justify-center shrink-0">
                         <Maximize2 className="w-4 h-4 text-[#F05A28]" />
                       </div>
@@ -799,7 +799,7 @@ export default function App() {
                     </div>
 
                     {/* Tile 4: Locale & Timezone */}
-                    <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
+                    <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
                       <div className="w-9 h-9 rounded-lg bg-indigo-50/60 border border-indigo-200 flex items-center justify-center shrink-0">
                         <Languages className="w-4 h-4 text-indigo-600" />
                       </div>
@@ -817,7 +817,7 @@ export default function App() {
                     </div>
 
                     {/* Tile 5: Active Session */}
-                    <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
+                    <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
                       <div className="w-9 h-9 rounded-lg bg-amber-50/60 border border-amber-200 flex items-center justify-center shrink-0">
                         <KeyRound className="w-4 h-4 text-amber-700" />
                       </div>
@@ -833,7 +833,7 @@ export default function App() {
                     </div>
 
                     {/* Tile 6: First / Last Seen */}
-                    <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
+                    <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
                       <div className="w-9 h-9 rounded-lg bg-emerald-50/60 border border-emerald-200 flex items-center justify-center shrink-0">
                         <CalendarClock className="w-4 h-4 text-emerald-600" />
                       </div>

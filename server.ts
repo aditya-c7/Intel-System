@@ -777,8 +777,6 @@ export function normalizeIspAndOrg(
     'leaseweb',
     'amazon',
     'aws',
-    'google cloud',
-    'google llc',
     'cloudflare',
     'microsoft corporation',
     'akamai',
@@ -1151,7 +1149,6 @@ function detectServerRegion(req?: express.Request): {
   const envRegion =
     process.env.VERCEL_REGION ||
     process.env.CLOUD_RUN_REGION ||
-    process.env.GOOGLE_CLOUD_REGION ||
     '';
   const appUrl = process.env.APP_URL || '';
   const vercelIdHeader = req ? String(req.headers['x-vercel-id'] || '') : '';

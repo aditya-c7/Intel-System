@@ -101,7 +101,7 @@ export function areTimezonesEquivalent(tzA: string | null | undefined, tzB: stri
 }
 
 const DATACENTER_NETWORK_PATTERN =
-  /google llc|google cloud|cloudflare|amazon|aws|digitalocean|hetzner|m247|linode|akamai|ovh|microsoft corporation|azure|choopa|vultr|datacamp|leaseweb|packethub|tzulo|cogent|equinix|fastly|scaleway|upcloud|contabo|kamatera|nordvpn|expressvpn|mullvad|proton ag|surfshark|private internet access|cyberghost|ivpn|tor exit|hosting|datacenter|cloud|vps|dedibox/i;
+  /cloudflare|amazon|aws|digitalocean|hetzner|m247|linode|akamai|ovh|microsoft corporation|azure|choopa|vultr|datacamp|leaseweb|packethub|tzulo|cogent|equinix|fastly|scaleway|upcloud|contabo|kamatera|nordvpn|expressvpn|mullvad|proton ag|surfshark|private internet access|cyberghost|ivpn|tor exit|hosting|datacenter|cloud|vps|dedibox/i;
 
 export function isDatacenterOrVpnNetwork(
   isp: string | null | undefined,
@@ -496,7 +496,7 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
   const vivaldiBrand = findBrand(/Vivaldi/i);
   const braveBrand = findBrand(/Brave/i);
   const samsungBrand = findBrand(/Samsung/i);
-  const chromeBrand = findBrand(/Google Chrome|Chromium/i);
+  const chromeBrand = findBrand(/Chrome|Chromium/i);
 
   const edgUa = ua.match(/Edg(?:e|A|iOS)?\/([\d.]+)/);
   const oprUa = ua.match(/(?:OPR|Opera)\/([\d.]+)/);
@@ -756,7 +756,7 @@ export async function evaluateSecuritySignals(
     botSignals.push('navigator.languages array is empty');
   }
   if (
-    /SwiftShader|llvmpipe|Mesa OffScreen|Google SwiftShader|Software Rasterizer/i.test(
+    /SwiftShader|llvmpipe|Mesa OffScreen|Software Rasterizer/i.test(
       hardwareSignals.gpuRenderer
     )
   ) {

@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
-import { Cpu, Play, Square, Clock, ExternalLink, RefreshCw } from 'lucide-react';
+import { Play, Square, ExternalLink, RefreshCw } from 'lucide-react';
 
 export type RawPressureState = 'nominal' | 'fair' | 'serious' | 'critical';
 export type DisplayPressureLevel = 'Normal' | 'Moderate' | 'High' | 'Heavy';
@@ -52,112 +52,25 @@ const PRESSURE_MAP: Record<RawPressureState, DisplayPressureLevel> = {
 
 const DISPLAY_LEVELS: DisplayPressureLevel[] = ['Normal', 'Moderate', 'High', 'Heavy'];
 
-const SYSTEM_LOAD_THEME: Record<
-  DisplayPressureLevel,
-  {
-    circleBg: string;
-    iconColor: string;
-    needleAngleDeg: number;
-    rawLabel: RawPressureState;
-  }
-> = {
-  Normal: {
-    circleBg: '#DCFCE7',
-    iconColor: '#15803D',
-    needleAngleDeg: -38,
-    rawLabel: 'nominal',
-  },
-  Moderate: {
-    circleBg: '#FDECC8',
-    iconColor: '#B45309',
-    needleAngleDeg: -16,
-    rawLabel: 'fair',
-  },
-  High: {
-    circleBg: '#FCD9BD',
-    iconColor: '#C2410C',
-    needleAngleDeg: 18,
-    rawLabel: 'serious',
-  },
-  Heavy: {
-    circleBg: '#FAD1D1',
-    iconColor: '#B91C1C',
-    needleAngleDeg: 42,
-    rawLabel: 'critical',
-  },
-};
-
-function SystemLoadGaugeIcon({
-  level,
-  size = 22,
-}: {
-  level: DisplayPressureLevel;
-  size?: number;
-}) {
-  const theme = SYSTEM_LOAD_THEME[level];
-  const maskId = `gauge-needle-cutout-${level.toLowerCase()}`;
-
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 24 24"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden="true"
-      className="block shrink-0"
-    >
-      <defs>
-        {/* Creates the authentic small gap in the speedometer arch right around the needle tip */}
-        <mask id={maskId}>
-          <rect x="0" y="0" width="24" height="24" fill="white" />
-          <g transform={`rotate(${theme.needleAngleDeg} 12 14)`}>
-            <polygon points="9.7,4.2 14.3,4.2 13.1,10.5 10.9,10.5" fill="black" />
-          </g>
-        </mask>
-      </defs>
-
-      {/* Speedometer D-shape arch + flat baseline */}
-      <path
-        d="M 5.35 16.5 A 7.6 7.6 0 1 1 18.65 16.5 C 18.95 15.95 18.55 17.2 17.6 17.2 L 6.4 17.2 C 5.45 17.2 5.05 15.95 5.35 16.5 Z"
-        stroke={theme.iconColor}
-        strokeWidth="1.95"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        mask={`url(#${maskId})`}
-      />
-
-      {/* Tapered gauge needle + center pivot */}
-      <g transform={`rotate(${theme.needleAngleDeg} 12 14)`}>
-        <path
-          d="M 10.45 14 L 11.65 5.4 C 11.75 4.85 12.25 4.85 12.35 5.4 L 13.55 14 Z"
-          fill={theme.iconColor}
-        />
-        <circle cx="12" cy="14" r="1.75" fill={theme.iconColor} />
-      </g>
-    </svg>
-  );
-}
-
 function SystemLoadBadge({ level }: { level: DisplayPressureLevel }) {
-  const theme = SYSTEM_LOAD_THEME[level];
+  const dotColor =
+    level === 'Heavy'
+      ? 'bg-rose-500'
+      : level === 'High'
+      ? 'bg-orange-500'
+      : level === 'Moderate'
+      ? 'bg-amber-500'
+      : 'bg-emerald-500';
 
   return (
-    <div className="inline-flex items-center gap-3.5 select-none">
-      <div
-        className="w-10 h-10 rounded-full flex items-center justify-center shrink-0 transition-colors duration-300"
-        style={{ backgroundColor: theme.circleBg }}
-      >
-        <SystemLoadGaugeIcon level={level} size={22} />
-      </div>
-      <div className="flex flex-col justify-center">
-        <span className="text-[15px] font-semibold text-slate-900 leading-tight tracking-[-0.01em]">
-          System load
-        </span>
-        <span className="text-[13px] font-normal text-slate-600 leading-snug mt-0.5">
-          {level}
-        </span>
-      </div>
+    <div className="min-w-0">
+      <span className="text-xs text-zinc-500 dark:text-zinc-400 font-normal block truncate">
+        System Load
+      </span>
+      <span className="inline-flex items-center gap-1.5 text-xs sm:text-sm font-mono tabular-nums font-medium text-zinc-900 dark:text-zinc-100 mt-0.5 truncate">
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
+        <span>{level}</span>
+      </span>
     </div>
   );
 }
@@ -721,38 +634,33 @@ export function CpuActivityPanel() {
     : 'Normal';
 
   return (
-    <div className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6 flex flex-col justify-between">
+    <div className="bg-white dark:bg-[#0A0D14] border border-zinc-200 dark:border-zinc-800/90 rounded-md flex flex-col justify-between overflow-hidden">
       <div>
         {/* Header */}
-        <div className="flex flex-wrap items-center justify-between gap-3 pb-3.5 border-b border-[#E5E7EB]">
-          <div className="flex items-center gap-2">
-            <Cpu className="w-4 h-4 text-[#2563EB] shrink-0" />
-            <h2 className="text-sm font-semibold text-slate-900">
-              CPU Activity
-            </h2>
-          </div>
+        <div className="px-4 sm:px-5 py-3 border-b border-zinc-200/70 dark:border-zinc-800/70 flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-xs sm:text-sm font-medium text-zinc-900 dark:text-zinc-100">
+            CPU Activity
+          </h2>
 
-          <div className="flex items-center gap-2.5">
-            <span className="text-xs font-mono text-slate-600">
-              Status:{' '}
-              <strong
-                className={
+          <div className="flex items-center gap-3">
+            <span className="inline-flex items-center gap-1.5 text-xs font-mono tabular-nums text-zinc-900 dark:text-zinc-100">
+              <span
+                className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                   status === 'Live' || status === 'Monitoring'
-                    ? 'text-emerald-700'
+                    ? 'bg-emerald-500'
                     : status === 'Paused' || status === 'Initializing'
-                    ? 'text-amber-700'
-                    : 'text-red-600'
-                }
-              >
-                {renderStatusText()}
-              </strong>
+                    ? 'bg-amber-500'
+                    : 'bg-rose-500'
+                }`}
+              />
+              <span>{renderStatusText()}</span>
             </span>
 
             {status === 'Blocked' || status === 'Error' ? (
               <button
                 type="button"
                 onClick={() => startCpuObservation(true)}
-                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-300 rounded whitespace-nowrap shrink-0 cursor-pointer"
+                className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-[#0A0D14] hover:bg-zinc-50 dark:hover:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded whitespace-nowrap shrink-0 cursor-pointer transition-colors"
               >
                 <RefreshCw className="w-3 h-3" />
                 <span>Retry</span>
@@ -762,7 +670,7 @@ export function CpuActivityPanel() {
                 type="button"
                 onClick={() => setUserEnabled((prev) => !prev)}
                 disabled={status === 'Unsupported'}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-300 rounded disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-[#0A0D14] hover:bg-zinc-50 dark:hover:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer transition-colors"
               >
                 {userEnabled ? (
                   <>
@@ -780,50 +688,46 @@ export function CpuActivityPanel() {
           </div>
         </div>
 
-        {/* Summary Metrics Row with Single Active System Load Badge */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 items-stretch gap-2.5 sm:gap-3 py-3.5 border-b border-slate-100 text-xs">
-          <div className="p-2.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center min-w-0">
+        {/* Hairline 4-Column Summary Metrics Row */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 border-b border-zinc-200/70 dark:border-zinc-800/70 divide-y sm:divide-y-0 divide-x divide-zinc-200/70 dark:divide-zinc-800/70 text-xs">
+          <div className="px-4 py-3 min-w-0">
             <SystemLoadBadge level={currentBadgeLevel} />
           </div>
 
-          <div className="p-2.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex flex-col justify-center min-w-0">
-            <span className="text-[11px] text-slate-500 block truncate">CPU State</span>
+          <div className="px-4 py-3 min-w-0">
+            <span className="text-xs text-zinc-500 dark:text-zinc-400 font-normal block truncate">
+              CPU State
+            </span>
             <span
-              className="text-sm sm:text-base font-bold text-slate-900 mt-0.5 block truncate"
+              className="text-xs sm:text-sm font-mono tabular-nums font-medium text-zinc-900 dark:text-zinc-100 mt-0.5 block truncate"
               title={errorDetail || renderCurrentLoadValue()}
             >
               {renderCurrentLoadValue()}
             </span>
           </div>
 
-          <div className="p-2.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex flex-col justify-center min-w-0">
-            <span className="text-[11px] text-slate-500 inline-flex items-center gap-1 truncate">
-              <Clock className="w-3 h-3 text-slate-400 shrink-0" /> Last Sample
+          <div className="px-4 py-3 min-w-0">
+            <span className="text-xs text-zinc-500 dark:text-zinc-400 font-normal block truncate">
+              Last Sample
             </span>
-            <span className="text-sm sm:text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block truncate">
+            <span className="text-xs sm:text-sm font-mono tabular-nums font-medium text-zinc-900 dark:text-zinc-100 mt-0.5 block truncate">
               {latestSample ? formatClockTimestamp(latestSample.timestampMs) : 'Waiting...'}
             </span>
-            {isStale && timeSinceLastObservationMs !== null && (
-              <span className="text-[10px] font-mono text-amber-700 block truncate">
-                {Math.round(timeSinceLastObservationMs / 1000)}s held
-              </span>
-            )}
           </div>
 
-          <div className="p-2.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex flex-col justify-center min-w-0">
-            <span className="text-[11px] text-slate-500 block truncate">Samples</span>
-            <span className="text-sm sm:text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block truncate">
-              {samples.length}{' '}
-              <span className="text-[11px] font-sans font-normal text-slate-500">
-                {samples.length === 1 ? 'record' : 'records'}
-              </span>
+          <div className="px-4 py-3 min-w-0">
+            <span className="text-xs text-zinc-500 dark:text-zinc-400 font-normal block truncate">
+              Samples
+            </span>
+            <span className="text-xs sm:text-sm font-mono tabular-nums font-medium text-zinc-900 dark:text-zinc-100 mt-0.5 block truncate">
+              {samples.length}
             </span>
           </div>
         </div>
 
         {/* Notice if blocked specifically by embedded preview iframe */}
         {status === 'Blocked' && insideIframe && (
-          <div className="mt-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900 flex items-center justify-between gap-2">
+          <div className="px-4 sm:px-5 py-2.5 border-b border-zinc-200/70 dark:border-zinc-800/70 text-xs text-zinc-600 dark:text-zinc-400 flex items-center justify-between gap-3">
             <span className="truncate">
               Open in a direct browser tab to enable W3C Compute Pressure telemetry.
             </span>
@@ -831,7 +735,7 @@ export function CpuActivityPanel() {
               href={typeof window !== 'undefined' ? window.location.href : '#'}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-amber-900 bg-white border border-amber-300 rounded hover:bg-amber-100 shrink-0"
+              className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-zinc-800 dark:text-zinc-200 border border-zinc-200 dark:border-zinc-800 rounded hover:bg-zinc-50 dark:hover:bg-zinc-900 shrink-0"
             >
               <span>Open Tab</span>
               <ExternalLink className="w-3 h-3" />
@@ -839,10 +743,10 @@ export function CpuActivityPanel() {
           </div>
         )}
 
-        {/* Step-Line Time-Series Graph (1:1 Responsive on Mobile & Desktop) */}
-        <div className="mt-3.5" ref={chartWrapperRef}>
-          <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1.5">
-            <span>CPU Pressure (Normal to Heavy) • Tap line to inspect</span>
+        {/* Step-Line Time-Series Graph */}
+        <div className="p-4 sm:p-5" ref={chartWrapperRef}>
+          <div className="flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400 mb-2">
+            <span>CPU Pressure (Normal to Heavy) · Click line to inspect</span>
             <span className="font-mono tabular-nums">
               {status === 'Live'
                 ? 'Live 5m'
@@ -852,7 +756,7 @@ export function CpuActivityPanel() {
             </span>
           </div>
 
-          <div className="relative w-full bg-white border border-slate-200 rounded p-2 select-none">
+          <div className="relative w-full bg-white dark:bg-[#0A0D14] border border-zinc-200/70 dark:border-zinc-800/70 rounded p-2 select-none">
             <svg
               ref={svgRef}
               width={svgWidth}
@@ -870,7 +774,6 @@ export function CpuActivityPanel() {
                 </clipPath>
               </defs>
 
-              {/* Horizontal Gridlines & Labels for Normal, Moderate, High, Heavy */}
               {DISPLAY_LEVELS.map((level) => {
                 const y = getYForLevel(level);
                 return (
@@ -887,7 +790,7 @@ export function CpuActivityPanel() {
                       x={padLeft - 6}
                       y={y + 3.5}
                       textAnchor="end"
-                      className="fill-slate-500 font-mono text-[10px]"
+                      className="fill-zinc-400 font-mono text-[10px]"
                     >
                       {level}
                     </text>
@@ -895,7 +798,6 @@ export function CpuActivityPanel() {
                 );
               })}
 
-              {/* Left Y-axis & Bottom X-axis thin lines */}
               <line
                 x1={padLeft}
                 y1={padTop}
@@ -913,7 +815,6 @@ export function CpuActivityPanel() {
                 strokeWidth="1"
               />
 
-              {/* Moving X-Axis Timestamp Labels */}
               {xTicks.map((tickMs) => {
                 const x = getXForTimestamp(tickMs);
                 if (x < padLeft + 26 || x > svgWidth - padRight - 26) return null;
@@ -939,7 +840,7 @@ export function CpuActivityPanel() {
                       x={x}
                       y={svgHeight - 7}
                       textAnchor="middle"
-                      className="fill-slate-500 font-mono text-[10px]"
+                      className="fill-zinc-400 font-mono text-[10px]"
                     >
                       {formatClockTimestamp(tickMs)}
                     </text>
@@ -947,20 +848,18 @@ export function CpuActivityPanel() {
                 );
               })}
 
-              {/* Clipped Plot Area: Blue Step-Line of Actual Observations */}
               <g clipPath="url(#cpu-pressure-plot-clip)">
                 {stepPath && (
                   <path
                     d={stepPath}
                     fill="none"
                     stroke="#2563EB"
-                    strokeWidth="2"
+                    strokeWidth="1.75"
                     strokeLinejoin="miter"
                     strokeLinecap="butt"
                   />
                 )}
 
-                {/* Interactive Crosshair at Clicked Actual Observation */}
                 {activeTooltipSample && activeTooltipX !== null && (
                   <line
                     x1={activeTooltipX}
@@ -974,13 +873,12 @@ export function CpuActivityPanel() {
                 )}
               </g>
 
-              {/* Status Overlay inside Chart when no observations have arrived yet or on error */}
               {visibleSamples.length === 0 && (
                 <text
                   x={padLeft + plotWidth / 2}
                   y={padTop + plotHeight / 2}
                   textAnchor="middle"
-                  className="fill-slate-500 font-sans text-[11px] font-medium"
+                  className="fill-zinc-400 font-sans text-[11px] font-normal"
                 >
                   {status === 'Monitoring'
                     ? 'Waiting for first CPU pressure observation'
@@ -999,7 +897,6 @@ export function CpuActivityPanel() {
               )}
             </svg>
 
-            {/* Click-Only Historical Tooltip */}
             {activeTooltipSample && activeTooltipX !== null && (
               <div
                 style={{
@@ -1007,15 +904,14 @@ export function CpuActivityPanel() {
                   top: `${Math.max(8, Math.min(115, (activeTooltipY / svgHeight) * 140))}px`,
                   transform: 'translateX(-50%)',
                 }}
-                className="absolute z-20 bg-white border border-slate-200 rounded shadow-sm px-3 py-2 text-xs pointer-events-none min-w-[175px]"
+                className="absolute z-20 bg-white dark:bg-[#0A0D14] border border-zinc-200 dark:border-zinc-800 rounded px-3 py-2 text-xs pointer-events-none min-w-[175px]"
               >
-                <div className="font-mono tabular-nums font-semibold text-slate-800 pb-1 border-b border-slate-100">
+                <div className="font-mono tabular-nums font-medium text-zinc-900 dark:text-zinc-100 pb-1 border-b border-zinc-200/70 dark:border-zinc-800/70">
                   {formatClockTimestamp(activeTooltipSample.timestampMs)}
                 </div>
-                <div className="flex items-center gap-2 mt-1.5">
-                  <span className="w-3 h-0.5 bg-[#2563EB] inline-block shrink-0" />
-                  <span className="text-slate-600">CPU state:</span>
-                  <span className="font-semibold text-slate-900 ml-auto">
+                <div className="flex items-center justify-between gap-4 mt-1.5">
+                  <span className="text-zinc-500 dark:text-zinc-400">CPU state</span>
+                  <span className="font-mono tabular-nums font-semibold text-zinc-900 dark:text-zinc-100">
                     {activeTooltipSample.displayLevel} ({activeTooltipSample.rawState})
                   </span>
                 </div>
@@ -1027,11 +923,11 @@ export function CpuActivityPanel() {
 
       {/* Concise Status Footer */}
       <div
-        className="mt-4 pt-3.5 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500"
+        className="px-4 sm:px-5 py-3 border-t border-zinc-200/70 dark:border-zinc-800/70 flex flex-wrap items-center justify-between gap-2 text-xs text-zinc-500 dark:text-zinc-400"
         title={httpPolicyHeader ? `Permissions-Policy: ${httpPolicyHeader}` : undefined}
       >
-        <span>Scale: Normal • Moderate • High • Heavy</span>
-        <span className="font-mono shrink-0">W3C Compute Pressure (1s)</span>
+        <span>Scale: Normal · Moderate · High · Heavy</span>
+        <span className="font-mono tabular-nums shrink-0">W3C Compute Pressure (1s)</span>
       </div>
     </div>
   );
