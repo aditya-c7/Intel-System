@@ -2,24 +2,32 @@ import express from 'express';
 import cookieParser from 'cookie-parser';
 import crypto from 'crypto';
 import net from 'net';
+import os from 'os';
 import path from 'path';
 import fs from 'fs';
-import Database from 'better-sqlite3';
-import { createServer as createViteServer } from 'vite';
+import { createRequire } from 'module';
 import dotenv from 'dotenv';
 import type {
   BrowserDeviceInfo,
   LocationInfo,
   VisitStatistics,
   VisitHistoryRecord,
+  SignedHistoryBackup,
   IntelVisitorResponse,
-} from './src/types/visitor.ts';
+} from './src/types/visitor';
 
 dotenv.config();
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const SESSION_TIMEOUT_MINUTES = 30;
 const SESSION_EXPIRATION_MS = SESSION_TIMEOUT_MINUTES * 60 * 1000;
+
+const IS_SERVERLESS_RUNTIME = Boolean(
+  process.env.VERCEL ||
+    process.env.VERCEL_ENV ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.NETLIFY
+);
 
 const HMAC_SECRET =
   process.env.VISITOR_HMAC_SECRET ||
@@ -27,97 +35,354 @@ const HMAC_SECRET =
 
 const SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES = 512 * 1024 * 1024; // 512 MB max budget so fast connections can sustain full 5s download
 const SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES = 256 * 1024 * 1024; // 256 MB max budget so fast connections can sustain full 5s upload
-const SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = 16 * 1024 * 1024; // 16 MB max per individual stream request
-const SPEED_TEST_MAX_STREAM_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MB max per individual upload stream request
+const SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = 2 * 1024 * 1024; // 2 MB max per individual stream request (safely under Vercel 4.5 MB limit)
+const SPEED_TEST_MAX_STREAM_UPLOAD_BYTES = 2 * 1024 * 1024; // 2 MB max per individual upload request (safely under Vercel 4.5 MB limit)
 const SPEED_TEST_CONCURRENT_STREAMS = 4;
 const SPEED_TEST_TOKEN_TTL_MS = 60 * 1000; // 60s token validity
 const SPEED_TEST_STREAM_TIMEOUT_MS = 15 * 1000; // 15s hard per-stream timeout
 const HIGH_ENTROPY_64KB_CHUNK = crypto.randomBytes(65536); // Non-compressible 64 KB random buffer
 
-const dataDir = path.resolve(process.cwd(), 'data');
-if (!fs.existsSync(dataDir)) {
-  fs.mkdirSync(dataDir, { recursive: true });
+interface VisitorRow {
+  visitor_id: string;
+  hmac_token: string;
+  created_at_utc: string;
+  updated_at_utc: string;
+  active_session_id: string;
+  last_activity_utc: string;
 }
 
-const dbPath = path.join(dataDir, 'intel_system.db');
-const db = new Database(dbPath);
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+interface VisitRow {
+  id: number;
+  visit_id: string;
+  visitor_id: string;
+  session_id: string;
+  page_load_id: string;
+  visited_at_utc: string;
+  public_ip: string;
+  city: string;
+  region: string;
+  country: string;
+  latitude: number | null;
+  longitude: number | null;
+  isp: string;
+  org: string;
+  asn: string;
+  browser: string;
+  os: string;
+  device_type: string;
+  screen_resolution: string;
+  language: string;
+  timezone: string;
+}
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS visitors (
-    visitor_id TEXT PRIMARY KEY,
-    hmac_token TEXT NOT NULL,
-    created_at_utc TEXT NOT NULL,
-    updated_at_utc TEXT NOT NULL,
-    active_session_id TEXT NOT NULL,
-    last_activity_utc TEXT NOT NULL
-  );
+interface GeoCacheRow {
+  ip_address: string;
+  city: string;
+  region: string;
+  country: string;
+  country_code: string;
+  latitude: number | null;
+  longitude: number | null;
+  isp: string;
+  org: string;
+  asn: string;
+  is_vpn_or_hosting: number;
+  verified_at_ms: number;
+}
 
-  CREATE TABLE IF NOT EXISTS visits (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    visit_id TEXT UNIQUE NOT NULL,
-    visitor_id TEXT NOT NULL,
-    session_id TEXT NOT NULL,
-    page_load_id TEXT NOT NULL,
-    visited_at_utc TEXT NOT NULL,
-    public_ip TEXT NOT NULL,
-    city TEXT NOT NULL,
-    region TEXT NOT NULL,
-    country TEXT NOT NULL,
-    latitude REAL,
-    longitude REAL,
-    isp TEXT NOT NULL DEFAULT 'Unknown',
-    org TEXT NOT NULL DEFAULT 'Unknown',
-    asn TEXT NOT NULL DEFAULT 'Unknown',
-    browser TEXT NOT NULL,
-    os TEXT NOT NULL,
-    device_type TEXT NOT NULL,
-    screen_resolution TEXT NOT NULL,
-    language TEXT NOT NULL,
-    timezone TEXT NOT NULL,
-    UNIQUE(visitor_id, page_load_id),
-    FOREIGN KEY (visitor_id) REFERENCES visitors(visitor_id) ON DELETE CASCADE
-  );
+interface PreparedStatementShim {
+  get: (...params: unknown[]) => unknown;
+  all: (...params: unknown[]) => unknown[];
+  run: (...params: unknown[]) => { changes: number };
+}
 
-  CREATE INDEX IF NOT EXISTS idx_visits_visitor_utc ON visits(visitor_id, visited_at_utc DESC, id DESC);
+interface DatabaseAdapter {
+  prepare: (sql: string) => PreparedStatementShim;
+  exec: (sql: string) => void;
+}
 
-  CREATE TABLE IF NOT EXISTS verified_geo_cache_v3 (
-    ip_address TEXT PRIMARY KEY,
-    city TEXT NOT NULL,
-    region TEXT NOT NULL,
-    country TEXT NOT NULL,
-    country_code TEXT NOT NULL,
-    latitude REAL,
-    longitude REAL,
-    isp TEXT NOT NULL,
-    org TEXT NOT NULL,
-    asn TEXT NOT NULL,
-    is_vpn_or_hosting INTEGER NOT NULL DEFAULT 0,
-    verified_at_ms INTEGER NOT NULL
-  );
-`);
+function createInMemoryDbAdapter(): DatabaseAdapter {
+  const visitorsMap = new Map<string, VisitorRow>();
+  const visitsList: VisitRow[] = [];
+  const geoCacheMap = new Map<string, GeoCacheRow>();
+  let autoIncrementId = 1;
 
-// Add isp, org, asn, latitude, longitude columns to existing tables if migrating from earlier schema
-for (const col of ['isp', 'org', 'asn']) {
+  return {
+    exec: () => {},
+    prepare: (sql: string): PreparedStatementShim => {
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+
+      return {
+        get: (...params: unknown[]) => {
+          if (normalized.includes('FROM verified_geo_cache_v3 WHERE ip_address = ?')) {
+            const ip = String(params[0] || '');
+            return geoCacheMap.get(ip);
+          }
+          if (normalized.includes('SELECT COUNT(*) AS count FROM visitors')) {
+            return { count: visitorsMap.size };
+          }
+          if (normalized.includes('SELECT COUNT(*) AS count FROM visits')) {
+            return { count: visitsList.length };
+          }
+          if (normalized.includes('SELECT * FROM visitors WHERE visitor_id = ?')) {
+            const vid = String(params[0] || '');
+            return visitorsMap.get(vid);
+          }
+          if (
+            normalized.includes(
+              'SELECT session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?'
+            )
+          ) {
+            const vid = String(params[0] || '');
+            const plId = String(params[1] || '');
+            const found = visitsList.find(
+              (v) => v.visitor_id === vid && v.page_load_id === plId
+            );
+            return found
+              ? { session_id: found.session_id, visited_at_utc: found.visited_at_utc }
+              : undefined;
+          }
+          if (normalized.includes('COUNT(*) AS total_visits') && normalized.includes('FROM visits WHERE visitor_id = ?')) {
+            const vid = String(params[0] || '');
+            const userVisits = visitsList.filter((v) => v.visitor_id === vid);
+            if (userVisits.length === 0) {
+              return {
+                total_visits: 0,
+                first_visit_utc: null,
+                last_visit_utc: null,
+                total_sessions: 0,
+              };
+            }
+            const sortedAsc = [...userVisits].sort((a, b) =>
+              a.visited_at_utc.localeCompare(b.visited_at_utc)
+            );
+            const sessions = new Set(userVisits.map((v) => v.session_id));
+            return {
+              total_visits: userVisits.length,
+              first_visit_utc: sortedAsc[0].visited_at_utc,
+              last_visit_utc: sortedAsc[sortedAsc.length - 1].visited_at_utc,
+              total_sessions: sessions.size,
+            };
+          }
+          if (normalized.includes('LIMIT 1 OFFSET 1')) {
+            const vid = String(params[0] || '');
+            const userVisits = visitsList
+              .filter((v) => v.visitor_id === vid)
+              .sort((a, b) => b.visited_at_utc.localeCompare(a.visited_at_utc) || b.id - a.id);
+            return userVisits.length > 1
+              ? { visited_at_utc: userVisits[1].visited_at_utc }
+              : undefined;
+          }
+          return undefined;
+        },
+
+        all: (...params: unknown[]) => {
+          if (normalized.includes('FROM visits WHERE visitor_id = ?')) {
+            const vid = String(params[0] || '');
+            return visitsList
+              .filter((v) => v.visitor_id === vid)
+              .sort((a, b) => b.visited_at_utc.localeCompare(a.visited_at_utc) || b.id - a.id)
+              .slice(0, 50);
+          }
+          return [];
+        },
+
+        run: (...params: unknown[]) => {
+          if (normalized.includes('INSERT OR REPLACE INTO verified_geo_cache_v3')) {
+            const row: GeoCacheRow = {
+              ip_address: String(params[0] || ''),
+              city: String(params[1] || 'Unknown'),
+              region: String(params[2] || 'Unknown'),
+              country: String(params[3] || 'Unknown'),
+              country_code: String(params[4] || ''),
+              latitude: typeof params[5] === 'number' ? params[5] : null,
+              longitude: typeof params[6] === 'number' ? params[6] : null,
+              isp: String(params[7] || 'Unknown'),
+              org: String(params[8] || 'Unknown'),
+              asn: String(params[9] || 'Unknown'),
+              is_vpn_or_hosting: Number(params[10] || 0),
+              verified_at_ms: Number(params[11] || Date.now()),
+            };
+            geoCacheMap.set(row.ip_address, row);
+            return { changes: 1 };
+          }
+          if (normalized.includes('INSERT INTO visitors') || normalized.includes('INSERT OR REPLACE INTO visitors')) {
+            const row: VisitorRow = {
+              visitor_id: String(params[0] || ''),
+              hmac_token: String(params[1] || ''),
+              created_at_utc: String(params[2] || ''),
+              updated_at_utc: String(params[3] || ''),
+              active_session_id: String(params[4] || ''),
+              last_activity_utc: String(params[5] || ''),
+            };
+            visitorsMap.set(row.visitor_id, row);
+            return { changes: 1 };
+          }
+          if (normalized.includes('UPDATE visitors')) {
+            const vid = String(params[3] || '');
+            const existing = visitorsMap.get(vid);
+            if (existing) {
+              existing.updated_at_utc = String(params[0] || existing.updated_at_utc);
+              existing.active_session_id = String(params[1] || existing.active_session_id);
+              existing.last_activity_utc = String(params[2] || existing.last_activity_utc);
+              return { changes: 1 };
+            }
+            return { changes: 0 };
+          }
+          if (normalized.includes('INSERT OR IGNORE INTO visits')) {
+            const visitId = String(params[0] || '');
+            const visitorId = String(params[1] || '');
+            const pageLoadId = String(params[3] || '');
+            const duplicate = visitsList.some(
+              (v) =>
+                v.visit_id === visitId ||
+                (v.visitor_id === visitorId && v.page_load_id === pageLoadId)
+            );
+            if (duplicate) {
+              return { changes: 0 };
+            }
+            visitsList.push({
+              id: autoIncrementId++,
+              visit_id: visitId,
+              visitor_id: visitorId,
+              session_id: String(params[2] || ''),
+              page_load_id: pageLoadId,
+              visited_at_utc: String(params[4] || ''),
+              public_ip: String(params[5] || 'Unavailable'),
+              city: String(params[6] || 'Unknown'),
+              region: String(params[7] || 'Unknown'),
+              country: String(params[8] || 'Unknown'),
+              latitude: typeof params[9] === 'number' ? params[9] : null,
+              longitude: typeof params[10] === 'number' ? params[10] : null,
+              isp: String(params[11] || 'Unknown'),
+              org: String(params[12] || 'Unknown'),
+              asn: String(params[13] || 'Unknown'),
+              browser: String(params[14] || 'Unknown'),
+              os: String(params[15] || 'Unknown'),
+              device_type: String(params[16] || 'Unknown'),
+              screen_resolution: String(params[17] || 'Unavailable'),
+              language: String(params[18] || 'Unavailable'),
+              timezone: String(params[19] || 'Unavailable'),
+            });
+            return { changes: 1 };
+          }
+          return { changes: 0 };
+        },
+      };
+    },
+  };
+}
+
+function initializeDatabase(): DatabaseAdapter {
+  let targetDir = path.join(os.tmpdir(), 'intel-system-data');
+  if (!IS_SERVERLESS_RUNTIME) {
+    try {
+      const localDataDir = path.resolve(process.cwd(), 'data');
+      if (!fs.existsSync(localDataDir)) {
+        fs.mkdirSync(localDataDir, { recursive: true });
+      }
+      fs.accessSync(localDataDir, fs.constants.W_OK);
+      targetDir = localDataDir;
+    } catch {
+      targetDir = path.join(os.tmpdir(), 'intel-system-data');
+    }
+  }
+
   try {
-    db.exec(`ALTER TABLE visits ADD COLUMN ${col} TEXT NOT NULL DEFAULT 'Unknown'`);
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+    }
+    const dbPath = path.join(targetDir, 'intel_system.db');
+    const requireModule = createRequire(import.meta.url);
+    const BetterSqlite3 = requireModule('better-sqlite3') as new (
+      filename: string
+    ) => DatabaseAdapter & { pragma: (str: string) => void };
+
+    const sqliteDb = new BetterSqlite3(dbPath);
+    sqliteDb.pragma('journal_mode = WAL');
+    sqliteDb.pragma('foreign_keys = ON');
+
+    sqliteDb.exec(`
+      CREATE TABLE IF NOT EXISTS visitors (
+        visitor_id TEXT PRIMARY KEY,
+        hmac_token TEXT NOT NULL,
+        created_at_utc TEXT NOT NULL,
+        updated_at_utc TEXT NOT NULL,
+        active_session_id TEXT NOT NULL,
+        last_activity_utc TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS visits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        visit_id TEXT UNIQUE NOT NULL,
+        visitor_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        page_load_id TEXT NOT NULL,
+        visited_at_utc TEXT NOT NULL,
+        public_ip TEXT NOT NULL,
+        city TEXT NOT NULL,
+        region TEXT NOT NULL,
+        country TEXT NOT NULL,
+        latitude REAL,
+        longitude REAL,
+        isp TEXT NOT NULL DEFAULT 'Unknown',
+        org TEXT NOT NULL DEFAULT 'Unknown',
+        asn TEXT NOT NULL DEFAULT 'Unknown',
+        browser TEXT NOT NULL,
+        os TEXT NOT NULL,
+        device_type TEXT NOT NULL,
+        screen_resolution TEXT NOT NULL,
+        language TEXT NOT NULL,
+        timezone TEXT NOT NULL,
+        UNIQUE(visitor_id, page_load_id),
+        FOREIGN KEY (visitor_id) REFERENCES visitors(visitor_id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_visits_visitor_utc ON visits(visitor_id, visited_at_utc DESC, id DESC);
+
+      CREATE TABLE IF NOT EXISTS verified_geo_cache_v3 (
+        ip_address TEXT PRIMARY KEY,
+        city TEXT NOT NULL,
+        region TEXT NOT NULL,
+        country TEXT NOT NULL,
+        country_code TEXT NOT NULL,
+        latitude REAL,
+        longitude REAL,
+        isp TEXT NOT NULL,
+        org TEXT NOT NULL,
+        asn TEXT NOT NULL,
+        is_vpn_or_hosting INTEGER NOT NULL DEFAULT 0,
+        verified_at_ms INTEGER NOT NULL
+      );
+    `);
+
+    for (const col of ['isp', 'org', 'asn']) {
+      try {
+        sqliteDb.exec(`ALTER TABLE visits ADD COLUMN ${col} TEXT NOT NULL DEFAULT 'Unknown'`);
+      } catch {
+        // Column already exists
+      }
+    }
+    for (const col of ['latitude', 'longitude']) {
+      try {
+        sqliteDb.exec(`ALTER TABLE visits ADD COLUMN ${col} REAL`);
+      } catch {
+        // Column already exists
+      }
+      try {
+        sqliteDb.exec(`ALTER TABLE verified_geo_cache_v3 ADD COLUMN ${col} REAL`);
+      } catch {
+        // Column already exists
+      }
+    }
+
+    return sqliteDb;
   } catch {
-    // Column already exists
+    return createInMemoryDbAdapter();
   }
 }
-for (const col of ['latitude', 'longitude']) {
-  try {
-    db.exec(`ALTER TABLE visits ADD COLUMN ${col} REAL`);
-  } catch {
-    // Column already exists
-  }
-  try {
-    db.exec(`ALTER TABLE verified_geo_cache_v3 ADD COLUMN ${col} REAL`);
-  } catch {
-    // Column already exists
-  }
-}
+
+const db = initializeDatabase();
 
 function signVisitorId(visitorId: string): string {
   return crypto.createHmac('sha256', HMAC_SECRET).update(visitorId).digest('hex');
@@ -131,6 +396,79 @@ function verifyVisitorToken(visitorId: string | undefined | null, token: string 
   if (expected.length !== token.length) return false;
   try {
     return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(token, 'hex'));
+  } catch {
+    return false;
+  }
+}
+
+function computeHistoryBackupSignature(
+  visitorId: string,
+  totalVisits: number,
+  totalSessions: number,
+  firstVisitUtc: string,
+  visits: VisitHistoryRecord[]
+): string {
+  const visitDigest = visits
+    .map((v) => `${v.visitId}:${v.sessionId}:${v.visitedAtUtc}:${v.publicIp}`)
+    .join('|');
+  const payload = `hist:${visitorId}:${totalVisits}:${totalSessions}:${firstVisitUtc}:${visitDigest}`;
+  return crypto.createHmac('sha256', HMAC_SECRET).update(payload).digest('hex');
+}
+
+function createSignedHistoryBackup(
+  visitorId: string,
+  totalVisits: number,
+  totalSessions: number,
+  firstVisitUtc: string,
+  visits: VisitHistoryRecord[]
+): SignedHistoryBackup {
+  const compactVisits = visits.slice(0, 35);
+  const signature = computeHistoryBackupSignature(
+    visitorId,
+    totalVisits,
+    totalSessions,
+    firstVisitUtc,
+    compactVisits
+  );
+  return {
+    visitorId,
+    totalVisits,
+    totalSessions,
+    firstVisitUtc,
+    visits: compactVisits,
+    signature,
+  };
+}
+
+function verifySignedHistoryBackup(
+  expectedVisitorId: string,
+  backup: SignedHistoryBackup | null | undefined
+): boolean {
+  if (
+    !backup ||
+    typeof backup !== 'object' ||
+    backup.visitorId !== expectedVisitorId ||
+    typeof backup.signature !== 'string' ||
+    typeof backup.totalVisits !== 'number' ||
+    typeof backup.totalSessions !== 'number' ||
+    typeof backup.firstVisitUtc !== 'string' ||
+    !Array.isArray(backup.visits)
+  ) {
+    return false;
+  }
+  const expectedSig = computeHistoryBackupSignature(
+    backup.visitorId,
+    backup.totalVisits,
+    backup.totalSessions,
+    backup.firstVisitUtc,
+    backup.visits
+  );
+  if (expectedSig.length !== backup.signature.length) return false;
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(expectedSig, 'hex'),
+      Buffer.from(backup.signature, 'hex')
+    );
   } catch {
     return false;
   }
@@ -221,6 +559,8 @@ export function isPublicRoutableIp(ip: string | null): boolean {
 
 export function extractVisitorIp(req: express.Request): { ip: string; isPublic: boolean } {
   const singleHeaders = [
+    'x-vercel-forwarded-for',
+    'x-vercel-proxied-for',
     'cf-connecting-ip',
     'true-client-ip',
     'x-real-ip',
@@ -231,7 +571,8 @@ export function extractVisitorIp(req: express.Request): { ip: string; isPublic: 
   for (const headerName of singleHeaders) {
     const rawVal = req.headers[headerName];
     if (typeof rawVal === 'string' && rawVal.trim()) {
-      const normalized = normalizeIpCandidate(rawVal);
+      const firstHop = rawVal.split(',')[0];
+      const normalized = normalizeIpCandidate(firstHop);
       if (normalized && isPublicRoutableIp(normalized)) {
         return { ip: normalized, isPublic: true };
       }
@@ -761,14 +1102,29 @@ function detectServerRegion(req?: express.Request): {
   regionLabel: string;
 } {
   const envRegion =
+    process.env.VERCEL_REGION ||
     process.env.CLOUD_RUN_REGION ||
     process.env.GOOGLE_CLOUD_REGION ||
     '';
   const appUrl = process.env.APP_URL || '';
+  const vercelIdHeader = req ? String(req.headers['x-vercel-id'] || '') : '';
   const hostHeader = req ? String(req.headers['x-forwarded-host'] || req.headers.host || '') : '';
-  const combined = `${envRegion} ${appUrl} ${hostHeader}`.toLowerCase();
+  const combined = `${envRegion} ${vercelIdHeader} ${appUrl} ${hostHeader}`.toLowerCase();
 
   const regionNames: Record<string, string> = {
+    'bom1': 'bom1 (Mumbai, India)',
+    'sin1': 'sin1 (Singapore)',
+    'hnd1': 'hnd1 (Tokyo, Japan)',
+    'icn1': 'icn1 (Seoul, South Korea)',
+    'syd1': 'syd1 (Sydney, Australia)',
+    'fra1': 'fra1 (Frankfurt, Germany)',
+    'lhr1': 'lhr1 (London, UK)',
+    'cdg1': 'cdg1 (Paris, France)',
+    'iad1': 'iad1 (Washington, D.C., USA)',
+    'sfo1': 'sfo1 (San Francisco, USA)',
+    'pdx1': 'pdx1 (Portland, USA)',
+    'cle1': 'cle1 (Cleveland, USA)',
+    'gru1': 'gru1 (Sao Paulo, Brazil)',
     'asia-southeast1': 'asia-southeast1 (Singapore)',
     'asia-south1': 'asia-south1 (Mumbai, India)',
     'asia-south2': 'asia-south2 (Delhi, India)',
@@ -788,8 +1144,8 @@ function detectServerRegion(req?: express.Request): {
   }
 
   return {
-    regionCode: 'asia-southeast1',
-    regionLabel: 'asia-southeast1 (Singapore)',
+    regionCode: 'global-edge',
+    regionLabel: 'Global Edge Network',
   };
 }
 
@@ -887,552 +1243,603 @@ function verifyAndGetSpeedTestLedger(
   return { valid: true, ledger };
 }
 
-async function startServer() {
-  const app = express();
-  app.set('trust proxy', true);
-  app.use(cookieParser());
+export const app = express();
+app.set('trust proxy', true);
+app.use(cookieParser());
 
-  // Ensure HTTP Permissions-Policy header allows compute-pressure in both top-level and embedded contexts
-  app.use((_req, res, next) => {
-    res.setHeader('Permissions-Policy', 'compute-pressure=*');
-    next();
-  });
+// Ensure HTTP Permissions-Policy header allows compute-pressure in both top-level and embedded contexts
+app.use((_req, res, next) => {
+  res.setHeader('Permissions-Policy', 'compute-pressure=*');
+  next();
+});
 
-  app.get('/api/network/ping', (_req, res) => {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    res.setHeader('Timing-Allow-Origin', '*');
-    res.status(200).json({ ok: true, serverTimestampMs: Date.now() });
-  });
+app.get('/api/network/ping', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Timing-Allow-Origin', '*');
+  res.status(200).json({ ok: true, serverTimestampMs: Date.now() });
+});
 
-  // Streaming Download Endpoint: 4 concurrent streams, max 64 MB aggregate per test, non-compressible 64KB chunks
-  app.get('/api/network/download', (req, res) => {
-    const nowMs = Date.now();
-    pruneSpeedTestState(nowMs);
+// Streaming Download Endpoint: 4 concurrent streams, non-compressible 64KB chunks
+app.get('/api/network/download', (req, res) => {
+  const nowMs = Date.now();
+  pruneSpeedTestState(nowMs);
 
-    const token = typeof req.query.token === 'string' ? req.query.token : '';
-    const { ip: extractedIp } = extractVisitorIp(req);
-    const visitorKey =
-      (req.cookies?.intel_http_vid as string | undefined) || extractedIp || 'anon';
+  const token = typeof req.query.token === 'string' ? req.query.token : '';
+  const { ip: extractedIp } = extractVisitorIp(req);
+  const visitorKey =
+    (req.cookies?.intel_http_vid as string | undefined) || extractedIp || 'anon';
 
-    const verification = verifyAndGetSpeedTestLedger(token, visitorKey, extractedIp);
-    if (!verification.valid || !verification.ledger) {
-      res.status(403).json({ error: verification.reason || 'Unauthorized speed test request.' });
-      return;
+  const verification = verifyAndGetSpeedTestLedger(token, visitorKey, extractedIp);
+  if (!verification.valid || !verification.ledger) {
+    res.status(403).json({ error: verification.reason || 'Unauthorized speed test request.' });
+    return;
+  }
+
+  const ledger = verification.ledger;
+  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 2) {
+    res.status(429).json({ error: 'Concurrent stream limit exceeded for this speed test.' });
+    return;
+  }
+
+  const remainingBudget = SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES - ledger.downloadedBytes;
+  if (remainingBudget <= 0) {
+    res.status(429).json({ error: 'Maximum download transfer limit reached for this test.' });
+    return;
+  }
+
+  const requestedBytes = parseInt(String(req.query.bytes || 1024 * 1024), 10);
+  const clampedRequest = Number.isNaN(requestedBytes)
+    ? 1024 * 1024
+    : Math.max(65536, Math.min(SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES, requestedBytes));
+  const targetBytes = Math.min(clampedRequest, remainingBudget);
+
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Encoding', 'identity');
+  res.setHeader('Content-Length', String(targetBytes));
+  res.setHeader(
+    'Cache-Control',
+    'no-store, no-cache, must-revalidate, proxy-revalidate, no-transform'
+  );
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Timing-Allow-Origin', '*');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  ledger.activeStreams += 1;
+  let bytesSentForStream = 0;
+  let streamClosed = false;
+
+  const cleanupStream = () => {
+    if (streamClosed) return;
+    streamClosed = true;
+    ledger.activeStreams = Math.max(0, ledger.activeStreams - 1);
+    clearTimeout(streamTimer);
+  };
+
+  const streamTimer = setTimeout(() => {
+    cleanupStream();
+    if (!res.writableEnded) {
+      res.end();
     }
+  }, SPEED_TEST_STREAM_TIMEOUT_MS);
 
-    const ledger = verification.ledger;
-    if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 2) {
-      res.status(429).json({ error: 'Concurrent stream limit exceeded for this speed test.' });
-      return;
-    }
+  req.on('close', cleanupStream);
+  res.on('close', cleanupStream);
+  res.on('error', cleanupStream);
 
-    const remainingBudget = SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES - ledger.downloadedBytes;
-    if (remainingBudget <= 0) {
-      res.status(429).json({ error: 'Maximum 64 MB download transfer limit reached for this test.' });
-      return;
-    }
-
-    const requestedBytes = parseInt(String(req.query.bytes || 2 * 1024 * 1024), 10);
-    const clampedRequest = Number.isNaN(requestedBytes)
-      ? 2 * 1024 * 1024
-      : Math.max(65536, Math.min(SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES, requestedBytes));
-    const targetBytes = Math.min(clampedRequest, remainingBudget);
-
-    res.setHeader('Content-Type', 'application/octet-stream');
-    res.setHeader('Content-Encoding', 'identity');
-    res.setHeader('Content-Length', String(targetBytes));
-    res.setHeader(
-      'Cache-Control',
-      'no-store, no-cache, must-revalidate, proxy-revalidate, no-transform'
-    );
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    res.setHeader('Timing-Allow-Origin', '*');
-    res.setHeader('X-Accel-Buffering', 'no');
-
-    ledger.activeStreams += 1;
-    let bytesSentForStream = 0;
-    let streamClosed = false;
-
-    const cleanupStream = () => {
-      if (streamClosed) return;
-      streamClosed = true;
-      ledger.activeStreams = Math.max(0, ledger.activeStreams - 1);
-      clearTimeout(streamTimer);
-    };
-
-    const streamTimer = setTimeout(() => {
-      cleanupStream();
-      if (!res.writableEnded) {
+  const writeNextChunk = () => {
+    while (!streamClosed && bytesSentForStream < targetBytes) {
+      const remainingInTest = SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES - ledger.downloadedBytes;
+      if (remainingInTest <= 0) {
+        cleanupStream();
         res.end();
+        return;
       }
-    }, SPEED_TEST_STREAM_TIMEOUT_MS);
 
-    req.on('close', cleanupStream);
-    res.on('close', cleanupStream);
-    res.on('error', cleanupStream);
+      const remainingInStream = targetBytes - bytesSentForStream;
+      const toWrite = Math.min(
+        HIGH_ENTROPY_64KB_CHUNK.length,
+        remainingInStream,
+        remainingInTest
+      );
 
-    const writeNextChunk = () => {
-      while (!streamClosed && bytesSentForStream < targetBytes) {
-        const remainingInTest = SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES - ledger.downloadedBytes;
-        if (remainingInTest <= 0) {
-          cleanupStream();
-          res.end();
-          return;
-        }
+      const slice =
+        toWrite === HIGH_ENTROPY_64KB_CHUNK.length
+          ? HIGH_ENTROPY_64KB_CHUNK
+          : HIGH_ENTROPY_64KB_CHUNK.subarray(0, toWrite);
 
-        const remainingInStream = targetBytes - bytesSentForStream;
-        const toWrite = Math.min(
-          HIGH_ENTROPY_64KB_CHUNK.length,
-          remainingInStream,
-          remainingInTest
-        );
+      bytesSentForStream += toWrite;
+      ledger.downloadedBytes += toWrite;
 
-        const slice =
-          toWrite === HIGH_ENTROPY_64KB_CHUNK.length
-            ? HIGH_ENTROPY_64KB_CHUNK
-            : HIGH_ENTROPY_64KB_CHUNK.subarray(0, toWrite);
-
-        bytesSentForStream += toWrite;
-        ledger.downloadedBytes += toWrite;
-
-        const canContinue = res.write(slice);
-        if (bytesSentForStream >= targetBytes) {
-          cleanupStream();
-          res.end();
-          return;
-        }
-        if (!canContinue) {
-          res.once('drain', writeNextChunk);
-          return;
-        }
+      const canContinue = res.write(slice);
+      if (bytesSentForStream >= targetBytes) {
+        cleanupStream();
+        res.end();
+        return;
       }
-    };
-
-    writeNextChunk();
-  });
-
-  // Streaming Upload Endpoint: mounted BEFORE express.json(), counts actual bytes received without disk/RAM buffering
-  app.post('/api/network/upload', (req, res) => {
-    const nowMs = Date.now();
-    pruneSpeedTestState(nowMs);
-
-    const token =
-      (typeof req.query.token === 'string' ? req.query.token : '') ||
-      (typeof req.headers['x-speedtest-token'] === 'string' ? req.headers['x-speedtest-token'] : '');
-    const { ip: extractedIp } = extractVisitorIp(req);
-    const visitorKey =
-      (req.cookies?.intel_http_vid as string | undefined) || extractedIp || 'anon';
-
-    const verification = verifyAndGetSpeedTestLedger(token, visitorKey, extractedIp);
-    if (!verification.valid || !verification.ledger) {
-      req.resume();
-      res.status(403).json({ error: verification.reason || 'Unauthorized upload test request.' });
-      return;
+      if (!canContinue) {
+        res.once('drain', writeNextChunk);
+        return;
+      }
     }
+  };
 
-    const ledger = verification.ledger;
-    if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 2) {
-      req.resume();
-      res.status(429).json({ error: 'Concurrent upload stream limit exceeded.' });
-      return;
+  writeNextChunk();
+});
+
+// Streaming Upload Endpoint: mounted BEFORE express.json(), counts actual bytes received without disk/RAM buffering
+app.post('/api/network/upload', (req, res) => {
+  const nowMs = Date.now();
+  pruneSpeedTestState(nowMs);
+
+  const token =
+    (typeof req.query.token === 'string' ? req.query.token : '') ||
+    (typeof req.headers['x-speedtest-token'] === 'string' ? req.headers['x-speedtest-token'] : '');
+  const { ip: extractedIp } = extractVisitorIp(req);
+  const visitorKey =
+    (req.cookies?.intel_http_vid as string | undefined) || extractedIp || 'anon';
+
+  const verification = verifyAndGetSpeedTestLedger(token, visitorKey, extractedIp);
+  if (!verification.valid || !verification.ledger) {
+    req.resume();
+    res.status(403).json({ error: verification.reason || 'Unauthorized upload test request.' });
+    return;
+  }
+
+  const ledger = verification.ledger;
+  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 2) {
+    req.resume();
+    res.status(429).json({ error: 'Concurrent upload stream limit exceeded.' });
+    return;
+  }
+
+  if (ledger.uploadedBytes >= SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
+    req.resume();
+    res.status(429).json({ error: 'Maximum upload transfer limit reached for this test.' });
+    return;
+  }
+
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Timing-Allow-Origin', '*');
+
+  ledger.activeStreams += 1;
+  const streamStartMs = Date.now();
+  let streamReceivedBytes = 0;
+  let finished = false;
+  let exceededCap = false;
+
+  const cleanupUpload = () => {
+    if (finished) return;
+    finished = true;
+    ledger.activeStreams = Math.max(0, ledger.activeStreams - 1);
+    clearTimeout(uploadTimer);
+  };
+
+  const uploadTimer = setTimeout(() => {
+    cleanupUpload();
+    if (!res.headersSent) {
+      res.status(408).json({
+        ok: false,
+        error: 'Upload stream timed out.',
+        receivedBytes: streamReceivedBytes,
+      });
     }
+  }, SPEED_TEST_STREAM_TIMEOUT_MS);
 
-    if (ledger.uploadedBytes >= SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
-      req.resume();
-      res.status(429).json({ error: 'Maximum 40 MB upload transfer limit reached for this test.' });
-      return;
-    }
-
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    res.setHeader('Timing-Allow-Origin', '*');
-
-    ledger.activeStreams += 1;
-    const streamStartMs = Date.now();
-    let streamReceivedBytes = 0;
-    let finished = false;
-    let exceededCap = false;
-
-    const cleanupUpload = () => {
-      if (finished) return;
-      finished = true;
-      ledger.activeStreams = Math.max(0, ledger.activeStreams - 1);
-      clearTimeout(uploadTimer);
-    };
-
-    const uploadTimer = setTimeout(() => {
+  req.on('data', (chunk: Buffer) => {
+    if (finished || exceededCap) return;
+    const chunkLen = chunk.length;
+    if (
+      streamReceivedBytes + chunkLen > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES ||
+      ledger.uploadedBytes + chunkLen > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES
+    ) {
+      exceededCap = true;
       cleanupUpload();
+      req.resume();
       if (!res.headersSent) {
-        res.status(408).json({
+        res.status(413).json({
           ok: false,
-          error: 'Upload stream timed out.',
+          error: 'Upload transfer limit exceeded.',
           receivedBytes: streamReceivedBytes,
         });
       }
-    }, SPEED_TEST_STREAM_TIMEOUT_MS);
-
-    req.on('data', (chunk: Buffer) => {
-      if (finished || exceededCap) return;
-      const chunkLen = chunk.length;
-      if (
-        streamReceivedBytes + chunkLen > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES ||
-        ledger.uploadedBytes + chunkLen > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES
-      ) {
-        exceededCap = true;
-        cleanupUpload();
-        req.resume();
-        if (!res.headersSent) {
-          res.status(413).json({
-            ok: false,
-            error: 'Upload transfer limit exceeded.',
-            receivedBytes: streamReceivedBytes,
-          });
-        }
-        return;
-      }
-      streamReceivedBytes += chunkLen;
-      ledger.uploadedBytes += chunkLen;
-    });
-
-    req.on('end', () => {
-      if (finished || exceededCap) return;
-      cleanupUpload();
-      const elapsedServerMs = Math.max(1, Date.now() - streamStartMs);
-      res.status(200).json({
-        ok: true,
-        receivedBytes: streamReceivedBytes,
-        totalTestUploadedBytes: ledger.uploadedBytes,
-        elapsedServerMs,
-        serverTimestampMs: Date.now(),
-      });
-    });
-
-    req.on('aborted', () => {
-      cleanupUpload();
-    });
-
-    req.on('error', () => {
-      cleanupUpload();
-    });
+      return;
+    }
+    streamReceivedBytes += chunkLen;
+    ledger.uploadedBytes += chunkLen;
   });
 
-  app.use(express.json({ limit: '128kb' }));
-
-  // Initialize a user-triggered Speed Test session with rate limiting & short-lived signed token
-  app.post('/api/network/speed-test/init', (req, res) => {
-    const nowMs = Date.now();
-    pruneSpeedTestState(nowMs);
-
-    const { ip: extractedIp } = extractVisitorIp(req);
-    const body = (req.body || {}) as { visitorId?: string; sessionId?: string };
-    const cookieVid = req.cookies?.intel_http_vid as string | undefined;
-
-    const visitorKey = cookieVid || (typeof body.visitorId === 'string' && body.visitorId.trim()) || extractedIp || 'anon';
-    const sessionKey = (typeof body.sessionId === 'string' && body.sessionId.trim()) || visitorKey;
-    const ipKey = extractedIp && extractedIp !== 'Unavailable' ? extractedIp : visitorKey;
-
-    // 1. Check global instance concurrency & replace any stale test for the same visitor
-    let activeCount = 0;
-    let activeIpCount = 0;
-    for (const [existingId, ledger] of activeSpeedTests.entries()) {
-      if (ledger.visitorKey === visitorKey) {
-        ledger.completed = true;
-        activeSpeedTests.delete(existingId);
-        continue;
-      }
-      if (!ledger.completed && nowMs < ledger.expiresAtMs && nowMs - ledger.createdAtMs < 20000) {
-        activeCount += 1;
-        if (ledger.ipKey === ipKey) {
-          activeIpCount += 1;
-        }
-      }
-    }
-
-    if (activeCount >= MAX_CONCURRENT_TESTS_PER_INSTANCE) {
-      res.status(503).json({
-        error: 'Server speed-test capacity is currently busy. Please try again in a few seconds.',
-      });
-      return;
-    }
-
-    if (activeIpCount >= MAX_CONCURRENT_TESTS_PER_IP) {
-      res.status(429).json({
-        error: 'Too many simultaneous speed tests from this network. Please wait a moment.',
-      });
-      return;
-    }
-
-    // 2. Per-visitor rolling 10-minute rate limit
-    const visitorHistory = visitorTestTimestamps.get(visitorKey) || [];
-    if (visitorHistory.length >= MAX_TESTS_PER_VISITOR_WINDOW) {
-      const oldestMs = visitorHistory[0];
-      const retrySec = Math.max(5, Math.ceil((RATE_WINDOW_MS - (nowMs - oldestMs)) / 1000));
-      res.status(429).json({
-        error: `Rate limit reached (${MAX_TESTS_PER_VISITOR_WINDOW} tests per 10 minutes). Try again in ${retrySec}s.`,
-      });
-      return;
-    }
-
-    // 3. Per-session limit
-    const sessionCount = sessionTestCounts.get(sessionKey) || 0;
-    if (sessionCount >= MAX_TESTS_PER_SESSION) {
-      res.status(429).json({
-        error: `Session speed-test limit (${MAX_TESTS_PER_SESSION} tests) reached.`,
-      });
-      return;
-    }
-
-    // 4. CGNAT-aware per-IP secondary rate limit
-    const ipHistory = ipTestTimestamps.get(ipKey) || [];
-    if (ipHistory.length >= MAX_TESTS_PER_IP_WINDOW) {
-      res.status(429).json({
-        error: 'Network rate limit reached. Please wait a few minutes before running another test.',
-      });
-      return;
-    }
-
-    // Record test start
-    visitorHistory.push(nowMs);
-    visitorTestTimestamps.set(visitorKey, visitorHistory);
-    sessionTestCounts.set(sessionKey, sessionCount + 1);
-    ipHistory.push(nowMs);
-    ipTestTimestamps.set(ipKey, ipHistory);
-
-    const testId = 'st_' + crypto.randomBytes(8).toString('hex');
-    const expiresAtMs = nowMs + SPEED_TEST_TOKEN_TTL_MS;
-    const token = createSignedSpeedTestToken(testId, expiresAtMs, visitorKey);
-
-    activeSpeedTests.set(testId, {
-      testId,
-      visitorKey,
-      sessionKey,
-      ipKey,
-      createdAtMs: nowMs,
-      expiresAtMs,
-      downloadedBytes: 0,
-      uploadedBytes: 0,
-      activeStreams: 0,
-      completed: false,
-    });
-
-    const { regionCode, regionLabel } = detectServerRegion(req);
-
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  req.on('end', () => {
+    if (finished || exceededCap) return;
+    cleanupUpload();
+    const elapsedServerMs = Math.max(1, Date.now() - streamStartMs);
     res.status(200).json({
       ok: true,
-      testId,
-      token,
-      expiresAtMs,
-      serverRegion: regionLabel,
-      serverRegionCode: regionCode,
-      concurrentStreams: SPEED_TEST_CONCURRENT_STREAMS,
-      maxDownloadBytes: SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES,
-      maxUploadBytes: SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES,
+      receivedBytes: streamReceivedBytes,
+      totalTestUploadedBytes: ledger.uploadedBytes,
+      elapsedServerMs,
+      serverTimestampMs: Date.now(),
     });
   });
 
-  // Release active lock when a test finishes or is cancelled by the visitor
-  app.post('/api/network/speed-test/complete', (req, res) => {
-    const body = (req.body || {}) as { token?: string };
-    const rawToken = typeof body.token === 'string' ? body.token.trim() : '';
-    const testId = rawToken.split('.')[0];
-    if (testId && activeSpeedTests.has(testId)) {
-      const ledger = activeSpeedTests.get(testId);
-      if (ledger) {
-        ledger.completed = true;
-      }
-      activeSpeedTests.delete(testId);
+  req.on('aborted', () => {
+    cleanupUpload();
+  });
+
+  req.on('error', () => {
+    cleanupUpload();
+  });
+});
+
+app.use(express.json({ limit: '512kb' }));
+
+// Initialize a Speed Test session with rate limiting & short-lived signed token
+app.post('/api/network/speed-test/init', (req, res) => {
+  const nowMs = Date.now();
+  pruneSpeedTestState(nowMs);
+
+  const { ip: extractedIp } = extractVisitorIp(req);
+  const body = (req.body || {}) as { visitorId?: string; sessionId?: string };
+  const cookieVid = req.cookies?.intel_http_vid as string | undefined;
+
+  const visitorKey =
+    cookieVid ||
+    (typeof body.visitorId === 'string' && body.visitorId.trim()) ||
+    extractedIp ||
+    'anon';
+  const sessionKey = (typeof body.sessionId === 'string' && body.sessionId.trim()) || visitorKey;
+  const ipKey = extractedIp && extractedIp !== 'Unavailable' ? extractedIp : visitorKey;
+
+  let activeCount = 0;
+  let activeIpCount = 0;
+  for (const [existingId, ledger] of activeSpeedTests.entries()) {
+    if (ledger.visitorKey === visitorKey) {
+      ledger.completed = true;
+      activeSpeedTests.delete(existingId);
+      continue;
     }
-    res.status(200).json({ ok: true });
+    if (!ledger.completed && nowMs < ledger.expiresAtMs && nowMs - ledger.createdAtMs < 20000) {
+      activeCount += 1;
+      if (ledger.ipKey === ipKey) {
+        activeIpCount += 1;
+      }
+    }
+  }
+
+  if (activeCount >= MAX_CONCURRENT_TESTS_PER_INSTANCE) {
+    res.status(503).json({
+      error: 'Server speed-test capacity is currently busy. Please try again in a few seconds.',
+    });
+    return;
+  }
+
+  if (activeIpCount >= MAX_CONCURRENT_TESTS_PER_IP) {
+    res.status(429).json({
+      error: 'Too many simultaneous speed tests from this network. Please wait a moment.',
+    });
+    return;
+  }
+
+  const visitorHistory = visitorTestTimestamps.get(visitorKey) || [];
+  if (visitorHistory.length >= MAX_TESTS_PER_VISITOR_WINDOW) {
+    const oldestMs = visitorHistory[0];
+    const retrySec = Math.max(5, Math.ceil((RATE_WINDOW_MS - (nowMs - oldestMs)) / 1000));
+    res.status(429).json({
+      error: `Rate limit reached (${MAX_TESTS_PER_VISITOR_WINDOW} tests per 10 minutes). Try again in ${retrySec}s.`,
+    });
+    return;
+  }
+
+  const sessionCount = sessionTestCounts.get(sessionKey) || 0;
+  if (sessionCount >= MAX_TESTS_PER_SESSION) {
+    res.status(429).json({
+      error: `Session speed-test limit (${MAX_TESTS_PER_SESSION} tests) reached.`,
+    });
+    return;
+  }
+
+  const ipHistory = ipTestTimestamps.get(ipKey) || [];
+  if (ipHistory.length >= MAX_TESTS_PER_IP_WINDOW) {
+    res.status(429).json({
+      error: 'Network rate limit reached. Please wait a few minutes before running another test.',
+    });
+    return;
+  }
+
+  visitorHistory.push(nowMs);
+  visitorTestTimestamps.set(visitorKey, visitorHistory);
+  sessionTestCounts.set(sessionKey, sessionCount + 1);
+  ipHistory.push(nowMs);
+  ipTestTimestamps.set(ipKey, ipHistory);
+
+  const testId = 'st_' + crypto.randomBytes(8).toString('hex');
+  const expiresAtMs = nowMs + SPEED_TEST_TOKEN_TTL_MS;
+  const token = createSignedSpeedTestToken(testId, expiresAtMs, visitorKey);
+
+  activeSpeedTests.set(testId, {
+    testId,
+    visitorKey,
+    sessionKey,
+    ipKey,
+    createdAtMs: nowMs,
+    expiresAtMs,
+    downloadedBytes: 0,
+    uploadedBytes: 0,
+    activeStreams: 0,
+    completed: false,
   });
 
-  app.get('/api/health', (_req, res) => {
-    const visitorsCount = (
-      db.prepare('SELECT COUNT(*) AS count FROM visitors').get() as { count: number }
-    ).count;
-    const visitsCount = (
-      db.prepare('SELECT COUNT(*) AS count FROM visits').get() as { count: number }
-    ).count;
-    const { regionCode, regionLabel } = detectServerRegion();
-    res.json({ status: 'ok', visitorsCount, visitsCount, regionCode, regionLabel });
-  });
+  const { regionCode, regionLabel } = detectServerRegion(req);
 
-  app.post('/api/visitor/identify', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.status(200).json({
+    ok: true,
+    testId,
+    token,
+    expiresAtMs,
+    serverRegion: regionLabel,
+    serverRegionCode: regionCode,
+    concurrentStreams: SPEED_TEST_CONCURRENT_STREAMS,
+    maxDownloadBytes: SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES,
+    maxUploadBytes: SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES,
+  });
+});
+
+// Release active lock when a test finishes or is cancelled by the visitor
+app.post('/api/network/speed-test/complete', (req, res) => {
+  const body = (req.body || {}) as { token?: string };
+  const rawToken = typeof body.token === 'string' ? body.token.trim() : '';
+  const testId = rawToken.split('.')[0];
+  if (testId && activeSpeedTests.has(testId)) {
+    const ledger = activeSpeedTests.get(testId);
+    if (ledger) {
+      ledger.completed = true;
+    }
+    activeSpeedTests.delete(testId);
+  }
+  res.status(200).json({ ok: true });
+});
+
+app.get('/api/health', (req, res) => {
+  const visitorsCount = (
+    db.prepare('SELECT COUNT(*) AS count FROM visitors').get() as { count: number }
+  ).count;
+  const visitsCount = (
+    db.prepare('SELECT COUNT(*) AS count FROM visits').get() as { count: number }
+  ).count;
+  const { regionCode, regionLabel } = detectServerRegion(req);
+  res.json({ status: 'ok', visitorsCount, visitsCount, regionCode, regionLabel });
+});
+
+function extractVercelEdgeGeo(req: express.Request): {
+  city: string;
+  region: string;
+  country: string;
+  latitude: number | null;
+  longitude: number | null;
+} {
+  const decodeHeader = (val: unknown): string => {
+    if (typeof val !== 'string' || !val.trim()) return '';
     try {
-      const {
-        pageLoadId,
-        storedVisitorId,
-        storedVisitorToken,
-        clientSessionId,
-        browserDevice: rawBrowserDevice,
-        clientGeoHint,
-      } = req.body as {
-        pageLoadId?: string;
-        storedVisitorId?: string | null;
-        storedVisitorToken?: string | null;
-        clientSessionId?: string | null;
-        browserDevice?: Partial<BrowserDeviceInfo>;
-        clientGeoHint?: {
-          ip?: string;
-          city?: string;
-          region?: string;
-          country?: string;
-          countryCode?: string;
-          latitude?: number | null;
-          longitude?: number | null;
-          isp?: string;
-          org?: string;
-          asn?: string;
-          isVpnOrHosting?: boolean;
-        } | null;
+      return decodeURIComponent(val.trim());
+    } catch {
+      return val.trim();
+    }
+  };
+  const city = decodeHeader(req.headers['x-vercel-ip-city']);
+  const region = decodeHeader(req.headers['x-vercel-ip-country-region']);
+  const country = decodeHeader(req.headers['x-vercel-ip-country']);
+  const rawLat = parseFloat(String(req.headers['x-vercel-ip-latitude'] || ''));
+  const rawLon = parseFloat(String(req.headers['x-vercel-ip-longitude'] || ''));
+
+  return {
+    city,
+    region,
+    country,
+    latitude: Number.isFinite(rawLat) ? rawLat : null,
+    longitude: Number.isFinite(rawLon) ? rawLon : null,
+  };
+}
+
+app.post('/api/visitor/identify', async (req, res) => {
+  try {
+    const {
+      pageLoadId,
+      storedVisitorId,
+      storedVisitorToken,
+      clientSessionId,
+      clientHistoryBackup,
+      browserDevice: rawBrowserDevice,
+      clientGeoHint,
+    } = (req.body || {}) as {
+      pageLoadId?: string;
+      storedVisitorId?: string | null;
+      storedVisitorToken?: string | null;
+      clientSessionId?: string | null;
+      clientHistoryBackup?: SignedHistoryBackup | null;
+      browserDevice?: Partial<BrowserDeviceInfo>;
+      clientGeoHint?: {
+        ip?: string;
+        city?: string;
+        region?: string;
+        country?: string;
+        countryCode?: string;
+        latitude?: number | null;
+        longitude?: number | null;
+        isp?: string;
+        org?: string;
+        asn?: string;
+        isVpnOrHosting?: boolean;
+      } | null;
+    };
+
+    const safePageLoadId =
+      typeof pageLoadId === 'string' && pageLoadId.trim().length > 0
+        ? pageLoadId.trim().slice(0, 80)
+        : 'pl_' + crypto.randomBytes(8).toString('hex');
+
+    const browserDevice = sanitizeBrowserDevice(rawBrowserDevice);
+
+    let { ip: extractedIp, isPublic } = extractVisitorIp(req);
+
+    if (!isPublic && clientGeoHint && typeof clientGeoHint.ip === 'string') {
+      const normalizedHintIp = normalizeIpCandidate(clientGeoHint.ip);
+      if (normalizedHintIp && isPublicRoutableIp(normalizedHintIp)) {
+        extractedIp = normalizedHintIp;
+        isPublic = true;
+      }
+    }
+
+    let location = await lookupVerifiedGeolocation(extractedIp, isPublic);
+    const vercelGeo = extractVercelEdgeGeo(req);
+
+    if (
+      isPublic &&
+      (!location.isLocationVerified || location.isp === 'Unknown' || location.latitude === null) &&
+      clientGeoHint &&
+      normalizeIpCandidate(clientGeoHint.ip)?.toLowerCase() === extractedIp.toLowerCase()
+    ) {
+      const hintNet = normalizeIspAndOrg(
+        clientGeoHint.isp,
+        clientGeoHint.org,
+        clientGeoHint.asn,
+        Boolean(clientGeoHint.isVpnOrHosting)
+      );
+      const hintLat =
+        typeof clientGeoHint.latitude === 'number' && Number.isFinite(clientGeoHint.latitude)
+          ? clientGeoHint.latitude
+          : vercelGeo.latitude;
+      const hintLon =
+        typeof clientGeoHint.longitude === 'number' && Number.isFinite(clientGeoHint.longitude)
+          ? clientGeoHint.longitude
+          : vercelGeo.longitude;
+      location = {
+        publicIp: extractedIp,
+        city:
+          location.city !== 'Unavailable' && location.city !== 'Unknown'
+            ? location.city
+            : (typeof clientGeoHint.city === 'string' && clientGeoHint.city) ||
+              vercelGeo.city ||
+              'Unknown',
+        region:
+          location.region !== 'Unavailable' && location.region !== 'Unknown'
+            ? location.region
+            : (typeof clientGeoHint.region === 'string' && clientGeoHint.region) ||
+              vercelGeo.region ||
+              'Unknown',
+        country:
+          location.country !== 'Unavailable' && location.country !== 'Unknown'
+            ? location.country
+            : (typeof clientGeoHint.country === 'string' && clientGeoHint.country) ||
+              vercelGeo.country ||
+              'Unknown',
+        countryCode:
+          location.countryCode ||
+          (typeof clientGeoHint.countryCode === 'string' ? clientGeoHint.countryCode : '') ||
+          vercelGeo.country,
+        latitude: location.latitude !== null ? location.latitude : hintLat,
+        longitude: location.longitude !== null ? location.longitude : hintLon,
+        isp: location.isp !== 'Unknown' ? location.isp : hintNet.isp,
+        org: location.org !== 'Unknown' ? location.org : hintNet.org,
+        asn: location.asn !== 'Unknown' ? location.asn : hintNet.asn,
+        isVpnOrHosting: location.isVpnOrHosting || hintNet.isVpnOrHosting,
+        isIpVerified: true,
+        isLocationVerified: true,
       };
+    } else if (
+      isPublic &&
+      (!location.isLocationVerified || location.latitude === null) &&
+      (vercelGeo.city || vercelGeo.country || vercelGeo.latitude !== null)
+    ) {
+      location = {
+        ...location,
+        city:
+          location.city !== 'Unavailable' && location.city !== 'Unknown'
+            ? location.city
+            : vercelGeo.city || 'Unknown',
+        region:
+          location.region !== 'Unavailable' && location.region !== 'Unknown'
+            ? location.region
+            : vercelGeo.region || 'Unknown',
+        country:
+          location.country !== 'Unavailable' && location.country !== 'Unknown'
+            ? location.country
+            : vercelGeo.country || 'Unknown',
+        countryCode: location.countryCode || vercelGeo.country,
+        latitude: location.latitude !== null ? location.latitude : vercelGeo.latitude,
+        longitude: location.longitude !== null ? location.longitude : vercelGeo.longitude,
+        isLocationVerified: true,
+      };
+    }
 
-      const safePageLoadId =
-        typeof pageLoadId === 'string' && pageLoadId.trim().length > 0
-          ? pageLoadId.trim().slice(0, 80)
-          : 'pl_' + crypto.randomBytes(8).toString('hex');
+    const cookieVid = req.cookies?.intel_http_vid as string | undefined;
+    const cookieToken = req.cookies?.intel_http_token as string | undefined;
 
-      const browserDevice = sanitizeBrowserDevice(rawBrowserDevice);
+    let existingVisitor: VisitorRow | undefined;
+    let recognitionSource: IntelVisitorResponse['recognitionSource'] = 'New First-Party ID';
 
-      let { ip: extractedIp, isPublic } = extractVisitorIp(req);
+    const cookieVerified = Boolean(cookieVid && verifyVisitorToken(cookieVid, cookieToken));
+    const storageVerified = Boolean(
+      storedVisitorId && verifyVisitorToken(storedVisitorId, storedVisitorToken)
+    );
 
-      if (!isPublic && clientGeoHint && typeof clientGeoHint.ip === 'string') {
-        const normalizedHintIp = normalizeIpCandidate(clientGeoHint.ip);
-        if (normalizedHintIp && isPublicRoutableIp(normalizedHintIp)) {
-          extractedIp = normalizedHintIp;
-          isPublic = true;
-        }
-      }
+    const verifiedVid = cookieVerified
+      ? cookieVid!
+      : storageVerified
+      ? storedVisitorId!
+      : null;
+    const verifiedToken = cookieVerified
+      ? cookieToken!
+      : storageVerified
+      ? storedVisitorToken!
+      : null;
 
-      let location = await lookupVerifiedGeolocation(extractedIp, isPublic);
+    if (verifiedVid && verifiedToken) {
+      recognitionSource = cookieVerified ? 'First-Party Cookie' : 'First-Party LocalStorage';
+      existingVisitor = db
+        .prepare('SELECT * FROM visitors WHERE visitor_id = ?')
+        .get(verifiedVid) as VisitorRow | undefined;
 
-      if (
-        isPublic &&
-        (!location.isLocationVerified || location.isp === 'Unknown' || location.latitude === null) &&
-        clientGeoHint &&
-        normalizeIpCandidate(clientGeoHint.ip)?.toLowerCase() === extractedIp.toLowerCase()
-      ) {
-        const hintNet = normalizeIspAndOrg(
-          clientGeoHint.isp,
-          clientGeoHint.org,
-          clientGeoHint.asn,
-          Boolean(clientGeoHint.isVpnOrHosting)
+      // Serverless cold-start rehydration: if HMAC token is valid, restore visitor & signed history backup into db
+      const validHistoryBackup =
+        clientHistoryBackup &&
+        verifySignedHistoryBackup(verifiedVid, clientHistoryBackup)
+          ? clientHistoryBackup
+          : null;
+
+      if (!existingVisitor) {
+        const nowIso = new Date().toISOString();
+        const restoredFirstUtc = validHistoryBackup?.firstVisitUtc || nowIso;
+        const latestBackupVisit = validHistoryBackup?.visits?.[0];
+        const restoredLastUtc = latestBackupVisit?.visitedAtUtc || nowIso;
+        const restoredSessionId =
+          clientSessionId || latestBackupVisit?.sessionId || generateSessionId();
+
+        db.prepare(
+          `INSERT INTO visitors (
+            visitor_id, hmac_token, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
+          ) VALUES (?, ?, ?, ?, ?, ?)`
+        ).run(
+          verifiedVid,
+          verifiedToken,
+          restoredFirstUtc,
+          restoredLastUtc,
+          restoredSessionId,
+          restoredLastUtc
         );
-        const hintLat =
-          typeof clientGeoHint.latitude === 'number' && Number.isFinite(clientGeoHint.latitude)
-            ? clientGeoHint.latitude
-            : null;
-        const hintLon =
-          typeof clientGeoHint.longitude === 'number' && Number.isFinite(clientGeoHint.longitude)
-            ? clientGeoHint.longitude
-            : null;
-        location = {
-          publicIp: extractedIp,
-          city:
-            location.city !== 'Unavailable' && location.city !== 'Unknown'
-              ? location.city
-              : typeof clientGeoHint.city === 'string' && clientGeoHint.city
-              ? clientGeoHint.city
-              : 'Unknown',
-          region:
-            location.region !== 'Unavailable' && location.region !== 'Unknown'
-              ? location.region
-              : typeof clientGeoHint.region === 'string' && clientGeoHint.region
-              ? clientGeoHint.region
-              : 'Unknown',
-          country:
-            location.country !== 'Unavailable' && location.country !== 'Unknown'
-              ? location.country
-              : typeof clientGeoHint.country === 'string' && clientGeoHint.country
-              ? clientGeoHint.country
-              : 'Unknown',
-          countryCode:
-            location.countryCode ||
-            (typeof clientGeoHint.countryCode === 'string' ? clientGeoHint.countryCode : ''),
-          latitude: location.latitude !== null ? location.latitude : hintLat,
-          longitude: location.longitude !== null ? location.longitude : hintLon,
-          isp: location.isp !== 'Unknown' ? location.isp : hintNet.isp,
-          org: location.org !== 'Unknown' ? location.org : hintNet.org,
-          asn: location.asn !== 'Unknown' ? location.asn : hintNet.asn,
-          isVpnOrHosting: location.isVpnOrHosting || hintNet.isVpnOrHosting,
-          isIpVerified: true,
-          isLocationVerified: true,
-        };
-      }
 
-      const cookieVid = req.cookies?.intel_http_vid as string | undefined;
-      const cookieToken = req.cookies?.intel_http_token as string | undefined;
-
-      let existingVisitor:
-        | {
-            visitor_id: string;
-            hmac_token: string;
-            created_at_utc: string;
-            updated_at_utc: string;
-            active_session_id: string;
-            last_activity_utc: string;
-          }
-        | undefined;
-
-      let recognitionSource: IntelVisitorResponse['recognitionSource'] = 'New First-Party ID';
-
-      if (cookieVid && verifyVisitorToken(cookieVid, cookieToken)) {
-        const row = db
+        existingVisitor = db
           .prepare('SELECT * FROM visitors WHERE visitor_id = ?')
-          .get(cookieVid) as typeof existingVisitor;
-        if (row) {
-          existingVisitor = row;
-          recognitionSource = 'First-Party Cookie';
-        }
+          .get(verifiedVid) as VisitorRow | undefined;
       }
 
-      if (!existingVisitor && storedVisitorId && verifyVisitorToken(storedVisitorId, storedVisitorToken)) {
-        const row = db
-          .prepare('SELECT * FROM visitors WHERE visitor_id = ?')
-          .get(storedVisitorId) as typeof existingVisitor;
-        if (row) {
-          existingVisitor = row;
-          recognitionSource = 'First-Party LocalStorage';
-        }
-      }
-
-      const nowUtc = new Date().toISOString();
-      const nowMs = Date.now();
-
-      let visitorId: string;
-      let visitorToken: string;
-      let currentSessionId: string;
-      let isReturning = false;
-
-      if (existingVisitor) {
-        visitorId = existingVisitor.visitor_id;
-        visitorToken = existingVisitor.hmac_token;
-        isReturning = true;
-
-        const lastActivityMs = new Date(existingVisitor.last_activity_utc).getTime();
-        const isExpiredByInactivity =
-          Number.isNaN(lastActivityMs) || nowMs - lastActivityMs > SESSION_EXPIRATION_MS;
-        const isSameClientSession =
-          Boolean(clientSessionId) && clientSessionId === existingVisitor.active_session_id;
-
-        const existingPageLoadVisit = db
-          .prepare('SELECT session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?')
-          .get(visitorId, safePageLoadId) as { session_id: string; visited_at_utc: string } | undefined;
-
-        if (existingPageLoadVisit) {
-          currentSessionId = existingPageLoadVisit.session_id;
-        } else {
-          if (isExpiredByInactivity || !isSameClientSession) {
-            currentSessionId = generateSessionId();
-          } else {
-            currentSessionId = existingVisitor.active_session_id;
-          }
-
-          const visitId = generateVisitId();
+      if (validHistoryBackup && validHistoryBackup.visits.length > 0) {
+        const orderedAsc = [...validHistoryBackup.visits].reverse();
+        for (const histVisit of orderedAsc) {
           db.prepare(
             `INSERT OR IGNORE INTO visits (
               visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
@@ -1440,49 +1847,66 @@ async function startServer() {
               browser, os, device_type, screen_resolution, language, timezone
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).run(
-            visitId,
-            visitorId,
-            currentSessionId,
-            safePageLoadId,
-            nowUtc,
-            location.publicIp,
-            location.city,
-            location.region,
-            location.country,
-            location.latitude,
-            location.longitude,
-            location.isp,
-            location.org,
-            location.asn,
-            browserDevice.browser,
-            browserDevice.os,
-            browserDevice.deviceType,
-            browserDevice.screenResolution,
-            browserDevice.language,
-            browserDevice.timezone
+            histVisit.visitId,
+            verifiedVid,
+            histVisit.sessionId,
+            `rehydrated_${histVisit.visitId}`,
+            histVisit.visitedAtUtc,
+            histVisit.publicIp,
+            histVisit.city,
+            histVisit.region,
+            histVisit.country,
+            histVisit.latitude,
+            histVisit.longitude,
+            histVisit.isp || 'Unknown',
+            histVisit.org || 'Unknown',
+            histVisit.asn || 'Unknown',
+            histVisit.browser,
+            histVisit.os,
+            histVisit.deviceType,
+            histVisit.screenResolution,
+            histVisit.language,
+            histVisit.timezone
           );
-
-          db.prepare(
-            `UPDATE visitors
-             SET updated_at_utc = ?, active_session_id = ?, last_activity_utc = ?
-             WHERE visitor_id = ?`
-          ).run(nowUtc, currentSessionId, nowUtc, visitorId);
         }
-      } else {
-        visitorId = generateVisitorId();
-        visitorToken = signVisitorId(visitorId);
-        currentSessionId = generateSessionId();
-        isReturning = false;
+      }
+    }
 
-        db.prepare(
-          `INSERT INTO visitors (
-            visitor_id, hmac_token, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
-          ) VALUES (?, ?, ?, ?, ?, ?)`
-        ).run(visitorId, visitorToken, nowUtc, nowUtc, currentSessionId, nowUtc);
+    const nowUtc = new Date().toISOString();
+    const nowMs = Date.now();
+
+    let visitorId: string;
+    let visitorToken: string;
+    let currentSessionId: string;
+    let isReturning = false;
+
+    if (existingVisitor) {
+      visitorId = existingVisitor.visitor_id;
+      visitorToken = existingVisitor.hmac_token;
+      isReturning = true;
+
+      const lastActivityMs = new Date(existingVisitor.last_activity_utc).getTime();
+      const isExpiredByInactivity =
+        Number.isNaN(lastActivityMs) || nowMs - lastActivityMs > SESSION_EXPIRATION_MS;
+      const isSameClientSession =
+        Boolean(clientSessionId) && clientSessionId === existingVisitor.active_session_id;
+
+      const existingPageLoadVisit = db
+        .prepare('SELECT session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?')
+        .get(visitorId, safePageLoadId) as { session_id: string; visited_at_utc: string } | undefined;
+
+      if (existingPageLoadVisit) {
+        currentSessionId = existingPageLoadVisit.session_id;
+      } else {
+        if (isExpiredByInactivity || !isSameClientSession) {
+          currentSessionId = generateSessionId();
+        } else {
+          currentSessionId = existingVisitor.active_session_id;
+        }
 
         const visitId = generateVisitId();
         db.prepare(
-          `INSERT INTO visits (
+          `INSERT OR IGNORE INTO visits (
             visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
             public_ip, city, region, country, latitude, longitude, isp, org, asn,
             browser, os, device_type, screen_resolution, language, timezone
@@ -1509,146 +1933,227 @@ async function startServer() {
           browserDevice.language,
           browserDevice.timezone
         );
-      }
 
-      const cookieOptions = {
-        maxAge: 365 * 24 * 60 * 60 * 1000,
-        httpOnly: true,
-        sameSite: 'lax' as const,
-        path: '/',
-      };
-      res.cookie('intel_http_vid', visitorId, cookieOptions);
-      res.cookie('intel_http_token', visitorToken, cookieOptions);
-
-      const statsAgg = db
-        .prepare(
-          `SELECT
-            COUNT(*) AS total_visits,
-            MIN(visited_at_utc) AS first_visit_utc,
-            MAX(visited_at_utc) AS last_visit_utc,
-            COUNT(DISTINCT session_id) AS total_sessions
-           FROM visits
+        db.prepare(
+          `UPDATE visitors
+           SET updated_at_utc = ?, active_session_id = ?, last_activity_utc = ?
            WHERE visitor_id = ?`
-        )
-        .get(visitorId) as {
-        total_visits: number;
-        first_visit_utc: string | null;
-        last_visit_utc: string | null;
-        total_sessions: number;
-      };
-
-      const prevVisitRow = db
-        .prepare(
-          `SELECT visited_at_utc
-           FROM visits
-           WHERE visitor_id = ?
-           ORDER BY visited_at_utc DESC, id DESC
-           LIMIT 1 OFFSET 1`
-        )
-        .get(visitorId) as { visited_at_utc: string } | undefined;
-
-      const statistics: VisitStatistics = {
-        firstVisitUtc: statsAgg.first_visit_utc || nowUtc,
-        lastVisitUtc: statsAgg.last_visit_utc || nowUtc,
-        previousVisitUtc: prevVisitRow ? prevVisitRow.visited_at_utc : null,
-        totalVisits: Number(statsAgg.total_visits) || 1,
-        totalSessions: Number(statsAgg.total_sessions) || 1,
-        currentSessionId,
-        sessionTimeoutMinutes: SESSION_TIMEOUT_MINUTES,
-      };
-
-      if (statistics.totalVisits > 1) {
-        isReturning = true;
+        ).run(nowUtc, currentSessionId, nowUtc, visitorId);
       }
+    } else {
+      visitorId = generateVisitorId();
+      visitorToken = signVisitorId(visitorId);
+      currentSessionId = generateSessionId();
+      isReturning = false;
 
-      const rawVisits = db
-        .prepare(
-          `SELECT
-            id, visit_id, visitor_id, session_id, visited_at_utc,
-            public_ip, city, region, country, latitude, longitude, isp, org, asn,
-            browser, os, device_type, screen_resolution, language, timezone
-           FROM visits
-           WHERE visitor_id = ?
-           ORDER BY visited_at_utc DESC, id DESC
-           LIMIT 50`
-        )
-        .all(visitorId) as Array<Record<string, unknown>>;
+      db.prepare(
+        `INSERT INTO visitors (
+          visitor_id, hmac_token, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
+        ) VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(visitorId, visitorToken, nowUtc, nowUtc, currentSessionId, nowUtc);
 
-      const visitHistory: VisitHistoryRecord[] = rawVisits.map((r) => ({
-        id: Number(r.id),
-        visitId: String(r.visit_id),
-        visitorId: String(r.visitor_id),
-        sessionId: String(r.session_id),
-        visitedAtUtc: String(r.visited_at_utc),
-        publicIp: String(r.public_ip),
-        city: String(r.city),
-        region: String(r.region),
-        country: String(r.country),
-        latitude: typeof r.latitude === 'number' && Number.isFinite(r.latitude) ? r.latitude : null,
-        longitude: typeof r.longitude === 'number' && Number.isFinite(r.longitude) ? r.longitude : null,
-        isp: String(r.isp || 'Unknown'),
-        org: String(r.org || 'Unknown'),
-        asn: String(r.asn || 'Unknown'),
-        browser: String(r.browser),
-        os: String(r.os),
-        deviceType: String(r.device_type),
-        screenResolution: String(r.screen_resolution),
-        language: String(r.language),
-        timezone: String(r.timezone),
-      }));
-
-      const payload: IntelVisitorResponse = {
+      const visitId = generateVisitId();
+      db.prepare(
+        `INSERT OR IGNORE INTO visits (
+          visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
+          public_ip, city, region, country, latitude, longitude, isp, org, asn,
+          browser, os, device_type, screen_resolution, language, timezone
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        visitId,
         visitorId,
-        visitorToken,
-        isReturning,
-        recognitionSource,
-        location,
-        browserDevice,
-        statistics,
-        visitHistory,
-      };
-
-      res.json(payload);
-    } catch (err) {
-      console.error('Error in /api/visitor/identify:', err);
-      res.status(500).json({ error: 'Unable to process visitor identification request.' });
-    }
-  });
-
-  app.get('/api/visitor/history/:visitorId', (req, res) => {
-    const requestedVisitorId = req.params.visitorId;
-    const headerToken = req.headers['x-visitor-token'] as string | undefined;
-    const cookieVid = req.cookies?.intel_http_vid as string | undefined;
-    const cookieToken = req.cookies?.intel_http_token as string | undefined;
-
-    const authorizedByHeader = verifyVisitorToken(requestedVisitorId, headerToken);
-    const authorizedByCookie =
-      cookieVid === requestedVisitorId && verifyVisitorToken(cookieVid, cookieToken);
-
-    if (!authorizedByHeader && !authorizedByCookie) {
-      res.status(403).json({
-        error: 'Forbidden: You are not authorized to access another visitor’s records.',
-      });
-      return;
+        currentSessionId,
+        safePageLoadId,
+        nowUtc,
+        location.publicIp,
+        location.city,
+        location.region,
+        location.country,
+        location.latitude,
+        location.longitude,
+        location.isp,
+        location.org,
+        location.asn,
+        browserDevice.browser,
+        browserDevice.os,
+        browserDevice.deviceType,
+        browserDevice.screenResolution,
+        browserDevice.language,
+        browserDevice.timezone
+      );
     }
 
-    const visits = db
+    const cookieOptions = {
+      maxAge: 365 * 24 * 60 * 60 * 1000,
+      httpOnly: true,
+      sameSite: 'lax' as const,
+      path: '/',
+    };
+    res.cookie('intel_http_vid', visitorId, cookieOptions);
+    res.cookie('intel_http_token', visitorToken, cookieOptions);
+
+    const statsAgg = db
+      .prepare(
+        `SELECT
+          COUNT(*) AS total_visits,
+          MIN(visited_at_utc) AS first_visit_utc,
+          MAX(visited_at_utc) AS last_visit_utc,
+          COUNT(DISTINCT session_id) AS total_sessions
+         FROM visits
+         WHERE visitor_id = ?`
+      )
+      .get(visitorId) as {
+      total_visits: number;
+      first_visit_utc: string | null;
+      last_visit_utc: string | null;
+      total_sessions: number;
+    };
+
+    const prevVisitRow = db
+      .prepare(
+        `SELECT visited_at_utc
+         FROM visits
+         WHERE visitor_id = ?
+         ORDER BY visited_at_utc DESC, id DESC
+         LIMIT 1 OFFSET 1`
+      )
+      .get(visitorId) as { visited_at_utc: string } | undefined;
+
+    const validBackupForStats =
+      clientHistoryBackup && verifySignedHistoryBackup(visitorId, clientHistoryBackup)
+        ? clientHistoryBackup
+        : null;
+
+    const dbTotalVisits = Number(statsAgg.total_visits) || 1;
+    const mergedTotalVisits = validBackupForStats
+      ? Math.max(dbTotalVisits, validBackupForStats.totalVisits)
+      : dbTotalVisits;
+
+    const dbTotalSessions = Number(statsAgg.total_sessions) || 1;
+    const mergedTotalSessions = validBackupForStats
+      ? Math.max(dbTotalSessions, validBackupForStats.totalSessions)
+      : dbTotalSessions;
+
+    const mergedFirstVisitUtc =
+      validBackupForStats &&
+      validBackupForStats.firstVisitUtc &&
+      validBackupForStats.firstVisitUtc < (statsAgg.first_visit_utc || nowUtc)
+        ? validBackupForStats.firstVisitUtc
+        : statsAgg.first_visit_utc || nowUtc;
+
+    const statistics: VisitStatistics = {
+      firstVisitUtc: mergedFirstVisitUtc,
+      lastVisitUtc: statsAgg.last_visit_utc || nowUtc,
+      previousVisitUtc: prevVisitRow ? prevVisitRow.visited_at_utc : null,
+      totalVisits: mergedTotalVisits,
+      totalSessions: mergedTotalSessions,
+      currentSessionId,
+      sessionTimeoutMinutes: SESSION_TIMEOUT_MINUTES,
+    };
+
+    if (statistics.totalVisits > 1) {
+      isReturning = true;
+    }
+
+    const rawVisits = db
       .prepare(
         `SELECT
           id, visit_id, visitor_id, session_id, visited_at_utc,
-          public_ip, city, region, country, isp, org, asn,
+          public_ip, city, region, country, latitude, longitude, isp, org, asn,
           browser, os, device_type, screen_resolution, language, timezone
          FROM visits
          WHERE visitor_id = ?
          ORDER BY visited_at_utc DESC, id DESC
          LIMIT 50`
       )
-      .all(requestedVisitorId);
+      .all(visitorId) as Array<Record<string, unknown>>;
 
-    res.json({ visitorId: requestedVisitorId, visits });
-  });
+    const visitHistory: VisitHistoryRecord[] = rawVisits.map((r) => ({
+      id: Number(r.id),
+      visitId: String(r.visit_id),
+      visitorId: String(r.visitor_id),
+      sessionId: String(r.session_id),
+      visitedAtUtc: String(r.visited_at_utc),
+      publicIp: String(r.public_ip),
+      city: String(r.city),
+      region: String(r.region),
+      country: String(r.country),
+      latitude: typeof r.latitude === 'number' && Number.isFinite(r.latitude) ? r.latitude : null,
+      longitude: typeof r.longitude === 'number' && Number.isFinite(r.longitude) ? r.longitude : null,
+      isp: String(r.isp || 'Unknown'),
+      org: String(r.org || 'Unknown'),
+      asn: String(r.asn || 'Unknown'),
+      browser: String(r.browser),
+      os: String(r.os),
+      deviceType: String(r.device_type),
+      screenResolution: String(r.screen_resolution),
+      language: String(r.language),
+      timezone: String(r.timezone),
+    }));
 
+    const historyBackup = createSignedHistoryBackup(
+      visitorId,
+      statistics.totalVisits,
+      statistics.totalSessions,
+      statistics.firstVisitUtc,
+      visitHistory
+    );
+
+    const payload: IntelVisitorResponse = {
+      visitorId,
+      visitorToken,
+      isReturning,
+      recognitionSource,
+      location,
+      browserDevice,
+      statistics,
+      visitHistory,
+      historyBackup,
+    };
+
+    res.json(payload);
+  } catch (err) {
+    console.error('Error in /api/visitor/identify:', err);
+    res.status(500).json({ error: 'Unable to process visitor identification request.' });
+  }
+});
+
+app.get('/api/visitor/history/:visitorId', (req, res) => {
+  const requestedVisitorId = req.params.visitorId;
+  const headerToken = req.headers['x-visitor-token'] as string | undefined;
+  const cookieVid = req.cookies?.intel_http_vid as string | undefined;
+  const cookieToken = req.cookies?.intel_http_token as string | undefined;
+
+  const authorizedByHeader = verifyVisitorToken(requestedVisitorId, headerToken);
+  const authorizedByCookie =
+    cookieVid === requestedVisitorId && verifyVisitorToken(cookieVid, cookieToken);
+
+  if (!authorizedByHeader && !authorizedByCookie) {
+    res.status(403).json({
+      error: 'Forbidden: You are not authorized to access another visitor’s records.',
+    });
+    return;
+  }
+
+  const visits = db
+    .prepare(
+      `SELECT
+        id, visit_id, visitor_id, session_id, visited_at_utc,
+        public_ip, city, region, country, isp, org, asn,
+        browser, os, device_type, screen_resolution, language, timezone
+       FROM visits
+       WHERE visitor_id = ?
+       ORDER BY visited_at_utc DESC, id DESC
+       LIMIT 50`
+    )
+    .all(requestedVisitorId);
+
+  res.json({ visitorId: requestedVisitorId, visits });
+});
+
+async function startStandaloneServer() {
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -1667,4 +2172,8 @@ async function startServer() {
   });
 }
 
-startServer();
+if (!IS_SERVERLESS_RUNTIME) {
+  startStandaloneServer();
+}
+
+export default app;

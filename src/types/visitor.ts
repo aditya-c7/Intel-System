@@ -58,6 +58,15 @@ export interface VisitHistoryRecord {
   timezone: string;
 }
 
+export interface SignedHistoryBackup {
+  visitorId: string;
+  totalVisits: number;
+  totalSessions: number;
+  firstVisitUtc: string;
+  visits: VisitHistoryRecord[];
+  signature: string;
+}
+
 export interface IntelVisitorResponse {
   visitorId: string;
   visitorToken: string;
@@ -67,4 +76,5 @@ export interface IntelVisitorResponse {
   browserDevice: BrowserDeviceInfo;
   statistics: VisitStatistics;
   visitHistory: VisitHistoryRecord[];
+  historyBackup?: SignedHistoryBackup;
 }

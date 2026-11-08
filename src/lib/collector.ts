@@ -1,9 +1,14 @@
-import type { BrowserDeviceInfo, IntelVisitorResponse } from '../types/visitor';
+import type {
+  BrowserDeviceInfo,
+  IntelVisitorResponse,
+  SignedHistoryBackup,
+} from '../types/visitor';
 
 const STORAGE_KEYS = {
   VISITOR_ID: 'intel_fp_vid',
   VISITOR_TOKEN: 'intel_fp_token',
   SESSION_ID: 'intel_fp_sid',
+  HISTORY_BACKUP: 'intel_fp_history_backup',
 };
 
 const CURRENT_PAGE_LOAD_ID: string =
@@ -339,14 +344,28 @@ export function getFirstPartyStorage(): {
   visitorId: string | null;
   visitorToken: string | null;
   sessionId: string | null;
+  historyBackup: SignedHistoryBackup | null;
 } {
   let visitorId: string | null = null;
   let visitorToken: string | null = null;
   let sessionId: string | null = null;
+  let historyBackup: SignedHistoryBackup | null = null;
 
   try {
     visitorId = localStorage.getItem(STORAGE_KEYS.VISITOR_ID);
     visitorToken = localStorage.getItem(STORAGE_KEYS.VISITOR_TOKEN);
+    const rawBackup = localStorage.getItem(STORAGE_KEYS.HISTORY_BACKUP);
+    if (rawBackup) {
+      const parsed = JSON.parse(rawBackup) as SignedHistoryBackup;
+      if (
+        parsed &&
+        typeof parsed.visitorId === 'string' &&
+        typeof parsed.signature === 'string' &&
+        Array.isArray(parsed.visits)
+      ) {
+        historyBackup = parsed;
+      }
+    }
   } catch {
     // localStorage unavailable
   }
@@ -366,13 +385,21 @@ export function getFirstPartyStorage(): {
     sessionId = null;
   }
 
-  return { visitorId, visitorToken, sessionId };
+  return { visitorId, visitorToken, sessionId, historyBackup };
 }
 
-export function saveFirstPartyStorage(visitorId: string, visitorToken: string, sessionId: string): void {
+export function saveFirstPartyStorage(
+  visitorId: string,
+  visitorToken: string,
+  sessionId: string,
+  historyBackup?: SignedHistoryBackup
+): void {
   try {
     localStorage.setItem(STORAGE_KEYS.VISITOR_ID, visitorId);
     localStorage.setItem(STORAGE_KEYS.VISITOR_TOKEN, visitorToken);
+    if (historyBackup) {
+      localStorage.setItem(STORAGE_KEYS.HISTORY_BACKUP, JSON.stringify(historyBackup));
+    }
   } catch {
     // Ignore if blocked
   }
@@ -422,6 +449,7 @@ export async function identifyCurrentVisitor(options?: {
         storedVisitorId: stored.visitorId,
         storedVisitorToken: stored.visitorToken,
         clientSessionId: stored.sessionId,
+        clientHistoryBackup: stored.historyBackup,
         browserDevice,
         clientGeoHint,
       }),
@@ -433,7 +461,12 @@ export async function identifyCurrentVisitor(options?: {
     }
 
     const data = (await response.json()) as IntelVisitorResponse;
-    saveFirstPartyStorage(data.visitorId, data.visitorToken, data.statistics.currentSessionId);
+    saveFirstPartyStorage(
+      data.visitorId,
+      data.visitorToken,
+      data.statistics.currentSessionId,
+      data.historyBackup
+    );
     return data;
   };
 
