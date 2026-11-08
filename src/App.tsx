@@ -263,8 +263,9 @@ export default function App() {
   const [theme, setTheme] = useState<ThemeMode>(resolveInitialTheme);
 
   useEffect(() => {
-    const root = document.documentElement;
-    root.classList.toggle('dark', theme === 'dark');
+    const isDark = theme === 'dark';
+    document.documentElement.classList.toggle('dark', isDark);
+    document.body?.classList.toggle('dark', isDark);
     try {
       window.localStorage.setItem(THEME_STORAGE_KEY, theme);
     } catch {
@@ -368,7 +369,11 @@ export default function App() {
     : '';
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#F4F5F7] text-[#111827]">
+    <div
+      className={`${
+        theme === 'dark' ? 'dark bg-[#0b1220] text-[#f1f5f9]' : 'bg-[#F4F5F7] text-[#111827]'
+      } min-h-screen flex flex-col transition-colors duration-150`}
+    >
       {/* Responsive Top Navigation Bar */}
       <header className="bg-white border-b border-[#E5E7EB] px-4 sm:px-6 py-3.5">
         <div className="max-w-7xl mx-auto flex items-center justify-between gap-4 sm:gap-8">
