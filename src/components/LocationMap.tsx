@@ -120,7 +120,7 @@ export function LocationMap({
 
       const marker = L.marker([lat, lng], { icon: pinIcon }).addTo(map);
       marker.bindPopup(
-        `<div style="font-family:sans-serif;font-size:12px;line-height:1.4;"><strong>${labelText}</strong><br/><span style="font-family:monospace;color:#475569;">IP: ${publicIp}</span></div>`
+        `<div style="font-family:sans-serif;font-size:12px;line-height:1.4;"><strong>${labelText}</strong><br/><span style="font-family:monospace;opacity:0.75;">IP: ${publicIp}</span></div>`
       );
 
       mapRef.current = map;
@@ -134,7 +134,7 @@ export function LocationMap({
       if (markerRef.current) {
         markerRef.current.setLatLng([lat, lng]);
         markerRef.current.setPopupContent(
-          `<div style="font-family:sans-serif;font-size:12px;line-height:1.4;"><strong>${labelText}</strong><br/><span style="font-family:monospace;color:#475569;">IP: ${publicIp}</span></div>`
+          `<div style="font-family:sans-serif;font-size:12px;line-height:1.4;"><strong>${labelText}</strong><br/><span style="font-family:monospace;opacity:0.75;">IP: ${publicIp}</span></div>`
         );
       }
     }

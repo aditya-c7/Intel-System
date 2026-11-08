@@ -20,7 +20,24 @@ import {
   History,
   ShieldCheck,
   Building2,
+  Moon,
+  Sun,
 } from 'lucide-react';
+
+type ThemeMode = 'light' | 'dark';
+
+const THEME_STORAGE_KEY = 'intel_theme';
+
+function resolveInitialTheme(): ThemeMode {
+  if (typeof window === 'undefined') return 'light';
+  try {
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+    if (stored === 'dark' || stored === 'light') return stored;
+  } catch {
+    // localStorage unavailable
+  }
+  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
 
 /**
  * Formats a stored UTC ISO-8601 timestamp into the visitor's local timezone.
@@ -99,6 +116,21 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<boolean>(false);
   const [selectedVisitIndex, setSelectedVisitIndex] = useState<number>(0);
+  const [theme, setTheme] = useState<ThemeMode>(resolveInitialTheme);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.classList.toggle('dark', theme === 'dark');
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {
+      // localStorage unavailable
+    }
+  }, [theme]);
+
+  const toggleTheme = useCallback(() => {
+    setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
+  }, []);
 
   const loadVisitorData = useCallback(async (manualRefresh = false) => {
     try {
@@ -205,7 +237,21 @@ export default function App() {
             </a>
           </nav>
 
-          <div className="flex items-center shrink-0">
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={toggleTheme}
+              aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+              aria-pressed={theme === 'dark'}
+              title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+              className="inline-flex items-center justify-center w-8 h-8 text-slate-700 bg-white hover:bg-slate-50 border border-slate-300 rounded-md shrink-0 cursor-pointer"
+            >
+              {theme === 'dark' ? (
+                <Sun className="w-4 h-4" />
+              ) : (
+                <Moon className="w-4 h-4" />
+              )}
+            </button>
             <button
               type="button"
               onClick={() => loadVisitorData(true)}
