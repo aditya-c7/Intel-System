@@ -78,22 +78,34 @@ function applyRestoredUrlAndQuery(
 }
 
 function restoreOriginalApiUrl(req: VercelRequest): void {
-  const rawUrl = typeof req.url === 'string' && req.url.length > 0 ? req.url : API_PREFIX;
-  const queryIndex = rawUrl.indexOf('?');
-  const pathPart = queryIndex === -1 ? rawUrl : rawUrl.slice(0, queryIndex);
-  const queryPart = queryIndex === -1 ? '' : rawUrl.slice(queryIndex + 1);
+  const rawUrl = typeof req.url === 'string' && req.url.length > 0 ? req.url : '/';
 
-  const params = new URLSearchParams(queryPart);
+  // Parse the (possibly rewritten) request URL safely. Vercel rewrites `/api/(.*)`
+  // to `/api/index?__ipath=$1`, so the rewritten URL carries the real route inside
+  // the __ipath query parameter.
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(rawUrl, 'http://localhost');
+  } catch {
+    try {
+      // Tolerate malformed percent-encoding (e.g. a bare trailing `%`) instead of failing
+      parsedUrl = new URL(rawUrl.replace(/%(?![0-9a-fA-F]{2})/g, '%25'), 'http://localhost');
+    } catch {
+      return; // Leave the request untouched rather than breaking it
+    }
+  }
 
-  // Merge any query parameters pre-parsed by the Vercel runtime into params
+  const searchParams = parsedUrl.searchParams;
+
+  // Merge any query parameters pre-parsed by the Vercel runtime into searchParams
   try {
     if (req.query && typeof req.query === 'object') {
       for (const [k, v] of Object.entries(req.query)) {
-        if (!params.has(k)) {
+        if (!searchParams.has(k)) {
           if (typeof v === 'string') {
-            params.set(k, v);
+            searchParams.set(k, v);
           } else if (Array.isArray(v) && typeof v[0] === 'string') {
-            params.set(k, v[0]);
+            searchParams.set(k, v[0]);
           }
         }
       }
@@ -102,33 +114,34 @@ function restoreOriginalApiUrl(req: VercelRequest): void {
     // Ignore getter errors on req.query
   }
 
-  const injectedPath = params.get('__ipath');
+  const pathPart = parsedUrl.pathname;
+  const rawIpath = searchParams.get('__ipath');
 
-  if (injectedPath !== null) {
-    params.delete('__ipath');
-    let decodedInjected = injectedPath;
+  if (rawIpath !== null) {
+    searchParams.delete('__ipath');
+    let decodedInjected = rawIpath;
     try {
       if (decodedInjected.includes('%')) {
         decodedInjected = decodeURIComponent(decodedInjected);
       }
     } catch {
-      decodedInjected = injectedPath;
+      decodedInjected = rawIpath;
     }
 
-    // Handle case where injectedPath itself had "?foo=bar" appended
+    // Handle case where the injected path itself had "?foo=bar" appended
     const [cleanInjectedPath, embeddedQuery] = decodedInjected.split('?');
     if (embeddedQuery) {
       const embeddedParams = new URLSearchParams(embeddedQuery);
       for (const [ek, ev] of embeddedParams.entries()) {
-        if (ek !== '__ipath' && !params.has(ek)) {
-          params.set(ek, ev);
+        if (ek !== '__ipath' && !searchParams.has(ek)) {
+          searchParams.set(ek, ev);
         }
       }
     }
 
-    const ipath = cleanInjectedPath.replace(/^\/+/, '').replace(/^api\/+/i, '');
-    const restoredPath = ipath ? `${API_PREFIX}/${ipath}` : API_PREFIX;
-    applyRestoredUrlAndQuery(req, restoredPath, params);
+    const cleanSubpath = cleanInjectedPath.replace(/^\/+/, '').replace(/^api\/+/i, '');
+    const restoredPath = cleanSubpath ? `${API_PREFIX}/${cleanSubpath}` : API_PREFIX;
+    applyRestoredUrlAndQuery(req, restoredPath, searchParams);
     return;
   }
 
@@ -150,7 +163,7 @@ function restoreOriginalApiUrl(req: VercelRequest): void {
       const normPath = normQIdx === -1 ? normalized : normalized.slice(0, normQIdx);
       const normQuery = normQIdx === -1 ? '' : normalized.slice(normQIdx + 1);
       const mergedParams = new URLSearchParams(normQuery);
-      for (const [k, v] of params.entries()) {
+      for (const [k, v] of searchParams.entries()) {
         if (k !== '__ipath' && !mergedParams.has(k)) {
           mergedParams.set(k, v);
         }
@@ -161,7 +174,7 @@ function restoreOriginalApiUrl(req: VercelRequest): void {
   }
 
   // Even when req.url already has the original path (/api/...), ensure req.query is synced
-  applyRestoredUrlAndQuery(req, pathPart, params);
+  applyRestoredUrlAndQuery(req, pathPart, searchParams);
 }
 
 export default function handler(req: VercelRequest, res: ServerResponse): void {

@@ -824,6 +824,7 @@ export async function evaluateSecuritySignals(
     hardwareSignals.gpuRenderer
   );
   const datacenterAsn = dcCheck.isDatacenter;
+  const cloudOrMaskedGpu = datacenterAsn && maskedGpu;
 
   const vpnReasons: string[] = [];
   if (timezoneMismatch) {
@@ -961,6 +962,7 @@ export async function evaluateSecuritySignals(
     browserTimezone,
     ipTimezone,
     datacenterAsn,
+    cloudOrMaskedGpu,
     vpnReasons,
     tamperDetected,
     tamperReasons,

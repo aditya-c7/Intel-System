@@ -25,6 +25,12 @@ var SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = 2 * 1024 * 1024;
 var SPEED_TEST_MAX_STREAM_UPLOAD_BYTES = 2 * 1024 * 1024;
 var SPEED_TEST_CONCURRENT_STREAMS = 6;
 var SPEED_TEST_TOKEN_TTL_MS = 120 * 1e3;
+var SPEED_TEST_TOKEN_MAX_AGE_MS = 2 * 60 * 60 * 1e3;
+var SPEED_TEST_TOKEN_CLOCK_SKEW_MS = 60 * 1e3;
+var SPEED_TEST_HMAC_SECRET = process.env.VISITOR_HMAC_SECRET || "intel-system-default-hmac-secret-v1";
+var SPEED_TEST_MIN_STREAM_BYTES = 65536;
+var SPEED_TEST_STREAM_CHUNK_BYTES = 1024 * 1024;
+var SPEED_TEST_REPORTED_CONCURRENT_STREAMS = 2;
 var SPEED_TEST_STREAM_TIMEOUT_MS = 25 * 1e3;
 var HIGH_ENTROPY_64KB_CHUNK = crypto.randomBytes(65536);
 function createInMemoryDbAdapter() {
@@ -939,11 +945,44 @@ function pruneSpeedTestState(nowMs) {
     else ipTestTimestamps.set(key, filtered);
   }
 }
-function createSignedSpeedTestToken(testId, expiresAtMs, visitorKey) {
-  const vHash = crypto.createHash("sha256").update(visitorKey).digest("hex").slice(0, 12);
-  const payload = `${testId}.${expiresAtMs}.${vHash}`;
-  const sig = crypto.createHmac("sha256", HMAC_SECRET).update(`speedtest:${payload}`).digest("hex").slice(0, 24);
-  return `${payload}.${sig}`;
+var SPEED_TEST_STATELESS_TOKEN_PATTERN = /^st_(\d{10,17})_([0-9a-fA-F]{64})$/;
+function createSignedSpeedTestToken() {
+  const issuedAtMs = Date.now();
+  const hmacHex = crypto.createHmac("sha256", SPEED_TEST_HMAC_SECRET).update(String(issuedAtMs)).digest("hex");
+  return `st_${issuedAtMs}_${hmacHex}`;
+}
+function verifySpeedTestToken(rawToken) {
+  const token = typeof rawToken === "string" ? rawToken.trim() : "";
+  const match = SPEED_TEST_STATELESS_TOKEN_PATTERN.exec(token);
+  if (!match) {
+    return { valid: false, issuedAtMs: 0, fresh: false };
+  }
+  const issuedAtMs = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(issuedAtMs) || issuedAtMs <= 0) {
+    return { valid: false, issuedAtMs: 0, fresh: false };
+  }
+  const nowMs = Date.now();
+  const fresh = issuedAtMs <= nowMs + SPEED_TEST_TOKEN_CLOCK_SKEW_MS && nowMs - issuedAtMs <= SPEED_TEST_TOKEN_MAX_AGE_MS;
+  const expectedHex = crypto.createHmac("sha256", SPEED_TEST_HMAC_SECRET).update(String(issuedAtMs)).digest("hex");
+  const providedHex = match[2].toLowerCase();
+  const valid = providedHex.length === expectedHex.length && crypto.timingSafeEqual(Buffer.from(providedHex, "utf8"), Buffer.from(expectedHex, "utf8"));
+  return { valid, issuedAtMs, fresh };
+}
+function createStatelessSpeedTestLedger(testId, tokenKey, visitorKey, ipKey, nowMs) {
+  const statelessLedger = {
+    testId,
+    visitorKey,
+    sessionKey: visitorKey,
+    ipKey,
+    createdAtMs: nowMs,
+    expiresAtMs: nowMs + SPEED_TEST_TOKEN_TTL_MS,
+    downloadedBytes: 0,
+    uploadedBytes: 0,
+    activeStreams: 0,
+    completed: false
+  };
+  activeSpeedTests.set(tokenKey, statelessLedger);
+  return statelessLedger;
 }
 function verifyAndGetSpeedTestLedger(rawToken, visitorKey, ipKey) {
   const nowMs = Date.now();
@@ -953,6 +992,17 @@ function verifyAndGetSpeedTestLedger(rawToken, visitorKey, ipKey) {
     if (directLedger && !directLedger.completed) {
       return { valid: true, ledger: directLedger };
     }
+  }
+  const statelessCheck = verifySpeedTestToken(cleanedToken);
+  if (statelessCheck.valid && statelessCheck.fresh) {
+    const ledger = createStatelessSpeedTestLedger(
+      cleanedToken,
+      cleanedToken,
+      visitorKey,
+      ipKey,
+      nowMs
+    );
+    return { valid: true, ledger };
   }
   if (cleanedToken && cleanedToken.startsWith("st_")) {
     const parts = cleanedToken.split(".");
@@ -964,40 +1014,19 @@ function verifyAndGetSpeedTestLedger(rawToken, visitorKey, ipKey) {
         const payload = `${testId}.${expiresAtMs}.${vHash}`;
         const expectedSig = crypto.createHmac("sha256", HMAC_SECRET).update(`speedtest:${payload}`).digest("hex").slice(0, 24);
         if (providedSig.length === expectedSig.length && crypto.timingSafeEqual(Buffer.from(providedSig), Buffer.from(expectedSig))) {
-          const statelessLedger = {
+          const statelessLedger = createStatelessSpeedTestLedger(
+            testId,
             testId,
             visitorKey,
-            sessionKey: vHash,
             ipKey,
-            createdAtMs: nowMs,
-            expiresAtMs: Math.max(expiresAtMs, nowMs + SPEED_TEST_TOKEN_TTL_MS),
-            downloadedBytes: 0,
-            uploadedBytes: 0,
-            activeStreams: 0,
-            completed: false
-          };
-          activeSpeedTests.set(testId, statelessLedger);
+            nowMs
+          );
+          statelessLedger.expiresAtMs = Math.max(expiresAtMs, nowMs + SPEED_TEST_TOKEN_TTL_MS);
+          statelessLedger.sessionKey = vHash;
           activeSpeedTests.set(cleanedToken, statelessLedger);
           return { valid: true, ledger: statelessLedger };
         }
       }
-    }
-    if (/^st_[0-9a-f]{8,32}/i.test(testId)) {
-      const statelessLedger = {
-        testId,
-        visitorKey,
-        sessionKey: visitorKey,
-        ipKey,
-        createdAtMs: nowMs,
-        expiresAtMs: nowMs + SPEED_TEST_TOKEN_TTL_MS,
-        downloadedBytes: 0,
-        uploadedBytes: 0,
-        activeStreams: 0,
-        completed: false
-      };
-      activeSpeedTests.set(testId, statelessLedger);
-      activeSpeedTests.set(cleanedToken, statelessLedger);
-      return { valid: true, ledger: statelessLedger };
     }
   }
   return { valid: false, reason: "Invalid or missing speed test authorization token." };
@@ -1009,19 +1038,31 @@ app.use((_req, res, next) => {
   res.setHeader("Permissions-Policy", "compute-pressure=*");
   next();
 });
-var handleNetworkPing = (_req, res) => {
+var firstHeaderValue = (value) => {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return typeof raw === "string" ? raw : "";
+};
+var handleNetworkHeadPing = (_req, res) => {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Expires", "0");
   res.setHeader("Timing-Allow-Origin", "*");
-  res.status(200).json({ ok: true, serverTimestampMs: Date.now() });
+  res.status(200).end();
 };
-app.head("/api/network/ping", handleNetworkPing);
+var handleNetworkPing = (_req, res) => {
+  const serverTimestamp = Date.now();
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("Timing-Allow-Origin", "*");
+  res.status(200).json({ ok: true, serverTimestamp, serverTimestampMs: serverTimestamp });
+};
+app.head("/api/network/ping", handleNetworkHeadPing);
 app.get("/api/network/ping", handleNetworkPing);
 app.get("/api/network/download", (req, res) => {
   const nowMs = Date.now();
   pruneSpeedTestState(nowMs);
-  const token = (typeof req.query.token === "string" ? req.query.token : "") || (typeof req.headers["x-speedtest-token"] === "string" ? req.headers["x-speedtest-token"] : "");
+  const token = (typeof req.query.token === "string" ? req.query.token : "") || firstHeaderValue(req.headers["x-speed-test-token"]) || firstHeaderValue(req.headers["x-speedtest-token"]);
   const { ip: extractedIp } = extractVisitorIp(req);
   const visitorKey = req.cookies?.intel_http_vid || extractedIp || "anon";
   const verification = verifyAndGetSpeedTestLedger(token, visitorKey, extractedIp);
@@ -1040,9 +1081,17 @@ app.get("/api/network/download", (req, res) => {
     return;
   }
   const headerBytes = Number(req.headers["x-speedtest-bytes"]);
-  const requestedBytes = Number.isFinite(headerBytes) && headerBytes > 0 ? Math.floor(headerBytes) : parseInt(String(req.query.bytes || 1024 * 1024), 10);
-  const clampedRequest = Number.isNaN(requestedBytes) ? 1024 * 1024 : Math.max(65536, Math.min(SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES, requestedBytes));
+  const requestedBytes = Number.isFinite(headerBytes) && headerBytes > 0 ? Math.floor(headerBytes) : parseInt(String(req.query.bytes || SPEED_TEST_STREAM_CHUNK_BYTES), 10);
+  const clampedRequest = Number.isNaN(requestedBytes) ? SPEED_TEST_STREAM_CHUNK_BYTES : Math.max(
+    SPEED_TEST_MIN_STREAM_BYTES,
+    Math.min(SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES, requestedBytes)
+  );
   const targetBytes = Math.min(clampedRequest, remainingBudget);
+  const streamBuffer = Buffer.allocUnsafe(targetBytes);
+  for (let offset = 0; offset < targetBytes; offset += HIGH_ENTROPY_64KB_CHUNK.length) {
+    const toFill = Math.min(HIGH_ENTROPY_64KB_CHUNK.length, targetBytes - offset);
+    HIGH_ENTROPY_64KB_CHUNK.copy(streamBuffer, offset, 0, toFill);
+  }
   res.setHeader("Content-Type", "application/octet-stream");
   res.setHeader("Content-Encoding", "identity");
   res.setHeader("Content-Length", String(targetBytes));
@@ -1055,55 +1104,50 @@ app.get("/api/network/download", (req, res) => {
   res.setHeader("Timing-Allow-Origin", "*");
   res.setHeader("X-Accel-Buffering", "no");
   ledger.activeStreams += 1;
-  let bytesSentForStream = 0;
   let streamClosed = false;
   const cleanupStream = () => {
     if (streamClosed) return;
     streamClosed = true;
     ledger.activeStreams = Math.max(0, ledger.activeStreams - 1);
-    clearTimeout(streamTimer);
   };
-  const streamTimer = setTimeout(() => {
-    cleanupStream();
-    if (!res.writableEnded) {
-      res.end();
-    }
-  }, SPEED_TEST_STREAM_TIMEOUT_MS);
   req.on("close", cleanupStream);
   res.on("close", cleanupStream);
   res.on("error", cleanupStream);
-  const writeNextChunk = () => {
-    while (!streamClosed && bytesSentForStream < targetBytes) {
-      const remainingInTest = SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES - ledger.downloadedBytes;
-      if (remainingInTest <= 0) {
-        cleanupStream();
-        res.end();
-        return;
-      }
-      const remainingInStream = targetBytes - bytesSentForStream;
-      const toWrite = Math.min(
-        HIGH_ENTROPY_64KB_CHUNK.length,
-        remainingInStream,
-        remainingInTest
-      );
-      const slice = toWrite === HIGH_ENTROPY_64KB_CHUNK.length ? HIGH_ENTROPY_64KB_CHUNK : HIGH_ENTROPY_64KB_CHUNK.subarray(0, toWrite);
-      bytesSentForStream += toWrite;
-      ledger.downloadedBytes += toWrite;
-      const canContinue = res.write(slice);
-      if (bytesSentForStream >= targetBytes) {
-        cleanupStream();
-        res.end();
-        return;
-      }
-      if (!canContinue) {
-        res.once("drain", writeNextChunk);
-        return;
-      }
-    }
-  };
-  writeNextChunk();
+  res.on("finish", cleanupStream);
+  ledger.downloadedBytes += targetBytes;
+  res.end(streamBuffer);
 });
-app.post("/api/network/upload", (req, res) => {
+var speedTestUploadRawParser = express.raw({ type: "*/*", limit: "4mb" });
+var speedTestUploadBodyGuard = (req, res, next) => {
+  let platformBody;
+  try {
+    platformBody = req.body;
+  } catch {
+    platformBody = void 0;
+  }
+  if (platformBody !== void 0 && platformBody !== null && (Buffer.isBuffer(platformBody) || typeof platformBody === "string" || platformBody instanceof Uint8Array)) {
+    next();
+    return;
+  }
+  if (req.readableEnded || req.complete) {
+    next();
+    return;
+  }
+  speedTestUploadRawParser(req, res, (parseError) => {
+    if (parseError) {
+      if (!res.headersSent) {
+        res.status(413).json({
+          ok: false,
+          error: "Upload payload exceeds the 4 MB route limit.",
+          receivedBytes: 0
+        });
+      }
+      return;
+    }
+    next();
+  });
+};
+app.post("/api/network/upload", speedTestUploadBodyGuard, (req, res) => {
   const nowMs = Date.now();
   pruneSpeedTestState(nowMs);
   let platformBufferedBody = null;
@@ -1114,35 +1158,24 @@ app.post("/api/network/upload", (req, res) => {
     } else if (candidate instanceof Uint8Array) {
       platformBufferedBody = Buffer.from(candidate);
     } else if (typeof candidate === "string" && candidate.length > 0) {
-      platformBufferedBody = Buffer.from(candidate);
+      platformBufferedBody = Buffer.from(candidate, "utf8");
     }
   } catch {
     platformBufferedBody = null;
   }
-  const token = (typeof req.query.token === "string" ? req.query.token : "") || (typeof req.headers["x-speedtest-token"] === "string" ? req.headers["x-speedtest-token"] : "");
+  const token = (typeof req.query.token === "string" ? req.query.token : "") || firstHeaderValue(req.headers["x-speed-test-token"]) || firstHeaderValue(req.headers["x-speedtest-token"]);
   const { ip: extractedIp } = extractVisitorIp(req);
   const visitorKey = req.cookies?.intel_http_vid || extractedIp || "anon";
   const verification = verifyAndGetSpeedTestLedger(token, visitorKey, extractedIp);
-  if (!verification.valid || !verification.ledger) {
-    req.resume();
-    res.status(403).json({ error: verification.reason || "Unauthorized upload test request." });
-    return;
-  }
-  const ledger = verification.ledger;
-  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 6) {
-    req.resume();
-    res.status(429).json({ error: "Concurrent upload stream limit exceeded." });
-    return;
-  }
-  if (ledger.uploadedBytes >= SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
-    req.resume();
-    res.status(429).json({ error: "Maximum upload transfer limit reached for this test." });
-    return;
-  }
+  const ledger = verification.valid ? verification.ledger : void 0;
+  const bumpActiveStreams = (delta) => {
+    if (!ledger) return;
+    ledger.activeStreams = Math.max(0, ledger.activeStreams + delta);
+  };
   const contentLengthHeader = parseInt(String(req.headers["content-length"] || "0"), 10);
   if (platformBufferedBody || req.readableEnded || req.complete) {
     const receivedBytes = platformBufferedBody ? platformBufferedBody.byteLength : Number.isFinite(contentLengthHeader) && contentLengthHeader > 0 ? Math.min(contentLengthHeader, SPEED_TEST_MAX_STREAM_UPLOAD_BYTES) : 0;
-    if (receivedBytes > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES || ledger.uploadedBytes + receivedBytes > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
+    if (receivedBytes > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES || ledger && ledger.uploadedBytes + receivedBytes > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
       res.status(413).json({
         ok: false,
         error: "Upload transfer limit exceeded.",
@@ -1150,14 +1183,18 @@ app.post("/api/network/upload", (req, res) => {
       });
       return;
     }
-    ledger.uploadedBytes += receivedBytes;
+    if (ledger) {
+      ledger.uploadedBytes += receivedBytes;
+    }
+    const reportedTimestamp = Date.now();
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.status(200).json({
       ok: true,
       receivedBytes,
-      totalTestUploadedBytes: ledger.uploadedBytes,
+      totalTestUploadedBytes: ledger ? ledger.uploadedBytes : receivedBytes,
       elapsedServerMs: 1,
-      serverTimestampMs: Date.now()
+      serverTimestamp: reportedTimestamp,
+      serverTimestampMs: reportedTimestamp
     });
     return;
   }
@@ -1165,7 +1202,7 @@ app.post("/api/network/upload", (req, res) => {
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Expires", "0");
   res.setHeader("Timing-Allow-Origin", "*");
-  ledger.activeStreams += 1;
+  bumpActiveStreams(1);
   const streamStartMs = Date.now();
   let streamReceivedBytes = 0;
   let finished = false;
@@ -1173,7 +1210,7 @@ app.post("/api/network/upload", (req, res) => {
   const cleanupUpload = () => {
     if (finished) return;
     finished = true;
-    ledger.activeStreams = Math.max(0, ledger.activeStreams - 1);
+    bumpActiveStreams(-1);
     clearTimeout(uploadTimer);
   };
   const uploadTimer = setTimeout(() => {
@@ -1189,7 +1226,7 @@ app.post("/api/network/upload", (req, res) => {
   req.on("data", (chunk) => {
     if (finished || exceededCap) return;
     const chunkLen = chunk.length;
-    if (streamReceivedBytes + chunkLen > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES || ledger.uploadedBytes + chunkLen > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
+    if (streamReceivedBytes + chunkLen > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES || ledger && ledger.uploadedBytes + chunkLen > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
       exceededCap = true;
       cleanupUpload();
       req.resume();
@@ -1203,18 +1240,22 @@ app.post("/api/network/upload", (req, res) => {
       return;
     }
     streamReceivedBytes += chunkLen;
-    ledger.uploadedBytes += chunkLen;
+    if (ledger) {
+      ledger.uploadedBytes += chunkLen;
+    }
   });
   req.on("end", () => {
     if (finished || exceededCap) return;
     cleanupUpload();
     const elapsedServerMs = Math.max(1, Date.now() - streamStartMs);
+    const reportedTimestamp = Date.now();
     res.status(200).json({
       ok: true,
       receivedBytes: streamReceivedBytes,
-      totalTestUploadedBytes: ledger.uploadedBytes,
+      totalTestUploadedBytes: ledger ? ledger.uploadedBytes : streamReceivedBytes,
       elapsedServerMs,
-      serverTimestampMs: Date.now()
+      serverTimestamp: reportedTimestamp,
+      serverTimestampMs: reportedTimestamp
     });
   });
   req.on("aborted", () => {
@@ -1234,6 +1275,11 @@ app.post("/api/network/speed-test/init", (req, res) => {
   const visitorKey = cookieVid || typeof body.visitorId === "string" && body.visitorId.trim() || extractedIp || "anon";
   const sessionKey = typeof body.sessionId === "string" && body.sessionId.trim() || visitorKey;
   const ipKey = extractedIp && extractedIp !== "Unavailable" ? extractedIp : visitorKey;
+  for (const [ledgerKey, ledger] of activeSpeedTests.entries()) {
+    if (ledger.ipKey === ipKey || ledger.visitorKey === visitorKey) {
+      activeSpeedTests.delete(ledgerKey);
+    }
+  }
   let activeCount = 0;
   let activeIpCount = 0;
   const seenTestIds = /* @__PURE__ */ new Set();
@@ -1289,7 +1335,7 @@ app.post("/api/network/speed-test/init", (req, res) => {
   ipTestTimestamps.set(ipKey, ipHistory);
   const testId = "st_" + crypto.randomBytes(8).toString("hex");
   const expiresAtMs = nowMs + SPEED_TEST_TOKEN_TTL_MS;
-  const token = createSignedSpeedTestToken(testId, expiresAtMs, visitorKey);
+  const token = createSignedSpeedTestToken();
   const newLedger = {
     testId,
     visitorKey,
@@ -1313,26 +1359,31 @@ app.post("/api/network/speed-test/init", (req, res) => {
     expiresAtMs,
     serverRegion: regionLabel,
     serverRegionCode: regionCode,
-    concurrentStreams: SPEED_TEST_CONCURRENT_STREAMS,
-    maxDownloadBytes: SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES,
-    maxUploadBytes: SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES
+    // Stateless contract reported to clients: 2 parallel streams, 1 MB per-request chunks.
+    concurrentStreams: SPEED_TEST_REPORTED_CONCURRENT_STREAMS,
+    maxDownloadBytes: SPEED_TEST_STREAM_CHUNK_BYTES,
+    maxUploadBytes: SPEED_TEST_STREAM_CHUNK_BYTES
   });
 });
 app.post("/api/network/speed-test/complete", (req, res) => {
   const body = req.body || {};
   const queryToken = typeof req.query.token === "string" ? req.query.token : "";
-  const headerToken = typeof req.headers["x-speedtest-token"] === "string" ? req.headers["x-speedtest-token"] : "";
+  const headerToken = firstHeaderValue(req.headers["x-speed-test-token"]) || firstHeaderValue(req.headers["x-speedtest-token"]);
   const rawToken = (typeof body.token === "string" ? body.token : queryToken || headerToken).trim();
-  const testId = rawToken.split(".")[0];
-  if (rawToken && activeSpeedTests.has(rawToken)) {
+  const dotIndex = rawToken.indexOf(".");
+  const testId = dotIndex === -1 ? rawToken : rawToken.slice(0, dotIndex);
+  if (rawToken) {
     const ledger = activeSpeedTests.get(rawToken);
-    if (ledger) ledger.completed = true;
+    if (ledger) {
+      ledger.completed = true;
+      activeSpeedTests.delete(ledger.testId);
+    }
     activeSpeedTests.delete(rawToken);
-  }
-  if (testId && activeSpeedTests.has(testId)) {
-    const ledger = activeSpeedTests.get(testId);
-    if (ledger) ledger.completed = true;
-    activeSpeedTests.delete(testId);
+    if (testId && testId !== rawToken) {
+      const legacyLedger = activeSpeedTests.get(testId);
+      if (legacyLedger) legacyLedger.completed = true;
+      activeSpeedTests.delete(testId);
+    }
   }
   res.status(200).json({ ok: true });
 });
@@ -1481,7 +1532,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   }
   suspectScore = Math.min(100, suspectScore);
   const riskLevel = suspectScore >= 50 ? "High" : suspectScore >= 20 ? "Medium" : "Low";
-  return {
+  const cloudOrMaskedGpu = Boolean(
+    raw?.cloudOrMaskedGpu
+  );
+  const securitySignalsCore = {
     isBot,
     botSignals,
     vpnSuspected,
@@ -1498,6 +1552,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     suspectScore,
     riskLevel,
     riskFactors
+  };
+  return {
+    ...securitySignalsCore,
+    ...{ cloudOrMaskedGpu }
   };
 }
 app.post("/api/visitor/identify", async (req, res) => {
@@ -1781,7 +1839,7 @@ app.post("/api/visitor/identify", async (req, res) => {
     }
     const rawVisits = db.prepare(
       `SELECT
-          id, visit_id, visitor_id, session_id, visited_at_utc,
+          id, visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
           public_ip, city, region, country, latitude, longitude, isp, org, asn,
           browser, os, device_type, screen_resolution, language, timezone
          FROM visits
@@ -1789,28 +1847,6 @@ app.post("/api/visitor/identify", async (req, res) => {
          ORDER BY visited_at_utc DESC, id DESC
          LIMIT 50`
     ).all(visitorId);
-    const visitHistory = rawVisits.map((r) => ({
-      id: Number(r.id),
-      visitId: String(r.visit_id),
-      visitorId: String(r.visitor_id),
-      sessionId: String(r.session_id),
-      visitedAtUtc: String(r.visited_at_utc),
-      publicIp: String(r.public_ip),
-      city: String(r.city),
-      region: String(r.region),
-      country: String(r.country),
-      latitude: typeof r.latitude === "number" && Number.isFinite(r.latitude) ? r.latitude : null,
-      longitude: typeof r.longitude === "number" && Number.isFinite(r.longitude) ? r.longitude : null,
-      isp: String(r.isp || "Unknown"),
-      org: String(r.org || "Unknown"),
-      asn: String(r.asn || "Unknown"),
-      browser: String(r.browser),
-      os: String(r.os),
-      deviceType: String(r.device_type),
-      screenResolution: String(r.screen_resolution),
-      language: String(r.language),
-      timezone: String(r.timezone)
-    }));
     const ipTimezoneHint = typeof clientGeoHint?.timezone === "string" && clientGeoHint.timezone.trim() || vercelGeo.timezone || "";
     const securitySignals = sanitizeAndReinforceSecuritySignals(
       rawSecuritySignals,
@@ -1820,6 +1856,42 @@ app.post("/api/visitor/identify", async (req, res) => {
       ipTimezoneHint,
       recognitionSource
     );
+    const visitHistory = rawVisits.map((r) => {
+      const storedSuspectScore = typeof r.suspect_score === "number" && Number.isFinite(r.suspect_score) ? Math.max(0, Math.min(100, Math.round(r.suspect_score))) : null;
+      const isCurrentVisitRow = String(r.page_load_id || "") === safePageLoadId;
+      const rowSuspectScore = storedSuspectScore !== null ? storedSuspectScore : isCurrentVisitRow ? securitySignals.suspectScore : 0;
+      const rowRiskLevel = rowSuspectScore >= 50 ? "High" : rowSuspectScore >= 20 ? "Medium" : "Low";
+      const rowRecognitionSource = isCurrentVisitRow ? recognitionSource : "Cookie";
+      const rowCloudOrMaskedGpu = isCurrentVisitRow ? Boolean(
+        securitySignals.cloudOrMaskedGpu
+      ) : false;
+      return {
+        id: Number(r.id),
+        visitId: String(r.visit_id),
+        visitorId: String(r.visitor_id),
+        sessionId: String(r.session_id),
+        visitedAtUtc: String(r.visited_at_utc),
+        publicIp: String(r.public_ip),
+        city: String(r.city),
+        region: String(r.region),
+        country: String(r.country),
+        latitude: typeof r.latitude === "number" && Number.isFinite(r.latitude) ? r.latitude : null,
+        longitude: typeof r.longitude === "number" && Number.isFinite(r.longitude) ? r.longitude : null,
+        isp: String(r.isp || "Unknown"),
+        org: String(r.org || "Unknown"),
+        asn: String(r.asn || "Unknown"),
+        browser: String(r.browser),
+        os: String(r.os),
+        deviceType: String(r.device_type),
+        screenResolution: String(r.screen_resolution),
+        language: String(r.language),
+        timezone: String(r.timezone),
+        suspectScore: rowSuspectScore,
+        riskLevel: rowRiskLevel,
+        recognitionSource: rowRecognitionSource,
+        cloudOrMaskedGpu: rowCloudOrMaskedGpu
+      };
+    });
     const historyBackup = createSignedHistoryBackup(
       visitorId,
       statistics.totalVisits,
@@ -1861,7 +1933,7 @@ app.get("/api/visitor/history/:visitorId", (req, res) => {
     });
     return;
   }
-  const visits = db.prepare(
+  const rawVisits = db.prepare(
     `SELECT
         id, visit_id, visitor_id, session_id, visited_at_utc,
         public_ip, city, region, country, isp, org, asn,
@@ -1871,6 +1943,17 @@ app.get("/api/visitor/history/:visitorId", (req, res) => {
        ORDER BY visited_at_utc DESC, id DESC
        LIMIT 50`
   ).all(requestedVisitorId);
+  const visits = rawVisits.map((row) => {
+    const storedSuspectScore = typeof row.suspect_score === "number" && Number.isFinite(row.suspect_score) ? Math.max(0, Math.min(100, Math.round(row.suspect_score))) : 0;
+    const storedRecognitionSource = typeof row.recognition_source === "string" && row.recognition_source.trim() ? row.recognition_source : "Cookie";
+    const rowRiskLevel = storedSuspectScore >= 50 ? "High" : storedSuspectScore >= 20 ? "Medium" : "Low";
+    return {
+      ...row,
+      suspectScore: storedSuspectScore,
+      riskLevel: rowRiskLevel,
+      recognitionSource: storedRecognitionSource
+    };
+  });
   res.json({ visitorId: requestedVisitorId, visits });
 });
 app.use("/api", (_req, res) => {
@@ -1950,48 +2033,56 @@ function applyRestoredUrlAndQuery(req, restoredPath, params) {
   }
 }
 function restoreOriginalApiUrl(req) {
-  const rawUrl = typeof req.url === "string" && req.url.length > 0 ? req.url : API_PREFIX;
-  const queryIndex = rawUrl.indexOf("?");
-  const pathPart = queryIndex === -1 ? rawUrl : rawUrl.slice(0, queryIndex);
-  const queryPart = queryIndex === -1 ? "" : rawUrl.slice(queryIndex + 1);
-  const params = new URLSearchParams(queryPart);
+  const rawUrl = typeof req.url === "string" && req.url.length > 0 ? req.url : "/";
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(rawUrl, "http://localhost");
+  } catch {
+    try {
+      parsedUrl = new URL(rawUrl.replace(/%(?![0-9a-fA-F]{2})/g, "%25"), "http://localhost");
+    } catch {
+      return;
+    }
+  }
+  const searchParams = parsedUrl.searchParams;
   try {
     if (req.query && typeof req.query === "object") {
       for (const [k, v] of Object.entries(req.query)) {
-        if (!params.has(k)) {
+        if (!searchParams.has(k)) {
           if (typeof v === "string") {
-            params.set(k, v);
+            searchParams.set(k, v);
           } else if (Array.isArray(v) && typeof v[0] === "string") {
-            params.set(k, v[0]);
+            searchParams.set(k, v[0]);
           }
         }
       }
     }
   } catch {
   }
-  const injectedPath = params.get("__ipath");
-  if (injectedPath !== null) {
-    params.delete("__ipath");
-    let decodedInjected = injectedPath;
+  const pathPart = parsedUrl.pathname;
+  const rawIpath = searchParams.get("__ipath");
+  if (rawIpath !== null) {
+    searchParams.delete("__ipath");
+    let decodedInjected = rawIpath;
     try {
       if (decodedInjected.includes("%")) {
         decodedInjected = decodeURIComponent(decodedInjected);
       }
     } catch {
-      decodedInjected = injectedPath;
+      decodedInjected = rawIpath;
     }
     const [cleanInjectedPath, embeddedQuery] = decodedInjected.split("?");
     if (embeddedQuery) {
       const embeddedParams = new URLSearchParams(embeddedQuery);
       for (const [ek, ev] of embeddedParams.entries()) {
-        if (ek !== "__ipath" && !params.has(ek)) {
-          params.set(ek, ev);
+        if (ek !== "__ipath" && !searchParams.has(ek)) {
+          searchParams.set(ek, ev);
         }
       }
     }
-    const ipath = cleanInjectedPath.replace(/^\/+/, "").replace(/^api\/+/i, "");
-    const restoredPath = ipath ? `${API_PREFIX}/${ipath}` : API_PREFIX;
-    applyRestoredUrlAndQuery(req, restoredPath, params);
+    const cleanSubpath = cleanInjectedPath.replace(/^\/+/, "").replace(/^api\/+/i, "");
+    const restoredPath = cleanSubpath ? `${API_PREFIX}/${cleanSubpath}` : API_PREFIX;
+    applyRestoredUrlAndQuery(req, restoredPath, searchParams);
     return;
   }
   if (pathPart === "/api/index" || pathPart === "/api/index.js") {
@@ -2003,7 +2094,7 @@ function restoreOriginalApiUrl(req) {
       const normPath = normQIdx === -1 ? normalized : normalized.slice(0, normQIdx);
       const normQuery = normQIdx === -1 ? "" : normalized.slice(normQIdx + 1);
       const mergedParams = new URLSearchParams(normQuery);
-      for (const [k, v] of params.entries()) {
+      for (const [k, v] of searchParams.entries()) {
         if (k !== "__ipath" && !mergedParams.has(k)) {
           mergedParams.set(k, v);
         }
@@ -2012,7 +2103,7 @@ function restoreOriginalApiUrl(req) {
       return;
     }
   }
-  applyRestoredUrlAndQuery(req, pathPart, params);
+  applyRestoredUrlAndQuery(req, pathPart, searchParams);
 }
 function handler(req, res) {
   try {

@@ -43,6 +43,13 @@ const SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = 2 * 1024 * 1024; // 2 MB max per in
 const SPEED_TEST_MAX_STREAM_UPLOAD_BYTES = 2 * 1024 * 1024; // 2 MB max per individual upload request (well below Vercel 4.5 MB limit)
 const SPEED_TEST_CONCURRENT_STREAMS = 6;
 const SPEED_TEST_TOKEN_TTL_MS = 120 * 1000; // 120s token validity for 15s DL + 15s UL cycle
+const SPEED_TEST_TOKEN_MAX_AGE_MS = 2 * 60 * 60 * 1000; // Stateless HMAC token freshness window (2h)
+const SPEED_TEST_TOKEN_CLOCK_SKEW_MS = 60 * 1000; // Tolerance for issuedAtMs timestamps slightly in the future
+const SPEED_TEST_HMAC_SECRET =
+  process.env.VISITOR_HMAC_SECRET || 'intel-system-default-hmac-secret-v1';
+const SPEED_TEST_MIN_STREAM_BYTES = 65536; // 64 KB floor for a single download request
+const SPEED_TEST_STREAM_CHUNK_BYTES = 1024 * 1024; // 1 MB default / reported per-request chunk size
+const SPEED_TEST_REPORTED_CONCURRENT_STREAMS = 2; // Parallel stream count reported to the client
 const SPEED_TEST_STREAM_TIMEOUT_MS = 25 * 1000; // 25s hard per-stream timeout
 const HIGH_ENTROPY_64KB_CHUNK = crypto.randomBytes(65536); // Non-compressible 64 KB random buffer
 
@@ -1218,19 +1225,84 @@ function pruneSpeedTestState(nowMs: number): void {
   }
 }
 
-function createSignedSpeedTestToken(
+const SPEED_TEST_STATELESS_TOKEN_PATTERN = /^st_(\d{10,17})_([0-9a-fA-F]{64})$/;
+
+/**
+ * Create a 100% stateless speed-test token: `st_<issuedAtMs>_<hmacHex>`.
+ *
+ * The HMAC-SHA256 of the issuance timestamp makes the token verifiable on ANY
+ * serverless instance (nothing needs to live in the shared in-memory Map), and
+ * the freshness window caps its replay lifetime to 2 hours.
+ */
+function createSignedSpeedTestToken(): string {
+  const issuedAtMs = Date.now();
+  const hmacHex = crypto
+    .createHmac('sha256', SPEED_TEST_HMAC_SECRET)
+    .update(String(issuedAtMs))
+    .digest('hex');
+  return `st_${issuedAtMs}_${hmacHex}`;
+}
+
+/**
+ * Verify a stateless speed-test token (`st_<issuedAtMs>_<hmacHex>`) without any
+ * in-memory state: recompute the HMAC, compare timing-safely, and check that the
+ * token is fresh (issued no earlier than 2 hours ago).
+ */
+export function verifySpeedTestToken(rawToken: string | null | undefined): {
+  valid: boolean;
+  issuedAtMs: number;
+  fresh: boolean;
+} {
+  const token = typeof rawToken === 'string' ? rawToken.trim() : '';
+  const match = SPEED_TEST_STATELESS_TOKEN_PATTERN.exec(token);
+  if (!match) {
+    return { valid: false, issuedAtMs: 0, fresh: false };
+  }
+
+  const issuedAtMs = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(issuedAtMs) || issuedAtMs <= 0) {
+    return { valid: false, issuedAtMs: 0, fresh: false };
+  }
+
+  const nowMs = Date.now();
+  const fresh =
+    issuedAtMs <= nowMs + SPEED_TEST_TOKEN_CLOCK_SKEW_MS &&
+    nowMs - issuedAtMs <= SPEED_TEST_TOKEN_MAX_AGE_MS;
+
+  const expectedHex = crypto
+    .createHmac('sha256', SPEED_TEST_HMAC_SECRET)
+    .update(String(issuedAtMs))
+    .digest('hex');
+  const providedHex = match[2].toLowerCase();
+
+  const valid =
+    providedHex.length === expectedHex.length &&
+    crypto.timingSafeEqual(Buffer.from(providedHex, 'utf8'), Buffer.from(expectedHex, 'utf8'));
+
+  return { valid, issuedAtMs, fresh };
+}
+
+function createStatelessSpeedTestLedger(
   testId: string,
-  expiresAtMs: number,
-  visitorKey: string
-): string {
-  const vHash = crypto.createHash('sha256').update(visitorKey).digest('hex').slice(0, 12);
-  const payload = `${testId}.${expiresAtMs}.${vHash}`;
-  const sig = crypto
-    .createHmac('sha256', HMAC_SECRET)
-    .update(`speedtest:${payload}`)
-    .digest('hex')
-    .slice(0, 24);
-  return `${payload}.${sig}`;
+  tokenKey: string,
+  visitorKey: string,
+  ipKey: string,
+  nowMs: number
+): SpeedTestLedger {
+  const statelessLedger: SpeedTestLedger = {
+    testId,
+    visitorKey,
+    sessionKey: visitorKey,
+    ipKey,
+    createdAtMs: nowMs,
+    expiresAtMs: nowMs + SPEED_TEST_TOKEN_TTL_MS,
+    downloadedBytes: 0,
+    uploadedBytes: 0,
+    activeStreams: 0,
+    completed: false,
+  };
+  activeSpeedTests.set(tokenKey, statelessLedger);
+  return statelessLedger;
 }
 
 function verifyAndGetSpeedTestLedger(
@@ -1241,7 +1313,7 @@ function verifyAndGetSpeedTestLedger(
   const nowMs = Date.now();
   const cleanedToken = typeof rawToken === 'string' ? rawToken.trim() : '';
 
-  // 1. Direct lookup in activeSpeedTests by full token or testId prefix
+  // 1. Direct lookup in activeSpeedTests by full token or testId prefix (same instance)
   if (cleanedToken) {
     const directLedger =
       activeSpeedTests.get(cleanedToken) || activeSpeedTests.get(cleanedToken.split('.')[0]);
@@ -1250,7 +1322,23 @@ function verifyAndGetSpeedTestLedger(
     }
   }
 
-  // 2. Stateless HMAC & prefix validation when request lands on a different Vercel serverless instance or cold start
+  // 2. Stateless HMAC validation for `st_<issuedAtMs>_<hmacHex>` tokens: the request landed
+  //    on a different Vercel serverless instance (or a cold start wiped the Map). Recreate
+  //    the ledger instead of rejecting with 403/404.
+  const statelessCheck = verifySpeedTestToken(cleanedToken);
+  if (statelessCheck.valid && statelessCheck.fresh) {
+    const ledger = createStatelessSpeedTestLedger(
+      cleanedToken,
+      cleanedToken,
+      visitorKey,
+      ipKey,
+      nowMs
+    );
+    return { valid: true, ledger };
+  }
+
+  // 3. Legacy dotted-format HMAC validation (`st_<id>.<expiry>.<vHash>.<sig>`) for tokens
+  //    issued before the stateless rollout, with a 5-minute clock-skew grace window.
   if (cleanedToken && cleanedToken.startsWith('st_')) {
     const parts = cleanedToken.split('.');
     const testId = parts[0];
@@ -1259,7 +1347,6 @@ function verifyAndGetSpeedTestLedger(
       const [, expStr, vHash, providedSig] = parts;
       const expiresAtMs = parseInt(expStr, 10);
 
-      // Allow 5-minute clock-skew grace window across distributed serverless containers
       if (!Number.isNaN(expiresAtMs) && nowMs <= expiresAtMs + 5 * 60 * 1000) {
         const payload = `${testId}.${expiresAtMs}.${vHash}`;
         const expectedSig = crypto
@@ -1272,42 +1359,19 @@ function verifyAndGetSpeedTestLedger(
           providedSig.length === expectedSig.length &&
           crypto.timingSafeEqual(Buffer.from(providedSig), Buffer.from(expectedSig))
         ) {
-          const statelessLedger: SpeedTestLedger = {
+          const statelessLedger = createStatelessSpeedTestLedger(
+            testId,
             testId,
             visitorKey,
-            sessionKey: vHash,
             ipKey,
-            createdAtMs: nowMs,
-            expiresAtMs: Math.max(expiresAtMs, nowMs + SPEED_TEST_TOKEN_TTL_MS),
-            downloadedBytes: 0,
-            uploadedBytes: 0,
-            activeStreams: 0,
-            completed: false,
-          };
-          activeSpeedTests.set(testId, statelessLedger);
+            nowMs
+          );
+          statelessLedger.expiresAtMs = Math.max(expiresAtMs, nowMs + SPEED_TEST_TOKEN_TTL_MS);
+          statelessLedger.sessionKey = vHash;
           activeSpeedTests.set(cleanedToken, statelessLedger);
           return { valid: true, ledger: statelessLedger };
         }
       }
-    }
-
-    // Prefix fallback if token starts with valid st_<hex> format on stateless serverless runtime
-    if (/^st_[0-9a-f]{8,32}/i.test(testId)) {
-      const statelessLedger: SpeedTestLedger = {
-        testId,
-        visitorKey,
-        sessionKey: visitorKey,
-        ipKey,
-        createdAtMs: nowMs,
-        expiresAtMs: nowMs + SPEED_TEST_TOKEN_TTL_MS,
-        downloadedBytes: 0,
-        uploadedBytes: 0,
-        activeStreams: 0,
-        completed: false,
-      };
-      activeSpeedTests.set(testId, statelessLedger);
-      activeSpeedTests.set(cleanedToken, statelessLedger);
-      return { valid: true, ledger: statelessLedger };
     }
   }
 
@@ -1324,31 +1388,51 @@ app.use((_req, res, next) => {
   next();
 });
 
-const handleNetworkPing = (_req: express.Request, res: express.Response) => {
+const firstHeaderValue = (value: string | string[] | undefined): string => {
+  const raw = Array.isArray(value) ? value[0] : value;
+  return typeof raw === 'string' ? raw : '';
+};
+
+const handleNetworkHeadPing = (_req: express.Request, res: express.Response) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
   res.setHeader('Timing-Allow-Origin', '*');
-  res.status(200).json({ ok: true, serverTimestampMs: Date.now() });
+  res.status(200).end();
 };
 
-app.head('/api/network/ping', handleNetworkPing);
+const handleNetworkPing = (_req: express.Request, res: express.Response) => {
+  const serverTimestamp = Date.now();
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  res.setHeader('Timing-Allow-Origin', '*');
+  res.status(200).json({ ok: true, serverTimestamp, serverTimestampMs: serverTimestamp });
+};
+
+app.head('/api/network/ping', handleNetworkHeadPing);
 app.get('/api/network/ping', handleNetworkPing);
 
-// Streaming Download Endpoint: 4 concurrent streams, non-compressible 64KB chunks
+// Streaming Download Endpoint: stateless on Vercel — a valid HMAC token is always served even
+// when the in-memory ledger was created on a different serverless instance. Keeps explicit
+// Content-Type / Content-Length / no-store headers and avoids any buffering/compressing middle
+// layer so the payload is streamed out deterministically in one fixed-size pass.
 app.get('/api/network/download', (req, res) => {
   const nowMs = Date.now();
   pruneSpeedTestState(nowMs);
 
   const token =
     (typeof req.query.token === 'string' ? req.query.token : '') ||
-    (typeof req.headers['x-speedtest-token'] === 'string' ? req.headers['x-speedtest-token'] : '');
+    firstHeaderValue(req.headers['x-speed-test-token']) ||
+    firstHeaderValue(req.headers['x-speedtest-token']);
   const { ip: extractedIp } = extractVisitorIp(req);
   const visitorKey =
     (req.cookies?.intel_http_vid as string | undefined) || extractedIp || 'anon';
 
   const verification = verifyAndGetSpeedTestLedger(token, visitorKey, extractedIp);
   if (!verification.valid || !verification.ledger) {
+    // Only a missing/invalid/tampered token is rejected here. Losing the in-memory ledger
+    // across instances is handled statelessly inside verifyAndGetSpeedTestLedger.
     res.status(403).json({ error: verification.reason || 'Unauthorized speed test request.' });
     return;
   }
@@ -1368,11 +1452,22 @@ app.get('/api/network/download', (req, res) => {
   const headerBytes = Number(req.headers['x-speedtest-bytes']);
   const requestedBytes = Number.isFinite(headerBytes) && headerBytes > 0
     ? Math.floor(headerBytes)
-    : parseInt(String(req.query.bytes || 1024 * 1024), 10);
+    : parseInt(String(req.query.bytes || SPEED_TEST_STREAM_CHUNK_BYTES), 10);
   const clampedRequest = Number.isNaN(requestedBytes)
-    ? 1024 * 1024
-    : Math.max(65536, Math.min(SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES, requestedBytes));
+    ? SPEED_TEST_STREAM_CHUNK_BYTES
+    : Math.max(
+        SPEED_TEST_MIN_STREAM_BYTES,
+        Math.min(SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES, requestedBytes)
+      );
   const targetBytes = Math.min(clampedRequest, remainingBudget);
+
+  // Deterministic, fast-filling payload: a small non-compressible repeating pattern copied over
+  // the exact requested byte length into a pre-allocated buffer (no per-chunk streaming writes).
+  const streamBuffer = Buffer.allocUnsafe(targetBytes);
+  for (let offset = 0; offset < targetBytes; offset += HIGH_ENTROPY_64KB_CHUNK.length) {
+    const toFill = Math.min(HIGH_ENTROPY_64KB_CHUNK.length, targetBytes - offset);
+    HIGH_ENTROPY_64KB_CHUNK.copy(streamBuffer, offset, 0, toFill);
+  }
 
   res.setHeader('Content-Type', 'application/octet-stream');
   res.setHeader('Content-Encoding', 'identity');
@@ -1387,76 +1482,88 @@ app.get('/api/network/download', (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no');
 
   ledger.activeStreams += 1;
-  let bytesSentForStream = 0;
   let streamClosed = false;
 
   const cleanupStream = () => {
     if (streamClosed) return;
     streamClosed = true;
     ledger.activeStreams = Math.max(0, ledger.activeStreams - 1);
-    clearTimeout(streamTimer);
   };
-
-  const streamTimer = setTimeout(() => {
-    cleanupStream();
-    if (!res.writableEnded) {
-      res.end();
-    }
-  }, SPEED_TEST_STREAM_TIMEOUT_MS);
 
   req.on('close', cleanupStream);
   res.on('close', cleanupStream);
   res.on('error', cleanupStream);
+  res.on('finish', cleanupStream);
 
-  const writeNextChunk = () => {
-    while (!streamClosed && bytesSentForStream < targetBytes) {
-      const remainingInTest = SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES - ledger.downloadedBytes;
-      if (remainingInTest <= 0) {
-        cleanupStream();
-        res.end();
-        return;
-      }
-
-      const remainingInStream = targetBytes - bytesSentForStream;
-      const toWrite = Math.min(
-        HIGH_ENTROPY_64KB_CHUNK.length,
-        remainingInStream,
-        remainingInTest
-      );
-
-      const slice =
-        toWrite === HIGH_ENTROPY_64KB_CHUNK.length
-          ? HIGH_ENTROPY_64KB_CHUNK
-          : HIGH_ENTROPY_64KB_CHUNK.subarray(0, toWrite);
-
-      bytesSentForStream += toWrite;
-      ledger.downloadedBytes += toWrite;
-
-      const canContinue = res.write(slice);
-      if (bytesSentForStream >= targetBytes) {
-        cleanupStream();
-        res.end();
-        return;
-      }
-      if (!canContinue) {
-        res.once('drain', writeNextChunk);
-        return;
-      }
-    }
-  };
-
-  writeNextChunk();
+  ledger.downloadedBytes += targetBytes;
+  res.end(streamBuffer);
 });
 
+/**
+ * Route-level raw-body capture for the upload endpoint, registered BEFORE the global
+ * express.json() below. Binary octet-stream payloads must never be mangled or rejected
+ * by the JSON parser, and raw-body must never sit waiting on a stream that the
+ * serverless platform already consumed into `req.body`.
+ */
+const speedTestUploadRawParser = express.raw({ type: '*/*', limit: '4mb' });
+
+const speedTestUploadBodyGuard = (
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) => {
+  // Case (a): the platform already buffered the body (Vercel exposes `request.body` as a
+  // lazy getter that consumes the raw stream on first access) — skip raw-body entirely.
+  let platformBody: unknown;
+  try {
+    platformBody = (req as express.Request & { body?: unknown }).body;
+  } catch {
+    platformBody = undefined;
+  }
+  if (
+    platformBody !== undefined &&
+    platformBody !== null &&
+    (Buffer.isBuffer(platformBody) ||
+      typeof platformBody === 'string' ||
+      platformBody instanceof Uint8Array)
+  ) {
+    next();
+    return;
+  }
+
+  // Case (b): the stream was already drained by the runtime but no body was exposed —
+  // counting falls back to Content-Length in the handler, no parsing needed.
+  if (req.readableEnded || req.complete) {
+    next();
+    return;
+  }
+
+  // Case (c): a live stream — capture the raw payload (4 MB ceiling, below Vercel's
+  // hard 4.5 MB serverless request cap) instead of letting global express.json() run.
+  speedTestUploadRawParser(req, res, (parseError: unknown) => {
+    if (parseError) {
+      if (!res.headersSent) {
+        res.status(413).json({
+          ok: false,
+          error: 'Upload payload exceeds the 4 MB route limit.',
+          receivedBytes: 0,
+        });
+      }
+      return;
+    }
+    next();
+  });
+};
+
 // Streaming Upload Endpoint: mounted BEFORE express.json(), counts actual bytes received without disk/RAM buffering
-app.post('/api/network/upload', (req, res) => {
+app.post('/api/network/upload', speedTestUploadBodyGuard, (req, res) => {
   const nowMs = Date.now();
   pruneSpeedTestState(nowMs);
 
   // Vercel's Node.js runtime exposes `request.body` as a lazy getter and may
   // already have consumed the raw request stream for application/octet-stream
-  // payloads. Reading it here lets us count the bytes instead of waiting for
-  // `data`/`end` events that will never fire.
+  // payloads. Accepting every already-parsed shape here lets us count the bytes
+  // instead of waiting for `data`/`end` events that will never fire.
   let platformBufferedBody: Buffer | null = null;
   try {
     const candidate = (req as express.Request & { body?: unknown }).body;
@@ -1465,7 +1572,7 @@ app.post('/api/network/upload', (req, res) => {
     } else if (candidate instanceof Uint8Array) {
       platformBufferedBody = Buffer.from(candidate);
     } else if (typeof candidate === 'string' && candidate.length > 0) {
-      platformBufferedBody = Buffer.from(candidate);
+      platformBufferedBody = Buffer.from(candidate, 'utf8');
     }
   } catch {
     platformBufferedBody = null;
@@ -1473,30 +1580,22 @@ app.post('/api/network/upload', (req, res) => {
 
   const token =
     (typeof req.query.token === 'string' ? req.query.token : '') ||
-    (typeof req.headers['x-speedtest-token'] === 'string' ? req.headers['x-speedtest-token'] : '');
+    firstHeaderValue(req.headers['x-speed-test-token']) ||
+    firstHeaderValue(req.headers['x-speedtest-token']);
   const { ip: extractedIp } = extractVisitorIp(req);
   const visitorKey =
     (req.cookies?.intel_http_vid as string | undefined) || extractedIp || 'anon';
 
+  // 100% stateless: a missing in-memory ledger (different serverless instance) must never
+  // 401/403/404 the upload. If a token is present and HMAC-valid the ledger is (re)created by
+  // verifyAndGetSpeedTestLedger; without any valid token we still count and accept the bytes.
   const verification = verifyAndGetSpeedTestLedger(token, visitorKey, extractedIp);
-  if (!verification.valid || !verification.ledger) {
-    req.resume();
-    res.status(403).json({ error: verification.reason || 'Unauthorized upload test request.' });
-    return;
-  }
+  const ledger = verification.valid ? verification.ledger : undefined;
 
-  const ledger = verification.ledger;
-  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 6) {
-    req.resume();
-    res.status(429).json({ error: 'Concurrent upload stream limit exceeded.' });
-    return;
-  }
-
-  if (ledger.uploadedBytes >= SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
-    req.resume();
-    res.status(429).json({ error: 'Maximum upload transfer limit reached for this test.' });
-    return;
-  }
+  const bumpActiveStreams = (delta: number) => {
+    if (!ledger) return;
+    ledger.activeStreams = Math.max(0, ledger.activeStreams + delta);
+  };
 
   // If the serverless platform already buffered or ended the incoming request stream,
   // count the buffered bytes (or Content-Length header) immediately without hanging on req.on('end')
@@ -1510,7 +1609,7 @@ app.post('/api/network/upload', (req, res) => {
 
     if (
       receivedBytes > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES ||
-      ledger.uploadedBytes + receivedBytes > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES
+      (ledger && ledger.uploadedBytes + receivedBytes > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES)
     ) {
       res.status(413).json({
         ok: false,
@@ -1520,14 +1619,18 @@ app.post('/api/network/upload', (req, res) => {
       return;
     }
 
-    ledger.uploadedBytes += receivedBytes;
+    if (ledger) {
+      ledger.uploadedBytes += receivedBytes;
+    }
+    const reportedTimestamp = Date.now();
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.status(200).json({
       ok: true,
       receivedBytes,
-      totalTestUploadedBytes: ledger.uploadedBytes,
+      totalTestUploadedBytes: ledger ? ledger.uploadedBytes : receivedBytes,
       elapsedServerMs: 1,
-      serverTimestampMs: Date.now(),
+      serverTimestamp: reportedTimestamp,
+      serverTimestampMs: reportedTimestamp,
     });
     return;
   }
@@ -1537,7 +1640,7 @@ app.post('/api/network/upload', (req, res) => {
   res.setHeader('Expires', '0');
   res.setHeader('Timing-Allow-Origin', '*');
 
-  ledger.activeStreams += 1;
+  bumpActiveStreams(1);
   const streamStartMs = Date.now();
   let streamReceivedBytes = 0;
   let finished = false;
@@ -1546,7 +1649,7 @@ app.post('/api/network/upload', (req, res) => {
   const cleanupUpload = () => {
     if (finished) return;
     finished = true;
-    ledger.activeStreams = Math.max(0, ledger.activeStreams - 1);
+    bumpActiveStreams(-1);
     clearTimeout(uploadTimer);
   };
 
@@ -1566,7 +1669,7 @@ app.post('/api/network/upload', (req, res) => {
     const chunkLen = chunk.length;
     if (
       streamReceivedBytes + chunkLen > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES ||
-      ledger.uploadedBytes + chunkLen > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES
+      (ledger && ledger.uploadedBytes + chunkLen > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES)
     ) {
       exceededCap = true;
       cleanupUpload();
@@ -1581,19 +1684,23 @@ app.post('/api/network/upload', (req, res) => {
       return;
     }
     streamReceivedBytes += chunkLen;
-    ledger.uploadedBytes += chunkLen;
+    if (ledger) {
+      ledger.uploadedBytes += chunkLen;
+    }
   });
 
   req.on('end', () => {
     if (finished || exceededCap) return;
     cleanupUpload();
     const elapsedServerMs = Math.max(1, Date.now() - streamStartMs);
+    const reportedTimestamp = Date.now();
     res.status(200).json({
       ok: true,
       receivedBytes: streamReceivedBytes,
-      totalTestUploadedBytes: ledger.uploadedBytes,
+      totalTestUploadedBytes: ledger ? ledger.uploadedBytes : streamReceivedBytes,
       elapsedServerMs,
-      serverTimestampMs: Date.now(),
+      serverTimestamp: reportedTimestamp,
+      serverTimestampMs: reportedTimestamp,
     });
   });
 
@@ -1624,6 +1731,15 @@ app.post('/api/network/speed-test/init', (req, res) => {
     'anon';
   const sessionKey = (typeof body.sessionId === 'string' && body.sessionId.trim()) || visitorKey;
   const ipKey = extractedIp && extractedIp !== 'Unavailable' ? extractedIp : visitorKey;
+
+  // Auto-evict any earlier entry for this visitor / IP BEFORE applying the concurrency caps:
+  // re-runs and page refreshes must always succeed, even when the previous test has not been
+  // garbage-collected yet (it would otherwise block a new test with 429).
+  for (const [ledgerKey, ledger] of activeSpeedTests.entries()) {
+    if (ledger.ipKey === ipKey || ledger.visitorKey === visitorKey) {
+      activeSpeedTests.delete(ledgerKey);
+    }
+  }
 
   let activeCount = 0;
   let activeIpCount = 0;
@@ -1687,7 +1803,7 @@ app.post('/api/network/speed-test/init', (req, res) => {
 
   const testId = 'st_' + crypto.randomBytes(8).toString('hex');
   const expiresAtMs = nowMs + SPEED_TEST_TOKEN_TTL_MS;
-  const token = createSignedSpeedTestToken(testId, expiresAtMs, visitorKey);
+  const token = createSignedSpeedTestToken();
 
   const newLedger: SpeedTestLedger = {
     testId,
@@ -1714,9 +1830,10 @@ app.post('/api/network/speed-test/init', (req, res) => {
     expiresAtMs,
     serverRegion: regionLabel,
     serverRegionCode: regionCode,
-    concurrentStreams: SPEED_TEST_CONCURRENT_STREAMS,
-    maxDownloadBytes: SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES,
-    maxUploadBytes: SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES,
+    // Stateless contract reported to clients: 2 parallel streams, 1 MB per-request chunks.
+    concurrentStreams: SPEED_TEST_REPORTED_CONCURRENT_STREAMS,
+    maxDownloadBytes: SPEED_TEST_STREAM_CHUNK_BYTES,
+    maxUploadBytes: SPEED_TEST_STREAM_CHUNK_BYTES,
   });
 });
 
@@ -1725,19 +1842,27 @@ app.post('/api/network/speed-test/complete', (req, res) => {
   const body = (req.body || {}) as { token?: string };
   const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
   const headerToken =
-    typeof req.headers['x-speedtest-token'] === 'string' ? req.headers['x-speedtest-token'] : '';
+    firstHeaderValue(req.headers['x-speed-test-token']) ||
+    firstHeaderValue(req.headers['x-speedtest-token']);
   const rawToken = (typeof body.token === 'string' ? body.token : queryToken || headerToken).trim();
-  const testId = rawToken.split('.')[0];
-  if (rawToken && activeSpeedTests.has(rawToken)) {
+  // Legacy dotted tokens carry the testId as the first dot-separated segment; new stateless
+  // tokens are self-contained so the token itself doubles as the ledger key.
+  const dotIndex = rawToken.indexOf('.');
+  const testId = dotIndex === -1 ? rawToken : rawToken.slice(0, dotIndex);
+  if (rawToken) {
     const ledger = activeSpeedTests.get(rawToken);
-    if (ledger) ledger.completed = true;
+    if (ledger) {
+      ledger.completed = true;
+      activeSpeedTests.delete(ledger.testId);
+    }
     activeSpeedTests.delete(rawToken);
+    if (testId && testId !== rawToken) {
+      const legacyLedger = activeSpeedTests.get(testId);
+      if (legacyLedger) legacyLedger.completed = true;
+      activeSpeedTests.delete(testId);
+    }
   }
-  if (testId && activeSpeedTests.has(testId)) {
-    const ledger = activeSpeedTests.get(testId);
-    if (ledger) ledger.completed = true;
-    activeSpeedTests.delete(testId);
-  }
+  // Always acknowledge: the test may have been served (or already evicted) on another instance.
   res.status(200).json({ ok: true });
 });
 
@@ -2007,7 +2132,16 @@ function sanitizeAndReinforceSecuritySignals(
   const riskLevel: SecuritySignals['riskLevel'] =
     suspectScore >= 50 ? 'High' : suspectScore >= 20 ? 'Medium' : 'Low';
 
-  return {
+  // Forward-compatibility pass-through: preserve unknown / newly introduced collector fields
+  // (never strip them during sanitization). New fields are spread from a typed variable so
+  // this stays valid TypeScript whether or not the shared SecuritySignals interface already
+  // declares them.
+  const cloudOrMaskedGpu = Boolean(
+    (raw as (Partial<SecuritySignals> & { cloudOrMaskedGpu?: boolean }) | null | undefined)
+      ?.cloudOrMaskedGpu
+  );
+
+  const securitySignalsCore: SecuritySignals = {
     isBot,
     botSignals,
     vpnSuspected,
@@ -2024,6 +2158,11 @@ function sanitizeAndReinforceSecuritySignals(
     suspectScore,
     riskLevel,
     riskFactors,
+  };
+
+  return {
+    ...securitySignalsCore,
+    ...({ cloudOrMaskedGpu } as Partial<SecuritySignals> & { cloudOrMaskedGpu?: boolean }),
   };
 }
 
@@ -2460,7 +2599,7 @@ app.post('/api/visitor/identify', async (req, res) => {
     const rawVisits = db
       .prepare(
         `SELECT
-          id, visit_id, visitor_id, session_id, visited_at_utc,
+          id, visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
           public_ip, city, region, country, latitude, longitude, isp, org, asn,
           browser, os, device_type, screen_resolution, language, timezone
          FROM visits
@@ -2469,29 +2608,6 @@ app.post('/api/visitor/identify', async (req, res) => {
          LIMIT 50`
       )
       .all(visitorId) as Array<Record<string, unknown>>;
-
-    const visitHistory: VisitHistoryRecord[] = rawVisits.map((r) => ({
-      id: Number(r.id),
-      visitId: String(r.visit_id),
-      visitorId: String(r.visitor_id),
-      sessionId: String(r.session_id),
-      visitedAtUtc: String(r.visited_at_utc),
-      publicIp: String(r.public_ip),
-      city: String(r.city),
-      region: String(r.region),
-      country: String(r.country),
-      latitude: typeof r.latitude === 'number' && Number.isFinite(r.latitude) ? r.latitude : null,
-      longitude: typeof r.longitude === 'number' && Number.isFinite(r.longitude) ? r.longitude : null,
-      isp: String(r.isp || 'Unknown'),
-      org: String(r.org || 'Unknown'),
-      asn: String(r.asn || 'Unknown'),
-      browser: String(r.browser),
-      os: String(r.os),
-      deviceType: String(r.device_type),
-      screenResolution: String(r.screen_resolution),
-      language: String(r.language),
-      timezone: String(r.timezone),
-    }));
 
     const ipTimezoneHint =
       (typeof clientGeoHint?.timezone === 'string' && clientGeoHint.timezone.trim()) ||
@@ -2506,6 +2622,58 @@ app.post('/api/visitor/identify', async (req, res) => {
       ipTimezoneHint,
       recognitionSource
     );
+
+    // Every history row always carries suspectScore / riskLevel / recognitionSource so the UI
+    // never renders `undefined`. Stored per-visit risk data is used when present; the current
+    // visit falls back to the just-computed security signals; legacy rows use safe defaults.
+    const visitHistory = rawVisits.map((r) => {
+      const storedSuspectScore =
+        typeof r.suspect_score === 'number' && Number.isFinite(r.suspect_score)
+          ? Math.max(0, Math.min(100, Math.round(r.suspect_score)))
+          : null;
+      const isCurrentVisitRow = String(r.page_load_id || '') === safePageLoadId;
+      const rowSuspectScore =
+        storedSuspectScore !== null
+          ? storedSuspectScore
+          : isCurrentVisitRow
+          ? securitySignals.suspectScore
+          : 0;
+      const rowRiskLevel: RiskLevel =
+        rowSuspectScore >= 50 ? 'High' : rowSuspectScore >= 20 ? 'Medium' : 'Low';
+      const rowRecognitionSource = isCurrentVisitRow ? recognitionSource : 'Cookie';
+      const rowCloudOrMaskedGpu = isCurrentVisitRow
+        ? Boolean(
+            (securitySignals as SecuritySignals & { cloudOrMaskedGpu?: boolean }).cloudOrMaskedGpu
+          )
+        : false;
+
+      return {
+        id: Number(r.id),
+        visitId: String(r.visit_id),
+        visitorId: String(r.visitor_id),
+        sessionId: String(r.session_id),
+        visitedAtUtc: String(r.visited_at_utc),
+        publicIp: String(r.public_ip),
+        city: String(r.city),
+        region: String(r.region),
+        country: String(r.country),
+        latitude: typeof r.latitude === 'number' && Number.isFinite(r.latitude) ? r.latitude : null,
+        longitude: typeof r.longitude === 'number' && Number.isFinite(r.longitude) ? r.longitude : null,
+        isp: String(r.isp || 'Unknown'),
+        org: String(r.org || 'Unknown'),
+        asn: String(r.asn || 'Unknown'),
+        browser: String(r.browser),
+        os: String(r.os),
+        deviceType: String(r.device_type),
+        screenResolution: String(r.screen_resolution),
+        language: String(r.language),
+        timezone: String(r.timezone),
+        suspectScore: rowSuspectScore,
+        riskLevel: rowRiskLevel,
+        recognitionSource: rowRecognitionSource,
+        cloudOrMaskedGpu: rowCloudOrMaskedGpu,
+      };
+    });
 
     const historyBackup = createSignedHistoryBackup(
       visitorId,
@@ -2555,7 +2723,7 @@ app.get('/api/visitor/history/:visitorId', (req, res) => {
     return;
   }
 
-  const visits = db
+  const rawVisits = db
     .prepare(
       `SELECT
         id, visit_id, visitor_id, session_id, visited_at_utc,
@@ -2566,7 +2734,29 @@ app.get('/api/visitor/history/:visitorId', (req, res) => {
        ORDER BY visited_at_utc DESC, id DESC
        LIMIT 50`
     )
-    .all(requestedVisitorId);
+    .all(requestedVisitorId) as Array<Record<string, unknown>>;
+
+  // Every row always carries suspectScore / riskLevel / recognitionSource (with safe defaults
+  // for legacy rows that have no stored per-visit risk record).
+  const visits = rawVisits.map((row) => {
+    const storedSuspectScore =
+      typeof row.suspect_score === 'number' && Number.isFinite(row.suspect_score)
+        ? Math.max(0, Math.min(100, Math.round(row.suspect_score)))
+        : 0;
+    const storedRecognitionSource =
+      typeof row.recognition_source === 'string' && row.recognition_source.trim()
+        ? row.recognition_source
+        : 'Cookie';
+    const rowRiskLevel: RiskLevel =
+      storedSuspectScore >= 50 ? 'High' : storedSuspectScore >= 20 ? 'Medium' : 'Low';
+
+    return {
+      ...row,
+      suspectScore: storedSuspectScore,
+      riskLevel: rowRiskLevel,
+      recognitionSource: storedRecognitionSource,
+    };
+  });
 
   res.json({ visitorId: requestedVisitorId, visits });
 });

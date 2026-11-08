@@ -40,6 +40,7 @@ export interface SecuritySignals {
   browserTimezone: string;
   ipTimezone: string;
   datacenterAsn: boolean;
+  cloudOrMaskedGpu?: boolean;
   vpnReasons: string[];
   tamperDetected: boolean;
   tamperReasons: string[];
@@ -99,6 +100,9 @@ export interface VisitHistoryRecord {
   screenResolution: string;
   language: string;
   timezone: string;
+  suspectScore?: number;
+  riskLevel?: RiskLevel;
+  recognitionSource?: string;
 }
 
 export interface SignedHistoryBackup {

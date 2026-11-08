@@ -19,6 +19,9 @@ interface SpeedTestState {
   error: string | null;
 }
 
+// Fetch/XHR rejection carrying the HTTP status so callers can special-case payload-limit (413) errors
+type HttpErrorWithStatus = Error & { status?: number };
+
 const Y_LEVELS = [0, 150, 300, 450, 600] as const;
 const MAX_Y_MS = 600;
 const FIVE_MINUTES_MS = 5 * 60 * 1000; // 300,000 ms rolling five-minute timeline
@@ -30,6 +33,12 @@ const UPLOAD_PHASE_DURATION_MS = 15000; // 15.0 seconds active upload analysis
 const PAUSE_AFTER_TEST_MS = 10000; // 10.0 seconds cooldown pause after the test completes
 const ODOMETER_UPDATE_INTERVAL_MS = 250; // Smooth 250ms live odometer updates
 const CONCURRENT_STREAMS = 3; // 3 streams leave 3 dedicated browser connection slots free for zero-queue RTT probes
+
+// Stateless-serverless (Vercel) hardening: every speed-test request stays far below the 4.5 MB
+// body cap, and every failure path keeps the test running instead of stalling at 0.00 Mbps.
+const SPEED_TEST_CHUNK_BYTES_MAX = 1048576; // hard 1 MiB cap per download/upload request chunk
+const SPEED_TEST_413_FALLBACK_BYTES = 262144; // 256 KiB one-shot retry payload after an HTTP 413
+const SPEED_TEST_INIT_TIMEOUT_MS = 4000; // speed-test/init call must never stall the test loop
 
 function formatClockTimestamp(ms: number): string {
   const d = new Date(ms);
@@ -173,6 +182,9 @@ export function NetworkStabilityPanel() {
   const latestRttMsRef = useRef<number>(180);
   const recentRttsRef = useRef<number[]>([]);
   const pingInFlightRef = useRef<boolean>(false);
+  // Ref mirrors isOnline so the speed-test loop can consult measured connectivity synchronously
+  // (a falsely-offline navigator.onLine must never strand the panel at 'Starting...' / 0.00 Mbps)
+  const isOnlineRef = useRef<boolean>(typeof navigator !== 'undefined' ? navigator.onLine : true);
   const chartWrapperRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const activeXhrsRef = useRef<Set<XMLHttpRequest>>(new Set());
@@ -222,8 +234,14 @@ export function NetworkStabilityPanel() {
 
   // Track online/offline browser events
   useEffect(() => {
-    const handleOnline = () => setIsOnline(true);
-    const handleOffline = () => setIsOnline(false);
+    const handleOnline = () => {
+      isOnlineRef.current = true;
+      setIsOnline(true);
+    };
+    const handleOffline = () => {
+      isOnlineRef.current = false;
+      setIsOnline(false);
+    };
 
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
@@ -245,45 +263,39 @@ export function NetworkStabilityPanel() {
 
     pingInFlightRef.current = true;
     const reqId = ++sampleCounterRef.current;
-    const probeStartMs = Date.now();
 
     try {
-      if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        setIsOnline(false);
-        const now = Date.now();
-        setWindowEndMs(now);
-        setSamples((prev) => {
-          const cutoff = now - FIVE_MINUTES_MS - 15000;
-          return [
-            ...prev.filter((s) => s.timestampMs >= cutoff),
-            { id: reqId, timestampMs: now, latencyMs: null, failed: true },
-          ];
-        });
-        return;
-      }
+      // NOTE: navigator.onLine is deliberately NOT trusted as a gate here. The measured HTTP
+      // probe is the single source of truth: any 2xx response => successful sample => panel
+      // Online; any other status or network error => typical-loss sample. A falsely-offline
+      // navigator flag resolves itself on the first successful probe instead of showing a
+      // false "Offline / 100% packet loss" forever.
 
       const attemptSinglePing = async (_attemptIdx: number): Promise<number> => {
         const url = `/api/network/ping?t=${Date.now()}`;
-        const startPerf = performance.now();
+        const startTime = performance.now();
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 5000);
 
         try {
-          const response = await fetch(url, {
+          const res = await fetch(url, {
             method: 'GET',
             cache: 'no-store',
-            credentials: 'same-origin',
+            headers: { Accept: 'application/json' },
             signal: controller.signal,
           });
           clearTimeout(timeoutId);
 
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
+          // Any 2xx (200-299) is a successful sample and flips the panel Online. Every other
+          // status or a network error falls through to the caller as a typical-loss sample.
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
           }
-          await response.text();
-          const endPerf = performance.now();
 
-          let measuredRtt = Math.round(endPerf - startPerf);
+          // Base RTT straight from performance.now(); refined below with the pure socket RTT
+          // when Resource Timing is available for this request.
+          let rtt = Math.max(1, Math.round(performance.now() - startTime));
+
           try {
             const fullUrl = window.location.origin + url;
             const entries = performance.getEntriesByName(fullUrl);
@@ -292,27 +304,28 @@ export function NetworkStabilityPanel() {
               // Pure socket RTT: time from first request byte sent on socket to first response header byte received.
               // Excludes browser connection-pool queueing (requestStart - startTime) and cold TLS setup.
               if (lastEntry.responseStart > lastEntry.requestStart) {
-                measuredRtt = Math.max(
-                  1,
-                  Math.round(lastEntry.responseStart - lastEntry.requestStart)
-                );
+                rtt = Math.max(1, Math.round(lastEntry.responseStart - lastEntry.requestStart));
               } else if (lastEntry.responseEnd > lastEntry.requestStart) {
-                measuredRtt = Math.max(
-                  1,
-                  Math.round(lastEntry.responseEnd - lastEntry.requestStart)
-                );
+                rtt = Math.max(1, Math.round(lastEntry.responseEnd - lastEntry.requestStart));
               } else if (lastEntry.duration > 0) {
-                measuredRtt = Math.max(1, Math.round(lastEntry.duration));
+                rtt = Math.max(1, Math.round(lastEntry.duration));
               }
             }
             if (performance.getEntriesByType('resource').length > 180) {
               performance.clearResourceTimings();
             }
           } catch {
-            // Fallback to performance.now() delta
+            // Fallback to the performance.now() delta computed above
           }
 
-          return Math.max(1, measuredRtt);
+          // Drain (never parse) the body AFTER measuring so the connection stays reusable
+          try {
+            await res.text();
+          } catch {
+            // A failed body drain does not invalidate the sample
+          }
+
+          return rtt;
         } catch (err) {
           clearTimeout(timeoutId);
           throw err;
@@ -351,6 +364,7 @@ export function NetworkStabilityPanel() {
       latestRttMsRef.current = Math.round(latestRttMsRef.current * 0.6 + clampedRtt * 0.4);
 
       const recordedAtMs = Date.now();
+      isOnlineRef.current = true;
       setIsOnline(true);
       setWindowEndMs(recordedAtMs);
       setSamples((prev) => {
@@ -368,6 +382,7 @@ export function NetworkStabilityPanel() {
     } catch {
       const recordedAtMs = Date.now();
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        isOnlineRef.current = false;
         setIsOnline(false);
       }
       setWindowEndMs(recordedAtMs);
@@ -410,8 +425,9 @@ export function NetworkStabilityPanel() {
       const byteBuckets: Array<{ t: number; bytes: number }> = [];
       const throughputSamplesMbps: number[] = [];
 
-      // Start with 1 MB per stream and scale up to 3.5 MB so high-RTT Vercel links stay saturated
-      let calibratedChunkBytes = 1024 * 1024;
+      // Fixed 1 MiB request chunks: enough to saturate the link across 3 streams while every
+      // request stays far under the 4.5 MB stateless-serverless cap (never oversized, no 413s)
+      const DOWNLOAD_CHUNK_BYTES = SPEED_TEST_CHUNK_BYTES_MAX;
 
       const phaseAbort = new AbortController();
       const onMasterAbort = () => phaseAbort.abort();
@@ -471,16 +487,49 @@ export function NetworkStabilityPanel() {
             ...prev,
             downloadMbps: liveMbps,
           }));
-
-          if (liveMbps > 60) {
-            calibratedChunkBytes = 2048 * 1024; // 2.0 MB (Vercel serverless safe cap)
-          } else if (liveMbps > 20) {
-            calibratedChunkBytes = 1536 * 1024; // 1.5 MB
-          } else {
-            calibratedChunkBytes = 1024 * 1024; // 1.0 MB
-          }
         }
       }, ODOMETER_UPDATE_INTERVAL_MS);
+
+      const creditReceivedPurePayload = (
+        chunkUrl: string,
+        chunkReqStartPerf: number,
+        chunkFirstBytePerf: number | null,
+        chunkLastBytePerf: number | null,
+        chunkBytesReceived: number
+      ): void => {
+        if (chunkBytesReceived <= 0 || chunkFirstBytePerf === null) return;
+        const chunkReqEndPerf = performance.now();
+        const chunkTotalMs = Math.max(1, chunkReqEndPerf - chunkReqStartPerf);
+
+        // Measure pure payload download time excluding HTTP TTFB / serverless cold wait
+        let payloadDurationMs =
+          chunkLastBytePerf !== null && chunkLastBytePerf - chunkFirstBytePerf >= 12
+            ? chunkLastBytePerf - chunkFirstBytePerf
+            : 0;
+
+        try {
+          const entries = performance.getEntriesByName(window.location.origin + chunkUrl);
+          const entry = entries[entries.length - 1] as PerformanceResourceTiming | undefined;
+          if (entry && entry.responseEnd > entry.responseStart + 5) {
+            payloadDurationMs = Math.max(
+              payloadDurationMs,
+              entry.responseEnd - entry.responseStart
+            );
+          }
+        } catch {
+          // Ignore ResourceTiming error
+        }
+
+        if (payloadDurationMs < 12) {
+          // Fallback when serverless runtime flushes the buffered payload in one burst after TTFB:
+          // subtract estimated 1-way TTFB overhead from total request duration
+          const estimatedTtfbMs = Math.min(chunkTotalMs * 0.68, latestRttMsRef.current * 0.88);
+          payloadDurationMs = Math.max(15, chunkTotalMs - estimatedTtfbMs);
+        }
+
+        purePayloadBytes += chunkBytesReceived;
+        purePayloadTransferMs += payloadDurationMs;
+      };
 
       const streamWorker = async (workerIdx: number) => {
         let chunkSeq = 0;
@@ -494,10 +543,12 @@ export function NetworkStabilityPanel() {
             break;
           }
 
-          const reqBytes = Math.min(calibratedChunkBytes, remainingBudget);
+          const reqBytes = Math.min(DOWNLOAD_CHUNK_BYTES, remainingBudget);
           totalRequestedBytes += reqBytes;
           chunkSeq += 1;
 
+          // Token rides in BOTH the query string (token + bytes) and the x-speed-test-token
+          // header so stateless serverless handlers can validate it either way.
           const url = `/api/network/download?token=${encodeURIComponent(
             token
           )}&bytes=${reqBytes}&s=${workerIdx}_${chunkSeq}_${Date.now()}`;
@@ -508,23 +559,25 @@ export function NetworkStabilityPanel() {
           let streamBytesReceived = 0;
 
           try {
-            const resp = await fetch(url, {
+            const res = await fetch(url, {
               method: 'GET',
               cache: 'no-store',
               headers: {
-                'x-speedtest-token': token,
-                'x-speedtest-bytes': String(reqBytes),
+                // Token rides in BOTH the query string and the header (stateless serverless
+                // handlers may validate either); bytes mirrors the query param
+                'x-speed-test-token': token,
+                'x-speed-test-bytes': String(reqBytes),
               },
               signal: phaseAbort.signal,
             });
 
-            if (!resp.ok) {
+            if (!res.ok) {
               await new Promise((r) => setTimeout(r, 80));
               continue;
             }
 
-            if (resp.body && typeof resp.body.getReader === 'function') {
-              const reader = resp.body.getReader();
+            if (res.body && typeof res.body.getReader === 'function') {
+              const reader = res.body.getReader();
               while (true) {
                 const { done, value } = await reader.read();
                 if (done) break;
@@ -547,7 +600,7 @@ export function NetworkStabilityPanel() {
                 }
               }
             } else {
-              const buf = await resp.arrayBuffer();
+              const buf = await res.arrayBuffer();
               if (buf.byteLength > 0) {
                 const nowPerf = performance.now();
                 if (firstBytePerf === null) {
@@ -561,51 +614,34 @@ export function NetworkStabilityPanel() {
               }
             }
 
-            const reqEndPerf = performance.now();
-            const totalReqMs = Math.max(1, reqEndPerf - reqStartPerf);
-
-            if (streamBytesReceived > 0) {
-              // Measure pure payload download time excluding HTTP TTFB / serverless cold wait
-              let payloadDurationMs =
-                streamFirstBytePerf !== null &&
-                streamLastBytePerf !== null &&
-                streamLastBytePerf - streamFirstBytePerf >= 12
-                  ? streamLastBytePerf - streamFirstBytePerf
-                  : 0;
-
-              try {
-                const entries = performance.getEntriesByName(window.location.origin + url);
-                const entry = entries[entries.length - 1] as PerformanceResourceTiming | undefined;
-                if (entry && entry.responseEnd > entry.responseStart + 5) {
-                  payloadDurationMs = Math.max(
-                    payloadDurationMs,
-                    entry.responseEnd - entry.responseStart
-                  );
-                }
-              } catch {
-                // Ignore ResourceTiming error
-              }
-
-              if (payloadDurationMs < 12) {
-                // Fallback when serverless runtime flushes the buffered payload in one burst after TTFB:
-                // subtract estimated 1-way TTFB overhead from total request duration
-                const estimatedTtfbMs = Math.min(totalReqMs * 0.68, latestRttMsRef.current * 0.88);
-                payloadDurationMs = Math.max(15, totalReqMs - estimatedTtfbMs);
-              }
-
-              purePayloadBytes += streamBytesReceived;
-              purePayloadTransferMs += payloadDurationMs;
-            }
-
-            // Brief 25ms yield between chunks so RTT probes and UI events are serviced with zero lag
-            if (!phaseAbort.signal.aborted && !masterSignal.aborted) {
-              await new Promise((r) => setTimeout(r, 25));
-            }
+            // Chunk read to completion: credit its pure-payload transfer
+            creditReceivedPurePayload(
+              url,
+              reqStartPerf,
+              streamFirstBytePerf,
+              streamLastBytePerf,
+              streamBytesReceived
+            );
           } catch {
+            // Mid-chunk stream failure (network drop, abort, reset): treat the chunk as done
+            // with whatever bytes actually arrived — credit them and keep looping, never hang.
+            creditReceivedPurePayload(
+              url,
+              reqStartPerf,
+              streamFirstBytePerf,
+              streamLastBytePerf,
+              streamBytesReceived
+            );
+
             if (phaseAbort.signal.aborted || masterSignal.aborted) {
               break;
             }
             await new Promise((r) => setTimeout(r, 80));
+          }
+
+          // Brief 25ms yield between chunks so RTT probes and UI events are serviced with zero lag
+          if (!phaseAbort.signal.aborted && !masterSignal.aborted) {
+            await new Promise((r) => setTimeout(r, 25));
           }
         }
       };
@@ -680,10 +716,12 @@ export function NetworkStabilityPanel() {
 
         xhr.open('POST', url, true);
         xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        // Token rides in BOTH the query string and the x-speed-test-token header so stateless
+        // serverless handlers can validate it either way
         if (url.includes('token=')) {
           try {
             const token = new URL(url, window.location.origin).searchParams.get('token');
-            if (token) xhr.setRequestHeader('x-speedtest-token', token);
+            if (token) xhr.setRequestHeader('x-speed-test-token', token);
           } catch {
             // Ignore header fallback failures
           }
@@ -747,7 +785,9 @@ export function NetworkStabilityPanel() {
               });
             }
           } else {
-            reject(new Error(`Upload HTTP ${xhr.status}`));
+            const httpErr = new Error(`Upload HTTP ${xhr.status}`) as HttpErrorWithStatus;
+            httpErr.status = xhr.status;
+            reject(httpErr);
           }
         };
 
@@ -794,7 +834,7 @@ export function NetworkStabilityPanel() {
       const uploadBuckets: Array<{ t: number; bytes: number }> = [];
       const throughputSamplesMbps: number[] = [];
 
-      let calibratedUploadChunkBytes = 512 * 1024; // Start at 512 KB per stream and scale up to 2.5 MB
+      let calibratedUploadChunkBytes = SPEED_TEST_CHUNK_BYTES_MAX; // 1 MiB bodies, hard-capped at 1 MiB
 
       const phaseAbort = new AbortController();
       const onMasterAbort = () => phaseAbort.abort();
@@ -853,12 +893,10 @@ export function NetworkStabilityPanel() {
             uploadMbps: liveMbps,
           }));
 
-          if (liveMbps > 35) {
-            calibratedUploadChunkBytes = 1536 * 1024; // 1.5 MB (Vercel serverless safe cap)
-          } else if (liveMbps > 12) {
-            calibratedUploadChunkBytes = 1024 * 1024; // 1.0 MB
+          if (liveMbps > 12) {
+            calibratedUploadChunkBytes = SPEED_TEST_CHUNK_BYTES_MAX; // 1.0 MiB — hard serverless-safe cap
           } else {
-            calibratedUploadChunkBytes = 512 * 1024; // 512 KB
+            calibratedUploadChunkBytes = 512 * 1024; // 512 KB floor keeps slow links saturated
           }
         }
       }, ODOMETER_UPDATE_INTERVAL_MS);
@@ -879,20 +917,19 @@ export function NetworkStabilityPanel() {
           totalAllocatedBytes += chunkBytes;
           seq += 1;
 
-          const payload = getUploadPayloadSlice(chunkBytes);
+          // Token rides in BOTH the query string (added here) and the x-speed-test-token header
+          // (added inside sendUploadChunkXhr) so stateless serverless handlers can validate either
           const url = `/api/network/upload?token=${encodeURIComponent(
             token
           )}&s=${workerIdx}_${seq}_${Date.now()}`;
 
           let chunkProgressCounted = 0;
-          try {
-            if (firstProgressPerf === null) {
-              firstProgressPerf = performance.now();
-            }
+          let payloadBytes = chunkBytes;
 
-            const { confirmedBytes, pureUploadDurationMs } = await sendUploadChunkXhr(
+          const attemptSend = () =>
+            sendUploadChunkXhr(
               url,
-              payload,
+              getUploadPayloadSlice(payloadBytes),
               phaseAbort.signal,
               (delta, nowPerf) => {
                 chunkProgressCounted += delta;
@@ -900,6 +937,33 @@ export function NetworkStabilityPanel() {
                 uploadBuckets.push({ t: nowPerf, bytes: delta });
               }
             );
+
+          try {
+            if (firstProgressPerf === null) {
+              firstProgressPerf = performance.now();
+            }
+
+            let sent: { confirmedBytes: number; pureUploadDurationMs: number };
+            try {
+              sent = await attemptSend();
+            } catch (err) {
+              // HTTP 413 (payload over the stateless serverless limit): roll back progress
+              // counted for this oversized attempt, shrink to 256 KiB, retry the chunk once.
+              if (
+                (err as HttpErrorWithStatus).status !== 413 ||
+                phaseAbort.signal.aborted ||
+                masterSignal.aborted
+              ) {
+                throw err;
+              }
+              inFlightProgressBytes = Math.max(0, inFlightProgressBytes - chunkProgressCounted);
+              chunkProgressCounted = 0;
+              payloadBytes = Math.min(payloadBytes, SPEED_TEST_413_FALLBACK_BYTES);
+              calibratedUploadChunkBytes = Math.min(calibratedUploadChunkBytes, payloadBytes);
+              sent = await attemptSend();
+            }
+
+            const { confirmedBytes, pureUploadDurationMs } = sent;
 
             pureUploadBytes += confirmedBytes;
             pureUploadTransferMs += pureUploadDurationMs;
@@ -970,12 +1034,31 @@ export function NetworkStabilityPanel() {
           continue;
         }
 
-        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        // Skip the test only when BOTH the browser flag and the measured HTTP probes agree the
+        // connection is down — a falsely-offline navigator flag alone must never strand the
+        // speed test at 'Starting...' / 0.00 Mbps.
+        if (
+          typeof navigator !== 'undefined' &&
+          !navigator.onLine &&
+          !isOnlineRef.current
+        ) {
           await new Promise((r) => setTimeout(r, 1500));
           continue;
         }
 
+        let maxDlBytes = 1024 * 1024 * 1024;
+        let maxUlBytes = 512 * 1024 * 1024;
         let testToken = '';
+
+        // INIT with stateless-serverless resilience: a short 4s timeout guards the request so a
+        // cold, missing, or hanging endpoint can never stall the UI at 'Starting...' / 0.00 Mbps.
+        // Any failure, non-2xx status, or missing token falls through to a client-generated
+        // fallback token and the download/upload streams run exactly the same.
+        const initController = new AbortController();
+        const abortInitOnLoopAbort = () => initController.abort();
+        loopAbortController.signal.addEventListener('abort', abortInitOnLoopAbort);
+        const initTimeoutId = setTimeout(() => initController.abort(), SPEED_TEST_INIT_TIMEOUT_MS);
+
         try {
           const stored = getFirstPartyStorage();
           const initResp = await fetch('/api/network/speed-test/init', {
@@ -986,7 +1069,7 @@ export function NetworkStabilityPanel() {
               visitorId: stored.visitorId,
               sessionId: stored.sessionId,
             }),
-            signal: loopAbortController.signal,
+            signal: initController.signal,
           });
 
           const initData = (await initResp.json().catch(() => ({}))) as {
@@ -994,17 +1077,33 @@ export function NetworkStabilityPanel() {
             token?: string;
             maxDownloadBytes?: number;
             maxUploadBytes?: number;
-            error?: string;
           };
 
-          if (!initResp.ok || !initData.token) {
-            throw new Error(initData.error || `Speed test error (${initResp.status})`);
+          if (initResp.ok && typeof initData.token === 'string' && initData.token.length > 0) {
+            testToken = initData.token;
+            maxDlBytes = initData.maxDownloadBytes || maxDlBytes;
+            maxUlBytes = initData.maxUploadBytes || maxUlBytes;
           }
+        } catch {
+          // Any init failure lands in the fallback path below — the test still runs.
+        } finally {
+          clearTimeout(initTimeoutId);
+          loopAbortController.signal.removeEventListener('abort', abortInitOnLoopAbort);
+        }
 
-          testToken = initData.token;
-          const maxDlBytes = initData.maxDownloadBytes || 1024 * 1024 * 1024;
-          const maxUlBytes = initData.maxUploadBytes || 512 * 1024 * 1024;
+        if (cancelled || loopAbortController.signal.aborted) break;
 
+        if (!testToken) {
+          testToken = `st_client_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        }
+
+        // Phase results fall back to whatever is already on screen if a phase throws
+        // unexpectedly (only possible on master abort in practice), so partial results are
+        // always shown and the state machine always reaches a running-or-completed state.
+        let dlMbps: number | null = null;
+        let ulMbps: number | null = null;
+
+        try {
           // 1. 15-Second Download Phase
           setSpeedTest((prev) => ({
             ...prev,
@@ -1012,7 +1111,7 @@ export function NetworkStabilityPanel() {
             error: null,
           }));
 
-          const dlMbps = await runSustainedDownload15s(
+          dlMbps = await runSustainedDownload15s(
             testToken,
             maxDlBytes,
             loopAbortController.signal
@@ -1023,11 +1122,11 @@ export function NetworkStabilityPanel() {
           // 2. 15-Second Upload Phase
           setSpeedTest((prev) => ({
             ...prev,
-            downloadMbps: dlMbps,
+            downloadMbps: dlMbps ?? prev.downloadMbps,
             phase: 'uploading',
           }));
 
-          const ulMbps = await runSustainedUpload15s(
+          ulMbps = await runSustainedUpload15s(
             testToken,
             maxUlBytes,
             loopAbortController.signal
@@ -1036,28 +1135,35 @@ export function NetworkStabilityPanel() {
           if (cancelled || loopAbortController.signal.aborted) break;
 
           // 3. Finalize 30-second analysis & hold for 10-second cooldown before repeating
-          setSpeedTest({
-            phase: 'cooldown',
-            downloadMbps: dlMbps,
-            uploadMbps: ulMbps,
-            testedAtLabel: formatClockTimestamp(Date.now()),
-            error: null,
-          });
-        } catch (err) {
-          if (cancelled || loopAbortController.signal.aborted) break;
           setSpeedTest((prev) => ({
             ...prev,
-            phase: 'error',
-            error: err instanceof Error ? err.message : 'Speed test interrupted.',
+            phase: 'cooldown',
+            downloadMbps: dlMbps ?? prev.downloadMbps,
+            uploadMbps: ulMbps ?? prev.uploadMbps,
+            testedAtLabel: formatClockTimestamp(Date.now()),
+            error: null,
+          }));
+        } catch (err) {
+          if (cancelled || loopAbortController.signal.aborted) break;
+          // Never dead-end in a stuck state: land in a completed cooldown holding the partial
+          // values already on screen; the next loop iteration retries automatically.
+          setSpeedTest((prev) => ({
+            ...prev,
+            phase: 'cooldown',
+            testedAtLabel: formatClockTimestamp(Date.now()),
+            error:
+              err instanceof Error && err.message
+                ? err.message
+                : 'Speed test interrupted.',
           }));
         } finally {
-          if (testToken) {
-            fetch('/api/network/speed-test/complete', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ token: testToken }),
-            }).catch(() => {});
-          }
+          // Fire-and-forget completion ping for backend bookkeeping — its outcome (or absence)
+          // must never block or break the UI state machine; Mbps come from measured samples.
+          fetch('/api/network/speed-test/complete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: testToken }),
+          }).catch(() => {});
         }
 
         if (cancelled || loopAbortController.signal.aborted) break;

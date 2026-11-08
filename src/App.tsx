@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
 import { identifyCurrentVisitor } from './lib/collector';
-import type { IntelVisitorResponse } from './types/visitor';
+import type { IntelVisitorResponse, RiskLevel } from './types/visitor';
 import { LocationMap } from './components/LocationMap';
 import { NetworkStabilityPanel } from './components/NetworkStabilityPanel';
 import { CpuActivityPanel } from './components/CpuActivityPanel';
@@ -245,6 +245,58 @@ function formatStorageQuotaCaption(quotaMb: number | null | undefined): string {
   return `~${Math.round(quotaMb)} MB browser quota active`;
 }
 
+/**
+ * Compact one-click copy control for monospace hash rows. Uses the async
+ * Clipboard API with an execCommand fallback and transient "Copied" feedback.
+ */
+function CopyHashButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState<boolean>(false);
+
+  const handleCopy = useCallback(async () => {
+    if (!value) return;
+    let copiedOk = false;
+    try {
+      await navigator.clipboard.writeText(value);
+      copiedOk = true;
+    } catch {
+      // Fallback for restricted contexts where the async Clipboard API is blocked
+      try {
+        const textarea = document.createElement('textarea');
+        textarea.value = value;
+        textarea.setAttribute('readonly', '');
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        copiedOk = document.execCommand('copy');
+        document.body.removeChild(textarea);
+      } catch {
+        copiedOk = false;
+      }
+    }
+    if (copiedOk) {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    }
+  }, [value]);
+
+  return (
+    <button
+      type="button"
+      onClick={handleCopy}
+      title={copied ? 'Copied to clipboard' : 'Copy value'}
+      className={`inline-flex items-center gap-1 pl-1.5 pr-2 py-0.5 rounded-md border text-[10px] font-medium transition-colors shrink-0 cursor-pointer ${
+        copied
+          ? 'bg-emerald-50/70 border-emerald-200 text-emerald-700'
+          : 'bg-white text-slate-500 hover:text-slate-900 hover:bg-slate-100 border-[#E5E7EB]'
+      }`}
+    >
+      {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+      {copied ? 'Copied' : 'Copy'}
+    </button>
+  );
+}
+
 export default function App() {
   const [data, setData] = useState<IntelVisitorResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -366,6 +418,17 @@ export default function App() {
         /^Standard (GPU|WebGL|Hardware)/i.test(data?.hardwareSignals?.gpuVendor || '') ||
         cleanGpuName === 'Standard GPU' ||
         data?.securitySignals?.vpnReasons?.some((r) => /Cloud \/ Masked GPU/i.test(r)))
+  );
+  const botCloudMasked = Boolean(data?.securitySignals?.cloudOrMaskedGpu) || isCloudMaskedGpu;
+  // Canvas 2D / Web Audio hashes are suppressed whenever the WebGL GPU is masked
+  // or unavailable — cloud and standard environments get no hash exposure.
+  // (Independent of the datacenter-ASN cloud check above.)
+  const isMaskedGpu = Boolean(
+    data?.hardwareSignals &&
+      (data.hardwareSignals.gpuVendor === 'Unavailable' ||
+        data.hardwareSignals.gpuRenderer === 'Standard GPU' ||
+        /^Standard (GPU|WebGL|Hardware)/i.test(data.hardwareSignals.gpuVendor || '') ||
+        cleanGpuName === 'Standard GPU')
   );
 
   return (
@@ -907,6 +970,8 @@ export default function App() {
                     title={
                       data.securitySignals.botSignals.length > 0
                         ? data.securitySignals.botSignals.join(' • ')
+                        : botCloudMasked
+                        ? 'Datacenter ASN with masked or unavailable WebGL GPU (no automation hooks detected)'
                         : 'No automation, headless WebDriver, or virtual GPU hooks detected'
                     }
                   >
@@ -914,6 +979,8 @@ export default function App() {
                       className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 border ${
                         data.securitySignals.isBot
                           ? 'bg-rose-50 border-rose-200 text-rose-600'
+                          : botCloudMasked
+                          ? 'bg-amber-50/60 border-amber-200 text-amber-600'
                           : 'bg-emerald-50/60 border-emerald-200 text-emerald-600'
                       }`}
                     >
@@ -925,17 +992,34 @@ export default function App() {
                           Bot Check
                         </span>
                         <span
-                          className={`text-[11px] font-mono font-semibold shrink-0 ${
-                            data.securitySignals.isBot ? 'text-rose-700' : 'text-emerald-700'
+                          className={`inline-flex items-center gap-1.5 text-[11px] font-mono font-semibold shrink-0 ${
+                            data.securitySignals.isBot
+                              ? 'text-rose-700'
+                              : botCloudMasked
+                              ? 'text-amber-700'
+                              : 'text-emerald-700'
                           }`}
                         >
-                          {data.securitySignals.isBot ? 'Bot Detected' : 'Verified Human'}
+                          <span
+                            className={`w-1.5 h-1.5 rounded-full shrink-0 ${
+                              data.securitySignals.isBot
+                                ? 'bg-rose-500'
+                                : botCloudMasked
+                                ? 'bg-amber-500'
+                                : 'bg-emerald-500'
+                            }`}
+                          />
+                          {data.securitySignals.isBot
+                            ? 'Bot / Automated'
+                            : botCloudMasked
+                            ? 'Cloud / Headless'
+                            : 'Verified Human'}
                         </span>
                       </div>
                       <p className="text-[11px] text-slate-500 truncate mt-1">
                         {data.securitySignals.isBot
                           ? 'Automation runtime hooks detected'
-                          : isCloudMaskedGpu
+                          : botCloudMasked
                           ? 'Cloud / Masked GPU environment'
                           : 'No automation or headless hooks'}
                       </p>
@@ -1212,6 +1296,48 @@ export default function App() {
                     </div>
                   </div>
 
+                  {!isMaskedGpu && (
+                    <>
+                      {/* Tile 5: Canvas 2D Hash (monospace, one-click copy; hidden on masked GPUs) */}
+                      <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
+                        <div className="w-9 h-9 rounded-lg bg-purple-50/60 border border-purple-200 flex items-center justify-center shrink-0">
+                          <Fingerprint className="w-4 h-4 text-purple-600" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center justify-between gap-1.5">
+                            <span className="text-[11px] text-slate-500">Canvas 2D Hash</span>
+                            <CopyHashButton value={data.hardwareSignals.canvasHash} />
+                          </div>
+                          <span
+                            className="block text-xs font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5"
+                            title={data.hardwareSignals.canvasHash || 'Unavailable'}
+                          >
+                            {data.hardwareSignals.canvasHash || 'Unavailable'}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Tile 6: Web Audio Hash (monospace, one-click copy; hidden on masked GPUs) */}
+                      <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
+                        <div className="w-9 h-9 rounded-lg bg-cyan-50/60 border border-cyan-200 flex items-center justify-center shrink-0">
+                          <Activity className="w-4 h-4 text-cyan-600" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center justify-between gap-1.5">
+                            <span className="text-[11px] text-slate-500">Web Audio Hash</span>
+                            <CopyHashButton value={data.hardwareSignals.audioHash} />
+                          </div>
+                          <span
+                            className="block text-xs font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5"
+                            title={data.hardwareSignals.audioHash || 'Unavailable'}
+                          >
+                            {data.hardwareSignals.audioHash || 'Unavailable'}
+                          </span>
+                        </div>
+                      </div>
+                    </>
+                  )}
+
                 </div>
               </div>
 
@@ -1271,6 +1397,7 @@ export default function App() {
                     <th className="py-2.5 px-3">Public IP</th>
                     <th className="py-2.5 px-3">Location</th>
                     <th className="py-2.5 px-3">ISP / ASN</th>
+                    <th className="py-2.5 px-3">Signal / Status</th>
                     <th className="py-2.5 pl-3 text-right">Browser &amp; OS</th>
                   </tr>
                 </thead>
@@ -1280,6 +1407,30 @@ export default function App() {
                     const rowOrg = formatValidNetworkField(visit.org);
                     const rowAsn = formatValidNetworkField(visit.asn);
                     const rowIspFormatted = formatCleanIspDisplay(rowIsp, rowOrg, rowAsn);
+                    const rowScore = visit.suspectScore ?? 0;
+                    const rowRisk: RiskLevel =
+                      visit.riskLevel === 'High' ||
+                      visit.riskLevel === 'Medium' ||
+                      visit.riskLevel === 'Low'
+                        ? visit.riskLevel
+                        : rowScore >= 70
+                        ? 'High'
+                        : rowScore >= 35
+                        ? 'Medium'
+                        : 'Low';
+                    const rowRiskLabel = `${rowRisk === 'Medium' ? 'Med' : rowRisk} · ${rowScore}/100`;
+                    const rowRiskDotClass =
+                      rowRisk === 'High'
+                        ? 'bg-rose-500'
+                        : rowRisk === 'Medium'
+                        ? 'bg-amber-500'
+                        : 'bg-emerald-500';
+                    const rowRiskTextClass =
+                      rowRisk === 'High'
+                        ? 'text-rose-700'
+                        : rowRisk === 'Medium'
+                        ? 'text-amber-700'
+                        : 'text-emerald-700';
                     return (
                       <tr
                         key={visit.visitId}
@@ -1307,6 +1458,19 @@ export default function App() {
                           title={rowIspFormatted.fullTooltip}
                         >
                           {rowIspFormatted.shortLabel}
+                        </td>
+                        <td
+                          className="py-2.5 px-3 whitespace-nowrap"
+                          title={`Recognition: ${visit.recognitionSource ?? 'Cookie'}`}
+                        >
+                          <span
+                            className={`inline-flex items-center gap-1.5 font-mono font-semibold tabular-nums ${rowRiskTextClass}`}
+                          >
+                            <span
+                              className={`w-1.5 h-1.5 rounded-full shrink-0 ${rowRiskDotClass}`}
+                            />
+                            {rowRiskLabel}
+                          </span>
                         </td>
                         <td className="py-2.5 pl-3 text-right text-slate-800 whitespace-nowrap">
                           {visit.browser} • {visit.os} ({visit.deviceType})
