@@ -377,6 +377,10 @@ export function NetworkStabilityPanel() {
             const resp = await fetch(url, {
               method: 'GET',
               cache: 'no-store',
+              headers: {
+                'x-speedtest-token': token,
+                'x-speedtest-bytes': String(reqBytes),
+              },
               signal: phaseAbort.signal,
             });
 
@@ -494,6 +498,14 @@ export function NetworkStabilityPanel() {
 
         xhr.open('POST', url, true);
         xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+        if (url.includes('token=')) {
+          try {
+            const token = new URL(url, window.location.origin).searchParams.get('token');
+            if (token) xhr.setRequestHeader('x-speedtest-token', token);
+          } catch {
+            // Ignore header fallback failures
+          }
+        }
         xhr.timeout = 6000;
 
         xhr.upload.onprogress = (event) => {

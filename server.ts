@@ -274,6 +274,10 @@ function createInMemoryDbAdapter(): DatabaseAdapter {
 }
 
 function initializeDatabase(): DatabaseAdapter {
+  if (process.env.INTEL_FORCE_MEMORY_DB === '1') {
+    return createInMemoryDbAdapter();
+  }
+
   let targetDir = path.join(os.tmpdir(), 'intel-system-data');
   if (!IS_SERVERLESS_RUNTIME) {
     try {
@@ -1266,7 +1270,9 @@ app.get('/api/network/download', (req, res) => {
   const nowMs = Date.now();
   pruneSpeedTestState(nowMs);
 
-  const token = typeof req.query.token === 'string' ? req.query.token : '';
+  const token =
+    (typeof req.query.token === 'string' ? req.query.token : '') ||
+    (typeof req.headers['x-speedtest-token'] === 'string' ? req.headers['x-speedtest-token'] : '');
   const { ip: extractedIp } = extractVisitorIp(req);
   const visitorKey =
     (req.cookies?.intel_http_vid as string | undefined) || extractedIp || 'anon';
@@ -1289,7 +1295,10 @@ app.get('/api/network/download', (req, res) => {
     return;
   }
 
-  const requestedBytes = parseInt(String(req.query.bytes || 1024 * 1024), 10);
+  const headerBytes = Number(req.headers['x-speedtest-bytes']);
+  const requestedBytes = Number.isFinite(headerBytes) && headerBytes > 0
+    ? Math.floor(headerBytes)
+    : parseInt(String(req.query.bytes || 1024 * 1024), 10);
   const clampedRequest = Number.isNaN(requestedBytes)
     ? 1024 * 1024
     : Math.max(65536, Math.min(SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES, requestedBytes));
@@ -1374,6 +1383,22 @@ app.post('/api/network/upload', (req, res) => {
   const nowMs = Date.now();
   pruneSpeedTestState(nowMs);
 
+  // Vercel's Node.js runtime exposes `request.body` as a lazy getter and may
+  // already have consumed the raw request stream for application/octet-stream
+  // payloads. Reading it here lets us count the bytes instead of waiting for
+  // `data`/`end` events that will never fire.
+  let platformBufferedBody: Buffer | null = null;
+  try {
+    const candidate = (req as express.Request & { body?: unknown }).body;
+    if (Buffer.isBuffer(candidate)) {
+      platformBufferedBody = candidate;
+    } else if (candidate instanceof Uint8Array) {
+      platformBufferedBody = Buffer.from(candidate);
+    }
+  } catch {
+    platformBufferedBody = null;
+  }
+
   const token =
     (typeof req.query.token === 'string' ? req.query.token : '') ||
     (typeof req.headers['x-speedtest-token'] === 'string' ? req.headers['x-speedtest-token'] : '');
@@ -1398,6 +1423,32 @@ app.post('/api/network/upload', (req, res) => {
   if (ledger.uploadedBytes >= SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
     req.resume();
     res.status(429).json({ error: 'Maximum upload transfer limit reached for this test.' });
+    return;
+  }
+
+  if (platformBufferedBody) {
+    const receivedBytes = platformBufferedBody.byteLength;
+    if (
+      receivedBytes > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES ||
+      ledger.uploadedBytes + receivedBytes > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES
+    ) {
+      res.status(413).json({
+        ok: false,
+        error: 'Upload transfer limit exceeded.',
+        receivedBytes: 0,
+      });
+      return;
+    }
+
+    ledger.uploadedBytes += receivedBytes;
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.status(200).json({
+      ok: true,
+      receivedBytes,
+      totalTestUploadedBytes: ledger.uploadedBytes,
+      elapsedServerMs: 1,
+      serverTimestampMs: Date.now(),
+    });
     return;
   }
 
@@ -1988,9 +2039,11 @@ app.post('/api/visitor/identify', async (req, res) => {
       httpOnly: true,
       sameSite: 'lax' as const,
       path: '/',
+      secure: Boolean(process.env.VERCEL) || process.env.NODE_ENV === 'production',
     };
     res.cookie('intel_http_vid', visitorId, cookieOptions);
     res.cookie('intel_http_token', visitorToken, cookieOptions);
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
 
     const statsAgg = db
       .prepare(
@@ -2150,6 +2203,27 @@ app.get('/api/visitor/history/:visitorId', (req, res) => {
 
   res.json({ visitorId: requestedVisitorId, visits });
 });
+
+// Explicit JSON 404 for unknown API routes (instead of the SPA fallback HTML).
+app.use('/api', (_req, res) => {
+  res.status(404).json({ error: 'API endpoint not found.' });
+});
+
+// Central error handler so a thrown error never leaves the serverless function
+// in an undefined state (recommended by Vercel for Express apps).
+app.use(
+  (
+    err: unknown,
+    _req: express.Request,
+    res: express.Response,
+    _next: express.NextFunction
+  ) => {
+    console.error('Unhandled API error:', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Internal server error.' });
+    }
+  }
+);
 
 async function startStandaloneServer() {
   if (process.env.NODE_ENV !== 'production') {
