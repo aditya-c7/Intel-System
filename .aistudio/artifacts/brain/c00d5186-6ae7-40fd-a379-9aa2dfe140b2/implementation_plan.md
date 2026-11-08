@@ -1,59 +1,54 @@
-# Intel System Vercel Serverless & Dual-Runtime Architecture
+# System Load Gauge Badges & Ookla-Grade 15s/15s Speed Test Engine
 
-This plan upgrades the Intel System backend, storage engine, and deployment routing so the repository deploys and runs without errors on **Vercel** (Static CDN + Serverless Functions) while remaining 100% compatible with persistent Node servers (local development, Cloud Run, Railway, and Render).
+This plan integrates the four **System load** gauge badges (**Normal** in green, **Moderate** in yellow, **High** in orange, and **Heavy** in red) prominently at the top of the **CPU Activity** panel, and upgrades the **Server Speed Test** to an **Ookla-style multi-stream throughput engine** running **15 seconds for Download** and **15 seconds for Upload** followed by a **10-second cooldown** with accurate high-RTT Vercel compensation.
 
 ### User Review & Critical Decisions
 
 > [!IMPORTANT]
-> Both architectural choices from our clarification step are locked in below. Review the plan and click **Proceed** to apply these changes across the codebase.
+> Both of your confirmed preferences are incorporated below. Click **Proceed** to implement these updates across the codebase and rebuild the Vercel bundle.
 
-- **Confirmed Decision 1 (Visitor History & Storage Persistence)**: **Hybrid Client Storage + Serverless `/tmp` SQLite**. On persistent servers, SQLite writes to the local data directory; on Vercel's read-only `/var/task` filesystem, the server automatically uses `/tmp` (with an automatic in-memory fallback if native SQLite bindings are unavailable in a given serverless image) AND synchronizes HMAC-verified visit history snapshots with the browser's first-party storage so returning visitors never lose their visit count or history across serverless cold starts.
-- **Confirmed Decision 2 (Deployment Runtime Compatibility)**: **Dual-Runtime Support (Vercel Serverless + Standard Node Server)**. The Express API application is exported as a reusable handler mounted by Vercel's `/api` serverless runtime via rewrite rules, while still running as a standalone Node/Vite server on port 3000 when executed directly.
+- **Confirmed Decision 1 (System Load Gauge Badge Placement & States)**: Display the circular **System load** gauge badge prominently at the top of the **CPU Activity** section with all four states:
+  - **Normal** (`nominal`): Soft green circle (`#DCFCE7`) with green gauge & left-angled needle (`#15803D`).
+  - **Moderate** (`fair`): Soft yellow-amber circle (`#FEF3C7`) with amber-brown gauge & slightly left-angled needle (`#B45309`).
+  - **High** (`serious`): Soft orange-peach circle (`#FFEDD5`) with deep orange-brown gauge & right-angled needle (`#C2410C`).
+  - **Heavy** (`critical`): Soft red-rose circle (`#FEE2E2`) with crimson red gauge & far-right needle (`#B91C1C`).
+- **Confirmed Decision 2 (Ookla-Style 15s Download + 15s Upload + 10s Cooldown Schedule)**: Run a full **15-second Download analysis** and **15-second Upload analysis** to finalize accurate results, pause for a **10-second cooldown**, and then repeat smoothly.
 
 ---
 
 ### 1. Overview & Core Concept
 
-- **What It Does**: Eliminates every point of failure when deploying the Intel System repository to Vercel:
-  1. Exposes all `/api/visitor/*`, `/api/network/*`, and `/api/health` endpoints through a Vercel-compatible serverless entry point and routing configuration.
-  2. Prevents the `EROFS: read-only file system` crash on Vercel by detecting serverless/read-only environments and routing database storage to `/tmp` with a pure JavaScript in-memory fallback if native C++ bindings are stripped.
-  3. Preserves returning visitor recognition, visit counts, session counts, and historical visit logs across serverless cold starts by pairing HMAC-signed client history snapshots with server-side persistence.
-  4. Keeps Download and Upload speed-test stream payloads safely within Vercel's 4.5 MB serverless body limit while sustaining the full 10-second analysis (5s Download + 5s Upload) and 10-second cooldown cycle.
-- **Target Audience / Persona**: Public visitors across desktop and mobile devices inspecting their real-time IP, ISP/ASN, geolocation map, network RTT stability, 4-stream throughput, and hardware CPU pressure on a production Vercel deployment.
-- **Key Value**: Zero-config `git push` deployment to Vercel with zero 404 API errors, zero read-only disk crashes, and uninterrupted visitor history retention.
+- **What It Does**:
+  1. **System Load Visual Indicator**: Renders the exact gauge icon design from your reference images (semi-circular dial with base line and angled needle inside a tinted circle) beside the **System load** title and live state subtitle (**Normal**, **Moderate**, **High**, **Heavy**).
+  2. **Root-Cause Fix for Low Speed Test Readings on Vercel**:
+     - Previously, your `~250 ms` HTTP RTT to the serverless function was included inside every small chunk's duration (`requestStart -> responseEnd`), plus an artificial `100 ms` delay between chunks. Over a 250 ms link, waiting 250 ms for TTFB on a 512 KB chunk capped throughput at ~14 Mbps regardless of your actual broadband speed.
+     - The upgraded engine uses **Ookla's methodology**: it opens **6 concurrent streams**, uses larger streaming payloads (`1 MB` to `3.5 MB`, safely under Vercel's 4.5 MB cap), removes all artificial sleep delays, measures **pure payload transfer time** (from first byte received `responseStart` to final byte `responseEnd` on Download, and active `xhr.upload.onprogress` byte-stream intervals on Upload, excluding serverless invocation/TTFB wait time), and applies **Ookla's Trimmed Mean** (discarding the bottom 30% TCP slow-start ramp-up samples and top 8% buffer spikes).
+- **Target Audience / Persona**: Visitors on any broadband or mobile connection worldwide accessing the Vercel deployment who expect accurate ISP-grade throughput measurements and clear CPU load visual feedback.
+- **Key Value**: True broadband Download and Upload speed measurement unaffected by 250 ms serverless RTT, paired with instant visual recognition of system CPU load.
 
 ---
 
 ### 2. User Experience & Visual Design
 
 - **Key User Flows**:
-  1. **Zero-State Arrival & Instant Recognition**: Visitor opens the Vercel deployment URL; the frontend collects browser/device signals, client geo hints, and any existing first-party visitor credentials + signed visit history backup, then calls `/api/visitor/identify`.
-  2. **Cold-Start Resilient History Restoration**: Even if the request hits a fresh Vercel serverless instance whose `/tmp` directory was just initialized, the server verifies the HMAC signature on the visitor's ID and rehydrates their previous visits before recording the new visit, returning accurate `totalVisits`, `totalSessions`, and `visitHistory`.
-  3. **Live Network RTT & 10s Speed Analysis + 10s Cooldown**: The Network Stability graph measures HTTP RTT every 1.5s, while the Server Speed Test runs a 5.0s multi-stream Download test and 5.0s multi-stream Upload test (updating the odometer counter every 250ms) followed by a 10.0s cooldown pause.
-  4. **Click-Only Historical Graph Inspection**: Clicking or tapping a point on either the Network Stability graph or the CPU Activity step-line graph pins a detailed inspection popup for that timestamp without hover popups.
+  1. **CPU Activity System Load Badge**: At the top of the CPU Activity card, the visitor immediately sees the circular **System load** gauge icon and state label (**Normal** in green, **Moderate** in yellow, **High** in orange, **Heavy** in red) alongside Last Observation and Recorded Observations, followed by the 5-minute rolling step-line graph.
+  2. **15s Download -> 15s Upload -> 10s Cooldown Speed Test**:
+     - **Phase 1 (0s to 15s)**: `Analyzing Download (15s)...` runs 6 parallel streams, smoothly rolling the Download `<OdometerNumber />` every `250 ms` as TCP windows scale up to full line speed, then locks in the finalized Download speed at 15.0 seconds.
+     - **Phase 2 (15s to 30s)**: `Analyzing Upload (15s)...` runs 6 parallel upload streams, smoothly rolling the Upload `<OdometerNumber />` every `250 ms`, then locks in the finalized Upload speed at 30.0 seconds.
+     - **Phase 3 (30s to 40s)**: `Updated HH:MM:SS` holds the finalized Download and Upload speeds during a 10.0-second cooldown before starting the next cycle.
 - **Visual Identity & Theme**:
-  - *Aesthetic Direction*: Existing clean, high-contrast utilitarian telemetry interface preserved without redesign.
-  - *Color Palette & Mood*: Crisp light neutral background (`#F8FAFC`), white structural cards (`#FFFFFF`) with `1px` borders (`#E5E7EB`), primary blue telemetry lines (`#2563EB`), emerald nominal indicators (`#059669`), and red alert states (`#DC2626`).
-  - *Typography & Hierarchy*: Clean sans-serif headings and labels paired with `font-mono tabular-nums` for IP addresses, ASN identifiers, latency figures, timestamps, and rolling odometer counters.
-  - *Component Styling & Layout*: Responsive 12-column grid with dynamic `ResizeObserver` 1:1 SVG chart viewports (`236px` height) so graphs never shrink or squeeze on mobile viewports.
+  - *System Load Gauge SVG*: Custom precision vector gauge matching the reference attachments: a rounded semi-circular meter arch (`stroke-width="2.2"`), flat bottom chord, and a tapered central pointer needle whose rotation angle (`-42°`, `-16°`, `+18°`, `+42°`) and color palette transition smoothly with the active CPU pressure level.
 
 ---
 
 ### 3. Key Product Decisions & Trade-Offs
 
-- **Decision 1: Serverless Entry Point & Request Routing**
-  - *Chosen Approach*: Decouple the Express API app creation from `app.listen()` so that Vercel invokes the Express app directly as a serverless handler for all `/api/*` routes, while static assets (`dist/`) are served directly by Vercel's edge network with `Permissions-Policy: compute-pressure=()` / `compute-pressure=*` headers configured.
-  - *Why*: Vercel does not run long-lived `app.listen()` processes; exporting the Express app for `/api/*` while only calling `listen()` outside Vercel allows the exact same codebase to run on both Vercel and standard Node hosts.
-  - *Alternatives Considered*: Rewriting every Express route into separate Vercel-only function handlers was passed over because it would break single-process local development and duplicate business logic.
-- **Decision 2: Three-Tier Resilient Storage Engine (Disk SQLite -> `/tmp` SQLite -> In-Memory Map + Signed Client Sync)**
-  - *Chosen Approach*:
-    1. Use writable `/tmp` on Vercel (`process.env.VERCEL`) or whenever the project root is read-only.
-    2. Wrap native `better-sqlite3` initialization in a safe loader with an automatic in-memory store fallback so even if Vercel's bundler omits native C++ bindings for a specific Node version, the API never crashes with a 500 error.
-    3. Store the visitor's recent `visitHistory` (up to 35 compact records) and aggregate counters in `localStorage` alongside an HMAC signature generated by the server. When `/api/visitor/identify` runs on a fresh serverless cold start, the server verifies the HMAC signature and restores missing visits into its storage before recording the current visit.
-  - *Why*: Guarantees 100% uptime and accurate returning-visitor history on Vercel Hobby/Pro plans without requiring external database credentials.
-- **Decision 3: Vercel Payload & Region Detection Compatibility**
-  - *Chosen Approach*: Cap individual `/api/network/download` and `/api/network/upload` stream requests at `2 MB` (well below Vercel's 4.5 MB serverless body limit) and detect Vercel edge/serverless headers (`x-vercel-ip-city`, `x-vercel-ip-country`, `x-vercel-ip-country-region`, `x-vercel-ip-latitude`, `x-vercel-ip-longitude`, `x-vercel-id`) in addition to existing proxy headers.
-  - *Why*: Prevents `413 FUNCTION_PAYLOAD_TOO_LARGE` errors on Vercel while providing instant, zero-latency IP and coordinate detection when hosted on Vercel's edge network.
+- **Decision 1: Ookla Trimmed-Mean & Pure Payload Transfer Window Calculation**
+  - *Chosen Approach*: Track active byte reception windows (`firstBytePerf -> lastBytePerf` per stream and 500ms sliding-window bandwidth buckets across all 6 concurrent workers). Discard the lowest 30% ramp-up buckets and highest 8% burst buckets to compute the sustained trimmed mean.
+  - *Why*: On Vercel Serverless Functions, each HTTP request incurs a 150 ms to 300 ms TTFB routing/invocation delay before bytes begin flowing. Excluding TTFB handshake latency and TCP slow-start ramp-up is the exact reason Speedtest by Ookla reports true broadband capacity instead of RTT-throttled averages.
+- **Decision 2: Server Concurrency & Token TTL Scaling (`server.ts` & `api/index.js`)**
+  - *Chosen Approach*: Increase `SPEED_TEST_CONCURRENT_STREAMS` allowance on the server to `12` concurrent streams per token, increase `SPEED_TEST_TOKEN_TTL_MS` to `120,000 ms` (2 minutes) so a 30-second test (15s Download + 15s Upload) never expires mid-run, and increase per-stream download/upload caps to `3.5 MB` (safely below Vercel's 4.5 MB limit).
+  - *Why*: Ensures 6 parallel streams can overlap and pipeline requests for the full 30-second active test without ever hitting `429 Concurrent stream limit exceeded` or token expiration on Vercel.
 
 ---
 
@@ -63,48 +58,34 @@ This plan upgrades the Intel System backend, storage engine, and deployment rout
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                        Browser Client (React + Vite)                       │
-│  ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────┐  │
-│  │ Public IP, ISP &     │  │ Network Stability    │  │ CPU Activity     │  │
-│  │ Leaflet OSM Map      │  │ (5m RTT + 10s/10s    │  │ (W3C Compute     │  │
-│  │ + Device/Visit Specs │  │  Odometer Speed Test)│  │  Pressure Graph) │  │
-│  └──────────┬───────────┘  └──────────┬───────────┘  └──────────────────┘  │
-│             │                         │                                    │
-│  ┌──────────┴─────────────────────────┴─────────────────────────────────┐  │
-│  │ First-Party Collector (localStorage ID + HMAC Token + Signed History)│  │
-│  └────────────────────────────────────┬─────────────────────────────────┘  │
-└───────────────────────────────────────┼────────────────────────────────────┘
-                                        │ HTTPS (/api/*)
-                                        ▼
+│                   Intel System Frontend (React + Vite)                     │
+│                                                                            │
+│  ┌──────────────────────────────────┐  ┌────────────────────────────────┐  │
+│  │ NetworkStabilityPanel.tsx        │  │ CpuActivityPanel.tsx           │  │
+│  │ • 5m Live HTTP RTT Line Graph    │  │ • System Load Gauge Badge:     │  │
+│  │ • Ookla-Grade Speed Engine:      │  │   - Normal   (Green  #15803D)  │  │
+│  │   - 15.0s Download (6 streams)   │  │   - Moderate (Amber  #B45309)  │  │
+│  │   - 15.0s Upload   (6 streams)   │  │   - High     (Orange #C2410C)  │  │
+│  │   - 10.0s Cooldown Pause         │  │   - Heavy    (Red    #B91C1C)  │  │
+│  │   - TTFB-Excluded Trimmed Mean   │  │ • 5m Step-Line Graph (Click)   │  │
+│  │   - 250ms Odometer Digit Roll    │  │ • W3C PressureObserver ("cpu") │  │
+│  └────────────────┬─────────────────┘  └────────────────────────────────┘  │
+└───────────────────┼────────────────────────────────────────────────────────┘
+                    │ 6 Parallel Streams (x-speedtest-token, <=3.5MB/chunk)
+                    ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
-│             Dual-Runtime Routing Layer (Vercel CDN / Node Server)          │
-│  ┌────────────────────────────────────┐ ┌────────────────────────────────┐ │
-│  │ Vercel Serverless Entry (/api/*)   │ │ Standalone Node/Vite Server    │ │
-│  │ + Static CDN + Permissions-Policy  │ │ (Port 3000 Dev & Container)    │ │
-│  └─────────────────┬──────────────────┘ └───────────────┬────────────────┘ │
-│                    └──────────────────┬─────────────────┘                  │
-│                                       ▼                                    │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │                  Shared Express API Application                      │  │
-│  │  • POST /api/visitor/identify (Vercel Header + Geo + History Sync)   │  │
-│  │  • GET  /api/network/ping     (Low-overhead RTT Responder)           │  │
-│  │  • POST /api/network/speed-test/init & /complete (Signed Token)      │  │
-│  │  • GET  /api/network/download & POST /api/network/upload (<2MB/req)  │  │
-│  └────────────────────────────────────┬─────────────────────────────────┘  │
-│                                       ▼                                    │
-│  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │      Resilient Storage Adapter (Local Disk / Vercel /tmp / Memory)   │  │
-│  └──────────────────────────────────────────────────────────────────────┘  │
+│            Vercel Serverless Function (api/index.js <- server.ts)          │
+│  • POST /api/network/speed-test/init (120s Token TTL, 12-Stream Allowance) │
+│  • GET  /api/network/download        (High-Entropy Binary Stream <=3.5MB)  │
+│  • POST /api/network/upload          (Buffered + Stream Receiver <=3.5MB)  │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
 - **Data Model & State**:
-  - **Signed History Sync Payload**:
-    - `cachedVisits`: Compact array of previously recorded `VisitHistoryRecord` items stored in `localStorage` under `intel_fp_history`.
-    - `historySignature`: Server-generated HMAC-SHA256 signature over `visitorId + totalVisits + cachedVisits` stored in `localStorage` under `intel_fp_history_sig`.
-  - **Storage Adapter Interface**:
-    - Unifies `visitors`, `visits`, and `verified_geo_cache_v3` operations behind a clean synchronous interface backed by SQLite (`./data/intel_system.db` locally or `/tmp/intel_system.db` on Vercel) with automatic fallback to an in-memory store if native bindings cannot initialize.
-- **Interactive Component & State Mapping**:
-  - **Identification & Rehydration Flow**: On page load or manual refresh, `identifyCurrentVisitor()` sends `storedVisitorId`, `storedVisitorToken`, `clientSessionId`, `cachedHistory` (visits + signature), `browserDevice`, and `clientGeoHint` to `/api/visitor/identify`. If the serverless instance lost its `/tmp` state, it validates `historySignature`, restores the historical visits into the active store, inserts the new visit if `pageLoadId` is new, computes accurate `totalVisits` and `totalSessions`, signs the updated history, and returns the complete `IntelVisitorResponse`.
-  - **Vercel Geolocation & Header Extraction**: `extractVisitorIp()` and `lookupVerifiedGeolocation()` check Vercel's injected headers (`x-vercel-forwarded-for`, `x-vercel-ip-city`, `x-vercel-ip-country-region`, `x-vercel-ip-country`, `x-vercel-ip-latitude`, `x-vercel-ip-longitude`) alongside standard proxy headers and multi-provider ISP/ASN lookup (`ipwho.is`, `ipapi.co`, `freeipapi.com`).
-  - **Stateless Multi-Stream Speed Test**: `/api/network/download` and `/api/network/upload` validate the HMAC-signed speed test token (`testId.expiresAtMs.vHash.sig`) statlessly across any serverless instance, capping individual request chunks at `2 MB` so Vercel never rejects requests with `413 Payload Too Large`.
+  - **System Load Badge Mapping (`CpuActivityPanel.tsx`)**:
+    - `nominal` -> Display Level `Normal` (Green badge `#DCFCE7`, icon `#15803D`, needle `-42deg`)
+    - `fair` -> Display Level `Moderate` (Yellow badge `#FEF3C7`, icon `#B45309`, needle `-16deg`)
+    - `serious` -> Display Level `High` (Orange badge `#FFEDD5`, icon `#C2410C`, needle `+18deg`)
+    - `critical` -> Display Level `Heavy` (Red badge `#FEE2E2`, icon `#B91C1C`, needle `+42deg`)
+  - **Throughput Bucket Sampler (`NetworkStabilityPanel.tsx`)**:
+    - Collects active transfer throughput samples every `250 ms` across 6 concurrent streams over the 15-second Download phase and 15-second Upload phase, excluding TTFB wait time (`requestStart` to first byte), and computes the Ookla trimmed mean (60th to 92nd percentile of sustained samples) for live odometer display and finalized results.

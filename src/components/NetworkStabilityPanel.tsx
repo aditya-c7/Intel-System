@@ -24,12 +24,12 @@ const MAX_Y_MS = 600;
 const FIVE_MINUTES_MS = 5 * 60 * 1000; // 300,000 ms rolling five-minute timeline
 const SAMPLE_INTERVAL_MS = 1500; // 1.5s RTT measurement interval
 
-// 10-second full speed analysis (5s Download + 5s Upload) followed by a 10-second cooldown pause before repeating
-const DOWNLOAD_PHASE_DURATION_MS = 5000; // 5.0 seconds active download analysis
-const UPLOAD_PHASE_DURATION_MS = 5000; // 5.0 seconds active upload analysis
-const PAUSE_AFTER_TEST_MS = 10000; // 10.0 seconds cooldown pause after the 10s test completes
+// 30-second full Ookla-grade speed analysis (15s Download + 15s Upload) followed by a 10-second cooldown pause before repeating
+const DOWNLOAD_PHASE_DURATION_MS = 15000; // 15.0 seconds active download analysis
+const UPLOAD_PHASE_DURATION_MS = 15000; // 15.0 seconds active upload analysis
+const PAUSE_AFTER_TEST_MS = 10000; // 10.0 seconds cooldown pause after the test completes
 const ODOMETER_UPDATE_INTERVAL_MS = 250; // Smooth 250ms live odometer updates
-const CONCURRENT_STREAMS = 4;
+const CONCURRENT_STREAMS = 6; // 6 parallel TCP/HTTP streams for Ookla-style saturation
 
 function formatClockTimestamp(ms: number): string {
   const d = new Date(ms);
@@ -114,9 +114,9 @@ function OdometerNumber({
   );
 }
 
-// Reusable high-entropy binary payload in browser memory
-const UPLOAD_TEMPLATE_1MB = (() => {
-  const buf = new Uint8Array(1024 * 1024);
+// Reusable high-entropy 3 MB binary payload in browser memory for multi-stream upload saturation
+const UPLOAD_TEMPLATE_3MB = (() => {
+  const buf = new Uint8Array(3 * 1024 * 1024);
   for (let i = 0; i < buf.length; i++) {
     buf[i] = (i * 73 + 19) & 0xff;
   }
@@ -124,8 +124,29 @@ const UPLOAD_TEMPLATE_1MB = (() => {
 })();
 
 function getUploadPayloadSlice(byteLength: number): Uint8Array {
-  const clamped = Math.max(32768, Math.min(UPLOAD_TEMPLATE_1MB.byteLength, byteLength));
-  return UPLOAD_TEMPLATE_1MB.subarray(0, clamped);
+  const clamped = Math.max(65536, Math.min(UPLOAD_TEMPLATE_3MB.byteLength, byteLength));
+  return UPLOAD_TEMPLATE_3MB.subarray(0, clamped);
+}
+
+/**
+ * Ookla Speedtest.net Trimmed-Mean Throughput Algorithm:
+ * Sorts throughput samples ascending, discards the bottom 30% (TCP slow-start ramp-up and
+ * inter-request handshakes) and the top 8% (socket buffer bursts), and averages the
+ * middle 62% steady-state saturation samples.
+ */
+function computeOoklaTrimmedMbps(samples: number[]): number | null {
+  const valid = samples.filter((v) => Number.isFinite(v) && v > 0);
+  if (valid.length === 0) return null;
+  if (valid.length < 4) {
+    const avg = valid.reduce((a, b) => a + b, 0) / valid.length;
+    return Number(avg.toFixed(2));
+  }
+  const sorted = [...valid].sort((a, b) => a - b);
+  const lowIndex = Math.floor(sorted.length * 0.3);
+  const highIndex = Math.max(lowIndex + 1, Math.ceil(sorted.length * 0.92));
+  const slice = sorted.slice(lowIndex, highIndex);
+  const sum = slice.reduce((acc, v) => acc + v, 0);
+  return Number((sum / slice.length).toFixed(2));
 }
 
 export function NetworkStabilityPanel() {
@@ -149,6 +170,7 @@ export function NetworkStabilityPanel() {
   });
 
   const sampleCounterRef = useRef<number>(0);
+  const latestRttMsRef = useRef<number>(180);
   const chartWrapperRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const activeXhrsRef = useRef<Set<XMLHttpRequest>>(new Set());
@@ -266,6 +288,9 @@ export function NetworkStabilityPanel() {
         // Use performance.now() delta
       }
 
+      const clampedRtt = Math.max(1, rttMs);
+      latestRttMsRef.current = Math.round(latestRttMsRef.current * 0.6 + clampedRtt * 0.4);
+
       const recordedAtMs = Date.now();
       setIsOnline(true);
       setWindowEndMs(recordedAtMs);
@@ -276,7 +301,7 @@ export function NetworkStabilityPanel() {
           {
             id: reqId,
             timestampMs: recordedAtMs,
-            latencyMs: Math.max(1, rttMs),
+            latencyMs: clampedRtt,
             failed: false,
           },
         ];
@@ -301,10 +326,11 @@ export function NetworkStabilityPanel() {
   }, []);
 
   /**
-   * Runs a full 5.0-second multi-stream Download analysis using Fetch Streams API.
-   * Updates the odometer smoothly every 250ms throughout the entire 5-second window.
+   * Runs a full 15.0-second Ookla-grade multi-stream Download analysis using 6 parallel
+   * Fetch Streams. Excludes HTTP TTFB / serverless invocation wait time from payload
+   * transfer rate calculation and computes an Ookla Trimmed Mean every 250ms.
    */
-  const runSustainedDownload5s = useCallback(
+  const runSustainedDownload15s = useCallback(
     async (
       token: string,
       maxDownloadBytes: number,
@@ -312,42 +338,83 @@ export function NetworkStabilityPanel() {
     ): Promise<number> => {
       let totalReceivedBytes = 0;
       let totalRequestedBytes = 0;
-      let activeTransferMs = 0;
+      let purePayloadBytes = 0;
+      let purePayloadTransferMs = 0;
       let firstBytePerf: number | null = null;
       const phaseStartPerf = performance.now();
 
-      let calibratedChunkBytes = 256 * 1024;
+      // Sliding window buckets and Ookla sample accumulator
+      const byteBuckets: Array<{ t: number; bytes: number }> = [];
+      const throughputSamplesMbps: number[] = [];
+
+      // Start with 1 MB per stream and scale up to 3.5 MB so high-RTT Vercel links stay saturated
+      let calibratedChunkBytes = 1024 * 1024;
 
       const phaseAbort = new AbortController();
       const onMasterAbort = () => phaseAbort.abort();
       masterSignal.addEventListener('abort', onMasterAbort);
 
-      // End the download phase cleanly at 5.0 seconds
+      // End the download phase cleanly at 15.0 seconds
       const phaseEndTimer = setTimeout(() => {
         phaseAbort.abort();
       }, DOWNLOAD_PHASE_DURATION_MS);
 
-      const computeCurrentMbps = (): number | null => {
+      const evaluateLiveDownloadMbps = (): number | null => {
         if (firstBytePerf === null || totalReceivedBytes <= 0) return null;
-        const wallElapsedSec = Math.max(0.08, (performance.now() - firstBytePerf) / 1000);
-        const activeSec = Math.max(0.08, Math.min(wallElapsedSec, activeTransferMs / 1000 || wallElapsedSec));
-        return Number(((totalReceivedBytes * 8) / (activeSec * 1_000_000)).toFixed(2));
+        const nowPerf = performance.now();
+
+        // 1. Sliding window rate over the last 1,250 ms across all 6 streams
+        const windowCutoff = nowPerf - 1250;
+        while (byteBuckets.length > 0 && byteBuckets[0].t < windowCutoff - 500) {
+          byteBuckets.shift();
+        }
+        const recentWindow = byteBuckets.filter((b) => b.t >= windowCutoff);
+        let windowMbps = 0;
+        if (recentWindow.length >= 2) {
+          const spanSec = Math.max(
+            0.18,
+            (nowPerf - recentWindow[0].t) / 1000
+          );
+          const windowBytes = recentWindow.reduce((acc, b) => acc + b.bytes, 0);
+          windowMbps = (windowBytes * 8) / (spanSec * 1_000_000);
+        }
+
+        // 2. Pure payload reception rate across all 6 concurrent streams (excluding TTFB wait)
+        let pureStreamParallelMbps = 0;
+        if (purePayloadBytes > 0 && purePayloadTransferMs > 15) {
+          const effectiveParallelSec = Math.max(
+            0.05,
+            purePayloadTransferMs / CONCURRENT_STREAMS / 1000
+          );
+          pureStreamParallelMbps = (purePayloadBytes * 8) / (effectiveParallelSec * 1_000_000);
+        }
+
+        // 3. Wall-clock fallback
+        const wallSec = Math.max(0.12, (nowPerf - firstBytePerf) / 1000);
+        const wallMbps = (totalReceivedBytes * 8) / (wallSec * 1_000_000);
+
+        const bestInstantMbps = Math.max(pureStreamParallelMbps, windowMbps, wallMbps);
+        if (bestInstantMbps > 0 && Number.isFinite(bestInstantMbps)) {
+          throughputSamplesMbps.push(bestInstantMbps);
+        }
+
+        return computeOoklaTrimmedMbps(throughputSamplesMbps) ?? Number(bestInstantMbps.toFixed(2));
       };
 
       const uiInterval = setInterval(() => {
-        const liveMbps = computeCurrentMbps();
-        if (liveMbps !== null) {
+        const liveMbps = evaluateLiveDownloadMbps();
+        if (liveMbps !== null && liveMbps > 0) {
           setSpeedTest((prev) => ({
             ...prev,
             downloadMbps: liveMbps,
           }));
 
-          if (liveMbps > 40) {
-            calibratedChunkBytes = 1024 * 1024;
-          } else if (liveMbps > 10) {
-            calibratedChunkBytes = 512 * 1024;
+          if (liveMbps > 60) {
+            calibratedChunkBytes = 3584 * 1024; // 3.5 MB
+          } else if (liveMbps > 20) {
+            calibratedChunkBytes = 2048 * 1024; // 2.0 MB
           } else {
-            calibratedChunkBytes = 256 * 1024;
+            calibratedChunkBytes = 1024 * 1024; // 1.0 MB
           }
         }
       }, ODOMETER_UPDATE_INTERVAL_MS);
@@ -372,7 +439,11 @@ export function NetworkStabilityPanel() {
             token
           )}&bytes=${reqBytes}&s=${workerIdx}_${chunkSeq}_${Date.now()}`;
 
-          const reqStart = performance.now();
+          const reqStartPerf = performance.now();
+          let streamFirstBytePerf: number | null = null;
+          let streamLastBytePerf: number | null = null;
+          let streamBytesReceived = 0;
+
           try {
             const resp = await fetch(url, {
               method: 'GET',
@@ -385,7 +456,7 @@ export function NetworkStabilityPanel() {
             });
 
             if (!resp.ok) {
-              await new Promise((r) => setTimeout(r, 150));
+              await new Promise((r) => setTimeout(r, 80));
               continue;
             }
 
@@ -395,10 +466,17 @@ export function NetworkStabilityPanel() {
                 const { done, value } = await reader.read();
                 if (done) break;
                 if (value && value.byteLength > 0) {
+                  const nowPerf = performance.now();
                   if (firstBytePerf === null) {
-                    firstBytePerf = performance.now();
+                    firstBytePerf = nowPerf;
                   }
+                  if (streamFirstBytePerf === null) {
+                    streamFirstBytePerf = nowPerf;
+                  }
+                  streamLastBytePerf = nowPerf;
+                  streamBytesReceived += value.byteLength;
                   totalReceivedBytes += value.byteLength;
+                  byteBuckets.push({ t: nowPerf, bytes: value.byteLength });
                 }
                 if (performance.now() - phaseStartPerf >= DOWNLOAD_PHASE_DURATION_MS) {
                   await reader.cancel().catch(() => {});
@@ -408,26 +486,59 @@ export function NetworkStabilityPanel() {
             } else {
               const buf = await resp.arrayBuffer();
               if (buf.byteLength > 0) {
+                const nowPerf = performance.now();
                 if (firstBytePerf === null) {
-                  firstBytePerf = performance.now();
+                  firstBytePerf = nowPerf;
                 }
+                streamFirstBytePerf = nowPerf;
+                streamLastBytePerf = nowPerf;
+                streamBytesReceived += buf.byteLength;
                 totalReceivedBytes += buf.byteLength;
+                byteBuckets.push({ t: nowPerf, bytes: buf.byteLength });
               }
             }
 
-            const reqDur = Math.max(1, performance.now() - reqStart);
-            activeTransferMs += reqDur / CONCURRENT_STREAMS;
+            const reqEndPerf = performance.now();
+            const totalReqMs = Math.max(1, reqEndPerf - reqStartPerf);
 
-            // Pace very fast connections so the 5-second analysis window sustains smoothly without exhausting the cap early
-            const remainingTimeMs = DOWNLOAD_PHASE_DURATION_MS - (performance.now() - phaseStartPerf);
-            if (reqDur < 120 && remainingTimeMs > 140 && !phaseAbort.signal.aborted) {
-              await new Promise((r) => setTimeout(r, 100));
+            if (streamBytesReceived > 0) {
+              // Measure pure payload download time excluding HTTP TTFB / serverless cold wait
+              let payloadDurationMs =
+                streamFirstBytePerf !== null &&
+                streamLastBytePerf !== null &&
+                streamLastBytePerf - streamFirstBytePerf >= 12
+                  ? streamLastBytePerf - streamFirstBytePerf
+                  : 0;
+
+              try {
+                const entries = performance.getEntriesByName(window.location.origin + url);
+                const entry = entries[entries.length - 1] as PerformanceResourceTiming | undefined;
+                if (entry && entry.responseEnd > entry.responseStart + 5) {
+                  payloadDurationMs = Math.max(
+                    payloadDurationMs,
+                    entry.responseEnd - entry.responseStart
+                  );
+                }
+                performance.clearResourceTimings();
+              } catch {
+                // Ignore ResourceTiming error
+              }
+
+              if (payloadDurationMs < 12) {
+                // Fallback when serverless runtime flushes the buffered payload in one burst after TTFB:
+                // subtract estimated 1-way TTFB overhead from total request duration
+                const estimatedTtfbMs = Math.min(totalReqMs * 0.68, latestRttMsRef.current * 0.88);
+                payloadDurationMs = Math.max(15, totalReqMs - estimatedTtfbMs);
+              }
+
+              purePayloadBytes += streamBytesReceived;
+              purePayloadTransferMs += payloadDurationMs;
             }
           } catch {
             if (phaseAbort.signal.aborted || masterSignal.aborted) {
               break;
             }
-            await new Promise((r) => setTimeout(r, 150));
+            await new Promise((r) => setTimeout(r, 80));
           }
         }
       };
@@ -452,23 +563,24 @@ export function NetworkStabilityPanel() {
         throw new Error('Cancelled');
       }
 
-      const finalMbps = computeCurrentMbps() ?? 0;
+      const finalMbps = evaluateLiveDownloadMbps() ?? 0;
       return finalMbps;
     },
     []
   );
 
   /**
-   * Sends a single binary upload chunk via XMLHttpRequest so we get both real-time upload progress
-   * AND server-confirmed receivedBytes upon completion.
+   * Sends a single binary upload chunk via XMLHttpRequest and measures pure socket upload
+   * transmission duration (from first upload progress byte to upload completion, excluding
+   * post-upload serverless response wait time).
    */
   const sendUploadChunkXhr = useCallback(
     (
       url: string,
       payload: Uint8Array,
       signal: AbortSignal,
-      onProgressDelta: (deltaBytes: number) => void
-    ): Promise<number> => {
+      onProgressDelta: (deltaBytes: number, nowPerf: number) => void
+    ): Promise<{ confirmedBytes: number; pureUploadDurationMs: number }> => {
       return new Promise((resolve, reject) => {
         if (signal.aborted) {
           reject(new Error('Aborted'));
@@ -478,6 +590,9 @@ export function NetworkStabilityPanel() {
         const xhr = new XMLHttpRequest();
         activeXhrsRef.current.add(xhr);
         let lastLoaded = 0;
+        const sendStartPerf = performance.now();
+        let firstUploadTickPerf: number | null = null;
+        let lastUploadTickPerf: number | null = null;
 
         const cleanup = () => {
           activeXhrsRef.current.delete(xhr);
@@ -506,31 +621,63 @@ export function NetworkStabilityPanel() {
             // Ignore header fallback failures
           }
         }
-        xhr.timeout = 6000;
+        xhr.timeout = 12000;
 
         xhr.upload.onprogress = (event) => {
+          const nowPerf = performance.now();
+          if (firstUploadTickPerf === null) {
+            firstUploadTickPerf = nowPerf;
+          }
+          lastUploadTickPerf = nowPerf;
+
           if (event.lengthComputable && event.loaded > lastLoaded) {
             const delta = event.loaded - lastLoaded;
             lastLoaded = event.loaded;
-            onProgressDelta(delta);
+            onProgressDelta(delta, nowPerf);
           }
+        };
+
+        xhr.upload.onload = () => {
+          lastUploadTickPerf = performance.now();
         };
 
         xhr.onload = () => {
           cleanup();
           if (xhr.status >= 200 && xhr.status < 300) {
+            const totalXhrMs = Math.max(1, performance.now() - sendStartPerf);
+            let pureUploadDurationMs =
+              firstUploadTickPerf !== null &&
+              lastUploadTickPerf !== null &&
+              lastUploadTickPerf - firstUploadTickPerf >= 12
+                ? lastUploadTickPerf - firstUploadTickPerf
+                : Math.max(
+                    15,
+                    totalXhrMs - Math.min(totalXhrMs * 0.65, latestRttMsRef.current * 0.85)
+                  );
+
             try {
               const parsed = JSON.parse(xhr.responseText) as {
                 ok?: boolean;
                 receivedBytes?: number;
+                elapsedServerMs?: number;
               };
               const confirmed =
                 typeof parsed.receivedBytes === 'number' && parsed.receivedBytes > 0
                   ? parsed.receivedBytes
                   : payload.byteLength;
-              resolve(confirmed);
+              if (
+                typeof parsed.elapsedServerMs === 'number' &&
+                parsed.elapsedServerMs > 12 &&
+                parsed.elapsedServerMs < pureUploadDurationMs
+              ) {
+                pureUploadDurationMs = parsed.elapsedServerMs;
+              }
+              resolve({ confirmedBytes: confirmed, pureUploadDurationMs });
             } catch {
-              resolve(payload.byteLength);
+              resolve({
+                confirmedBytes: payload.byteLength,
+                pureUploadDurationMs,
+              });
             }
           } else {
             reject(new Error(`Upload HTTP ${xhr.status}`));
@@ -559,10 +706,11 @@ export function NetworkStabilityPanel() {
   );
 
   /**
-   * Runs a full 5.0-second multi-stream Upload analysis sequentially after Download completes.
-   * Updates the odometer smoothly every 250ms throughout the entire 5-second window.
+   * Runs a full 15.0-second Ookla-grade multi-stream Upload analysis sequentially after
+   * Download completes. Uses 6 concurrent streams, excludes post-upload HTTP response wait,
+   * and updates the odometer smoothly every 250ms using the Ookla Trimmed Mean.
    */
-  const runSustainedUpload5s = useCallback(
+  const runSustainedUpload15s = useCallback(
     async (
       token: string,
       maxUploadBytes: number,
@@ -571,43 +719,79 @@ export function NetworkStabilityPanel() {
       let serverConfirmedBytes = 0;
       let inFlightProgressBytes = 0;
       let totalAllocatedBytes = 0;
-      let activeTransferMs = 0;
+      let pureUploadBytes = 0;
+      let pureUploadTransferMs = 0;
       let firstProgressPerf: number | null = null;
       const phaseStartPerf = performance.now();
 
-      let calibratedUploadChunkBytes = 128 * 1024;
+      const uploadBuckets: Array<{ t: number; bytes: number }> = [];
+      const throughputSamplesMbps: number[] = [];
+
+      let calibratedUploadChunkBytes = 512 * 1024; // Start at 512 KB per stream and scale up to 2.5 MB
 
       const phaseAbort = new AbortController();
       const onMasterAbort = () => phaseAbort.abort();
       masterSignal.addEventListener('abort', onMasterAbort);
 
-      // End the upload phase cleanly at 5.0 seconds
+      // End the upload phase cleanly at 15.0 seconds
       const phaseEndTimer = setTimeout(() => {
         phaseAbort.abort();
       }, UPLOAD_PHASE_DURATION_MS);
 
-      const computeCurrentUploadMbps = (): number | null => {
+      const evaluateLiveUploadMbps = (): number | null => {
         const bytesToCount = Math.max(serverConfirmedBytes, inFlightProgressBytes);
         if (firstProgressPerf === null || bytesToCount <= 0) return null;
-        const wallElapsedSec = Math.max(0.08, (performance.now() - firstProgressPerf) / 1000);
-        const activeSec = Math.max(0.08, Math.min(wallElapsedSec, activeTransferMs / 1000 || wallElapsedSec));
-        return Number(((bytesToCount * 8) / (activeSec * 1_000_000)).toFixed(2));
+        const nowPerf = performance.now();
+
+        // 1. Sliding window upload rate over the last 1,250 ms across all 6 streams
+        const windowCutoff = nowPerf - 1250;
+        while (uploadBuckets.length > 0 && uploadBuckets[0].t < windowCutoff - 500) {
+          uploadBuckets.shift();
+        }
+        const recentWindow = uploadBuckets.filter((b) => b.t >= windowCutoff);
+        let windowMbps = 0;
+        if (recentWindow.length >= 2) {
+          const spanSec = Math.max(0.18, (nowPerf - recentWindow[0].t) / 1000);
+          const windowBytes = recentWindow.reduce((acc, b) => acc + b.bytes, 0);
+          windowMbps = (windowBytes * 8) / (spanSec * 1_000_000);
+        }
+
+        // 2. Pure upload transmission rate across all 6 concurrent streams (excluding response wait)
+        let pureParallelUploadMbps = 0;
+        if (pureUploadBytes > 0 && pureUploadTransferMs > 15) {
+          const effectiveParallelSec = Math.max(
+            0.05,
+            pureUploadTransferMs / CONCURRENT_STREAMS / 1000
+          );
+          pureParallelUploadMbps = (pureUploadBytes * 8) / (effectiveParallelSec * 1_000_000);
+        }
+
+        // 3. Wall-clock fallback
+        const wallSec = Math.max(0.12, (nowPerf - firstProgressPerf) / 1000);
+        const wallMbps = (bytesToCount * 8) / (wallSec * 1_000_000);
+
+        const bestInstantMbps = Math.max(pureParallelUploadMbps, windowMbps, wallMbps);
+        if (bestInstantMbps > 0 && Number.isFinite(bestInstantMbps)) {
+          throughputSamplesMbps.push(bestInstantMbps);
+        }
+
+        return computeOoklaTrimmedMbps(throughputSamplesMbps) ?? Number(bestInstantMbps.toFixed(2));
       };
 
       const uiInterval = setInterval(() => {
-        const liveMbps = computeCurrentUploadMbps();
-        if (liveMbps !== null) {
+        const liveMbps = evaluateLiveUploadMbps();
+        if (liveMbps !== null && liveMbps > 0) {
           setSpeedTest((prev) => ({
             ...prev,
             uploadMbps: liveMbps,
           }));
 
-          if (liveMbps > 25) {
-            calibratedUploadChunkBytes = 512 * 1024;
-          } else if (liveMbps > 6) {
-            calibratedUploadChunkBytes = 256 * 1024;
+          if (liveMbps > 35) {
+            calibratedUploadChunkBytes = 2560 * 1024; // 2.5 MB
+          } else if (liveMbps > 12) {
+            calibratedUploadChunkBytes = 1280 * 1024; // 1.25 MB
           } else {
-            calibratedUploadChunkBytes = 128 * 1024;
+            calibratedUploadChunkBytes = 512 * 1024; // 512 KB
           }
         }
       }, ODOMETER_UPDATE_INTERVAL_MS);
@@ -620,7 +804,7 @@ export function NetworkStabilityPanel() {
           performance.now() - phaseStartPerf < UPLOAD_PHASE_DURATION_MS
         ) {
           const remainingBudget = maxUploadBytes - totalAllocatedBytes;
-          if (remainingBudget < 32768) {
+          if (remainingBudget < 65536) {
             break;
           }
 
@@ -634,41 +818,36 @@ export function NetworkStabilityPanel() {
           )}&s=${workerIdx}_${seq}_${Date.now()}`;
 
           let chunkProgressCounted = 0;
-          const reqStart = performance.now();
           try {
             if (firstProgressPerf === null) {
               firstProgressPerf = performance.now();
             }
 
-            const confirmedBytes = await sendUploadChunkXhr(
+            const { confirmedBytes, pureUploadDurationMs } = await sendUploadChunkXhr(
               url,
               payload,
               phaseAbort.signal,
-              (delta) => {
+              (delta, nowPerf) => {
                 chunkProgressCounted += delta;
                 inFlightProgressBytes += delta;
+                uploadBuckets.push({ t: nowPerf, bytes: delta });
               }
             );
 
-            const reqDur = Math.max(1, performance.now() - reqStart);
-            activeTransferMs += reqDur / CONCURRENT_STREAMS;
+            pureUploadBytes += confirmedBytes;
+            pureUploadTransferMs += pureUploadDurationMs;
 
             inFlightProgressBytes = Math.max(
               0,
               inFlightProgressBytes - chunkProgressCounted + confirmedBytes
             );
             serverConfirmedBytes += confirmedBytes;
-
-            const remainingTimeMs = UPLOAD_PHASE_DURATION_MS - (performance.now() - phaseStartPerf);
-            if (reqDur < 120 && remainingTimeMs > 140 && !phaseAbort.signal.aborted) {
-              await new Promise((r) => setTimeout(r, 100));
-            }
           } catch {
             inFlightProgressBytes = Math.max(0, inFlightProgressBytes - chunkProgressCounted);
             if (phaseAbort.signal.aborted || masterSignal.aborted) {
               break;
             }
-            await new Promise((r) => setTimeout(r, 150));
+            await new Promise((r) => setTimeout(r, 80));
           }
         }
       };
@@ -693,13 +872,13 @@ export function NetworkStabilityPanel() {
         throw new Error('Cancelled');
       }
 
-      const finalMbps = computeCurrentUploadMbps() ?? 0;
+      const finalMbps = evaluateLiveUploadMbps() ?? 0;
       return finalMbps;
     },
     [sendUploadChunkXhr]
   );
 
-  // Continuous loop: 10s Speed Analysis (5s Download + 5s Upload) -> 3s Pause -> Repeat
+  // Continuous loop: 30s Speed Analysis (15s Download + 15s Upload) -> 10s Cooldown -> Repeat
   useEffect(() => {
     if (!isRunning) {
       return;
@@ -751,17 +930,17 @@ export function NetworkStabilityPanel() {
           }
 
           testToken = initData.token;
-          const maxDlBytes = initData.maxDownloadBytes || 512 * 1024 * 1024;
-          const maxUlBytes = initData.maxUploadBytes || 256 * 1024 * 1024;
+          const maxDlBytes = initData.maxDownloadBytes || 1024 * 1024 * 1024;
+          const maxUlBytes = initData.maxUploadBytes || 512 * 1024 * 1024;
 
-          // 1. 5-Second Download Phase
+          // 1. 15-Second Download Phase
           setSpeedTest((prev) => ({
             ...prev,
             phase: 'downloading',
             error: null,
           }));
 
-          const dlMbps = await runSustainedDownload5s(
+          const dlMbps = await runSustainedDownload15s(
             testToken,
             maxDlBytes,
             loopAbortController.signal
@@ -769,14 +948,14 @@ export function NetworkStabilityPanel() {
 
           if (cancelled || loopAbortController.signal.aborted) break;
 
-          // 2. 5-Second Upload Phase
+          // 2. 15-Second Upload Phase
           setSpeedTest((prev) => ({
             ...prev,
             downloadMbps: dlMbps,
             phase: 'uploading',
           }));
 
-          const ulMbps = await runSustainedUpload5s(
+          const ulMbps = await runSustainedUpload15s(
             testToken,
             maxUlBytes,
             loopAbortController.signal
@@ -784,7 +963,7 @@ export function NetworkStabilityPanel() {
 
           if (cancelled || loopAbortController.signal.aborted) break;
 
-          // 3. Complete 10-second analysis & hold for 3 seconds before repeating
+          // 3. Finalize 30-second analysis & hold for 10-second cooldown before repeating
           setSpeedTest({
             phase: 'cooldown',
             downloadMbps: dlMbps,
@@ -811,7 +990,7 @@ export function NetworkStabilityPanel() {
 
         if (cancelled || loopAbortController.signal.aborted) break;
 
-        // Wait 3 seconds after the 10s Download + Upload test finishes, then repeat
+        // Wait 10 seconds cooldown after the 15s Download + 15s Upload test finishes, then repeat
         await new Promise<void>((resolve) => {
           pauseTimer = setTimeout(resolve, PAUSE_AFTER_TEST_MS);
         });
@@ -835,7 +1014,7 @@ export function NetworkStabilityPanel() {
       }
       activeXhrsRef.current.clear();
     };
-  }, [isRunning, runSustainedDownload5s, runSustainedUpload5s]);
+  }, [isRunning, runSustainedDownload15s, runSustainedUpload15s]);
 
   // Continuous live polling for RTT graph (every 1.5s) and smooth timeline clock (every 500ms)
   useEffect(() => {

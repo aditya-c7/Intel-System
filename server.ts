@@ -33,13 +33,13 @@ const HMAC_SECRET =
   process.env.VISITOR_HMAC_SECRET ||
   'intel-system-first-party-hmac-secret-2026';
 
-const SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES = 512 * 1024 * 1024; // 512 MB max budget so fast connections can sustain full 5s download
-const SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES = 256 * 1024 * 1024; // 256 MB max budget so fast connections can sustain full 5s upload
-const SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = 2 * 1024 * 1024; // 2 MB max per individual stream request (safely under Vercel 4.5 MB limit)
-const SPEED_TEST_MAX_STREAM_UPLOAD_BYTES = 2 * 1024 * 1024; // 2 MB max per individual upload request (safely under Vercel 4.5 MB limit)
-const SPEED_TEST_CONCURRENT_STREAMS = 4;
-const SPEED_TEST_TOKEN_TTL_MS = 60 * 1000; // 60s token validity
-const SPEED_TEST_STREAM_TIMEOUT_MS = 15 * 1000; // 15s hard per-stream timeout
+const SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES = 1024 * 1024 * 1024; // 1 GB max budget so high-bandwidth connections sustain full 15s download
+const SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES = 512 * 1024 * 1024; // 512 MB max budget so high-bandwidth connections sustain full 15s upload
+const SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = 3584 * 1024; // 3.5 MB max per individual stream request (safely under Vercel 4.5 MB limit)
+const SPEED_TEST_MAX_STREAM_UPLOAD_BYTES = 3584 * 1024; // 3.5 MB max per individual upload request (safely under Vercel 4.5 MB limit)
+const SPEED_TEST_CONCURRENT_STREAMS = 8;
+const SPEED_TEST_TOKEN_TTL_MS = 120 * 1000; // 120s token validity for 15s DL + 15s UL cycle
+const SPEED_TEST_STREAM_TIMEOUT_MS = 25 * 1000; // 25s hard per-stream timeout
 const HIGH_ENTROPY_64KB_CHUNK = crypto.randomBytes(65536); // Non-compressible 64 KB random buffer
 
 interface VisitorRow {
@@ -1284,7 +1284,7 @@ app.get('/api/network/download', (req, res) => {
   }
 
   const ledger = verification.ledger;
-  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 2) {
+  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 6) {
     res.status(429).json({ error: 'Concurrent stream limit exceeded for this speed test.' });
     return;
   }
@@ -1414,7 +1414,7 @@ app.post('/api/network/upload', (req, res) => {
   }
 
   const ledger = verification.ledger;
-  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 2) {
+  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS + 6) {
     req.resume();
     res.status(429).json({ error: 'Concurrent upload stream limit exceeded.' });
     return;
@@ -1553,7 +1553,7 @@ app.post('/api/network/speed-test/init', (req, res) => {
       activeSpeedTests.delete(existingId);
       continue;
     }
-    if (!ledger.completed && nowMs < ledger.expiresAtMs && nowMs - ledger.createdAtMs < 20000) {
+    if (!ledger.completed && nowMs < ledger.expiresAtMs && nowMs - ledger.createdAtMs < 45000) {
       activeCount += 1;
       if (ledger.ipKey === ipKey) {
         activeIpCount += 1;

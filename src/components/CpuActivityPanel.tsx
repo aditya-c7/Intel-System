@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { Cpu, Play, Square, Clock, ExternalLink, RefreshCw } from 'lucide-react';
 
 export type RawPressureState = 'nominal' | 'fair' | 'serious' | 'critical';
-export type DisplayPressureLevel = 'Light' | 'Moderate' | 'High' | 'Heavy';
+export type DisplayPressureLevel = 'Normal' | 'Moderate' | 'High' | 'Heavy';
 
 export type CpuMonitorStatus =
   | 'Initializing'
@@ -44,13 +44,123 @@ const FIVE_MINUTES_MS = 5 * 60 * 1000; // 300,000 ms rolling five-minute timelin
 const STALE_THRESHOLD_MS = 15 * 1000; // 15s threshold to indicate held/unchanged state
 
 const PRESSURE_MAP: Record<RawPressureState, DisplayPressureLevel> = {
-  nominal: 'Light',
+  nominal: 'Normal',
   fair: 'Moderate',
   serious: 'High',
   critical: 'Heavy',
 };
 
-const DISPLAY_LEVELS: DisplayPressureLevel[] = ['Light', 'Moderate', 'High', 'Heavy'];
+const DISPLAY_LEVELS: DisplayPressureLevel[] = ['Normal', 'Moderate', 'High', 'Heavy'];
+
+const SYSTEM_LOAD_THEME: Record<
+  DisplayPressureLevel,
+  {
+    circleBg: string;
+    iconColor: string;
+    needleAngleDeg: number;
+    rawLabel: RawPressureState;
+  }
+> = {
+  Normal: {
+    circleBg: '#DCFCE7',
+    iconColor: '#15803D',
+    needleAngleDeg: -38,
+    rawLabel: 'nominal',
+  },
+  Moderate: {
+    circleBg: '#FDECC8',
+    iconColor: '#B45309',
+    needleAngleDeg: -16,
+    rawLabel: 'fair',
+  },
+  High: {
+    circleBg: '#FCD9BD',
+    iconColor: '#C2410C',
+    needleAngleDeg: 18,
+    rawLabel: 'serious',
+  },
+  Heavy: {
+    circleBg: '#FAD1D1',
+    iconColor: '#B91C1C',
+    needleAngleDeg: 42,
+    rawLabel: 'critical',
+  },
+};
+
+function SystemLoadGaugeIcon({
+  level,
+  size = 22,
+}: {
+  level: DisplayPressureLevel;
+  size?: number;
+}) {
+  const theme = SYSTEM_LOAD_THEME[level];
+  const maskId = `gauge-needle-cutout-${level.toLowerCase()}`;
+
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+      className="block shrink-0"
+    >
+      <defs>
+        {/* Creates the authentic small gap in the speedometer arch right around the needle tip */}
+        <mask id={maskId}>
+          <rect x="0" y="0" width="24" height="24" fill="white" />
+          <g transform={`rotate(${theme.needleAngleDeg} 12 14)`}>
+            <polygon points="9.7,4.2 14.3,4.2 13.1,10.5 10.9,10.5" fill="black" />
+          </g>
+        </mask>
+      </defs>
+
+      {/* Speedometer D-shape arch + flat baseline */}
+      <path
+        d="M 5.35 16.5 A 7.6 7.6 0 1 1 18.65 16.5 C 18.95 15.95 18.55 17.2 17.6 17.2 L 6.4 17.2 C 5.45 17.2 5.05 15.95 5.35 16.5 Z"
+        stroke={theme.iconColor}
+        strokeWidth="1.95"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        mask={`url(#${maskId})`}
+      />
+
+      {/* Tapered gauge needle + center pivot */}
+      <g transform={`rotate(${theme.needleAngleDeg} 12 14)`}>
+        <path
+          d="M 10.45 14 L 11.65 5.4 C 11.75 4.85 12.25 4.85 12.35 5.4 L 13.55 14 Z"
+          fill={theme.iconColor}
+        />
+        <circle cx="12" cy="14" r="1.75" fill={theme.iconColor} />
+      </g>
+    </svg>
+  );
+}
+
+function SystemLoadBadge({ level }: { level: DisplayPressureLevel }) {
+  const theme = SYSTEM_LOAD_THEME[level];
+
+  return (
+    <div className="inline-flex items-center gap-3.5 select-none">
+      <div
+        className="w-10 h-10 rounded-full flex items-center justify-center shrink-0 transition-colors duration-300"
+        style={{ backgroundColor: theme.circleBg }}
+      >
+        <SystemLoadGaugeIcon level={level} size={22} />
+      </div>
+      <div className="flex flex-col justify-center">
+        <span className="text-[15px] font-semibold text-slate-900 leading-tight tracking-[-0.01em]">
+          System load
+        </span>
+        <span className="text-[13px] font-normal text-slate-600 leading-snug mt-0.5">
+          {level}
+        </span>
+      </div>
+    </div>
+  );
+}
 
 function formatClockTimestamp(ms: number): string {
   const d = new Date(ms);
@@ -608,6 +718,10 @@ export function CpuActivityPanel() {
     return errorDetail || 'Initialization error';
   };
 
+  const currentBadgeLevel: DisplayPressureLevel = latestSample
+    ? latestSample.displayLevel
+    : 'Normal';
+
   return (
     <div className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6 flex flex-col justify-between">
       <div>
@@ -668,8 +782,12 @@ export function CpuActivityPanel() {
           </div>
         </div>
 
-        {/* Summary Metrics Row */}
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 sm:gap-4 py-3.5 border-b border-slate-100 text-xs">
+        {/* Summary Metrics Row with Single Active System Load Badge */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 items-center gap-3 sm:gap-4 py-3.5 border-b border-slate-100 text-xs">
+          <div className="flex items-center">
+            <SystemLoadBadge level={currentBadgeLevel} />
+          </div>
+
           <div>
             <span className="text-slate-500 block">Current CPU State</span>
             <span className="text-sm sm:text-base font-bold text-slate-900 mt-0.5 block">
@@ -691,7 +809,7 @@ export function CpuActivityPanel() {
             )}
           </div>
 
-          <div className="col-span-2 sm:col-span-1">
+          <div>
             <span className="text-slate-500 block">Recorded Observations</span>
             <span className="text-sm sm:text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block">
               {samples.length} {samples.length === 1 ? 'record' : 'records'}
@@ -720,7 +838,7 @@ export function CpuActivityPanel() {
         {/* Step-Line Time-Series Graph (1:1 Responsive on Mobile & Desktop) */}
         <div className="mt-3.5" ref={chartWrapperRef}>
           <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1.5">
-            <span>CPU Pressure (Light to Heavy) / Click line to inspect time</span>
+            <span>CPU Pressure (Normal to Heavy) / Click line to inspect time</span>
             <span className="font-mono tabular-nums">
               {status === 'Live'
                 ? 'Live 5m'
@@ -748,7 +866,7 @@ export function CpuActivityPanel() {
                 </clipPath>
               </defs>
 
-              {/* Horizontal Gridlines & Labels for Light, Moderate, High, Heavy */}
+              {/* Horizontal Gridlines & Labels for Normal, Moderate, High, Heavy */}
               {DISPLAY_LEVELS.map((level) => {
                 const y = getYForLevel(level);
                 return (
@@ -905,7 +1023,7 @@ export function CpuActivityPanel() {
 
       {/* Concise Status Footer */}
       <div className="mt-4 pt-3.5 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
-        <span>nominal: Light / fair: Moderate / serious: High / critical: Heavy</span>
+        <span>nominal: Normal / fair: Moderate / serious: High / critical: Heavy</span>
         <span className="font-mono shrink-0">
           {httpPolicyHeader
             ? `Policy: ${httpPolicyHeader}`
