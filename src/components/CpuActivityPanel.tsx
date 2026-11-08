@@ -693,29 +693,27 @@ export function CpuActivityPanel() {
     }
   };
 
-  // Format main current load description according to the 7 distinct states
+  // Format main current load description concisely
   const renderCurrentLoadValue = () => {
     if (status === 'Initializing') {
-      return 'Initializing observer...';
+      return 'Initializing...';
     }
     if (status === 'Monitoring' && !latestSample) {
-      return 'Waiting for first CPU pressure observation';
+      return 'Awaiting sample';
     }
     if ((status === 'Live' || status === 'Paused' || status === 'Monitoring') && latestSample) {
       return `${latestSample.displayLevel} (${latestSample.rawState})`;
     }
     if (status === 'Paused') {
-      return 'Paused (tab inactive or stopped)';
+      return 'Paused';
     }
     if (status === 'Blocked') {
-      return insideIframe
-        ? 'Blocked in preview iframe (open in direct tab)'
-        : 'Permissions Policy rejected access';
+      return insideIframe ? 'Blocked in iframe' : 'Policy blocked';
     }
     if (status === 'Unsupported') {
-      return 'CPU source unavailable';
+      return 'Unsupported';
     }
-    return errorDetail || 'Initialization error';
+    return 'Error';
   };
 
   const currentBadgeLevel: DisplayPressureLevel = latestSample
@@ -783,45 +781,51 @@ export function CpuActivityPanel() {
         </div>
 
         {/* Summary Metrics Row with Single Active System Load Badge */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 items-center gap-3 sm:gap-4 py-3.5 border-b border-slate-100 text-xs">
-          <div className="flex items-center">
+        <div className="grid grid-cols-2 sm:grid-cols-4 items-stretch gap-2.5 sm:gap-3 py-3.5 border-b border-slate-100 text-xs">
+          <div className="p-2.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center min-w-0">
             <SystemLoadBadge level={currentBadgeLevel} />
           </div>
 
-          <div>
-            <span className="text-slate-500 block">Current CPU State</span>
-            <span className="text-sm sm:text-base font-bold text-slate-900 mt-0.5 block">
+          <div className="p-2.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex flex-col justify-center min-w-0">
+            <span className="text-[11px] text-slate-500 block truncate">CPU State</span>
+            <span
+              className="text-sm sm:text-base font-bold text-slate-900 mt-0.5 block truncate"
+              title={errorDetail || renderCurrentLoadValue()}
+            >
               {renderCurrentLoadValue()}
             </span>
           </div>
 
-          <div>
-            <span className="text-slate-500 inline-flex items-center gap-1">
-              <Clock className="w-3 h-3 text-slate-400" /> Last Observation
+          <div className="p-2.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex flex-col justify-center min-w-0">
+            <span className="text-[11px] text-slate-500 inline-flex items-center gap-1 truncate">
+              <Clock className="w-3 h-3 text-slate-400 shrink-0" /> Last Sample
             </span>
-            <span className="text-sm sm:text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block">
+            <span className="text-sm sm:text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block truncate">
               {latestSample ? formatClockTimestamp(latestSample.timestampMs) : 'Waiting...'}
             </span>
             {isStale && timeSinceLastObservationMs !== null && (
-              <span className="text-[11px] font-mono text-amber-700 block mt-0.5">
-                {Math.round(timeSinceLastObservationMs / 1000)}s ago (state held)
+              <span className="text-[10px] font-mono text-amber-700 block truncate">
+                {Math.round(timeSinceLastObservationMs / 1000)}s held
               </span>
             )}
           </div>
 
-          <div>
-            <span className="text-slate-500 block">Recorded Observations</span>
-            <span className="text-sm sm:text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block">
-              {samples.length} {samples.length === 1 ? 'record' : 'records'}
+          <div className="p-2.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex flex-col justify-center min-w-0">
+            <span className="text-[11px] text-slate-500 block truncate">Samples</span>
+            <span className="text-sm sm:text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block truncate">
+              {samples.length}{' '}
+              <span className="text-[11px] font-sans font-normal text-slate-500">
+                {samples.length === 1 ? 'record' : 'records'}
+              </span>
             </span>
           </div>
         </div>
 
         {/* Notice if blocked specifically by embedded preview iframe */}
         {status === 'Blocked' && insideIframe && (
-          <div className="mt-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-900 flex items-center justify-between gap-2">
-            <span>
-              The outer preview iframe does not delegate <code className="font-mono">compute-pressure</code>. Open the app URL directly in a browser tab (<code className="font-mono">InsideIframe: false</code>) for live CPU observations.
+          <div className="mt-3 px-3 py-2 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900 flex items-center justify-between gap-2">
+            <span className="truncate">
+              Open in a direct browser tab to enable W3C Compute Pressure telemetry.
             </span>
             <a
               href={typeof window !== 'undefined' ? window.location.href : '#'}
@@ -838,12 +842,12 @@ export function CpuActivityPanel() {
         {/* Step-Line Time-Series Graph (1:1 Responsive on Mobile & Desktop) */}
         <div className="mt-3.5" ref={chartWrapperRef}>
           <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1.5">
-            <span>CPU Pressure (Normal to Heavy) / Click line to inspect time</span>
+            <span>CPU Pressure (Normal to Heavy) • Tap line to inspect</span>
             <span className="font-mono tabular-nums">
               {status === 'Live'
                 ? 'Live 5m'
                 : status === 'Monitoring'
-                ? 'Waiting for first observation'
+                ? 'Awaiting sample'
                 : status}
             </span>
           </div>
@@ -1022,13 +1026,12 @@ export function CpuActivityPanel() {
       </div>
 
       {/* Concise Status Footer */}
-      <div className="mt-4 pt-3.5 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
-        <span>nominal: Normal / fair: Moderate / serious: High / critical: Heavy</span>
-        <span className="font-mono shrink-0">
-          {httpPolicyHeader
-            ? `Policy: ${httpPolicyHeader}`
-            : 'PressureObserver ("cpu", 1000ms)'}
-        </span>
+      <div
+        className="mt-4 pt-3.5 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500"
+        title={httpPolicyHeader ? `Permissions-Policy: ${httpPolicyHeader}` : undefined}
+      >
+        <span>Scale: Normal • Moderate • High • Heavy</span>
+        <span className="font-mono shrink-0">W3C Compute Pressure (1s)</span>
       </div>
     </div>
   );

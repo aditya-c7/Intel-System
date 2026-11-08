@@ -46,14 +46,22 @@
 .dark .bg-\[\#F8FAFC\] { background-color: #0b1220; }
 .dark .bg-\[\#FAFAFA\] { background-color: #111c2e; }
 .dark .bg-slate-50 { background-color: #111c2e; }
+.dark .bg-slate-50\/60,
+.dark .bg-slate-50\/70 { background-color: rgba(17, 28, 46, 0.75); }
 .dark .bg-slate-100 { background-color: #16223a; }
 .dark .bg-slate-200 { background-color: #1e2c45; }
 .dark .bg-\[\#ECFDF5\],
 .dark .bg-\[\#ECFDF5\]\/65 { background-color: rgba(16, 185, 129, 0.12); }
-.dark .bg-blue-50\/40 { background-color: rgba(59, 130, 246, 0.12); }
-.dark .bg-emerald-50\/40 { background-color: rgba(16, 185, 129, 0.12); }
+.dark .bg-blue-50\/40,
+.dark .bg-blue-50\/60 { background-color: rgba(59, 130, 246, 0.14); }
+.dark .bg-emerald-50\/40,
+.dark .bg-emerald-50\/60 { background-color: rgba(16, 185, 129, 0.14); }
 .dark .bg-orange-50\/60 { background-color: rgba(240, 90, 40, 0.14); }
-.dark .bg-amber-50 { background-color: rgba(245, 158, 11, 0.1); }
+.dark .bg-amber-50,
+.dark .bg-amber-50\/60 { background-color: rgba(245, 158, 11, 0.13); }
+.dark .bg-red-50,
+.dark .bg-rose-50 { background-color: rgba(244, 63, 94, 0.14); }
+.dark .bg-indigo-50\/60 { background-color: rgba(99, 102, 241, 0.14); }
 .dark .bg-\[\#2563EB\] { background-color: #2563eb; }
 
 .dark .hover\:bg-slate-50:hover,
@@ -71,7 +79,10 @@
 .dark .border-amber-200,
 .dark .border-amber-200\/80,
 .dark .border-amber-300 { border-color: #78350f; }
-.dark .border-red-300 { border-color: #7f1d1d; }
+.dark .border-red-300,
+.dark .border-rose-200,
+.dark .border-rose-300 { border-color: #881337; }
+.dark .border-indigo-200 { border-color: #312e81; }
 
 .dark .divide-\[\#E5E7EB\] > :not(:last-child),
 .dark .divide-slate-100 > :not(:last-child) { border-color: #223047; }
@@ -90,7 +101,11 @@
 .dark .text-emerald-600,
 .dark .text-emerald-700 { color: #34d399; }
 .dark .text-red-600,
-.dark .text-red-700 { color: #f87171; }
+.dark .text-red-700,
+.dark .text-rose-600,
+.dark .text-rose-700 { color: #fb7185; }
+.dark .text-indigo-600 { color: #818cf8; }
+.dark .text-amber-600,
 .dark .text-amber-700 { color: #fbbf24; }
 .dark .text-amber-800 { color: #fcd34d; }
 .dark .text-amber-900 { color: #fde68a; }

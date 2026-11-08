@@ -474,9 +474,9 @@ export function NetworkStabilityPanel() {
           }));
 
           if (liveMbps > 60) {
-            calibratedChunkBytes = 3584 * 1024; // 3.5 MB
+            calibratedChunkBytes = 2048 * 1024; // 2.0 MB (Vercel serverless safe cap)
           } else if (liveMbps > 20) {
-            calibratedChunkBytes = 2048 * 1024; // 2.0 MB
+            calibratedChunkBytes = 1536 * 1024; // 1.5 MB
           } else {
             calibratedChunkBytes = 1024 * 1024; // 1.0 MB
           }
@@ -855,9 +855,9 @@ export function NetworkStabilityPanel() {
           }));
 
           if (liveMbps > 35) {
-            calibratedUploadChunkBytes = 2560 * 1024; // 2.5 MB
+            calibratedUploadChunkBytes = 1536 * 1024; // 1.5 MB (Vercel serverless safe cap)
           } else if (liveMbps > 12) {
-            calibratedUploadChunkBytes = 1280 * 1024; // 1.25 MB
+            calibratedUploadChunkBytes = 1024 * 1024; // 1.0 MB
           } else {
             calibratedUploadChunkBytes = 512 * 1024; // 512 KB
           }
@@ -1319,10 +1319,10 @@ export function NetworkStabilityPanel() {
         </div>
 
         {/* Metrics Strip: Current Latency, Average Latency, Jitter, Failure Rate */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4 py-3.5 border-b border-slate-100 text-xs">
-          <div>
-            <span className="text-slate-500 block">Current Latency</span>
-            <span className="text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 sm:gap-3 py-3.5 border-b border-slate-100 text-xs">
+          <div className="p-2.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] min-w-0">
+            <span className="text-[11px] text-slate-500 block truncate">Current RTT</span>
+            <span className="text-sm sm:text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block truncate">
               {currentLatencyMs !== null
                 ? `${currentLatencyMs} ms`
                 : latestSample?.failed
@@ -1330,26 +1330,30 @@ export function NetworkStabilityPanel() {
                 : 'N/A'}
             </span>
           </div>
-          <div>
-            <span className="text-slate-500 block">Average</span>
-            <span className="text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block">
+          <div className="p-2.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] min-w-0">
+            <span className="text-[11px] text-slate-500 block truncate">Average RTT</span>
+            <span className="text-sm sm:text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block truncate">
               {averageLatencyMs !== null ? `${averageLatencyMs} ms` : 'N/A'}
             </span>
           </div>
-          <div>
-            <span className="text-slate-500 block">Jitter</span>
-            <span className="text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block">
+          <div className="p-2.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] min-w-0">
+            <span className="text-[11px] text-slate-500 block truncate">Jitter</span>
+            <span className="text-sm sm:text-base font-bold font-mono tabular-nums text-slate-900 mt-0.5 block truncate">
               {jitterMs !== null ? `${jitterMs} ms` : 'N/A'}
             </span>
           </div>
-          <div>
-            <span className="text-slate-500 block">Failure Rate</span>
+          <div className="p-2.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] min-w-0">
+            <span className="text-[11px] text-slate-500 block truncate">Packet Loss</span>
             <span
-              className={`text-base font-bold font-mono tabular-nums mt-0.5 block ${
+              className={`text-sm sm:text-base font-bold font-mono tabular-nums mt-0.5 block truncate ${
                 failedCount > 0 ? 'text-red-600' : 'text-slate-900'
               }`}
+              title={`${failedCount} failed of ${totalCount} probes`}
             >
-              {failureRatePercent}% ({failedCount}/{totalCount})
+              {failureRatePercent}%{' '}
+              <span className="text-[11px] font-normal text-slate-500">
+                ({failedCount}/{totalCount})
+              </span>
             </span>
           </div>
         </div>
@@ -1357,7 +1361,7 @@ export function NetworkStabilityPanel() {
         {/* Interactive Right-to-Left Scrolling Time-Series Graph (1:1 Responsive on Mobile & Desktop) */}
         <div className="mt-3.5" ref={chartWrapperRef}>
           <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1.5">
-            <span>HTTP RTT (ms) / Click line to inspect time</span>
+            <span>HTTP RTT (ms) • Tap line to inspect</span>
             <span className="font-mono tabular-nums">
               {isRunning ? 'Live 5m' : 'Paused'}
             </span>

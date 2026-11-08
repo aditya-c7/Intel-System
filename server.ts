@@ -9,6 +9,10 @@ import { createRequire } from 'module';
 import dotenv from 'dotenv';
 import type {
   BrowserDeviceInfo,
+  HardwareSignals,
+  SecuritySignals,
+  RiskLevel,
+  PersistenceMode,
   LocationInfo,
   VisitStatistics,
   VisitHistoryRecord,
@@ -35,9 +39,9 @@ const HMAC_SECRET =
 
 const SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES = 1024 * 1024 * 1024; // 1 GB max budget so high-bandwidth connections sustain full 15s download
 const SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES = 512 * 1024 * 1024; // 512 MB max budget so high-bandwidth connections sustain full 15s upload
-const SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = 3584 * 1024; // 3.5 MB max per individual stream request (safely under Vercel 4.5 MB limit)
-const SPEED_TEST_MAX_STREAM_UPLOAD_BYTES = 3584 * 1024; // 3.5 MB max per individual upload request (safely under Vercel 4.5 MB limit)
-const SPEED_TEST_CONCURRENT_STREAMS = 8;
+const SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = 2 * 1024 * 1024; // 2 MB max per individual stream request (well below Vercel 4.5 MB limit)
+const SPEED_TEST_MAX_STREAM_UPLOAD_BYTES = 2 * 1024 * 1024; // 2 MB max per individual upload request (well below Vercel 4.5 MB limit)
+const SPEED_TEST_CONCURRENT_STREAMS = 6;
 const SPEED_TEST_TOKEN_TTL_MS = 120 * 1000; // 120s token validity for 15s DL + 15s UL cycle
 const SPEED_TEST_STREAM_TIMEOUT_MS = 25 * 1000; // 25s hard per-stream timeout
 const HIGH_ENTROPY_64KB_CHUNK = crypto.randomBytes(65536); // Non-compressible 64 KB random buffer
@@ -45,6 +49,7 @@ const HIGH_ENTROPY_64KB_CHUNK = crypto.randomBytes(65536); // Non-compressible 6
 interface VisitorRow {
   visitor_id: string;
   hmac_token: string;
+  hardware_id: string;
   created_at_utc: string;
   updated_at_utc: string;
   active_session_id: string;
@@ -128,6 +133,14 @@ function createInMemoryDbAdapter(): DatabaseAdapter {
             const vid = String(params[0] || '');
             return visitorsMap.get(vid);
           }
+          if (normalized.includes('SELECT * FROM visitors WHERE hardware_id = ?')) {
+            const hwid = String(params[0] || '');
+            if (!hwid || !hwid.startsWith('hwid_')) return undefined;
+            const matches = Array.from(visitorsMap.values())
+              .filter((v) => v.hardware_id === hwid)
+              .sort((a, b) => b.updated_at_utc.localeCompare(a.updated_at_utc));
+            return matches[0];
+          }
           if (
             normalized.includes(
               'SELECT session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?'
@@ -207,24 +220,40 @@ function createInMemoryDbAdapter(): DatabaseAdapter {
             return { changes: 1 };
           }
           if (normalized.includes('INSERT INTO visitors') || normalized.includes('INSERT OR REPLACE INTO visitors')) {
-            const row: VisitorRow = {
-              visitor_id: String(params[0] || ''),
-              hmac_token: String(params[1] || ''),
-              created_at_utc: String(params[2] || ''),
-              updated_at_utc: String(params[3] || ''),
-              active_session_id: String(params[4] || ''),
-              last_activity_utc: String(params[5] || ''),
-            };
+            const hasHwCol = normalized.includes('hardware_id');
+            const row: VisitorRow = hasHwCol
+              ? {
+                  visitor_id: String(params[0] || ''),
+                  hmac_token: String(params[1] || ''),
+                  hardware_id: String(params[2] || ''),
+                  created_at_utc: String(params[3] || ''),
+                  updated_at_utc: String(params[4] || ''),
+                  active_session_id: String(params[5] || ''),
+                  last_activity_utc: String(params[6] || ''),
+                }
+              : {
+                  visitor_id: String(params[0] || ''),
+                  hmac_token: String(params[1] || ''),
+                  hardware_id: '',
+                  created_at_utc: String(params[2] || ''),
+                  updated_at_utc: String(params[3] || ''),
+                  active_session_id: String(params[4] || ''),
+                  last_activity_utc: String(params[5] || ''),
+                };
             visitorsMap.set(row.visitor_id, row);
             return { changes: 1 };
           }
           if (normalized.includes('UPDATE visitors')) {
-            const vid = String(params[3] || '');
+            const hasHwUpdate = normalized.includes('hardware_id = ?');
+            const vid = String(hasHwUpdate ? params[4] : params[3] || '');
             const existing = visitorsMap.get(vid);
             if (existing) {
               existing.updated_at_utc = String(params[0] || existing.updated_at_utc);
               existing.active_session_id = String(params[1] || existing.active_session_id);
               existing.last_activity_utc = String(params[2] || existing.last_activity_utc);
+              if (hasHwUpdate && typeof params[3] === 'string' && params[3]) {
+                existing.hardware_id = params[3];
+              }
               return { changes: 1 };
             }
             return { changes: 0 };
@@ -310,6 +339,7 @@ function initializeDatabase(): DatabaseAdapter {
       CREATE TABLE IF NOT EXISTS visitors (
         visitor_id TEXT PRIMARY KEY,
         hmac_token TEXT NOT NULL,
+        hardware_id TEXT NOT NULL DEFAULT '',
         created_at_utc TEXT NOT NULL,
         updated_at_utc TEXT NOT NULL,
         active_session_id TEXT NOT NULL,
@@ -359,6 +389,17 @@ function initializeDatabase(): DatabaseAdapter {
         verified_at_ms INTEGER NOT NULL
       );
     `);
+
+    try {
+      sqliteDb.exec(`ALTER TABLE visitors ADD COLUMN hardware_id TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_visitors_hwid ON visitors(hardware_id)`);
+    } catch {
+      // Ignore index error
+    }
 
     for (const col of ['isp', 'org', 'asn']) {
       try {
@@ -424,7 +465,8 @@ function createSignedHistoryBackup(
   totalVisits: number,
   totalSessions: number,
   firstVisitUtc: string,
-  visits: VisitHistoryRecord[]
+  visits: VisitHistoryRecord[],
+  hardwareId?: string
 ): SignedHistoryBackup {
   const compactVisits = visits.slice(0, 35);
   const signature = computeHistoryBackupSignature(
@@ -436,6 +478,7 @@ function createSignedHistoryBackup(
   );
   return {
     visitorId,
+    hardwareId,
     totalVisits,
     totalSessions,
     firstVisitUtc,
@@ -1673,6 +1716,7 @@ function extractVercelEdgeGeo(req: express.Request): {
   city: string;
   region: string;
   country: string;
+  timezone: string;
   latitude: number | null;
   longitude: number | null;
 } {
@@ -1687,6 +1731,7 @@ function extractVercelEdgeGeo(req: express.Request): {
   const city = decodeHeader(req.headers['x-vercel-ip-city']);
   const region = decodeHeader(req.headers['x-vercel-ip-country-region']);
   const country = decodeHeader(req.headers['x-vercel-ip-country']);
+  const timezone = decodeHeader(req.headers['x-vercel-ip-timezone']);
   const rawLat = parseFloat(String(req.headers['x-vercel-ip-latitude'] || ''));
   const rawLon = parseFloat(String(req.headers['x-vercel-ip-longitude'] || ''));
 
@@ -1694,8 +1739,224 @@ function extractVercelEdgeGeo(req: express.Request): {
     city,
     region,
     country,
+    timezone,
     latitude: Number.isFinite(rawLat) ? rawLat : null,
     longitude: Number.isFinite(rawLon) ? rawLon : null,
+  };
+}
+
+const SERVER_TIMEZONE_ALIAS_MAP: Record<string, string> = {
+  'asia/calcutta': 'asia/kolkata',
+  'asia/katmandu': 'asia/kathmandu',
+  'asia/rangoon': 'asia/yangon',
+  'asia/saigon': 'asia/ho_chi_minh',
+  'europe/kiev': 'europe/kyiv',
+  'us/eastern': 'america/new_york',
+  'us/central': 'america/chicago',
+  'us/mountain': 'america/denver',
+  'us/pacific': 'america/los_angeles',
+  'etc/utc': 'utc',
+  'etc/gmt': 'utc',
+};
+
+function normalizeServerTimezoneId(tz: string | null | undefined): string {
+  if (!tz || typeof tz !== 'string') return '';
+  const cleaned = tz.trim().toLowerCase();
+  if (!cleaned || cleaned === 'unknown') return '';
+  return SERVER_TIMEZONE_ALIAS_MAP[cleaned] || cleaned;
+}
+
+function sanitizeHardwareSignals(
+  raw: Partial<HardwareSignals> | null | undefined,
+  browserDevice: BrowserDeviceInfo
+): HardwareSignals {
+  const safeStr = (val: unknown, fallback: string, maxLen = 140): string =>
+    typeof val === 'string' && val.trim().length > 0 ? val.trim().slice(0, maxLen) : fallback;
+
+  const rawHwId = safeStr(raw?.hardwareId, '', 40);
+  const validHwId = /^hwid_[0-9a-f]{16,32}$/i.test(rawHwId)
+    ? rawHwId.toLowerCase()
+    : 'hwid_' +
+      crypto
+        .createHash('sha256')
+        .update(
+          `${browserDevice.os}|${browserDevice.screenResolution}|${browserDevice.pixelRatio}|${safeStr(raw?.gpuRenderer, 'gpu')}|${safeStr(raw?.canvasHash, 'canvas')}`
+        )
+        .digest('hex')
+        .slice(0, 20);
+
+  const cpuCores =
+    typeof raw?.cpuCores === 'number' && Number.isFinite(raw.cpuCores) && raw.cpuCores > 0
+      ? Math.min(256, Math.round(raw.cpuCores))
+      : null;
+
+  const deviceMemoryGb =
+    typeof raw?.deviceMemoryGb === 'number' &&
+    Number.isFinite(raw.deviceMemoryGb) &&
+    raw.deviceMemoryGb > 0
+      ? Number(raw.deviceMemoryGb)
+      : null;
+
+  const maxTouchPoints =
+    typeof raw?.maxTouchPoints === 'number' &&
+    Number.isFinite(raw.maxTouchPoints) &&
+    raw.maxTouchPoints >= 0
+      ? Math.min(64, Math.round(raw.maxTouchPoints))
+      : 0;
+
+  const colorDepth =
+    typeof raw?.colorDepth === 'number' && Number.isFinite(raw.colorDepth) && raw.colorDepth > 0
+      ? Math.min(64, Math.round(raw.colorDepth))
+      : 24;
+
+  const maxTextureSize =
+    typeof raw?.maxTextureSize === 'number' &&
+    Number.isFinite(raw.maxTextureSize) &&
+    raw.maxTextureSize >= 0
+      ? Math.round(raw.maxTextureSize)
+      : 0;
+
+  return {
+    hardwareId: validHwId,
+    gpuVendor: safeStr(raw?.gpuVendor, 'Standard WebGL Vendor', 120),
+    gpuRenderer: safeStr(raw?.gpuRenderer, 'Standard Hardware Renderer', 160),
+    maxTextureSize,
+    canvasHash: safeStr(raw?.canvasHash, 'unavailable', 40),
+    audioHash: safeStr(raw?.audioHash, 'unavailable', 40),
+    cpuCores,
+    deviceMemoryGb,
+    colorDepth,
+    maxTouchPoints,
+    hdrSupported: Boolean(raw?.hdrSupported),
+    colorGamut:
+      raw?.colorGamut === 'Rec2020' || raw?.colorGamut === 'P3' || raw?.colorGamut === 'sRGB'
+        ? raw.colorGamut
+        : 'sRGB',
+    architecture: safeStr(raw?.architecture, browserDevice.os, 80),
+  };
+}
+
+function sanitizeAndReinforceSecuritySignals(
+  raw: Partial<SecuritySignals> | null | undefined,
+  browserDevice: BrowserDeviceInfo,
+  location: LocationInfo,
+  ipTimezoneHint: string,
+  recognitionSource: IntelVisitorResponse['recognitionSource']
+): SecuritySignals {
+  const safeStrArray = (arr: unknown): string[] =>
+    Array.isArray(arr)
+      ? arr
+          .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+          .map((s) => s.trim().slice(0, 180))
+          .slice(0, 10)
+      : [];
+
+  const isBot = Boolean(raw?.isBot);
+  const botSignals = safeStrArray(raw?.botSignals);
+
+  const browserTimezone =
+    typeof raw?.browserTimezone === 'string' && raw.browserTimezone.trim()
+      ? raw.browserTimezone.trim().slice(0, 80)
+      : browserDevice.timezone || 'UTC';
+
+  const ipTimezone =
+    ipTimezoneHint ||
+    (typeof raw?.ipTimezone === 'string' && raw.ipTimezone.trim() && raw.ipTimezone !== 'Unavailable'
+      ? raw.ipTimezone.trim().slice(0, 80)
+      : 'Unavailable');
+
+  const normBrowserTz = normalizeServerTimezoneId(browserTimezone);
+  const normIpTz = normalizeServerTimezoneId(ipTimezone);
+  const serverTzMismatch = Boolean(normBrowserTz && normIpTz && normBrowserTz !== normIpTz);
+  const timezoneMismatch = Boolean(raw?.timezoneMismatch) || serverTzMismatch;
+
+  const datacenterAsn = Boolean(raw?.datacenterAsn) || Boolean(location.isVpnOrHosting);
+  const vpnReasons = safeStrArray(raw?.vpnReasons);
+  if (
+    timezoneMismatch &&
+    !vpnReasons.some((r) => r.toLowerCase().includes('timezone'))
+  ) {
+    vpnReasons.push(
+      `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})`
+    );
+  }
+  if (
+    datacenterAsn &&
+    !vpnReasons.some((r) => r.toLowerCase().includes('datacenter') || r.toLowerCase().includes('asn'))
+  ) {
+    vpnReasons.push(
+      `Network ASN / ISP (${location.isp}${location.asn !== 'Unknown' ? ` • ${location.asn}` : ''}) matches cloud/hosting or VPN infrastructure`
+    );
+  }
+  const vpnSuspected = Boolean(raw?.vpnSuspected) || timezoneMismatch || datacenterAsn;
+
+  const tamperDetected = Boolean(raw?.tamperDetected);
+  const tamperReasons = safeStrArray(raw?.tamperReasons);
+
+  const incognitoLikely = Boolean(raw?.incognitoLikely);
+  const storageQuotaMb =
+    typeof raw?.storageQuotaMb === 'number' &&
+    Number.isFinite(raw.storageQuotaMb) &&
+    raw.storageQuotaMb > 0
+      ? Math.round(raw.storageQuotaMb)
+      : null;
+
+  let persistenceMode: SecuritySignals['persistenceMode'] = 'First-Party Cookie';
+  if (recognitionSource === 'Hardware Fingerprint (Cookie-less / Incognito)') {
+    persistenceMode = 'Hardware ID Recovered';
+  } else if (incognitoLikely) {
+    persistenceMode = 'Private / Restricted Storage';
+  }
+
+  let suspectScore = 0;
+  const riskFactors: string[] = [];
+
+  if (isBot) {
+    suspectScore += 45;
+    riskFactors.push(botSignals[0] || 'Headless / automated browser runtime detected');
+  }
+  if (timezoneMismatch) {
+    suspectScore += 25;
+    riskFactors.push(`Timezone mismatch (${browserTimezone} vs ${ipTimezone})`);
+  }
+  if (datacenterAsn) {
+    suspectScore += 15;
+    riskFactors.push(`Datacenter or VPN network ASN (${location.isp})`);
+  }
+  if (tamperDetected) {
+    suspectScore += 15;
+    riskFactors.push(tamperReasons[0] || 'User-Agent / platform mismatch detected');
+  }
+  if (incognitoLikely) {
+    suspectScore += 10;
+    riskFactors.push(
+      storageQuotaMb !== null
+        ? `Restricted storage quota (${storageQuotaMb} MB) indicates private browsing`
+        : 'Private or restricted browser storage environment'
+    );
+  }
+
+  suspectScore = Math.min(100, suspectScore);
+  const riskLevel: SecuritySignals['riskLevel'] =
+    suspectScore >= 50 ? 'High' : suspectScore >= 20 ? 'Medium' : 'Low';
+
+  return {
+    isBot,
+    botSignals,
+    vpnSuspected,
+    timezoneMismatch,
+    datacenterAsn,
+    vpnReasons,
+    browserTimezone,
+    ipTimezone,
+    tamperDetected,
+    tamperReasons,
+    incognitoLikely,
+    storageQuotaMb,
+    persistenceMode,
+    suspectScore,
+    riskLevel,
+    riskFactors,
   };
 }
 
@@ -1708,6 +1969,8 @@ app.post('/api/visitor/identify', async (req, res) => {
       clientSessionId,
       clientHistoryBackup,
       browserDevice: rawBrowserDevice,
+      hardwareSignals: rawHardwareSignals,
+      securitySignals: rawSecuritySignals,
       clientGeoHint,
     } = (req.body || {}) as {
       pageLoadId?: string;
@@ -1716,6 +1979,8 @@ app.post('/api/visitor/identify', async (req, res) => {
       clientSessionId?: string | null;
       clientHistoryBackup?: SignedHistoryBackup | null;
       browserDevice?: Partial<BrowserDeviceInfo>;
+      hardwareSignals?: Partial<HardwareSignals> | null;
+      securitySignals?: Partial<SecuritySignals> | null;
       clientGeoHint?: {
         ip?: string;
         city?: string;
@@ -1727,6 +1992,7 @@ app.post('/api/visitor/identify', async (req, res) => {
         isp?: string;
         org?: string;
         asn?: string;
+        timezone?: string;
         isVpnOrHosting?: boolean;
       } | null;
     };
@@ -1737,6 +2003,8 @@ app.post('/api/visitor/identify', async (req, res) => {
         : 'pl_' + crypto.randomBytes(8).toString('hex');
 
     const browserDevice = sanitizeBrowserDevice(rawBrowserDevice);
+    const hardwareSignals = sanitizeHardwareSignals(rawHardwareSignals, browserDevice);
+    const hardwareId = hardwareSignals.hardwareId;
 
     let { ip: extractedIp, isPublic } = extractVisitorIp(req);
 
@@ -1875,11 +2143,12 @@ app.post('/api/visitor/identify', async (req, res) => {
 
         db.prepare(
           `INSERT INTO visitors (
-            visitor_id, hmac_token, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
-          ) VALUES (?, ?, ?, ?, ?, ?)`
+            visitor_id, hmac_token, hardware_id, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`
         ).run(
           verifiedVid,
           verifiedToken,
+          hardwareId,
           restoredFirstUtc,
           restoredLastUtc,
           restoredSessionId,
@@ -1923,6 +2192,16 @@ app.post('/api/visitor/identify', async (req, res) => {
             histVisit.timezone
           );
         }
+      }
+    } else if (hardwareId) {
+      // Cookie-less / Incognito recovery: look up visitor by deterministic Hardware ID (hwid_...)
+      const hwMatchedVisitor = db
+        .prepare('SELECT * FROM visitors WHERE hardware_id = ?')
+        .get(hardwareId) as VisitorRow | undefined;
+
+      if (hwMatchedVisitor) {
+        existingVisitor = hwMatchedVisitor;
+        recognitionSource = 'Hardware Fingerprint (Cookie-less / Incognito)';
       }
     }
 
@@ -1990,9 +2269,9 @@ app.post('/api/visitor/identify', async (req, res) => {
 
         db.prepare(
           `UPDATE visitors
-           SET updated_at_utc = ?, active_session_id = ?, last_activity_utc = ?
+           SET updated_at_utc = ?, active_session_id = ?, last_activity_utc = ?, hardware_id = ?
            WHERE visitor_id = ?`
-        ).run(nowUtc, currentSessionId, nowUtc, visitorId);
+        ).run(nowUtc, currentSessionId, nowUtc, hardwareId, visitorId);
       }
     } else {
       visitorId = generateVisitorId();
@@ -2002,9 +2281,9 @@ app.post('/api/visitor/identify', async (req, res) => {
 
       db.prepare(
         `INSERT INTO visitors (
-          visitor_id, hmac_token, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
-        ) VALUES (?, ?, ?, ?, ?, ?)`
-      ).run(visitorId, visitorToken, nowUtc, nowUtc, currentSessionId, nowUtc);
+          visitor_id, hmac_token, hardware_id, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(visitorId, visitorToken, hardwareId, nowUtc, nowUtc, currentSessionId, nowUtc);
 
       const visitId = generateVisitId();
       db.prepare(
@@ -2147,21 +2426,38 @@ app.post('/api/visitor/identify', async (req, res) => {
       timezone: String(r.timezone),
     }));
 
+    const ipTimezoneHint =
+      (typeof clientGeoHint?.timezone === 'string' && clientGeoHint.timezone.trim()) ||
+      vercelGeo.timezone ||
+      '';
+
+    const securitySignals = sanitizeAndReinforceSecuritySignals(
+      rawSecuritySignals,
+      browserDevice,
+      location,
+      ipTimezoneHint,
+      recognitionSource
+    );
+
     const historyBackup = createSignedHistoryBackup(
       visitorId,
       statistics.totalVisits,
       statistics.totalSessions,
       statistics.firstVisitUtc,
-      visitHistory
+      visitHistory,
+      hardwareId
     );
 
     const payload: IntelVisitorResponse = {
       visitorId,
       visitorToken,
+      hardwareId,
       isReturning,
       recognitionSource,
       location,
       browserDevice,
+      hardwareSignals,
+      securitySignals,
       statistics,
       visitHistory,
       historyBackup,
