@@ -245,58 +245,6 @@ function formatStorageQuotaCaption(quotaMb: number | null | undefined): string {
   return `~${Math.round(quotaMb)} MB browser quota active`;
 }
 
-/**
- * Compact one-click copy control for monospace hash rows. Uses the async
- * Clipboard API with an execCommand fallback and transient "Copied" feedback.
- */
-function CopyHashButton({ value }: { value: string }) {
-  const [copied, setCopied] = useState<boolean>(false);
-
-  const handleCopy = useCallback(async () => {
-    if (!value) return;
-    let copiedOk = false;
-    try {
-      await navigator.clipboard.writeText(value);
-      copiedOk = true;
-    } catch {
-      // Fallback for restricted contexts where the async Clipboard API is blocked
-      try {
-        const textarea = document.createElement('textarea');
-        textarea.value = value;
-        textarea.setAttribute('readonly', '');
-        textarea.style.position = 'fixed';
-        textarea.style.opacity = '0';
-        document.body.appendChild(textarea);
-        textarea.select();
-        copiedOk = document.execCommand('copy');
-        document.body.removeChild(textarea);
-      } catch {
-        copiedOk = false;
-      }
-    }
-    if (copiedOk) {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1500);
-    }
-  }, [value]);
-
-  return (
-    <button
-      type="button"
-      onClick={handleCopy}
-      title={copied ? 'Copied to clipboard' : 'Copy value'}
-      className={`inline-flex items-center gap-1 pl-1.5 pr-2 py-0.5 rounded-md border text-[10px] font-medium transition-colors shrink-0 cursor-pointer ${
-        copied
-          ? 'bg-emerald-50/70 border-emerald-200 text-emerald-700'
-          : 'bg-white text-slate-500 hover:text-slate-900 hover:bg-slate-100 border-[#E5E7EB]'
-      }`}
-    >
-      {copied ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-      {copied ? 'Copied' : 'Copy'}
-    </button>
-  );
-}
-
 export default function App() {
   const [data, setData] = useState<IntelVisitorResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -420,16 +368,6 @@ export default function App() {
         data?.securitySignals?.vpnReasons?.some((r) => /Cloud \/ Masked GPU/i.test(r)))
   );
   const botCloudMasked = Boolean(data?.securitySignals?.cloudOrMaskedGpu) || isCloudMaskedGpu;
-  // Canvas 2D / Web Audio hashes are suppressed whenever the WebGL GPU is masked
-  // or unavailable — cloud and standard environments get no hash exposure.
-  // (Independent of the datacenter-ASN cloud check above.)
-  const isMaskedGpu = Boolean(
-    data?.hardwareSignals &&
-      (data.hardwareSignals.gpuVendor === 'Unavailable' ||
-        data.hardwareSignals.gpuRenderer === 'Standard GPU' ||
-        /^Standard (GPU|WebGL|Hardware)/i.test(data.hardwareSignals.gpuVendor || '') ||
-        cleanGpuName === 'Standard GPU')
-  );
 
   return (
     <div
@@ -1295,49 +1233,6 @@ export default function App() {
                       </span>
                     </div>
                   </div>
-
-                  {!isMaskedGpu && (
-                    <>
-                      {/* Tile 5: Canvas 2D Hash (monospace, one-click copy; hidden on masked GPUs) */}
-                      <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
-                        <div className="w-9 h-9 rounded-lg bg-purple-50/60 border border-purple-200 flex items-center justify-center shrink-0">
-                          <Fingerprint className="w-4 h-4 text-purple-600" />
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center justify-between gap-1.5">
-                            <span className="text-[11px] text-slate-500">Canvas 2D Hash</span>
-                            <CopyHashButton value={data.hardwareSignals.canvasHash} />
-                          </div>
-                          <span
-                            className="block text-xs font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5"
-                            title={data.hardwareSignals.canvasHash || 'Unavailable'}
-                          >
-                            {data.hardwareSignals.canvasHash || 'Unavailable'}
-                          </span>
-                        </div>
-                      </div>
-
-                      {/* Tile 6: Web Audio Hash (monospace, one-click copy; hidden on masked GPUs) */}
-                      <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
-                        <div className="w-9 h-9 rounded-lg bg-cyan-50/60 border border-cyan-200 flex items-center justify-center shrink-0">
-                          <Activity className="w-4 h-4 text-cyan-600" />
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center justify-between gap-1.5">
-                            <span className="text-[11px] text-slate-500">Web Audio Hash</span>
-                            <CopyHashButton value={data.hardwareSignals.audioHash} />
-                          </div>
-                          <span
-                            className="block text-xs font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5"
-                            title={data.hardwareSignals.audioHash || 'Unavailable'}
-                          >
-                            {data.hardwareSignals.audioHash || 'Unavailable'}
-                          </span>
-                        </div>
-                      </div>
-                    </>
-                  )}
-
                 </div>
               </div>
 
