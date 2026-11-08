@@ -25,6 +25,58 @@ type VercelRequest = IncomingMessage & {
  * we normalise it here: Express always receives the real route and all original
  * query parameters (token, bytes, s, t, etc.) intact.
  */
+function applyRestoredUrlAndQuery(
+  req: VercelRequest,
+  restoredPath: string,
+  params: URLSearchParams
+): void {
+  params.delete('__ipath');
+  const remainingQuery = params.toString();
+  const finalUrl = remainingQuery ? `${restoredPath}?${remainingQuery}` : restoredPath;
+
+  req.url = finalUrl;
+  req.originalUrl = finalUrl;
+
+  // Clear any pre-cached parseurl metadata set by the serverless wrapper so Express re-parses req.url
+  const internalReq = req as unknown as Record<string, unknown>;
+  if ('_parsedUrl' in internalReq) {
+    delete internalReq._parsedUrl;
+  }
+  if ('_parsedOriginalUrl' in internalReq) {
+    delete internalReq._parsedOriginalUrl;
+  }
+
+  // Synchronize req.query so Express handlers reading req.query.token / req.query.bytes / req.query.t
+  // always receive the clean query parameters without __ipath even if the runtime defined a getter
+  const cleanQuery: Record<string, string | string[]> = {};
+  for (const [key, value] of params.entries()) {
+    if (key === '__ipath') continue;
+    const existing = cleanQuery[key];
+    if (existing === undefined) {
+      cleanQuery[key] = value;
+    } else if (Array.isArray(existing)) {
+      existing.push(value);
+    } else {
+      cleanQuery[key] = [existing, value];
+    }
+  }
+
+  try {
+    Object.defineProperty(req, 'query', {
+      value: cleanQuery,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  } catch {
+    try {
+      req.query = cleanQuery;
+    } catch {
+      // Ignore if frozen
+    }
+  }
+}
+
 function restoreOriginalApiUrl(req: VercelRequest): void {
   const rawUrl = typeof req.url === 'string' && req.url.length > 0 ? req.url : API_PREFIX;
   const queryIndex = rawUrl.indexOf('?');
@@ -33,41 +85,55 @@ function restoreOriginalApiUrl(req: VercelRequest): void {
 
   const params = new URLSearchParams(queryPart);
 
-  // Also merge any query parameters pre-parsed by the serverless platform into req.query
-  if (req.query && typeof req.query === 'object') {
-    for (const [k, v] of Object.entries(req.query)) {
-      if (!params.has(k) && typeof v === 'string') {
-        params.set(k, v);
+  // Merge any query parameters pre-parsed by the Vercel runtime into params
+  try {
+    if (req.query && typeof req.query === 'object') {
+      for (const [k, v] of Object.entries(req.query)) {
+        if (!params.has(k)) {
+          if (typeof v === 'string') {
+            params.set(k, v);
+          } else if (Array.isArray(v) && typeof v[0] === 'string') {
+            params.set(k, v[0]);
+          }
+        }
       }
     }
-    delete req.query.__ipath;
+  } catch {
+    // Ignore getter errors on req.query
   }
 
   const injectedPath = params.get('__ipath');
 
   if (injectedPath !== null) {
     params.delete('__ipath');
-    // Handle case where injectedPath itself accidentally had "?foo=bar" appended
-    const [cleanInjectedPath, embeddedQuery] = injectedPath.split('?');
+    let decodedInjected = injectedPath;
+    try {
+      if (decodedInjected.includes('%')) {
+        decodedInjected = decodeURIComponent(decodedInjected);
+      }
+    } catch {
+      decodedInjected = injectedPath;
+    }
+
+    // Handle case where injectedPath itself had "?foo=bar" appended
+    const [cleanInjectedPath, embeddedQuery] = decodedInjected.split('?');
     if (embeddedQuery) {
       const embeddedParams = new URLSearchParams(embeddedQuery);
       for (const [ek, ev] of embeddedParams.entries()) {
-        if (!params.has(ek)) {
+        if (ek !== '__ipath' && !params.has(ek)) {
           params.set(ek, ev);
         }
       }
     }
-    const suffix = cleanInjectedPath.replace(/^\/+/, '');
-    const restored = suffix ? `${API_PREFIX}/${suffix}` : API_PREFIX;
-    const remainingQuery = params.toString();
-    const finalUrl = remainingQuery ? `${restored}?${remainingQuery}` : restored;
-    req.url = finalUrl;
-    req.originalUrl = finalUrl;
+
+    const ipath = cleanInjectedPath.replace(/^\/+/, '').replace(/^api\/+/i, '');
+    const restoredPath = ipath ? `${API_PREFIX}/${ipath}` : API_PREFIX;
+    applyRestoredUrlAndQuery(req, restoredPath, params);
     return;
   }
 
-  // Safety net: if the platform handed us the rewritten path (/api/index) but
-  // dropped the injected marker, recover the original path from Vercel headers.
+  // Safety net: if the platform handed us the rewritten path (/api/index) without __ipath,
+  // recover the original path from Vercel headers.
   if (pathPart === '/api/index' || pathPart === '/api/index.js') {
     const headerValue =
       (req.headers['x-vercel-original-path'] as string | undefined) ||
@@ -89,12 +155,13 @@ function restoreOriginalApiUrl(req: VercelRequest): void {
           mergedParams.set(k, v);
         }
       }
-      const qs = mergedParams.toString();
-      const finalUrl = qs ? `${normPath}?${qs}` : normPath;
-      req.url = finalUrl;
-      req.originalUrl = finalUrl;
+      applyRestoredUrlAndQuery(req, normPath, mergedParams);
+      return;
     }
   }
+
+  // Even when req.url already has the original path (/api/...), ensure req.query is synced
+  applyRestoredUrlAndQuery(req, pathPart, params);
 }
 
 export default function handler(req: VercelRequest, res: ServerResponse): void {

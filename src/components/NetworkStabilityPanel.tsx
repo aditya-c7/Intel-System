@@ -262,8 +262,8 @@ export function NetworkStabilityPanel() {
         return;
       }
 
-      const attemptSinglePing = async (attemptIdx: number): Promise<number> => {
-        const url = `/api/network/ping?t=${probeStartMs}_${reqId}_${attemptIdx}`;
+      const attemptSinglePing = async (_attemptIdx: number): Promise<number> => {
+        const url = `/api/network/ping?t=${Date.now()}`;
         const startPerf = performance.now();
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 5000);
@@ -273,9 +273,8 @@ export function NetworkStabilityPanel() {
             method: 'GET',
             cache: 'no-store',
             credentials: 'same-origin',
-            priority: 'high',
             signal: controller.signal,
-          } as RequestInit);
+          });
           clearTimeout(timeoutId);
 
           if (!response.ok) {

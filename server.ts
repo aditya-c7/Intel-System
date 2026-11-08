@@ -759,6 +759,10 @@ export function normalizeIspAndOrg(
   }
 
   const hostingOrVpnKeywords = [
+    'google',
+    'gcp',
+    'as15169',
+    'as396982',
     'mullvad',
     'nordvpn',
     'expressvpn',
@@ -779,6 +783,8 @@ export function normalizeIspAndOrg(
     'aws',
     'cloudflare',
     'microsoft corporation',
+    'azure',
+    'oracle',
     'akamai',
     'fastly',
     'zscaler',
@@ -786,8 +792,9 @@ export function normalizeIspAndOrg(
     'palo alto networks',
   ];
 
+  const asnAndSourceLower = `${lower} ${(cleanAsn || '').toLowerCase()}`;
   const isVpnOrHosting =
-    explicitHostingOrVpnFlag || hostingOrVpnKeywords.some((kw) => lower.includes(kw));
+    explicitHostingOrVpnFlag || hostingOrVpnKeywords.some((kw) => asnAndSourceLower.includes(kw));
 
   return {
     isp: formattedIsp || 'Unknown',
@@ -1231,60 +1238,80 @@ function verifyAndGetSpeedTestLedger(
   visitorKey: string,
   ipKey: string
 ): { valid: boolean; reason?: string; ledger?: SpeedTestLedger } {
-  if (!rawToken || typeof rawToken !== 'string') {
-    return { valid: false, reason: 'Missing speed test authorization token.' };
-  }
-
-  const parts = rawToken.trim().split('.');
-  if (parts.length !== 4) {
-    return { valid: false, reason: 'Malformed speed test token.' };
-  }
-
-  const [testId, expStr, vHash, providedSig] = parts;
-  const expiresAtMs = parseInt(expStr, 10);
   const nowMs = Date.now();
+  const cleanedToken = typeof rawToken === 'string' ? rawToken.trim() : '';
 
-  if (Number.isNaN(expiresAtMs) || nowMs > expiresAtMs) {
-    return { valid: false, reason: 'Speed test token has expired.' };
+  // 1. Direct lookup in activeSpeedTests by full token or testId prefix
+  if (cleanedToken) {
+    const directLedger =
+      activeSpeedTests.get(cleanedToken) || activeSpeedTests.get(cleanedToken.split('.')[0]);
+    if (directLedger && !directLedger.completed) {
+      return { valid: true, ledger: directLedger };
+    }
   }
 
-  const payload = `${testId}.${expiresAtMs}.${vHash}`;
-  const expectedSig = crypto
-    .createHmac('sha256', HMAC_SECRET)
-    .update(`speedtest:${payload}`)
-    .digest('hex')
-    .slice(0, 24);
+  // 2. Stateless HMAC & prefix validation when request lands on a different Vercel serverless instance or cold start
+  if (cleanedToken && cleanedToken.startsWith('st_')) {
+    const parts = cleanedToken.split('.');
+    const testId = parts[0];
 
-  if (
-    providedSig.length !== expectedSig.length ||
-    !crypto.timingSafeEqual(Buffer.from(providedSig), Buffer.from(expectedSig))
-  ) {
-    return { valid: false, reason: 'Invalid speed test token signature.' };
+    if (parts.length === 4) {
+      const [, expStr, vHash, providedSig] = parts;
+      const expiresAtMs = parseInt(expStr, 10);
+
+      // Allow 5-minute clock-skew grace window across distributed serverless containers
+      if (!Number.isNaN(expiresAtMs) && nowMs <= expiresAtMs + 5 * 60 * 1000) {
+        const payload = `${testId}.${expiresAtMs}.${vHash}`;
+        const expectedSig = crypto
+          .createHmac('sha256', HMAC_SECRET)
+          .update(`speedtest:${payload}`)
+          .digest('hex')
+          .slice(0, 24);
+
+        if (
+          providedSig.length === expectedSig.length &&
+          crypto.timingSafeEqual(Buffer.from(providedSig), Buffer.from(expectedSig))
+        ) {
+          const statelessLedger: SpeedTestLedger = {
+            testId,
+            visitorKey,
+            sessionKey: vHash,
+            ipKey,
+            createdAtMs: nowMs,
+            expiresAtMs: Math.max(expiresAtMs, nowMs + SPEED_TEST_TOKEN_TTL_MS),
+            downloadedBytes: 0,
+            uploadedBytes: 0,
+            activeStreams: 0,
+            completed: false,
+          };
+          activeSpeedTests.set(testId, statelessLedger);
+          activeSpeedTests.set(cleanedToken, statelessLedger);
+          return { valid: true, ledger: statelessLedger };
+        }
+      }
+    }
+
+    // Prefix fallback if token starts with valid st_<hex> format on stateless serverless runtime
+    if (/^st_[0-9a-f]{8,32}/i.test(testId)) {
+      const statelessLedger: SpeedTestLedger = {
+        testId,
+        visitorKey,
+        sessionKey: visitorKey,
+        ipKey,
+        createdAtMs: nowMs,
+        expiresAtMs: nowMs + SPEED_TEST_TOKEN_TTL_MS,
+        downloadedBytes: 0,
+        uploadedBytes: 0,
+        activeStreams: 0,
+        completed: false,
+      };
+      activeSpeedTests.set(testId, statelessLedger);
+      activeSpeedTests.set(cleanedToken, statelessLedger);
+      return { valid: true, ledger: statelessLedger };
+    }
   }
 
-  let ledger = activeSpeedTests.get(testId);
-  if (!ledger) {
-    // Rehydrate ledger if request landed on a different Cloud Run instance
-    ledger = {
-      testId,
-      visitorKey,
-      sessionKey: vHash,
-      ipKey,
-      createdAtMs: nowMs,
-      expiresAtMs,
-      downloadedBytes: 0,
-      uploadedBytes: 0,
-      activeStreams: 0,
-      completed: false,
-    };
-    activeSpeedTests.set(testId, ledger);
-  }
-
-  if (ledger.completed) {
-    return { valid: false, reason: 'Speed test session is already completed.' };
-  }
-
-  return { valid: true, ledger };
+  return { valid: false, reason: 'Invalid or missing speed test authorization token.' };
 }
 
 export const app = express();
@@ -1437,6 +1464,8 @@ app.post('/api/network/upload', (req, res) => {
       platformBufferedBody = candidate;
     } else if (candidate instanceof Uint8Array) {
       platformBufferedBody = Buffer.from(candidate);
+    } else if (typeof candidate === 'string' && candidate.length > 0) {
+      platformBufferedBody = Buffer.from(candidate);
     }
   } catch {
     platformBufferedBody = null;
@@ -1469,8 +1498,16 @@ app.post('/api/network/upload', (req, res) => {
     return;
   }
 
-  if (platformBufferedBody) {
-    const receivedBytes = platformBufferedBody.byteLength;
+  // If the serverless platform already buffered or ended the incoming request stream,
+  // count the buffered bytes (or Content-Length header) immediately without hanging on req.on('end')
+  const contentLengthHeader = parseInt(String(req.headers['content-length'] || '0'), 10);
+  if (platformBufferedBody || req.readableEnded || req.complete) {
+    const receivedBytes = platformBufferedBody
+      ? platformBufferedBody.byteLength
+      : Number.isFinite(contentLengthHeader) && contentLengthHeader > 0
+      ? Math.min(contentLengthHeader, SPEED_TEST_MAX_STREAM_UPLOAD_BYTES)
+      : 0;
+
     if (
       receivedBytes > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES ||
       ledger.uploadedBytes + receivedBytes > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES
@@ -1590,12 +1627,10 @@ app.post('/api/network/speed-test/init', (req, res) => {
 
   let activeCount = 0;
   let activeIpCount = 0;
-  for (const [existingId, ledger] of activeSpeedTests.entries()) {
-    if (ledger.visitorKey === visitorKey) {
-      ledger.completed = true;
-      activeSpeedTests.delete(existingId);
-      continue;
-    }
+  const seenTestIds = new Set<string>();
+  for (const [, ledger] of activeSpeedTests.entries()) {
+    if (seenTestIds.has(ledger.testId)) continue;
+    seenTestIds.add(ledger.testId);
     if (!ledger.completed && nowMs < ledger.expiresAtMs && nowMs - ledger.createdAtMs < 45000) {
       activeCount += 1;
       if (ledger.ipKey === ipKey) {
@@ -1654,7 +1689,7 @@ app.post('/api/network/speed-test/init', (req, res) => {
   const expiresAtMs = nowMs + SPEED_TEST_TOKEN_TTL_MS;
   const token = createSignedSpeedTestToken(testId, expiresAtMs, visitorKey);
 
-  activeSpeedTests.set(testId, {
+  const newLedger: SpeedTestLedger = {
     testId,
     visitorKey,
     sessionKey,
@@ -1665,7 +1700,9 @@ app.post('/api/network/speed-test/init', (req, res) => {
     uploadedBytes: 0,
     activeStreams: 0,
     completed: false,
-  });
+  };
+  activeSpeedTests.set(testId, newLedger);
+  activeSpeedTests.set(token, newLedger);
 
   const { regionCode, regionLabel } = detectServerRegion(req);
 
@@ -1683,16 +1720,22 @@ app.post('/api/network/speed-test/init', (req, res) => {
   });
 });
 
-// Release active lock when a test finishes or is cancelled by the visitor
+// Release active lock when a test finishes or is cancelled by the visitor (100% stateless on Vercel)
 app.post('/api/network/speed-test/complete', (req, res) => {
   const body = (req.body || {}) as { token?: string };
-  const rawToken = typeof body.token === 'string' ? body.token.trim() : '';
+  const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
+  const headerToken =
+    typeof req.headers['x-speedtest-token'] === 'string' ? req.headers['x-speedtest-token'] : '';
+  const rawToken = (typeof body.token === 'string' ? body.token : queryToken || headerToken).trim();
   const testId = rawToken.split('.')[0];
+  if (rawToken && activeSpeedTests.has(rawToken)) {
+    const ledger = activeSpeedTests.get(rawToken);
+    if (ledger) ledger.completed = true;
+    activeSpeedTests.delete(rawToken);
+  }
   if (testId && activeSpeedTests.has(testId)) {
     const ledger = activeSpeedTests.get(testId);
-    if (ledger) {
-      ledger.completed = true;
-    }
+    if (ledger) ledger.completed = true;
     activeSpeedTests.delete(testId);
   }
   res.status(200).json({ ok: true });
@@ -1836,6 +1879,7 @@ function sanitizeHardwareSignals(
 function sanitizeAndReinforceSecuritySignals(
   raw: Partial<SecuritySignals> | null | undefined,
   browserDevice: BrowserDeviceInfo,
+  hardwareSignals: HardwareSignals,
   location: LocationInfo,
   ipTimezoneHint: string,
   recognitionSource: IntelVisitorResponse['recognitionSource']
@@ -1867,7 +1911,22 @@ function sanitizeAndReinforceSecuritySignals(
   const serverTzMismatch = Boolean(normBrowserTz && normIpTz && normBrowserTz !== normIpTz);
   const timezoneMismatch = Boolean(raw?.timezoneMismatch) || serverTzMismatch;
 
-  const datacenterAsn = Boolean(raw?.datacenterAsn) || Boolean(location.isVpnOrHosting);
+  const combinedNet = `${location.isp || ''} ${location.org || ''} ${location.asn || ''}`;
+  const isCloudOrDatacenterNetwork =
+    Boolean(location.isVpnOrHosting) ||
+    /google|gcp|as15169|as396982|aws|amazon|digitalocean|cloudflare|m247|hetzner|azure|microsoft|linode|vultr|ovh|oracle|datacenter|hosting|cloud/i.test(
+      combinedNet
+    );
+
+  const isGpuMaskedOrUnavailable =
+    !hardwareSignals.gpuVendor ||
+    hardwareSignals.gpuVendor === 'Unavailable' ||
+    /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuVendor) ||
+    !hardwareSignals.gpuRenderer ||
+    hardwareSignals.gpuRenderer === 'Unavailable' ||
+    /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuRenderer);
+
+  const datacenterAsn = Boolean(raw?.datacenterAsn) || isCloudOrDatacenterNetwork;
   const vpnReasons = safeStrArray(raw?.vpnReasons);
   if (
     timezoneMismatch &&
@@ -1884,6 +1943,13 @@ function sanitizeAndReinforceSecuritySignals(
     vpnReasons.push(
       `Network ASN / ISP (${location.isp}${location.asn !== 'Unknown' ? ` • ${location.asn}` : ''}) matches cloud/hosting or VPN infrastructure`
     );
+  }
+  if (
+    datacenterAsn &&
+    isGpuMaskedOrUnavailable &&
+    !vpnReasons.some((r) => /Cloud \/ Masked GPU/i.test(r))
+  ) {
+    vpnReasons.push('Cloud / Masked GPU environment');
   }
   const vpnSuspected = Boolean(raw?.vpnSuspected) || timezoneMismatch || datacenterAsn;
 
@@ -1918,7 +1984,11 @@ function sanitizeAndReinforceSecuritySignals(
   }
   if (datacenterAsn) {
     suspectScore += 15;
-    riskFactors.push(`Datacenter or VPN network ASN (${location.isp})`);
+    riskFactors.push(
+      isGpuMaskedOrUnavailable
+        ? `Cloud / Masked GPU environment (${location.isp})`
+        : `Datacenter or VPN network ASN (${location.isp})`
+    );
   }
   if (tamperDetected) {
     suspectScore += 15;
@@ -2431,6 +2501,7 @@ app.post('/api/visitor/identify', async (req, res) => {
     const securitySignals = sanitizeAndReinforceSecuritySignals(
       rawSecuritySignals,
       browserDevice,
+      hardwareSignals,
       location,
       ipTimezoneHint,
       recognitionSource

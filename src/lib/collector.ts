@@ -101,7 +101,30 @@ export function areTimezonesEquivalent(tzA: string | null | undefined, tzB: stri
 }
 
 const DATACENTER_NETWORK_PATTERN =
-  /cloudflare|amazon|aws|digitalocean|hetzner|m247|linode|akamai|ovh|microsoft corporation|azure|choopa|vultr|datacamp|leaseweb|packethub|tzulo|cogent|equinix|fastly|scaleway|upcloud|contabo|kamatera|nordvpn|expressvpn|mullvad|proton ag|surfshark|private internet access|cyberghost|ivpn|tor exit|hosting|datacenter|cloud|vps|dedibox/i;
+  /google|gcp|as15169|as396982|cloudflare|amazon|aws|digitalocean|hetzner|m247|linode|akamai|ovh|microsoft corporation|azure|oracle|choopa|vultr|datacamp|leaseweb|packethub|tzulo|cogent|equinix|fastly|scaleway|upcloud|contabo|kamatera|nordvpn|expressvpn|mullvad|proton ag|surfshark|private internet access|cyberghost|ivpn|tor exit|hosting|datacenter|cloud|vps|dedibox/i;
+
+export function isMaskedOrUnavailableGpu(
+  gpuVendor: string | null | undefined,
+  gpuRenderer: string | null | undefined
+): boolean {
+  const vendor = (gpuVendor || '').trim();
+  const renderer = (gpuRenderer || '').trim();
+  if (
+    !vendor ||
+    !renderer ||
+    vendor === 'Unavailable' ||
+    renderer === 'Unavailable' ||
+    /^Standard (GPU|WebGL|Hardware)/i.test(vendor) ||
+    /^Standard (GPU|WebGL|Hardware)/i.test(renderer) ||
+    /SwiftShader|llvmpipe|Mesa OffScreen|Software Rasterizer/i.test(renderer)
+  ) {
+    return true;
+  }
+  if (/^(WebKit|Mozilla)$/i.test(vendor) && /^(WebKit WebGL|Mozilla)$/i.test(renderer)) {
+    return true;
+  }
+  return false;
+}
 
 export function isDatacenterOrVpnNetwork(
   isp: string | null | undefined,
@@ -796,6 +819,10 @@ export async function evaluateSecuritySignals(
     clientGeoHint?.asn,
     Boolean(clientGeoHint?.isVpnOrHosting)
   );
+  const maskedGpu = isMaskedOrUnavailableGpu(
+    hardwareSignals.gpuVendor,
+    hardwareSignals.gpuRenderer
+  );
   const datacenterAsn = dcCheck.isDatacenter;
 
   const vpnReasons: string[] = [];
@@ -804,6 +831,9 @@ export async function evaluateSecuritySignals(
   }
   if (dcCheck.matchedReason) {
     vpnReasons.push(dcCheck.matchedReason);
+  }
+  if (datacenterAsn && maskedGpu) {
+    vpnReasons.push('Cloud / Masked GPU environment');
   }
   const vpnSuspected = timezoneMismatch || datacenterAsn;
 
@@ -900,7 +930,11 @@ export async function evaluateSecuritySignals(
   }
   if (datacenterAsn) {
     rawScore += 15;
-    riskFactors.push(`Datacenter / VPN network (+15): ${dcCheck.matchedReason || 'Hosting ASN'}`);
+    riskFactors.push(
+      maskedGpu
+        ? 'Cloud / Masked GPU environment (+15): Datacenter ASN with masked WebGL GPU'
+        : `Datacenter / VPN network (+15): ${dcCheck.matchedReason || 'Hosting ASN'}`
+    );
   }
   if (tamperDetected) {
     rawScore += 15;
@@ -917,7 +951,7 @@ export async function evaluateSecuritySignals(
 
   const suspectScore = Math.min(100, rawScore);
   const riskLevel: RiskLevel =
-    suspectScore >= 60 ? 'High' : suspectScore >= 25 ? 'Medium' : 'Low';
+    suspectScore >= 50 ? 'High' : suspectScore >= 20 ? 'Medium' : 'Low';
 
   return {
     isBot,

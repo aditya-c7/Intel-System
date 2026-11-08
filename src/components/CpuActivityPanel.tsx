@@ -53,24 +53,77 @@ const PRESSURE_MAP: Record<RawPressureState, DisplayPressureLevel> = {
 const DISPLAY_LEVELS: DisplayPressureLevel[] = ['Normal', 'Moderate', 'High', 'Heavy'];
 
 function SystemLoadBadge({ level }: { level: DisplayPressureLevel }) {
-  const dotColor =
+  // Smooth needle rotation angle:
+  // Normal -> towards left (-48deg, green)
+  // Moderate -> slightly left (-16deg, amber)
+  // High -> slightly right (+18deg, orange)
+  // Heavy -> towards right (+48deg, red)
+  const needleAngleDeg =
     level === 'Heavy'
-      ? 'bg-rose-500'
+      ? 48
       : level === 'High'
-      ? 'bg-orange-500'
+      ? 18
       : level === 'Moderate'
-      ? 'bg-amber-500'
-      : 'bg-emerald-500';
+      ? -16
+      : -48;
+
+  const badgeColors =
+    level === 'Heavy'
+      ? 'bg-[#FAD2CF] text-[#C5221F] dark:bg-rose-950/70 dark:text-rose-400'
+      : level === 'High'
+      ? 'bg-[#FCE8E6] text-[#D93025] dark:bg-orange-950/70 dark:text-orange-400'
+      : level === 'Moderate'
+      ? 'bg-[#FEF7E0] text-[#B06000] dark:bg-amber-950/70 dark:text-amber-400'
+      : 'bg-[#E6F4EA] text-[#137333] dark:bg-emerald-950/70 dark:text-emerald-400';
 
   return (
-    <div className="min-w-0">
-      <span className="text-xs text-zinc-500 dark:text-zinc-400 font-normal block truncate">
-        System Load
-      </span>
-      <span className="inline-flex items-center gap-1.5 text-xs sm:text-sm font-mono tabular-nums font-medium text-zinc-900 dark:text-zinc-100 mt-0.5 truncate">
-        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
-        <span>{level}</span>
-      </span>
+    <div className="flex items-center gap-3 min-w-0">
+      <div
+        className={`w-9 h-9 rounded-full flex items-center justify-center shrink-0 transition-colors duration-500 ${badgeColors}`}
+        aria-hidden="true"
+      >
+        <svg
+          viewBox="0 0 24 24"
+          className="w-6 h-6 overflow-visible"
+          fill="none"
+          xmlns="http://www.w3.org/2000/svg"
+        >
+          {/* Speedometer arch with flat bottom baseline */}
+          <path
+            d="M 3.6 17.4 A 9.1 9.1 0 1 1 20.4 17.4 Z"
+            stroke="currentColor"
+            strokeWidth="2.05"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+          {/* Smoothly shifting gauge pointer needle */}
+          <g
+            style={{
+              transform: `rotate(${needleAngleDeg}deg)`,
+              transformOrigin: '12px 14.4px',
+              transition: 'transform 550ms cubic-bezier(0.22, 1, 0.36, 1)',
+            }}
+          >
+            <circle cx="12" cy="14.4" r="1.7" fill="currentColor" />
+            <path
+              d="M 10.65 14.4 L 12 6.7 L 13.35 14.4 Z"
+              fill="currentColor"
+              stroke="currentColor"
+              strokeWidth="0.6"
+              strokeLinejoin="round"
+            />
+          </g>
+        </svg>
+      </div>
+
+      <div className="min-w-0">
+        <span className="text-xs font-semibold text-zinc-900 dark:text-zinc-100 block truncate">
+          System load
+        </span>
+        <span className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 block truncate">
+          {level}
+        </span>
+      </div>
     </div>
   );
 }

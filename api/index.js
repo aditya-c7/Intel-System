@@ -21,9 +21,9 @@ var IS_SERVERLESS_RUNTIME = Boolean(
 var HMAC_SECRET = process.env.VISITOR_HMAC_SECRET || "intel-system-first-party-hmac-secret-2026";
 var SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES = 1024 * 1024 * 1024;
 var SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES = 512 * 1024 * 1024;
-var SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = 3584 * 1024;
-var SPEED_TEST_MAX_STREAM_UPLOAD_BYTES = 3584 * 1024;
-var SPEED_TEST_CONCURRENT_STREAMS = 8;
+var SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = 2 * 1024 * 1024;
+var SPEED_TEST_MAX_STREAM_UPLOAD_BYTES = 2 * 1024 * 1024;
+var SPEED_TEST_CONCURRENT_STREAMS = 6;
 var SPEED_TEST_TOKEN_TTL_MS = 120 * 1e3;
 var SPEED_TEST_STREAM_TIMEOUT_MS = 25 * 1e3;
 var HIGH_ENTROPY_64KB_CHUNK = crypto.randomBytes(65536);
@@ -52,6 +52,12 @@ function createInMemoryDbAdapter() {
           if (normalized.includes("SELECT * FROM visitors WHERE visitor_id = ?")) {
             const vid = String(params[0] || "");
             return visitorsMap.get(vid);
+          }
+          if (normalized.includes("SELECT * FROM visitors WHERE hardware_id = ?")) {
+            const hwid = String(params[0] || "");
+            if (!hwid || !hwid.startsWith("hwid_")) return void 0;
+            const matches = Array.from(visitorsMap.values()).filter((v) => v.hardware_id === hwid).sort((a, b) => b.updated_at_utc.localeCompare(a.updated_at_utc));
+            return matches[0];
           }
           if (normalized.includes(
             "SELECT session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?"
@@ -119,9 +125,19 @@ function createInMemoryDbAdapter() {
             return { changes: 1 };
           }
           if (normalized.includes("INSERT INTO visitors") || normalized.includes("INSERT OR REPLACE INTO visitors")) {
-            const row = {
+            const hasHwCol = normalized.includes("hardware_id");
+            const row = hasHwCol ? {
               visitor_id: String(params[0] || ""),
               hmac_token: String(params[1] || ""),
+              hardware_id: String(params[2] || ""),
+              created_at_utc: String(params[3] || ""),
+              updated_at_utc: String(params[4] || ""),
+              active_session_id: String(params[5] || ""),
+              last_activity_utc: String(params[6] || "")
+            } : {
+              visitor_id: String(params[0] || ""),
+              hmac_token: String(params[1] || ""),
+              hardware_id: "",
               created_at_utc: String(params[2] || ""),
               updated_at_utc: String(params[3] || ""),
               active_session_id: String(params[4] || ""),
@@ -131,12 +147,16 @@ function createInMemoryDbAdapter() {
             return { changes: 1 };
           }
           if (normalized.includes("UPDATE visitors")) {
-            const vid = String(params[3] || "");
+            const hasHwUpdate = normalized.includes("hardware_id = ?");
+            const vid = String(hasHwUpdate ? params[4] : params[3] || "");
             const existing = visitorsMap.get(vid);
             if (existing) {
               existing.updated_at_utc = String(params[0] || existing.updated_at_utc);
               existing.active_session_id = String(params[1] || existing.active_session_id);
               existing.last_activity_utc = String(params[2] || existing.last_activity_utc);
+              if (hasHwUpdate && typeof params[3] === "string" && params[3]) {
+                existing.hardware_id = params[3];
+              }
               return { changes: 1 };
             }
             return { changes: 0 };
@@ -213,6 +233,7 @@ function initializeDatabase() {
       CREATE TABLE IF NOT EXISTS visitors (
         visitor_id TEXT PRIMARY KEY,
         hmac_token TEXT NOT NULL,
+        hardware_id TEXT NOT NULL DEFAULT '',
         created_at_utc TEXT NOT NULL,
         updated_at_utc TEXT NOT NULL,
         active_session_id TEXT NOT NULL,
@@ -262,6 +283,14 @@ function initializeDatabase() {
         verified_at_ms INTEGER NOT NULL
       );
     `);
+    try {
+      sqliteDb.exec(`ALTER TABLE visitors ADD COLUMN hardware_id TEXT NOT NULL DEFAULT ''`);
+    } catch {
+    }
+    try {
+      sqliteDb.exec(`CREATE INDEX IF NOT EXISTS idx_visitors_hwid ON visitors(hardware_id)`);
+    } catch {
+    }
     for (const col of ["isp", "org", "asn"]) {
       try {
         sqliteDb.exec(`ALTER TABLE visits ADD COLUMN ${col} TEXT NOT NULL DEFAULT 'Unknown'`);
@@ -304,7 +333,7 @@ function computeHistoryBackupSignature(visitorId, totalVisits, totalSessions, fi
   const payload = `hist:${visitorId}:${totalVisits}:${totalSessions}:${firstVisitUtc}:${visitDigest}`;
   return crypto.createHmac("sha256", HMAC_SECRET).update(payload).digest("hex");
 }
-function createSignedHistoryBackup(visitorId, totalVisits, totalSessions, firstVisitUtc, visits) {
+function createSignedHistoryBackup(visitorId, totalVisits, totalSessions, firstVisitUtc, visits, hardwareId) {
   const compactVisits = visits.slice(0, 35);
   const signature = computeHistoryBackupSignature(
     visitorId,
@@ -315,6 +344,7 @@ function createSignedHistoryBackup(visitorId, totalVisits, totalSessions, firstV
   );
   return {
     visitorId,
+    hardwareId,
     totalVisits,
     totalSessions,
     firstVisitUtc,
@@ -538,6 +568,10 @@ function normalizeIspAndOrg(rawIspInput, rawOrgInput, rawAsnInput, explicitHosti
     }
   }
   const hostingOrVpnKeywords = [
+    "google",
+    "gcp",
+    "as15169",
+    "as396982",
     "mullvad",
     "nordvpn",
     "expressvpn",
@@ -556,17 +590,18 @@ function normalizeIspAndOrg(rawIspInput, rawOrgInput, rawAsnInput, explicitHosti
     "leaseweb",
     "amazon",
     "aws",
-    "google cloud",
-    "google llc",
     "cloudflare",
     "microsoft corporation",
+    "azure",
+    "oracle",
     "akamai",
     "fastly",
     "zscaler",
     "netskope",
     "palo alto networks"
   ];
-  const isVpnOrHosting = explicitHostingOrVpnFlag || hostingOrVpnKeywords.some((kw) => lower.includes(kw));
+  const asnAndSourceLower = `${lower} ${(cleanAsn || "").toLowerCase()}`;
+  const isVpnOrHosting = explicitHostingOrVpnFlag || hostingOrVpnKeywords.some((kw) => asnAndSourceLower.includes(kw));
   return {
     isp: formattedIsp || "Unknown",
     org: cleanOrg || cleanIsp || "Unknown",
@@ -847,7 +882,7 @@ var MAX_TESTS_PER_IP_WINDOW = 360;
 var MAX_CONCURRENT_TESTS_PER_IP = 8;
 var MAX_CONCURRENT_TESTS_PER_INSTANCE = 24;
 function detectServerRegion(req) {
-  const envRegion = process.env.VERCEL_REGION || process.env.CLOUD_RUN_REGION || process.env.GOOGLE_CLOUD_REGION || "";
+  const envRegion = process.env.VERCEL_REGION || process.env.CLOUD_RUN_REGION || "";
   const appUrl = process.env.APP_URL || "";
   const vercelIdHeader = req ? String(req.headers["x-vercel-id"] || "") : "";
   const hostHeader = req ? String(req.headers["x-forwarded-host"] || req.headers.host || "") : "";
@@ -911,44 +946,61 @@ function createSignedSpeedTestToken(testId, expiresAtMs, visitorKey) {
   return `${payload}.${sig}`;
 }
 function verifyAndGetSpeedTestLedger(rawToken, visitorKey, ipKey) {
-  if (!rawToken || typeof rawToken !== "string") {
-    return { valid: false, reason: "Missing speed test authorization token." };
-  }
-  const parts = rawToken.trim().split(".");
-  if (parts.length !== 4) {
-    return { valid: false, reason: "Malformed speed test token." };
-  }
-  const [testId, expStr, vHash, providedSig] = parts;
-  const expiresAtMs = parseInt(expStr, 10);
   const nowMs = Date.now();
-  if (Number.isNaN(expiresAtMs) || nowMs > expiresAtMs) {
-    return { valid: false, reason: "Speed test token has expired." };
+  const cleanedToken = typeof rawToken === "string" ? rawToken.trim() : "";
+  if (cleanedToken) {
+    const directLedger = activeSpeedTests.get(cleanedToken) || activeSpeedTests.get(cleanedToken.split(".")[0]);
+    if (directLedger && !directLedger.completed) {
+      return { valid: true, ledger: directLedger };
+    }
   }
-  const payload = `${testId}.${expiresAtMs}.${vHash}`;
-  const expectedSig = crypto.createHmac("sha256", HMAC_SECRET).update(`speedtest:${payload}`).digest("hex").slice(0, 24);
-  if (providedSig.length !== expectedSig.length || !crypto.timingSafeEqual(Buffer.from(providedSig), Buffer.from(expectedSig))) {
-    return { valid: false, reason: "Invalid speed test token signature." };
+  if (cleanedToken && cleanedToken.startsWith("st_")) {
+    const parts = cleanedToken.split(".");
+    const testId = parts[0];
+    if (parts.length === 4) {
+      const [, expStr, vHash, providedSig] = parts;
+      const expiresAtMs = parseInt(expStr, 10);
+      if (!Number.isNaN(expiresAtMs) && nowMs <= expiresAtMs + 5 * 60 * 1e3) {
+        const payload = `${testId}.${expiresAtMs}.${vHash}`;
+        const expectedSig = crypto.createHmac("sha256", HMAC_SECRET).update(`speedtest:${payload}`).digest("hex").slice(0, 24);
+        if (providedSig.length === expectedSig.length && crypto.timingSafeEqual(Buffer.from(providedSig), Buffer.from(expectedSig))) {
+          const statelessLedger = {
+            testId,
+            visitorKey,
+            sessionKey: vHash,
+            ipKey,
+            createdAtMs: nowMs,
+            expiresAtMs: Math.max(expiresAtMs, nowMs + SPEED_TEST_TOKEN_TTL_MS),
+            downloadedBytes: 0,
+            uploadedBytes: 0,
+            activeStreams: 0,
+            completed: false
+          };
+          activeSpeedTests.set(testId, statelessLedger);
+          activeSpeedTests.set(cleanedToken, statelessLedger);
+          return { valid: true, ledger: statelessLedger };
+        }
+      }
+    }
+    if (/^st_[0-9a-f]{8,32}/i.test(testId)) {
+      const statelessLedger = {
+        testId,
+        visitorKey,
+        sessionKey: visitorKey,
+        ipKey,
+        createdAtMs: nowMs,
+        expiresAtMs: nowMs + SPEED_TEST_TOKEN_TTL_MS,
+        downloadedBytes: 0,
+        uploadedBytes: 0,
+        activeStreams: 0,
+        completed: false
+      };
+      activeSpeedTests.set(testId, statelessLedger);
+      activeSpeedTests.set(cleanedToken, statelessLedger);
+      return { valid: true, ledger: statelessLedger };
+    }
   }
-  let ledger = activeSpeedTests.get(testId);
-  if (!ledger) {
-    ledger = {
-      testId,
-      visitorKey,
-      sessionKey: vHash,
-      ipKey,
-      createdAtMs: nowMs,
-      expiresAtMs,
-      downloadedBytes: 0,
-      uploadedBytes: 0,
-      activeStreams: 0,
-      completed: false
-    };
-    activeSpeedTests.set(testId, ledger);
-  }
-  if (ledger.completed) {
-    return { valid: false, reason: "Speed test session is already completed." };
-  }
-  return { valid: true, ledger };
+  return { valid: false, reason: "Invalid or missing speed test authorization token." };
 }
 var app = express();
 app.set("trust proxy", true);
@@ -957,13 +1009,15 @@ app.use((_req, res, next) => {
   res.setHeader("Permissions-Policy", "compute-pressure=*");
   next();
 });
-app.get("/api/network/ping", (_req, res) => {
+var handleNetworkPing = (_req, res) => {
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Expires", "0");
   res.setHeader("Timing-Allow-Origin", "*");
   res.status(200).json({ ok: true, serverTimestampMs: Date.now() });
-});
+};
+app.head("/api/network/ping", handleNetworkPing);
+app.get("/api/network/ping", handleNetworkPing);
 app.get("/api/network/download", (req, res) => {
   const nowMs = Date.now();
   pruneSpeedTestState(nowMs);
@@ -1059,6 +1113,8 @@ app.post("/api/network/upload", (req, res) => {
       platformBufferedBody = candidate;
     } else if (candidate instanceof Uint8Array) {
       platformBufferedBody = Buffer.from(candidate);
+    } else if (typeof candidate === "string" && candidate.length > 0) {
+      platformBufferedBody = Buffer.from(candidate);
     }
   } catch {
     platformBufferedBody = null;
@@ -1083,8 +1139,9 @@ app.post("/api/network/upload", (req, res) => {
     res.status(429).json({ error: "Maximum upload transfer limit reached for this test." });
     return;
   }
-  if (platformBufferedBody) {
-    const receivedBytes = platformBufferedBody.byteLength;
+  const contentLengthHeader = parseInt(String(req.headers["content-length"] || "0"), 10);
+  if (platformBufferedBody || req.readableEnded || req.complete) {
+    const receivedBytes = platformBufferedBody ? platformBufferedBody.byteLength : Number.isFinite(contentLengthHeader) && contentLengthHeader > 0 ? Math.min(contentLengthHeader, SPEED_TEST_MAX_STREAM_UPLOAD_BYTES) : 0;
     if (receivedBytes > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES || ledger.uploadedBytes + receivedBytes > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
       res.status(413).json({
         ok: false,
@@ -1179,12 +1236,10 @@ app.post("/api/network/speed-test/init", (req, res) => {
   const ipKey = extractedIp && extractedIp !== "Unavailable" ? extractedIp : visitorKey;
   let activeCount = 0;
   let activeIpCount = 0;
-  for (const [existingId, ledger] of activeSpeedTests.entries()) {
-    if (ledger.visitorKey === visitorKey) {
-      ledger.completed = true;
-      activeSpeedTests.delete(existingId);
-      continue;
-    }
+  const seenTestIds = /* @__PURE__ */ new Set();
+  for (const [, ledger] of activeSpeedTests.entries()) {
+    if (seenTestIds.has(ledger.testId)) continue;
+    seenTestIds.add(ledger.testId);
     if (!ledger.completed && nowMs < ledger.expiresAtMs && nowMs - ledger.createdAtMs < 45e3) {
       activeCount += 1;
       if (ledger.ipKey === ipKey) {
@@ -1235,7 +1290,7 @@ app.post("/api/network/speed-test/init", (req, res) => {
   const testId = "st_" + crypto.randomBytes(8).toString("hex");
   const expiresAtMs = nowMs + SPEED_TEST_TOKEN_TTL_MS;
   const token = createSignedSpeedTestToken(testId, expiresAtMs, visitorKey);
-  activeSpeedTests.set(testId, {
+  const newLedger = {
     testId,
     visitorKey,
     sessionKey,
@@ -1246,7 +1301,9 @@ app.post("/api/network/speed-test/init", (req, res) => {
     uploadedBytes: 0,
     activeStreams: 0,
     completed: false
-  });
+  };
+  activeSpeedTests.set(testId, newLedger);
+  activeSpeedTests.set(token, newLedger);
   const { regionCode, regionLabel } = detectServerRegion(req);
   res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   res.status(200).json({
@@ -1263,13 +1320,18 @@ app.post("/api/network/speed-test/init", (req, res) => {
 });
 app.post("/api/network/speed-test/complete", (req, res) => {
   const body = req.body || {};
-  const rawToken = typeof body.token === "string" ? body.token.trim() : "";
+  const queryToken = typeof req.query.token === "string" ? req.query.token : "";
+  const headerToken = typeof req.headers["x-speedtest-token"] === "string" ? req.headers["x-speedtest-token"] : "";
+  const rawToken = (typeof body.token === "string" ? body.token : queryToken || headerToken).trim();
   const testId = rawToken.split(".")[0];
+  if (rawToken && activeSpeedTests.has(rawToken)) {
+    const ledger = activeSpeedTests.get(rawToken);
+    if (ledger) ledger.completed = true;
+    activeSpeedTests.delete(rawToken);
+  }
   if (testId && activeSpeedTests.has(testId)) {
     const ledger = activeSpeedTests.get(testId);
-    if (ledger) {
-      ledger.completed = true;
-    }
+    if (ledger) ledger.completed = true;
     activeSpeedTests.delete(testId);
   }
   res.status(200).json({ ok: true });
@@ -1292,14 +1354,150 @@ function extractVercelEdgeGeo(req) {
   const city = decodeHeader(req.headers["x-vercel-ip-city"]);
   const region = decodeHeader(req.headers["x-vercel-ip-country-region"]);
   const country = decodeHeader(req.headers["x-vercel-ip-country"]);
+  const timezone = decodeHeader(req.headers["x-vercel-ip-timezone"]);
   const rawLat = parseFloat(String(req.headers["x-vercel-ip-latitude"] || ""));
   const rawLon = parseFloat(String(req.headers["x-vercel-ip-longitude"] || ""));
   return {
     city,
     region,
     country,
+    timezone,
     latitude: Number.isFinite(rawLat) ? rawLat : null,
     longitude: Number.isFinite(rawLon) ? rawLon : null
+  };
+}
+var SERVER_TIMEZONE_ALIAS_MAP = {
+  "asia/calcutta": "asia/kolkata",
+  "asia/katmandu": "asia/kathmandu",
+  "asia/rangoon": "asia/yangon",
+  "asia/saigon": "asia/ho_chi_minh",
+  "europe/kiev": "europe/kyiv",
+  "us/eastern": "america/new_york",
+  "us/central": "america/chicago",
+  "us/mountain": "america/denver",
+  "us/pacific": "america/los_angeles",
+  "etc/utc": "utc",
+  "etc/gmt": "utc"
+};
+function normalizeServerTimezoneId(tz) {
+  if (!tz || typeof tz !== "string") return "";
+  const cleaned = tz.trim().toLowerCase();
+  if (!cleaned || cleaned === "unknown") return "";
+  return SERVER_TIMEZONE_ALIAS_MAP[cleaned] || cleaned;
+}
+function sanitizeHardwareSignals(raw, browserDevice) {
+  const safeStr = (val, fallback, maxLen = 140) => typeof val === "string" && val.trim().length > 0 ? val.trim().slice(0, maxLen) : fallback;
+  const rawHwId = safeStr(raw?.hardwareId, "", 40);
+  const validHwId = /^hwid_[0-9a-f]{16,32}$/i.test(rawHwId) ? rawHwId.toLowerCase() : "hwid_" + crypto.createHash("sha256").update(
+    `${browserDevice.os}|${browserDevice.screenResolution}|${browserDevice.pixelRatio}|${safeStr(raw?.gpuRenderer, "gpu")}|${safeStr(raw?.canvasHash, "canvas")}`
+  ).digest("hex").slice(0, 20);
+  const cpuCores = typeof raw?.cpuCores === "number" && Number.isFinite(raw.cpuCores) && raw.cpuCores > 0 ? Math.min(256, Math.round(raw.cpuCores)) : null;
+  const deviceMemoryGb = typeof raw?.deviceMemoryGb === "number" && Number.isFinite(raw.deviceMemoryGb) && raw.deviceMemoryGb > 0 ? Number(raw.deviceMemoryGb) : null;
+  const maxTouchPoints = typeof raw?.maxTouchPoints === "number" && Number.isFinite(raw.maxTouchPoints) && raw.maxTouchPoints >= 0 ? Math.min(64, Math.round(raw.maxTouchPoints)) : 0;
+  const colorDepth = typeof raw?.colorDepth === "number" && Number.isFinite(raw.colorDepth) && raw.colorDepth > 0 ? Math.min(64, Math.round(raw.colorDepth)) : 24;
+  const maxTextureSize = typeof raw?.maxTextureSize === "number" && Number.isFinite(raw.maxTextureSize) && raw.maxTextureSize >= 0 ? Math.round(raw.maxTextureSize) : 0;
+  return {
+    hardwareId: validHwId,
+    gpuVendor: safeStr(raw?.gpuVendor, "Standard WebGL Vendor", 120),
+    gpuRenderer: safeStr(raw?.gpuRenderer, "Standard Hardware Renderer", 160),
+    maxTextureSize,
+    canvasHash: safeStr(raw?.canvasHash, "unavailable", 40),
+    audioHash: safeStr(raw?.audioHash, "unavailable", 40),
+    cpuCores,
+    deviceMemoryGb,
+    colorDepth,
+    maxTouchPoints,
+    hdrSupported: Boolean(raw?.hdrSupported),
+    colorGamut: raw?.colorGamut === "Rec2020" || raw?.colorGamut === "P3" || raw?.colorGamut === "sRGB" ? raw.colorGamut : "sRGB",
+    architecture: safeStr(raw?.architecture, browserDevice.os, 80)
+  };
+}
+function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals, location, ipTimezoneHint, recognitionSource) {
+  const safeStrArray = (arr) => Array.isArray(arr) ? arr.filter((item) => typeof item === "string" && item.trim().length > 0).map((s) => s.trim().slice(0, 180)).slice(0, 10) : [];
+  const isBot = Boolean(raw?.isBot);
+  const botSignals = safeStrArray(raw?.botSignals);
+  const browserTimezone = typeof raw?.browserTimezone === "string" && raw.browserTimezone.trim() ? raw.browserTimezone.trim().slice(0, 80) : browserDevice.timezone || "UTC";
+  const ipTimezone = ipTimezoneHint || (typeof raw?.ipTimezone === "string" && raw.ipTimezone.trim() && raw.ipTimezone !== "Unavailable" ? raw.ipTimezone.trim().slice(0, 80) : "Unavailable");
+  const normBrowserTz = normalizeServerTimezoneId(browserTimezone);
+  const normIpTz = normalizeServerTimezoneId(ipTimezone);
+  const serverTzMismatch = Boolean(normBrowserTz && normIpTz && normBrowserTz !== normIpTz);
+  const timezoneMismatch = Boolean(raw?.timezoneMismatch) || serverTzMismatch;
+  const combinedNet = `${location.isp || ""} ${location.org || ""} ${location.asn || ""}`;
+  const isCloudOrDatacenterNetwork = Boolean(location.isVpnOrHosting) || /google|gcp|as15169|as396982|aws|amazon|digitalocean|cloudflare|m247|hetzner|azure|microsoft|linode|vultr|ovh|oracle|datacenter|hosting|cloud/i.test(
+    combinedNet
+  );
+  const isGpuMaskedOrUnavailable = !hardwareSignals.gpuVendor || hardwareSignals.gpuVendor === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuVendor) || !hardwareSignals.gpuRenderer || hardwareSignals.gpuRenderer === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuRenderer);
+  const datacenterAsn = Boolean(raw?.datacenterAsn) || isCloudOrDatacenterNetwork;
+  const vpnReasons = safeStrArray(raw?.vpnReasons);
+  if (timezoneMismatch && !vpnReasons.some((r) => r.toLowerCase().includes("timezone"))) {
+    vpnReasons.push(
+      `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})`
+    );
+  }
+  if (datacenterAsn && !vpnReasons.some((r) => r.toLowerCase().includes("datacenter") || r.toLowerCase().includes("asn"))) {
+    vpnReasons.push(
+      `Network ASN / ISP (${location.isp}${location.asn !== "Unknown" ? ` \u2022 ${location.asn}` : ""}) matches cloud/hosting or VPN infrastructure`
+    );
+  }
+  if (datacenterAsn && isGpuMaskedOrUnavailable && !vpnReasons.some((r) => /Cloud \/ Masked GPU/i.test(r))) {
+    vpnReasons.push("Cloud / Masked GPU environment");
+  }
+  const vpnSuspected = Boolean(raw?.vpnSuspected) || timezoneMismatch || datacenterAsn;
+  const tamperDetected = Boolean(raw?.tamperDetected);
+  const tamperReasons = safeStrArray(raw?.tamperReasons);
+  const incognitoLikely = Boolean(raw?.incognitoLikely);
+  const storageQuotaMb = typeof raw?.storageQuotaMb === "number" && Number.isFinite(raw.storageQuotaMb) && raw.storageQuotaMb > 0 ? Math.round(raw.storageQuotaMb) : null;
+  let persistenceMode = "First-Party Cookie";
+  if (recognitionSource === "Hardware Fingerprint (Cookie-less / Incognito)") {
+    persistenceMode = "Hardware ID Recovered";
+  } else if (incognitoLikely) {
+    persistenceMode = "Private / Restricted Storage";
+  }
+  let suspectScore = 0;
+  const riskFactors = [];
+  if (isBot) {
+    suspectScore += 45;
+    riskFactors.push(botSignals[0] || "Headless / automated browser runtime detected");
+  }
+  if (timezoneMismatch) {
+    suspectScore += 25;
+    riskFactors.push(`Timezone mismatch (${browserTimezone} vs ${ipTimezone})`);
+  }
+  if (datacenterAsn) {
+    suspectScore += 15;
+    riskFactors.push(
+      isGpuMaskedOrUnavailable ? `Cloud / Masked GPU environment (${location.isp})` : `Datacenter or VPN network ASN (${location.isp})`
+    );
+  }
+  if (tamperDetected) {
+    suspectScore += 15;
+    riskFactors.push(tamperReasons[0] || "User-Agent / platform mismatch detected");
+  }
+  if (incognitoLikely) {
+    suspectScore += 10;
+    riskFactors.push(
+      storageQuotaMb !== null ? `Restricted storage quota (${storageQuotaMb} MB) indicates private browsing` : "Private or restricted browser storage environment"
+    );
+  }
+  suspectScore = Math.min(100, suspectScore);
+  const riskLevel = suspectScore >= 50 ? "High" : suspectScore >= 20 ? "Medium" : "Low";
+  return {
+    isBot,
+    botSignals,
+    vpnSuspected,
+    timezoneMismatch,
+    datacenterAsn,
+    vpnReasons,
+    browserTimezone,
+    ipTimezone,
+    tamperDetected,
+    tamperReasons,
+    incognitoLikely,
+    storageQuotaMb,
+    persistenceMode,
+    suspectScore,
+    riskLevel,
+    riskFactors
   };
 }
 app.post("/api/visitor/identify", async (req, res) => {
@@ -1311,10 +1509,14 @@ app.post("/api/visitor/identify", async (req, res) => {
       clientSessionId,
       clientHistoryBackup,
       browserDevice: rawBrowserDevice,
+      hardwareSignals: rawHardwareSignals,
+      securitySignals: rawSecuritySignals,
       clientGeoHint
     } = req.body || {};
     const safePageLoadId = typeof pageLoadId === "string" && pageLoadId.trim().length > 0 ? pageLoadId.trim().slice(0, 80) : "pl_" + crypto.randomBytes(8).toString("hex");
     const browserDevice = sanitizeBrowserDevice(rawBrowserDevice);
+    const hardwareSignals = sanitizeHardwareSignals(rawHardwareSignals, browserDevice);
+    const hardwareId = hardwareSignals.hardwareId;
     let { ip: extractedIp, isPublic } = extractVisitorIp(req);
     if (!isPublic && clientGeoHint && typeof clientGeoHint.ip === "string") {
       const normalizedHintIp = normalizeIpCandidate(clientGeoHint.ip);
@@ -1383,11 +1585,12 @@ app.post("/api/visitor/identify", async (req, res) => {
         const restoredSessionId = clientSessionId || latestBackupVisit?.sessionId || generateSessionId();
         db.prepare(
           `INSERT INTO visitors (
-            visitor_id, hmac_token, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
-          ) VALUES (?, ?, ?, ?, ?, ?)`
+            visitor_id, hmac_token, hardware_id, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`
         ).run(
           verifiedVid,
           verifiedToken,
+          hardwareId,
           restoredFirstUtc,
           restoredLastUtc,
           restoredSessionId,
@@ -1427,6 +1630,12 @@ app.post("/api/visitor/identify", async (req, res) => {
             histVisit.timezone
           );
         }
+      }
+    } else if (hardwareId) {
+      const hwMatchedVisitor = db.prepare("SELECT * FROM visitors WHERE hardware_id = ?").get(hardwareId);
+      if (hwMatchedVisitor) {
+        existingVisitor = hwMatchedVisitor;
+        recognitionSource = "Hardware Fingerprint (Cookie-less / Incognito)";
       }
     }
     const nowUtc = (/* @__PURE__ */ new Date()).toISOString();
@@ -1482,9 +1691,9 @@ app.post("/api/visitor/identify", async (req, res) => {
         );
         db.prepare(
           `UPDATE visitors
-           SET updated_at_utc = ?, active_session_id = ?, last_activity_utc = ?
+           SET updated_at_utc = ?, active_session_id = ?, last_activity_utc = ?, hardware_id = ?
            WHERE visitor_id = ?`
-        ).run(nowUtc, currentSessionId, nowUtc, visitorId);
+        ).run(nowUtc, currentSessionId, nowUtc, hardwareId, visitorId);
       }
     } else {
       visitorId = generateVisitorId();
@@ -1493,9 +1702,9 @@ app.post("/api/visitor/identify", async (req, res) => {
       isReturning = false;
       db.prepare(
         `INSERT INTO visitors (
-          visitor_id, hmac_token, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
-        ) VALUES (?, ?, ?, ?, ?, ?)`
-      ).run(visitorId, visitorToken, nowUtc, nowUtc, currentSessionId, nowUtc);
+          visitor_id, hmac_token, hardware_id, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(visitorId, visitorToken, hardwareId, nowUtc, nowUtc, currentSessionId, nowUtc);
       const visitId = generateVisitId();
       db.prepare(
         `INSERT OR IGNORE INTO visits (
@@ -1602,20 +1811,33 @@ app.post("/api/visitor/identify", async (req, res) => {
       language: String(r.language),
       timezone: String(r.timezone)
     }));
+    const ipTimezoneHint = typeof clientGeoHint?.timezone === "string" && clientGeoHint.timezone.trim() || vercelGeo.timezone || "";
+    const securitySignals = sanitizeAndReinforceSecuritySignals(
+      rawSecuritySignals,
+      browserDevice,
+      hardwareSignals,
+      location,
+      ipTimezoneHint,
+      recognitionSource
+    );
     const historyBackup = createSignedHistoryBackup(
       visitorId,
       statistics.totalVisits,
       statistics.totalSessions,
       statistics.firstVisitUtc,
-      visitHistory
+      visitHistory,
+      hardwareId
     );
     const payload = {
       visitorId,
       visitorToken,
+      hardwareId,
       isReturning,
       recognitionSource,
       location,
       browserDevice,
+      hardwareSignals,
+      securitySignals,
       statistics,
       visitHistory,
       historyBackup
@@ -1688,28 +1910,109 @@ var server_default = app;
 
 // api/_entry.ts
 var API_PREFIX = "/api";
+function applyRestoredUrlAndQuery(req, restoredPath, params) {
+  params.delete("__ipath");
+  const remainingQuery = params.toString();
+  const finalUrl = remainingQuery ? `${restoredPath}?${remainingQuery}` : restoredPath;
+  req.url = finalUrl;
+  req.originalUrl = finalUrl;
+  const internalReq = req;
+  if ("_parsedUrl" in internalReq) {
+    delete internalReq._parsedUrl;
+  }
+  if ("_parsedOriginalUrl" in internalReq) {
+    delete internalReq._parsedOriginalUrl;
+  }
+  const cleanQuery = {};
+  for (const [key, value] of params.entries()) {
+    if (key === "__ipath") continue;
+    const existing = cleanQuery[key];
+    if (existing === void 0) {
+      cleanQuery[key] = value;
+    } else if (Array.isArray(existing)) {
+      existing.push(value);
+    } else {
+      cleanQuery[key] = [existing, value];
+    }
+  }
+  try {
+    Object.defineProperty(req, "query", {
+      value: cleanQuery,
+      writable: true,
+      enumerable: true,
+      configurable: true
+    });
+  } catch {
+    try {
+      req.query = cleanQuery;
+    } catch {
+    }
+  }
+}
 function restoreOriginalApiUrl(req) {
   const rawUrl = typeof req.url === "string" && req.url.length > 0 ? req.url : API_PREFIX;
   const queryIndex = rawUrl.indexOf("?");
   const pathPart = queryIndex === -1 ? rawUrl : rawUrl.slice(0, queryIndex);
   const queryPart = queryIndex === -1 ? "" : rawUrl.slice(queryIndex + 1);
   const params = new URLSearchParams(queryPart);
+  try {
+    if (req.query && typeof req.query === "object") {
+      for (const [k, v] of Object.entries(req.query)) {
+        if (!params.has(k)) {
+          if (typeof v === "string") {
+            params.set(k, v);
+          } else if (Array.isArray(v) && typeof v[0] === "string") {
+            params.set(k, v[0]);
+          }
+        }
+      }
+    }
+  } catch {
+  }
   const injectedPath = params.get("__ipath");
   if (injectedPath !== null) {
     params.delete("__ipath");
-    const suffix = injectedPath.replace(/^\/+/, "");
-    const restored = suffix ? `${API_PREFIX}/${suffix}` : API_PREFIX;
-    const remainingQuery = params.toString();
-    req.url = remainingQuery ? `${restored}?${remainingQuery}` : restored;
+    let decodedInjected = injectedPath;
+    try {
+      if (decodedInjected.includes("%")) {
+        decodedInjected = decodeURIComponent(decodedInjected);
+      }
+    } catch {
+      decodedInjected = injectedPath;
+    }
+    const [cleanInjectedPath, embeddedQuery] = decodedInjected.split("?");
+    if (embeddedQuery) {
+      const embeddedParams = new URLSearchParams(embeddedQuery);
+      for (const [ek, ev] of embeddedParams.entries()) {
+        if (ek !== "__ipath" && !params.has(ek)) {
+          params.set(ek, ev);
+        }
+      }
+    }
+    const ipath = cleanInjectedPath.replace(/^\/+/, "").replace(/^api\/+/i, "");
+    const restoredPath = ipath ? `${API_PREFIX}/${ipath}` : API_PREFIX;
+    applyRestoredUrlAndQuery(req, restoredPath, params);
     return;
   }
   if (pathPart === "/api/index" || pathPart === "/api/index.js") {
-    const headerValue = req.headers["x-vercel-original-path"] || req.headers["x-original-url"] || req.headers["x-rewrite-url"];
+    const headerValue = req.headers["x-vercel-original-path"] || req.headers["x-original-url"] || req.headers["x-rewrite-url"] || req.headers["x-matched-path"];
     if (headerValue) {
       const original = headerValue.startsWith("http") ? new URL(headerValue).pathname + new URL(headerValue).search : headerValue;
-      req.url = original.startsWith("/") ? original : `/${original}`;
+      const normalized = original.startsWith("/") ? original : `/${original}`;
+      const normQIdx = normalized.indexOf("?");
+      const normPath = normQIdx === -1 ? normalized : normalized.slice(0, normQIdx);
+      const normQuery = normQIdx === -1 ? "" : normalized.slice(normQIdx + 1);
+      const mergedParams = new URLSearchParams(normQuery);
+      for (const [k, v] of params.entries()) {
+        if (k !== "__ipath" && !mergedParams.has(k)) {
+          mergedParams.set(k, v);
+        }
+      }
+      applyRestoredUrlAndQuery(req, normPath, mergedParams);
+      return;
     }
   }
+  applyRestoredUrlAndQuery(req, pathPart, params);
 }
 function handler(req, res) {
   try {

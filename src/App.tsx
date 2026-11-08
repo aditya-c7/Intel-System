@@ -32,10 +32,6 @@ import {
   CircuitBoard,
   HardDrive,
   Palette,
-  Frame,
-  AudioWaveform,
-  ChevronDown,
-  ChevronUp,
   Moon,
   Sun,
 } from 'lucide-react';
@@ -256,9 +252,6 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<boolean>(false);
   const [copiedHwId, setCopiedHwId] = useState<boolean>(false);
-  const [copiedCanvas, setCopiedCanvas] = useState<boolean>(false);
-  const [copiedAudio, setCopiedAudio] = useState<boolean>(false);
-  const [showRawGpu, setShowRawGpu] = useState<boolean>(false);
   const [selectedVisitIndex, setSelectedVisitIndex] = useState<number>(0);
   const [theme, setTheme] = useState<ThemeMode>(resolveInitialTheme);
 
@@ -367,6 +360,13 @@ export default function App() {
   const rawGpuTooltip = data?.hardwareSignals
     ? `${data.hardwareSignals.gpuVendor} • ${data.hardwareSignals.gpuRenderer}`
     : '';
+  const isCloudMaskedGpu = Boolean(
+    data?.securitySignals?.datacenterAsn &&
+      (data?.hardwareSignals?.gpuVendor === 'Unavailable' ||
+        /^Standard (GPU|WebGL|Hardware)/i.test(data?.hardwareSignals?.gpuVendor || '') ||
+        cleanGpuName === 'Standard GPU' ||
+        data?.securitySignals?.vpnReasons?.some((r) => /Cloud \/ Masked GPU/i.test(r)))
+  );
 
   return (
     <div
@@ -935,6 +935,8 @@ export default function App() {
                       <p className="text-[11px] text-slate-500 truncate mt-1">
                         {data.securitySignals.isBot
                           ? 'Automation runtime hooks detected'
+                          : isCloudMaskedGpu
+                          ? 'Cloud / Masked GPU environment'
                           : 'No automation or headless hooks'}
                       </p>
                     </div>
@@ -976,6 +978,8 @@ export default function App() {
                       <p className="text-[11px] text-slate-500 truncate mt-1">
                         {data.securitySignals.timezoneMismatch
                           ? `TZ mismatch (${data.securitySignals.browserTimezone})`
+                          : isCloudMaskedGpu
+                          ? 'Cloud / Masked GPU environment'
                           : data.securitySignals.datacenterAsn
                           ? 'Datacenter or cloud ASN'
                           : 'Timezone & ISP match location'}
@@ -1189,108 +1193,45 @@ export default function App() {
                       <span className="block text-[11px] text-slate-500">
                         Display &amp; Input
                       </span>
-                      <span className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5">
+                      <span
+                        className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5"
+                        title={`${data.hardwareSignals.colorGamut} • ${
+                          data.hardwareSignals.hdrSupported ? 'HDR' : 'SDR'
+                        } • ${
+                          data.hardwareSignals.maxTouchPoints === 0
+                            ? 'No Touch'
+                            : `${data.hardwareSignals.maxTouchPoints}-pt Touch`
+                        }`}
+                      >
                         {data.hardwareSignals.colorGamut} •{' '}
                         {data.hardwareSignals.hdrSupported ? 'HDR' : 'SDR'} •{' '}
-                        {data.hardwareSignals.maxTouchPoints} Touch{' '}
-                        {data.hardwareSignals.maxTouchPoints === 1 ? 'Pt' : 'Pts'}
+                        {data.hardwareSignals.maxTouchPoints === 0
+                          ? 'No Touch'
+                          : `${data.hardwareSignals.maxTouchPoints}-pt Touch`}
                       </span>
                     </div>
                   </div>
 
-                  {/* Tile 5: Canvas 2D Hash */}
-                  <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center justify-between gap-2.5 min-w-0">
-                    <div className="flex items-center gap-3 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-blue-50/60 border border-blue-200 flex items-center justify-center shrink-0">
-                        <Frame className="w-4 h-4 text-[#2563EB]" />
-                      </div>
-                      <div className="min-w-0">
-                        <span className="block text-[11px] text-slate-500">Canvas 2D Hash</span>
-                        <code
-                          className="block text-xs sm:text-sm font-bold font-mono tabular-nums text-[#2563EB] truncate mt-0.5"
-                          title={data.hardwareSignals.canvasHash}
-                        >
-                          {data.hardwareSignals.canvasHash}
-                        </code>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        handleCopyText(data.hardwareSignals.canvasHash, setCopiedCanvas)
-                      }
-                      className="inline-flex items-center justify-center w-7 h-7 text-slate-500 hover:text-slate-900 bg-white hover:bg-slate-100 border border-[#E5E7EB] rounded-md shrink-0 cursor-pointer"
-                      title="Copy Canvas 2D SHA-256 Hash"
-                      aria-label="Copy Canvas 2D Hash"
-                    >
-                      {copiedCanvas ? (
-                        <Check className="w-3.5 h-3.5 text-emerald-600" />
-                      ) : (
-                        <Copy className="w-3.5 h-3.5" />
-                      )}
-                    </button>
-                  </div>
-
-                  {/* Tile 6: Web Audio Hash */}
-                  <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center justify-between gap-2.5 min-w-0">
-                    <div className="flex items-center gap-3 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-emerald-50/60 border border-emerald-200 flex items-center justify-center shrink-0">
-                        <AudioWaveform className="w-4 h-4 text-emerald-600" />
-                      </div>
-                      <div className="min-w-0">
-                        <span className="block text-[11px] text-slate-500">Web Audio Hash</span>
-                        <code
-                          className="block text-xs sm:text-sm font-bold font-mono tabular-nums text-emerald-700 truncate mt-0.5"
-                          title={data.hardwareSignals.audioHash}
-                        >
-                          {data.hardwareSignals.audioHash}
-                        </code>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        handleCopyText(data.hardwareSignals.audioHash, setCopiedAudio)
-                      }
-                      className="inline-flex items-center justify-center w-7 h-7 text-slate-500 hover:text-slate-900 bg-white hover:bg-slate-100 border border-[#E5E7EB] rounded-md shrink-0 cursor-pointer"
-                      title="Copy Web Audio SHA-256 Hash"
-                      aria-label="Copy Web Audio Hash"
-                    >
-                      {copiedAudio ? (
-                        <Check className="w-3.5 h-3.5 text-emerald-600" />
-                      ) : (
-                        <Copy className="w-3.5 h-3.5" />
-                      )}
-                    </button>
-                  </div>
                 </div>
               </div>
 
-              {/* Subtle Collapsible Raw GPU Driver Drawer */}
+              {/* Direct GPU Vendor & Raw GPU Renderer Display (Always Visible, No Dropdown) */}
               <div className="mt-4 pt-3.5 border-t border-[#E5E7EB]">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs text-slate-500 truncate">
-                    Vendor: <strong className="font-medium text-slate-700">{data.hardwareSignals.gpuVendor}</strong>
+                    Vendor:{' '}
+                    <strong className="font-semibold text-slate-800">
+                      {data.hardwareSignals.gpuVendor}
+                    </strong>
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => setShowRawGpu((prev) => !prev)}
-                    className="inline-flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-slate-900 shrink-0 cursor-pointer"
-                  >
-                    <span>{showRawGpu ? 'Hide Raw GPU' : 'Raw GPU String'}</span>
-                    {showRawGpu ? (
-                      <ChevronUp className="w-3.5 h-3.5" />
-                    ) : (
-                      <ChevronDown className="w-3.5 h-3.5" />
-                    )}
-                  </button>
+                  <span className="text-[11px] font-mono text-slate-400 shrink-0">
+                    Raw GPU
+                  </span>
                 </div>
 
-                {showRawGpu && (
-                  <div className="mt-2 p-2.5 rounded-lg bg-slate-50 border border-[#E5E7EB] text-[11px] font-mono text-slate-600 break-all">
-                    {data.hardwareSignals.gpuRenderer}
-                  </div>
-                )}
+                <div className="mt-2 p-2.5 rounded-lg bg-slate-50 border border-[#E5E7EB] text-[11px] font-mono text-slate-600 break-all">
+                  {data.hardwareSignals.gpuRenderer}
+                </div>
               </div>
             </div>
           </section>
