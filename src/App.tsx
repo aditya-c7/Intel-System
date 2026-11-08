@@ -1216,7 +1216,7 @@ export default function App() {
                         Display &amp; Input
                       </span>
                       <span
-                        className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5"
+                        className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] break-words leading-snug mt-0.5 min-w-0"
                         title={`${data.hardwareSignals.colorGamut} • ${
                           data.hardwareSignals.hdrSupported ? 'HDR' : 'SDR'
                         } • ${
