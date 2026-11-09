@@ -1,6 +1,8 @@
 import type {
   BrowserDeviceInfo,
   HardwareSignals,
+  IspNetworkClassification,
+  NetworkType,
   SecuritySignals,
   RiskLevel,
   PersistenceMode,
@@ -147,6 +149,250 @@ export function isDatacenterOrVpnNetwork(
     };
   }
   return { isDatacenter: false, matchedReason: null };
+}
+
+/**
+ * Task 1 - Clean ISP brand & network type classifier.
+ * Maps verbose WHOIS / legal network names into clean retail brands
+ * (e.g. "Comcast Cable Communications, LLC" -> "Xfinity (Comcast)").
+ * Rules are evaluated in the listed order: numeric ASN evidence first
+ * (ASN rules win over keywords inside the same rule), then ISP / Org keywords.
+ * Consumer rules are always checked BEFORE the cloud / datacenter rule, and
+ * Google Fiber is checked BEFORE generic Google cloud, so residential FTTH
+ * networks such as AS16591 are never mis-flagged as hosting.
+ */
+interface IspNetworkRule {
+  brandName: string;
+  networkType: NetworkType;
+  isConsumer: boolean;
+  label: string;
+  asns: number[];
+  pattern?: RegExp;
+}
+
+const RESIDENTIAL_BROADBAND: NetworkType = 'Residential Broadband';
+const CELLULAR_5G: NetworkType = 'Cellular / 5G';
+const SATELLITE_NETWORK: NetworkType = 'Satellite';
+const CLOUD_DATACENTER: NetworkType = 'Cloud / Datacenter';
+
+const ISP_NETWORK_RULES: IspNetworkRule[] = [
+  // US consumer broadband
+  {
+    brandName: 'Xfinity (Comcast)',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'Comcast consumer broadband',
+    asns: [7922, 7015, 7016],
+    pattern: /comcast|xfinity/i,
+  },
+  {
+    brandName: 'Spectrum (Charter)',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'Charter Spectrum consumer broadband',
+    asns: [20115, 11426, 10796],
+    pattern: /charter|spectrum/i,
+  },
+  {
+    brandName: 'AT&T Fiber',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'AT&T consumer broadband',
+    asns: [7018, 20057],
+    pattern: /at&t|att services|sbcglobal/i,
+  },
+  {
+    brandName: 'Verizon Fios',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'Verizon Fios consumer broadband',
+    asns: [701, 19262],
+    pattern: /fios|mci communications|verizon online/i,
+  },
+  {
+    brandName: 'Optimum',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'Optimum consumer broadband',
+    asns: [6128, 19108],
+    pattern: /optimum|cablevision|altice|suddenlink/i,
+  },
+  {
+    brandName: 'Cox',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'Cox consumer broadband',
+    asns: [22773],
+    pattern: /\bcox\b/i,
+  },
+  {
+    brandName: 'Frontier / CenturyLink',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'Frontier / CenturyLink consumer broadband',
+    asns: [5650, 209],
+  },
+  {
+    brandName: 'Google Fiber',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'Google Fiber residential FTTH',
+    asns: [16591],
+    pattern: /google fiber|gfiber/i,
+  },
+  // US mobile / 5G home
+  {
+    brandName: 'Verizon 5G Home',
+    networkType: CELLULAR_5G,
+    isConsumer: true,
+    label: 'Verizon Wireless 5G home',
+    asns: [6167, 22394],
+    pattern: /cellco|verizon wireless/i,
+  },
+  {
+    brandName: 'T-Mobile 5G Home',
+    networkType: CELLULAR_5G,
+    isConsumer: true,
+    label: 'T-Mobile 5G home',
+    asns: [21928],
+    pattern: /t-mobile|tmobile/i,
+  },
+  // Satellite
+  {
+    brandName: 'Starlink (SpaceX)',
+    networkType: SATELLITE_NETWORK,
+    isConsumer: true,
+    label: 'Starlink satellite broadband',
+    asns: [14593],
+    pattern: /starlink|spacex/i,
+  },
+  // India consumer broadband
+  {
+    brandName: 'Jio (Reliance Jio)',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'Reliance Jio consumer broadband',
+    asns: [55836],
+    pattern: /reliance jio|\bjio\b/i,
+  },
+  {
+    brandName: 'Airtel Xstream',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'Bharti Airtel consumer broadband',
+    asns: [24560, 45609, 9498],
+    pattern: /bharti airtel|\bairtel\b/i,
+  },
+  {
+    brandName: 'ACT Fibernet',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'ACT Fibernet consumer broadband',
+    asns: [24309],
+    pattern: /act fibernet|atria convergence/i,
+  },
+  {
+    brandName: 'BSNL Broadband',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'BSNL consumer broadband',
+    asns: [9829],
+    pattern: /\bbsnl\b|bharat sanchar/i,
+  },
+  {
+    brandName: 'Tata Play / Hathway',
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumer: true,
+    label: 'Tata Play / Hathway consumer broadband',
+    asns: [],
+    pattern: /tata play|tata sky broadband|hathway|excitel/i,
+  },
+  // Cloud / Datacenter rule: LAST on purpose, only reached when no consumer rule above matched.
+  {
+    brandName: 'Cloud Provider / Datacenter',
+    networkType: CLOUD_DATACENTER,
+    isConsumer: false,
+    label: 'cloud/hosting network',
+    asns: [
+      396178, 15169, 16509, 14618, 13335, 14061, 9009, 60068, 24940, 63949, 16276, 8075, 20473,
+    ],
+    pattern:
+      /google llc|google cloud|amazonaws|cloudflare|digitalocean|hetzner|m247|datacamp|linode|ovh|choopa|vultr|leaseweb|hostinger|contabo|akamai/i,
+  },
+];
+
+const UNKNOWN_NETWORK_NAME_PATTERN = /^(unknown|unavailable|n\/a|na|none|-)$/i;
+
+function extractAsnNumber(rawAsn: string | null | undefined): number | null {
+  if (!rawAsn) return null;
+  const trimmed = rawAsn.trim();
+  if (!trimmed) return null;
+  const lowered = trimmed.toLowerCase();
+  if (lowered === 'unknown' || lowered === 'unavailable') return null;
+  // Accept both "AS55836" and "55836" forms; treat anything without a numeric
+  // head as unknown.
+  const digitsMatch = trimmed.replace(/^AS/i, '').match(/^(\d{1,10})/);
+  const digits = digitsMatch && digitsMatch[1] ? digitsMatch[1] : null;
+  if (!digits) return null;
+  const value = Number.parseInt(digits, 10);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function cleanIspBrandText(ispText: string, orgText: string): string {
+  const candidates = [ispText, orgText];
+  for (const candidate of candidates) {
+    const cleaned = candidate.replace(/\s+/g, ' ').trim();
+    if (!cleaned || UNKNOWN_NETWORK_NAME_PATTERN.test(cleaned)) continue;
+    return cleaned;
+  }
+  return 'Unknown ISP';
+}
+
+export function classifyIspNetwork(
+  isp: string,
+  org: string,
+  asn: string
+): IspNetworkClassification {
+  const ispText = (isp || '').trim();
+  const orgText = (org || '').trim();
+  const keywordCorpus = `${ispText} ${orgText}`.trim();
+  const asnNumber = extractAsnNumber(asn);
+
+  const applyRule = (rule: IspNetworkRule, matchedReason: string): IspNetworkClassification => ({
+    brandName: rule.brandName,
+    networkType: rule.networkType,
+    isConsumerBroadband: rule.isConsumer,
+    isDatacenterOrHosting: !rule.isConsumer,
+    matchedReason,
+  });
+
+  // Pass 1: numeric ASN evidence takes priority over any ISP / Org keyword.
+  if (asnNumber !== null) {
+    for (const rule of ISP_NETWORK_RULES) {
+      if (rule.asns.includes(asnNumber)) {
+        return applyRule(rule, `Matched AS${asnNumber} (${rule.label})`);
+      }
+    }
+  }
+
+  // Pass 2: keyword evidence over the ISP / Org strings (rule order matters).
+  for (const rule of ISP_NETWORK_RULES) {
+    if (!rule.pattern) continue;
+    const keywordMatch = keywordCorpus.match(rule.pattern);
+    const keyword = keywordMatch && keywordMatch[0] ? keywordMatch[0] : null;
+    if (keyword) {
+      return applyRule(rule, `Matched keyword '${keyword}' (${rule.label})`);
+    }
+  }
+
+  // Fallback: nothing matched; keep the cleaned ISP / Org name as the brand.
+  return {
+    brandName: cleanIspBrandText(ispText, orgText),
+    networkType: RESIDENTIAL_BROADBAND,
+    isConsumerBroadband: false,
+    isDatacenterOrHosting: false,
+    matchedReason: null,
+  };
 }
 
 /**
@@ -757,8 +1003,238 @@ export async function collectHardwareSignals(
 }
 
 /**
+ * Task 3c - Virtual machine / hypervisor environment detection.
+ * Combines WebGL GPU hypervisor signatures with desktop hardware anomalies
+ * that are typical of virtualized compute instances.
+ */
+function detectVirtualMachine(
+  hardwareSignals: HardwareSignals,
+  browserDevice: BrowserDeviceInfo
+): { isVirtualMachine: boolean; vmReason: string } {
+  const gpuVendor = (hardwareSignals.gpuVendor || '').trim();
+  const gpuRenderer = (hardwareSignals.gpuRenderer || '').trim();
+  const gpuSignature = `${gpuVendor} ${gpuRenderer}`.trim();
+
+  const hypervisorMatch = gpuSignature.match(
+    /vmware|virtualbox|vbox|parallels|qemu|virtio|llvmpipe|softpipe|swiftshader|microsoft basic render|mesa offscreen/i
+  );
+  const hypervisorToken = hypervisorMatch ? hypervisorMatch[0] : null;
+  if (hypervisorToken) {
+    return {
+      isVirtualMachine: true,
+      vmReason: `Hypervisor GPU signature (${hypervisorToken.toLowerCase()})`,
+    };
+  }
+
+  const isDesktopPlatform = /Win|Mac|Linux/i.test(browserDevice.platform || '');
+  if (hardwareSignals.cpuCores != null && hardwareSignals.cpuCores <= 2 && isDesktopPlatform) {
+    return {
+      isVirtualMachine: true,
+      vmReason: `Low core count (${hardwareSignals.cpuCores}) on desktop platform`,
+    };
+  }
+
+  if (gpuVendor === 'Unavailable' && browserDevice.deviceType === 'Desktop') {
+    return {
+      isVirtualMachine: true,
+      vmReason: 'GPU vendor unavailable on desktop',
+    };
+  }
+
+  return { isVirtualMachine: false, vmReason: '' };
+}
+
+/**
+ * Task 3d - Live DevTools window-geometry detection.
+ * Only desktop (non-touch) contexts are evaluated; mobile and tablet layouts return
+ * false because their outer/inner deltas are small.
+ */
+export function computeDevToolsOpen(): boolean {
+  if (typeof window === 'undefined') return false;
+  if (typeof navigator === 'undefined') return false;
+  const isDesktopContext =
+    navigator.maxTouchPoints === 0 || /Win|Mac|Linux/i.test(navigator.platform);
+  if (!isDesktopContext) return false;
+  try {
+    const widthDiff = window.outerWidth - window.innerWidth;
+    const heightDiff = window.outerHeight - window.innerHeight;
+    return window.outerWidth > 0 && (widthDiff > 160 || heightDiff > 220);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Task 3f - Privacy shielding inspection.
+ * Deterministic canvas farbling pixel probe, ad-blocker DOM bait element probe and
+ * Brave privacy browser detection. Every suggested element is removed again in a
+ * finally block.
+ */
+async function inspectPrivacyShielding(): Promise<{
+  canvasFarblingDetected: boolean;
+  adBlockerDetected: boolean;
+  privacyDetail: string;
+}> {
+  let canvasFarblingDetected = false;
+  let adBlockerDetected = false;
+  const causes: string[] = [];
+
+  // Deterministic 8x8 canvas noise probe: farbling engines (Brave, CanvasBlocker,
+  // Libre Wolf) corrupt pixel readbacks of an exactly known solid fill color.
+  if (typeof document !== 'undefined') {
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = 8;
+      canvas.height = 8;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = 'rgb(255, 102, 0)';
+        ctx.fillRect(0, 0, 8, 8);
+        const pixel = ctx.getImageData(2, 2, 1, 1).data;
+        if (pixel[0] !== 255 || pixel[1] !== 102 || pixel[2] !== 0) {
+          canvasFarblingDetected = true;
+          causes.push('Canvas farbling pixel corruption');
+        }
+      }
+    } catch {
+      // Pixel readback is restricted in this environment. Never treat that alone as
+      // farbling evidence, only note it.
+      causes.push('Canvas pixel readback restricted');
+    }
+  }
+
+  // DOM bait element probe: known ad classnames are hidden or removed by
+  // uBlock-style blockers before layout runs.
+  if (typeof document !== 'undefined' && document.body) {
+    const baitElement = document.createElement('div');
+    baitElement.className = 'adsbox ad-banner doubleclick pub_300x250';
+    try {
+      baitElement.style.width = '1px';
+      baitElement.style.height = '1px';
+      baitElement.style.position = 'absolute';
+      baitElement.style.top = '-9999px';
+      document.body.appendChild(baitElement);
+      const hiddenByLayout = baitElement.offsetHeight === 0;
+      const baitDisplay =
+        typeof window !== 'undefined' && typeof window.getComputedStyle === 'function'
+          ? window.getComputedStyle(baitElement).display
+          : '';
+      if (hiddenByLayout || baitDisplay === 'none') {
+        adBlockerDetected = true;
+        causes.push('Ad-blocker hidden bait element');
+      }
+    } finally {
+      try {
+        if (baitElement.parentNode) {
+          baitElement.parentNode.removeChild(baitElement);
+        }
+      } catch {
+        // Ignore cleanup failures
+      }
+    }
+  }
+
+  // Brave ships privacy shielding (Shields plus farbling), but the browser flag
+  // alone is NOT an ad-blocker confirmation.
+  const navLike =
+    typeof navigator !== 'undefined' ? (navigator as unknown as { brave?: unknown }) : null;
+  if (navLike && Boolean(navLike.brave)) {
+    causes.push('Brave browser detected');
+  }
+
+  return {
+    canvasFarblingDetected,
+    adBlockerDetected,
+    privacyDetail: causes.join('; '),
+  };
+}
+
+/**
+ * Task 3g - Short-budget WebRTC STUN probe that compares the local ICE public
+ * candidate address with the HTTP-visible IP. A different public srflx address is
+ * a strong VPN / proxy signal; mDNS (".local") or matching addresses are clean.
+ */
+async function probeWebRtcLeak(
+  httpIp: string | null | undefined
+): Promise<{ candidateIp: string | null; webrtcLeak: boolean; webrtcDetail: string }> {
+  if (typeof RTCPeerConnection === 'undefined') {
+    return { candidateIp: null, webrtcLeak: false, webrtcDetail: 'STUN unavailable in this environment' };
+  }
+
+  let peerConnection: RTCPeerConnection | null = null;
+  try {
+    peerConnection = new RTCPeerConnection({
+      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+    });
+
+    const candidateLines: string[] = [];
+    peerConnection.onicecandidate = (event) => {
+      const candidate = event && event.candidate ? event.candidate.candidate : '';
+      if (candidate) {
+        candidateLines.push(candidate);
+      }
+    };
+
+    try {
+      peerConnection.createDataChannel('intel-stun-probe');
+    } catch {
+      // DataChannel is optional for ICE gathering
+    }
+
+    const offer = await peerConnection.createOffer();
+    await peerConnection.setLocalDescription(offer);
+
+    // Short collection budget: ICE gathering finishes well inside a second.
+    await new Promise<null>((resolve) => setTimeout(() => resolve(null), 800));
+
+    // Prefer the srflx (server-reflexive) candidate; fall back to the first one.
+    const srflxLine = candidateLines.find((line) => line.includes('typ srflx'));
+    const chosenLine = srflxLine || candidateLines[0] || '';
+
+    let candidateIp: string | null = null;
+    if (chosenLine) {
+      const parts = chosenLine.split(' ');
+      const directIp = parts[4] || '';
+      if (/^[0-9]{1,3}(\.[0-9]{1,3}){3}$/.test(directIp)) {
+        candidateIp = directIp;
+      } else {
+        const fallbackMatch = chosenLine.match(/([0-9]{1,3}(\.[0-9]{1,3}){3})/);
+        candidateIp = fallbackMatch && fallbackMatch[0] ? fallbackMatch[0] : null;
+      }
+    }
+
+    const trimmedHttpIp = typeof httpIp === 'string' ? httpIp.trim() : '';
+    const httpIpIsReal =
+      trimmedHttpIp.length > 0 &&
+      !/^unknown$/i.test(trimmedHttpIp) &&
+      trimmedHttpIp.toLowerCase() !== 'unavailable';
+    const mdnsMasked = candidateIp !== null && candidateIp.endsWith('.local');
+
+    let webrtcLeak = false;
+    let webrtcDetail = 'STUN matches HTTP IP or mDNS Masked';
+    if (candidateIp && !mdnsMasked && httpIpIsReal && candidateIp !== trimmedHttpIp) {
+      webrtcLeak = true;
+      webrtcDetail = `STUN IP ${candidateIp} != HTTP IP ${trimmedHttpIp}`;
+    }
+
+    return { candidateIp, webrtcLeak, webrtcDetail };
+  } catch {
+    // STUN blocked, permissions denied or an unsupported browser build.
+    return { candidateIp: null, webrtcLeak: false, webrtcDetail: 'STUN unavailable in this environment' };
+  } finally {
+    if (peerConnection) {
+      try {
+        peerConnection.close();
+      } catch {
+        // Ignore close errors
+      }
+    }
+  }
+}
+
+/**
  * Evaluates First-Party Security & Anomaly Signals ("Smart Signals") and computes an
- * explainable Suspect & Trust Score (0-100).
+ * explainable Suspect & Risk Score (0-10).
  */
 export async function evaluateSecuritySignals(
   browserDevice: BrowserDeviceInfo,
@@ -796,12 +1272,21 @@ export async function evaluateSecuritySignals(
   ) {
     botSignals.push('Automation framework runtime global detected');
   }
+  if (win.__webdriver_evaluate && typeof win.__webdriver_evaluate === 'function') {
+    botSignals.push('Selenium __webdriver_evaluate hook on window');
+  }
+  if (
+    typeof document !== 'undefined' &&
+    Boolean((document as unknown as Record<string, unknown>).__selenium_evaluate)
+  ) {
+    botSignals.push('Selenium __selenium_evaluate hook on document');
+  }
   if (/Chrome|Chromium/i.test(ua) && !/Edg|OPR|Firefox/i.test(ua) && typeof win.chrome === 'undefined') {
     botSignals.push('Missing window.chrome runtime object on Chromium UA');
   }
   const isBot = botSignals.length > 0;
 
-  // 2. VPN / Proxy & Datacenter Detection
+  // 2. VPN / Proxy & Network Classification (Task 1 classifier)
   const browserTimezone = browserDevice.timezone || 'Unavailable';
   const ipTimezone =
     clientGeoHint?.timezone && clientGeoHint.timezone !== 'Unknown'
@@ -813,27 +1298,45 @@ export async function evaluateSecuritySignals(
     ipTimezone !== 'Unavailable' &&
     !areTimezonesEquivalent(browserTimezone, ipTimezone);
 
-  const dcCheck = isDatacenterOrVpnNetwork(
-    clientGeoHint?.isp,
-    clientGeoHint?.org,
-    clientGeoHint?.asn,
-    Boolean(clientGeoHint?.isVpnOrHosting)
+  const classification = classifyIspNetwork(
+    clientGeoHint?.isp ?? '',
+    clientGeoHint?.org ?? '',
+    clientGeoHint?.asn ?? ''
   );
+
+  const isConsumerBroadband = classification.isConsumerBroadband;
+  let brandName = classification.brandName;
+  let networkType: NetworkType = classification.networkType;
+  let ispNetworkReason = classification.matchedReason;
+  // Consumer broadband can never be promoted to datacenter / hosting, even when the
+  // IP intelligence provider flags the connection as proxy or VPN.
+  let isDatacenterOrHosting = isConsumerBroadband ? false : classification.isDatacenterOrHosting;
+
+  if (clientGeoHint?.isVpnOrHosting && !isConsumerBroadband) {
+    brandName = 'VPN / Proxy Hosting';
+    networkType = CLOUD_DATACENTER;
+    isDatacenterOrHosting = true;
+    ispNetworkReason = ispNetworkReason
+      ? `${ispNetworkReason}; provider flagged VPN or hosting routing`
+      : 'IP intelligence provider flagged hosting, proxy, or VPN routing';
+  }
+
+  const datacenterAsn = isDatacenterOrHosting;
+
   const maskedGpu = isMaskedOrUnavailableGpu(
     hardwareSignals.gpuVendor,
     hardwareSignals.gpuRenderer
   );
-  const datacenterAsn = dcCheck.isDatacenter;
   const cloudOrMaskedGpu = datacenterAsn && maskedGpu;
 
   const vpnReasons: string[] = [];
   if (timezoneMismatch) {
     vpnReasons.push(`Browser timezone (${browserTimezone}) differs from IP timezone (${ipTimezone})`);
   }
-  if (dcCheck.matchedReason) {
-    vpnReasons.push(dcCheck.matchedReason);
+  if (datacenterAsn && ispNetworkReason) {
+    vpnReasons.push(ispNetworkReason);
   }
-  if (datacenterAsn && maskedGpu) {
+  if (cloudOrMaskedGpu) {
     vpnReasons.push('Cloud / Masked GPU environment');
   }
   const vpnSuspected = timezoneMismatch || datacenterAsn;
@@ -882,7 +1385,7 @@ export async function evaluateSecuritySignals(
   }
   const tamperDetected = tamperReasons.length > 0;
 
-  // 4. Private Mode / Storage Quota Inspection
+  // 4. Private Mode / Storage Quota Inspection (Task 3e heuristics)
   let storageQuotaMb: number | null = null;
   let incognitoLikely = false;
   if (nav?.storage && typeof nav.storage.estimate === 'function') {
@@ -890,7 +1393,26 @@ export async function evaluateSecuritySignals(
       const estimate = await nav.storage.estimate();
       if (typeof estimate.quota === 'number' && estimate.quota > 0) {
         storageQuotaMb = Math.round(estimate.quota / (1024 * 1024));
-        if (storageQuotaMb < 120) {
+        // Desktop browsers grant multi-gigabyte quotas in normal mode, so a tiny
+        // quota is a strong private / ephemeral profile signal.
+        const desktopRestrictedQuota =
+          browserDevice.deviceType === 'Desktop' &&
+          storageQuotaMb > 0 &&
+          storageQuotaMb < 1400;
+        // Bonus heuristic (applies regardless of device type): when the granted
+        // quota sits below roughly 2.5x the JS heap limit the partition is
+        // almost certainly ephemeral.
+        const perfMemory =
+          typeof performance !== 'undefined'
+            ? (performance as unknown as { memory?: { jsHeapSizeLimit?: number } }).memory
+            : undefined;
+        const jsHeapSizeLimit =
+          perfMemory && typeof perfMemory.jsHeapSizeLimit === 'number'
+            ? perfMemory.jsHeapSizeLimit
+            : null;
+        const heapRatioRestrictedQuota =
+          jsHeapSizeLimit !== null && estimate.quota < jsHeapSizeLimit * 2.5;
+        if (desktopRestrictedQuota || heapRatioRestrictedQuota) {
           incognitoLikely = true;
         }
       }
@@ -909,50 +1431,87 @@ export async function evaluateSecuritySignals(
     incognitoLikely = true;
   }
 
+  // Ephemeral-identity clearance is decided server-side (hardware ID recovery);
+  // the browser only knows whether a stored identity exists, so this column stays
+  // false here by design.
+  const incognitoOrCleared = false;
+
   const persistenceMode: PersistenceMode = !localStorageAvailable || incognitoLikely
     ? 'Private / Restricted Storage'
     : hasStoredIdentity
     ? 'First-Party Cookie'
     : 'First-Party Cookie';
 
-  // 5. Composite Suspect & Trust Score (0-100)
+  // 5. Virtual Machine / Hypervisor Detection
+  const vmStatus = detectVirtualMachine(hardwareSignals, browserDevice);
+
+  // 6. Live DevTools Geometry Probe (desktop contexts only)
+  const devToolsOpen = computeDevToolsOpen();
+
+  // 7. Privacy Shielding & WebRTC STUN Leak Probes
+  const [privacyInspection, webrtcProbe] = await Promise.all([
+    inspectPrivacyShielding(),
+    probeWebRtcLeak(clientGeoHint?.ip ?? null),
+  ]);
+  const privacyProtected =
+    privacyInspection.canvasFarblingDetected || privacyInspection.adBlockerDetected;
+
+  // 8. Composite Suspect & Risk Score (0-10)
   let rawScore = 0;
   const riskFactors: string[] = [];
 
   if (isBot) {
-    rawScore += 45;
-    riskFactors.push(`Automation / headless signal (+45): ${botSignals[0]}`);
-  }
-  if (timezoneMismatch) {
-    rawScore += 25;
+    rawScore += 3;
     riskFactors.push(
-      `Timezone mismatch (+25): Browser ${browserTimezone} vs IP ${ipTimezone}`
+      `Automation / headless signal (+3): ${botSignals[0] || 'automation runtime detected'}`
     );
   }
-  if (datacenterAsn) {
-    rawScore += 15;
-    riskFactors.push(
-      maskedGpu
-        ? 'Cloud / Masked GPU environment (+15): Datacenter ASN with masked WebGL GPU'
-        : `Datacenter / VPN network (+15): ${dcCheck.matchedReason || 'Hosting ASN'}`
-    );
+  if (vpnSuspected || webrtcProbe.webrtcLeak) {
+    rawScore += 2;
+    const vpnDetail =
+      (vpnSuspected && vpnReasons.length > 0 ? vpnReasons[0] : webrtcProbe.webrtcDetail) ||
+      'proxy network signal';
+    riskFactors.push(`VPN / proxy or WebRTC leak (+2): ${vpnDetail}`);
+  }
+  if (vmStatus.isVirtualMachine || cloudOrMaskedGpu) {
+    rawScore += 2;
+    const virtualDetail =
+      vmStatus.isVirtualMachine && cloudOrMaskedGpu
+        ? `${vmStatus.vmReason}; Cloud / Masked GPU environment`
+        : vmStatus.isVirtualMachine
+        ? vmStatus.vmReason
+        : 'Cloud / Masked GPU environment';
+    riskFactors.push(`Virtualization / cloud GPU signal (+2): ${virtualDetail}`);
   }
   if (tamperDetected) {
-    rawScore += 15;
-    riskFactors.push(`Environment spoofing (+15): ${tamperReasons[0]}`);
+    rawScore += 1;
+    riskFactors.push(`Environment spoofing (+1): ${tamperReasons[0] || 'UA / platform conflicts'}`);
   }
-  if (incognitoLikely) {
-    rawScore += 10;
-    riskFactors.push(
-      `Restricted / private storage quota (+10)${
-        storageQuotaMb !== null ? `: ${storageQuotaMb} MB` : ''
-      }`
-    );
+  if (incognitoLikely || incognitoOrCleared) {
+    rawScore += 1;
+    const storageDetail =
+      storageQuotaMb !== null
+        ? `${storageQuotaMb} MB storage quota`
+        : !localStorageAvailable
+        ? 'first-party storage write blocked'
+        : 'restricted storage';
+    riskFactors.push(`Private / ephemeral storage (+1): ${storageDetail}`);
+  }
+  if (devToolsOpen || privacyProtected) {
+    rawScore += 1;
+    const privacyScoreFactors: string[] = [];
+    if (privacyProtected) {
+      privacyScoreFactors.push(privacyInspection.privacyDetail || 'privacy shielding detected');
+    }
+    if (devToolsOpen) {
+      privacyScoreFactors.push('DevTools open via window geometry');
+    }
+    riskFactors.push(`Privacy shielding / DevTools open (+1): ${privacyScoreFactors.join('; ')}`);
   }
 
-  const suspectScore = Math.min(100, rawScore);
+  const suspectScore = Math.min(10, rawScore);
   const riskLevel: RiskLevel =
-    suspectScore >= 50 ? 'High' : suspectScore >= 20 ? 'Medium' : 'Low';
+    suspectScore >= 7 ? 'High' : suspectScore >= 3 ? 'Medium' : 'Low';
 
   return {
     isBot,
@@ -972,6 +1531,25 @@ export async function evaluateSecuritySignals(
     suspectScore,
     riskLevel,
     riskFactors,
+    /* Task 1 - ISP brand & network classification */
+    brandName,
+    networkType,
+    isConsumerBroadband,
+    isDatacenterOrHosting,
+    /* Task 3 - deep technical detection payloads */
+    webrtcLeak: webrtcProbe.webrtcLeak,
+    webrtcCandidateIp: webrtcProbe.candidateIp,
+    webrtcDetail: webrtcProbe.webrtcDetail,
+    privacyProtected,
+    privacyDetail: privacyInspection.privacyDetail,
+    adBlockerDetected: privacyInspection.adBlockerDetected,
+    canvasFarblingDetected: privacyInspection.canvasFarblingDetected,
+    incognitoOrCleared: false,
+    isVirtualMachine: vmStatus.isVirtualMachine,
+    vmReason: vmStatus.vmReason,
+    devToolsOpen,
+    distinctIpsLastHour: undefined,
+    visitsLastHour: undefined,
   };
 }
 

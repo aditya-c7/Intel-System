@@ -32,6 +32,20 @@ export type PersistenceMode =
   | 'Hardware ID Recovered'
   | 'Private / Restricted Storage';
 
+export type NetworkType =
+  | 'Residential Broadband'
+  | 'Cellular / 5G'
+  | 'Satellite'
+  | 'Cloud / Datacenter';
+
+export interface IspNetworkClassification {
+  brandName: string;
+  networkType: NetworkType;
+  isConsumerBroadband: boolean;
+  isDatacenterOrHosting: boolean;
+  matchedReason: string | null;
+}
+
 export interface SecuritySignals {
   isBot: boolean;
   botSignals: string[];
@@ -47,9 +61,31 @@ export interface SecuritySignals {
   incognitoLikely: boolean;
   storageQuotaMb: number | null;
   persistenceMode: PersistenceMode;
+  /** Threat / risk rating on a 0/10 to 10/10 scale (Task 2). */
   suspectScore: number;
   riskLevel: RiskLevel;
   riskFactors: string[];
+
+  /* Task 1 — ISP brand & network classification (server-computed, mirrored client-side) */
+  brandName?: string;
+  networkType?: NetworkType;
+  isConsumerBroadband?: boolean;
+  isDatacenterOrHosting?: boolean;
+
+  /* Task 3 — deep technical detection payloads */
+  webrtcLeak?: boolean;
+  webrtcCandidateIp?: string | null;
+  webrtcDetail?: string;
+  privacyProtected?: boolean;
+  privacyDetail?: string;
+  adBlockerDetected?: boolean;
+  canvasFarblingDetected?: boolean;
+  incognitoOrCleared?: boolean;
+  isVirtualMachine?: boolean;
+  vmReason?: string;
+  devToolsOpen?: boolean;
+  distinctIpsLastHour?: number;
+  visitsLastHour?: number;
 }
 
 export interface LocationInfo {
