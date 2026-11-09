@@ -9,3 +9,6 @@ coverage/
 .vercel
 data/*.db
 data/*.db-*
+
+# local research notes
+.research/
