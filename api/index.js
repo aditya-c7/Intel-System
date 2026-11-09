@@ -676,7 +676,7 @@ function classifyIspNetwork(isp, org, asn) {
     };
   }
   return {
-    brandName: cleanIsp || cleanOrg || "Unknown ISP",
+    brandName: cleanIsp && !/^unknown$|^unknown isp$/i.test(cleanIsp) ? cleanIsp : cleanOrg && !/^unknown$|^unknown isp$/i.test(cleanOrg) ? cleanOrg : "Unknown ISP",
     networkType: "Residential Broadband",
     isConsumerBroadband: false,
     isDatacenterOrHosting: false,
@@ -1506,7 +1506,7 @@ var SERVER_TIMEZONE_ALIAS_MAP = {
 function normalizeServerTimezoneId(tz) {
   if (!tz || typeof tz !== "string") return "";
   const cleaned = tz.trim().toLowerCase();
-  if (!cleaned || cleaned === "unknown") return "";
+  if (!cleaned || cleaned === "unknown" || cleaned === "unavailable") return "";
   return SERVER_TIMEZONE_ALIAS_MAP[cleaned] || cleaned;
 }
 function sanitizeHardwareSignals(raw, browserDevice) {
