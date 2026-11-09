@@ -1578,7 +1578,6 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const isVirtualMachine = Boolean(raw?.isVirtualMachine);
   const vmReason = typeof raw?.vmReason === "string" && raw.vmReason.trim() ? raw.vmReason.trim().slice(0, 200) : "";
   const devToolsOpen = Boolean(raw?.devToolsOpen);
-  const incognitoOrCleared = Boolean(raw?.incognitoOrCleared) || recognitionSource === "Hardware Fingerprint (Cookie-less / Incognito)";
   const cloudOrMaskedGpu = Boolean(
     raw?.cloudOrMaskedGpu
   );
@@ -1588,6 +1587,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   } else if (incognitoLikely) {
     persistenceMode = "Private / Restricted Storage";
   }
+  const incognitoOrCleared = Boolean(raw?.incognitoOrCleared) || recognitionSource === "Hardware Fingerprint (Cookie-less / Incognito)" || persistenceMode === "Hardware ID Recovered";
   let suspectScore = 0;
   const riskFactors = [];
   if (isBot) {
@@ -1613,28 +1613,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       `Virtual machine or masked GPU environment (+2): ${isVirtualMachine ? vmReason || "VM indicators present in the hardware signals" : "cloud environment with a masked or generic GPU signature"}`
     );
   }
-  if (tamperDetected) {
-    suspectScore += 1;
-    riskFactors.push(
-      `User-Agent / platform tampering detected (+1): ${tamperReasons[0] || "mismatched fingerprint components"}`
-    );
-  }
   if (incognitoLikely || incognitoOrCleared) {
     suspectScore += 1;
     const incognitoDetail = storageQuotaMb !== null ? `${storageQuotaMb} MB storage quota indicates a private browsing context` : incognitoOrCleared && !incognitoLikely ? "visitor recovered from a cookie-less / incognito session through the hardware fingerprint" : "private or restricted browser storage environment";
     riskFactors.push(`Incognito / private browsing indicators (+1): ${incognitoDetail}`);
-  }
-  if (devToolsOpen || privacyProtected || velocity.highVelocity) {
-    suspectScore += 1;
-    const hardeningDetail = devToolsOpen ? "developer tools were open while signals were collected" : privacyProtected ? privacyDetail || "privacy protection limited canvas / WebGL reporting" : `high visit velocity (${velocity.distinctIpsLastHour} distinct IPs across ${velocity.visitsLastHour} visits in the last hour)`;
-    riskFactors.push(
-      `Developer tools active, privacy / farbling hardening, or high visit velocity (+1): ${hardeningDetail}`
-    );
-  }
-  if (velocity.highVelocity) {
-    riskFactors.push(
-      `High velocity / IP rotation (+1): ${velocity.distinctIpsLastHour} distinct IPs across ${velocity.visitsLastHour} visits in the last hour`
-    );
   }
   suspectScore = Math.max(0, Math.min(10, suspectScore));
   const riskLevel = suspectScore >= 7 ? "High" : suspectScore >= 3 ? "Medium" : "Low";

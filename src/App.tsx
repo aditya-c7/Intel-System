@@ -1,5 +1,5 @@
-import { useEffect, useState, useCallback, type ReactNode } from 'react';
-import { identifyCurrentVisitor, computeDevToolsOpen } from './lib/collector';
+import { useEffect, useState, useCallback } from 'react';
+import { identifyCurrentVisitor } from './lib/collector';
 import type {
   IntelVisitorResponse,
   NetworkType,
@@ -30,12 +30,6 @@ import {
   Languages,
   KeyRound,
   CalendarClock,
-  Bot,
-  GlobeLock,
-  Terminal,
-  Database,
-  Radar,
-  Shield,
   CircuitBoard,
   HardDrive,
   Palette,
@@ -239,20 +233,6 @@ function formatCleanGpuName(rawRenderer: string | undefined, rawVendor?: string)
 }
 
 /**
- * Formats browser storage quota in MB or GB for concise micro-captions.
- */
-function formatStorageQuotaCaption(quotaMb: number | null | undefined): string {
-  if (typeof quotaMb !== 'number' || !Number.isFinite(quotaMb) || quotaMb <= 0) {
-    return 'Standard browser storage active';
-  }
-  if (quotaMb >= 1024) {
-    const gb = (quotaMb / 1024).toFixed(1);
-    return `Persistent quota (~${gb} GB)`;
-  }
-  return `Persistent quota (~${Math.round(quotaMb)} MB)`;
-}
-
-/**
  * Maps legacy 0..100 suspect scores to the current 0..10 scale.
  */
 function normalizeLegacyScore(score: number | null | undefined): number {
@@ -281,12 +261,6 @@ const NETWORK_TYPE_BADGE_CLASS: Record<NetworkType, string> = {
 
 type SignalTone = 'ok' | 'warn' | 'bad';
 
-const TONE_CHIP_CLASS: Record<SignalTone, string> = {
-  ok: 'bg-emerald-50/60 border-emerald-200 text-emerald-600',
-  warn: 'bg-amber-50/60 border-amber-200 text-amber-600',
-  bad: 'bg-rose-50/60 border-rose-200 text-rose-600',
-};
-
 const TONE_DOT_CLASS: Record<SignalTone, string> = {
   ok: 'bg-emerald-500',
   warn: 'bg-amber-500',
@@ -299,100 +273,114 @@ const TONE_TEXT_CLASS: Record<SignalTone, string> = {
   bad: 'text-rose-700',
 };
 
+/**
+ * Maps a 0..10 per-signal severity onto the shared risk tier scale.
+ */
+function resolveSignalRiskTier(severity: number): RiskLevel {
+  if (severity >= 7) return 'High';
+  if (severity >= 3) return 'Medium';
+  return 'Low';
+}
+
 interface SignalRowModel {
   key: string;
-  icon: ReactNode;
-  chipClass: string;
   dotClass: string;
-  statusTextClass: string;
   title: string;
   caption: string;
   statusLabel: string;
   tooltip: string;
+  riskScore: number;
 }
 
 function createSignalRow(
-  params: Omit<SignalRowModel, 'chipClass' | 'dotClass' | 'statusTextClass'> & {
+  params: Omit<SignalRowModel, 'dotClass'> & {
     tone: SignalTone;
   }
 ): SignalRowModel {
   const { tone, ...rest } = params;
   return {
     ...rest,
-    chipClass: TONE_CHIP_CLASS[tone],
     dotClass: TONE_DOT_CLASS[tone],
-    statusTextClass: TONE_TEXT_CLASS[tone],
   };
 }
 
 /**
- * Single hairline row for the Smart Signals Swiss grid
- * (left: icon chip + title + caption, right: colored dot + status label).
+ * Single Swiss technical tile for the Smart Signals core grid.
  */
-function SignalRow(row: SignalRowModel) {
+function SignalRow(row: SignalRowModel & { className?: string }) {
+  const riskTier = resolveSignalRiskTier(row.riskScore);
+  const riskTone: SignalTone =
+    riskTier === 'High' ? 'bad' : riskTier === 'Medium' ? 'warn' : 'ok';
+
   return (
     <div
-      className="grid grid-cols-[1fr_auto] items-center gap-3 min-h-[52px] px-3 py-2.5"
+      className={`p-3.5 sm:p-4 min-h-[96px] flex flex-col justify-between gap-2 min-w-0 ${row.className ?? ''}`}
       title={row.tooltip}
     >
-      <div className="flex items-start gap-2.5 min-w-0">
-        <div
-          className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border ${row.chipClass}`}
-        >
-          {row.icon}
-        </div>
-        <div className="min-w-0">
-          <span className="block text-xs font-semibold text-[#111827] truncate">
-            {row.title}
-          </span>
-          <span className="block text-[11px] text-slate-500 truncate mt-0.5">
-            {row.caption}
-          </span>
-        </div>
-      </div>
-      <span
-        className={`flex items-center gap-1.5 text-[11px] font-mono font-semibold whitespace-nowrap shrink-0 ${row.statusTextClass}`}
-      >
+      <span className="text-xs font-semibold text-[#111827] truncate">
+        {row.title}
+      </span>
+
+      <span className="flex items-center gap-1.5 min-w-0">
         <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${row.dotClass}`} />
-        {row.statusLabel}
+        <span className="text-[11px] font-mono font-semibold text-[#111827] truncate">
+          {row.statusLabel}
+        </span>
+      </span>
+
+      <span className="text-[11px] text-slate-500 line-clamp-2">
+        {row.caption}
+      </span>
+
+      <span
+        className={`text-[11px] font-mono font-semibold tabular-nums ${TONE_TEXT_CLASS[riskTone]}`}
+      >
+        {`${riskTier} Risk • ${row.riskScore}/10`}
       </span>
     </div>
   );
 }
 
 /**
- * Builds the 8-row Smart Signals grid: Bot & Automation, VPN/Proxy & Network
- * Type, Virtual Machine, DevTools, Incognito & Storage, Privacy Shield,
- * WebRTC STUN leak, and Visit Velocity & OS Integrity.
+ * Builds the 4-signal core grid: Incognito / Private Browsing, Bot &
+ * Automation, VPN / Proxy & Network Type, and Virtual Machine &
+ * Environment Integrity.
  */
-function buildSignalRows(
-  signals: SecuritySignals,
-  devToolsOpen: boolean,
-  httpIp: string,
-  browserOs: string,
-  browserPlatform: string
-): SignalRowModel[] {
+function buildSignalRows(signals: SecuritySignals): SignalRowModel[] {
   const botCloud = Boolean(signals.datacenterAsn && signals.cloudOrMaskedGpu);
+  const cloudOrMaskedGpu = Boolean(signals.cloudOrMaskedGpu);
   const incognitoEphemeral =
     signals.incognitoLikely ||
     Boolean(signals.incognitoOrCleared) ||
-    signals.persistenceMode === 'Hardware ID Recovered';
-  const highVelocity =
-    (signals.visitsLastHour ?? 0) >= 8 || (signals.distinctIpsLastHour ?? 0) > 1;
-  const httpIpKnown = Boolean(httpIp) && httpIp !== 'Unavailable';
+    signals.persistenceMode === 'Hardware ID Recovered' ||
+    signals.persistenceMode === 'Private / Restricted Storage';
 
   return [
-    // Row 1: Bot & Automation Detection
+    // Tile 1: Incognito / Private Browsing
+    createSignalRow({
+      key: 'incognito',
+      tone: incognitoEphemeral ? 'warn' : 'ok',
+      title: 'Incognito / Private Browsing',
+      caption: incognitoEphemeral
+        ? 'No persistent first-party storage or cookie survived this session'
+        : 'Persistent storage and first-party cookies active',
+      statusLabel: incognitoEphemeral ? 'Incognito / Private Mode' : 'Standard Window',
+      tooltip: `Persistence Mode: ${signals.persistenceMode}`,
+      riskScore: incognitoEphemeral ? 4 : 0,
+    }),
+
+    // Tile 2: Bot & Automation
     createSignalRow({
       key: 'bot',
-      icon: <Bot className="w-4 h-4" />,
       tone: signals.isBot ? 'bad' : botCloud ? 'warn' : 'ok',
-      title: 'Bot & Automation Detection',
-      caption: signals.isBot
-        ? (signals.botSignals[0] ?? 'Automation runtime hooks detected')
-        : botCloud
-        ? 'Cloud / Masked GPU environment'
-        : 'Interactive human session verified',
+      title: 'Bot & Automation',
+      caption:
+        signals.botSignals[0] ??
+        (signals.isBot
+          ? 'Automation runtime hooks detected'
+          : botCloud
+          ? 'Cloud / Masked GPU environment'
+          : 'Interactive human session verified'),
       statusLabel: signals.isBot
         ? 'Bot / Automated'
         : botCloud
@@ -405,115 +393,35 @@ function buildSignalRows(
         : botCloud
         ? 'Datacenter ASN with masked or unavailable WebGL GPU (no automation hooks detected)'
         : 'No automation, headless WebDriver, or virtual GPU hooks detected',
+      riskScore: signals.isBot || (signals.datacenterAsn && signals.cloudOrMaskedGpu) ? 8 : 0,
     }),
 
-    // Row 2: VPN, Proxy & Network Type
+    // Tile 3: VPN / Proxy & Network Type
     createSignalRow({
       key: 'vpn',
-      icon: <GlobeLock className="w-4 h-4" />,
       tone: signals.vpnSuspected ? 'warn' : 'ok',
-      title: 'VPN, Proxy & Network Type',
+      title: 'VPN / Proxy & Network Type',
       caption: signals.vpnSuspected
-        ? `TZ mismatch (${signals.browserTimezone} vs ${signals.ipTimezone}) or Cloud Datacenter ASN`
-        : `Standard ISP (${
+        ? (signals.vpnReasons[0] ?? 'Timezone or datacenter ASN mismatch detected')
+        : `${signals.brandName ?? 'Unknown ISP'} • ${
             signals.networkType ?? 'Residential Broadband'
-          } • ${signals.brandName ?? 'Unknown ISP'})`,
+          }`,
       statusLabel: signals.vpnSuspected ? 'VPN / Proxy' : 'Standard ISP',
       tooltip: signals.vpnReasons.length > 0
         ? signals.vpnReasons.join(' • ')
         : `Browser TZ (${signals.browserTimezone}) matches IP TZ (${signals.ipTimezone})`,
+      riskScore: signals.vpnSuspected ? 6 : 0,
     }),
 
-    // Row 3: Virtual Machine & Hypervisor
+    // Tile 4: Virtual Machine & Environment Integrity
     createSignalRow({
       key: 'vm',
-      icon: <Cpu className="w-4 h-4" />,
       tone: signals.isVirtualMachine ? 'warn' : 'ok',
-      title: 'Virtual Machine & Hypervisor',
+      title: 'Virtual Machine & Environment Integrity',
       caption: signals.vmReason ?? 'Bare-metal GPU & CPU profile',
-      statusLabel: signals.isVirtualMachine ? 'Virtual / Hypervisor' : 'Physical Hardware',
+      statusLabel: signals.isVirtualMachine ? 'Virtual Machine' : 'Physical Hardware',
       tooltip: signals.vmReason ?? 'No hypervisor or virtualization markers detected',
-    }),
-
-    // Row 4: Developer Tools Detection (live viewport state)
-    createSignalRow({
-      key: 'devtools',
-      icon: <Terminal className="w-4 h-4" />,
-      tone: devToolsOpen ? 'warn' : 'ok',
-      title: 'Developer Tools Detection',
-      caption: devToolsOpen ? 'Docked inspector viewport detected' : 'Normal viewport geometry',
-      statusLabel: devToolsOpen ? 'DevTools Active' : 'Closed',
-      tooltip: devToolsOpen
-        ? 'Docked DevTools panel detected via viewport geometry'
-        : 'Viewport proportions match a normal browsing window',
-    }),
-
-    // Row 5: Incognito & Ephemeral Storage
-    createSignalRow({
-      key: 'storage',
-      icon: <Database className="w-4 h-4" />,
-      tone: incognitoEphemeral ? 'warn' : 'ok',
-      title: 'Incognito & Ephemeral Storage',
-      caption: incognitoEphemeral
-        ? 'Private window or cleared storage'
-        : formatStorageQuotaCaption(signals.storageQuotaMb),
-      statusLabel: incognitoEphemeral ? 'Incognito / Ephemeral' : 'Standard Window',
-      tooltip: `Persistence Mode: ${signals.persistenceMode}`,
-    }),
-
-    // Row 6: Privacy Shield & Ad-Blocker
-    createSignalRow({
-      key: 'privacy',
-      icon: <Shield className="w-4 h-4" />,
-      tone: signals.privacyProtected ? 'warn' : 'ok',
-      title: 'Privacy Shield & Ad-Blocker',
-      caption: signals.privacyDetail ?? 'Unmodified canvas & DOM APIs',
-      statusLabel: signals.privacyProtected ? 'Privacy Shield Active' : 'Standard Telemetry',
-      tooltip:
-        signals.privacyDetail ??
-        'Canvas, WebGL & DOM telemetry APIs unmodified (no farbling or blocking detected)',
-    }),
-
-    // Row 7: WebRTC STUN IP Leak
-    createSignalRow({
-      key: 'webrtc',
-      icon: <Wifi className="w-4 h-4" />,
-      tone: signals.webrtcLeak ? 'bad' : 'ok',
-      title: 'WebRTC STUN IP Leak',
-      caption: signals.webrtcLeak
-        ? httpIpKnown
-          ? `STUN IP ${signals.webrtcCandidateIp ?? 'Unknown'} != HTTP IP ${httpIp}`
-          : (signals.webrtcDetail || 'WebRTC STUN candidate IP differs from HTTP IP')
-        : (signals.webrtcDetail || 'STUN matches HTTP IP or mDNS Masked'),
-      statusLabel: signals.webrtcLeak ? 'WebRTC IP Leak' : 'No IP Leak',
-      tooltip:
-        signals.webrtcDetail ??
-        (signals.webrtcLeak
-          ? 'STUN candidate IP differs from the HTTP-facing public IP'
-          : 'STUN matches HTTP IP or mDNS Masked'),
-    }),
-
-    // Row 8: Visit Velocity & OS Integrity (tamper + velocity merged)
-    createSignalRow({
-      key: 'velocity',
-      icon: <Radar className="w-4 h-4" />,
-      tone: signals.tamperDetected ? 'bad' : highVelocity ? 'warn' : 'ok',
-      title: 'Visit Velocity & OS Integrity',
-      caption: signals.tamperDetected
-        ? (signals.tamperReasons[0] ?? 'User-Agent contradicts platform')
-        : highVelocity
-        ? `${signals.distinctIpsLastHour ?? 0} IPs across ${signals.visitsLastHour ?? 0} visits (1h)`
-        : 'Normal rate, consistent device identity',
-      statusLabel: signals.tamperDetected
-        ? 'Spoofed UA'
-        : highVelocity
-        ? 'High Velocity / IP Rotation'
-        : 'Authentic',
-      tooltip: signals.tamperDetected
-        ? signals.tamperReasons.length > 0
-          ? signals.tamperReasons.join(' • ')
-          : 'User-Agent contradicts host platform'
-        : `User-Agent (${browserOs}) matches platform (${browserPlatform}) • Normal visit velocity`,
+      riskScore: signals.isVirtualMachine || cloudOrMaskedGpu ? 7 : 0,
     }),
   ];
 }
@@ -527,7 +435,6 @@ export default function App() {
   const [copiedHwId, setCopiedHwId] = useState<boolean>(false);
   const [selectedVisitIndex, setSelectedVisitIndex] = useState<number>(0);
   const [theme, setTheme] = useState<ThemeMode>(resolveInitialTheme);
-  const [devToolsOpen, setDevToolsOpen] = useState<boolean>(false);
 
   useEffect(() => {
     const isDark = theme === 'dark';
@@ -539,25 +446,6 @@ export default function App() {
       // localStorage unavailable
     }
   }, [theme]);
-
-  // Live DevTools detection: seed the initial state, then re-check on a
-  // debounced resize so opening a docked inspector flips the row immediately.
-  useEffect(() => {
-    setDevToolsOpen(computeDevToolsOpen());
-    let timer: number | undefined;
-    const onResize = () => {
-      if (timer !== undefined) window.clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        setDevToolsOpen(computeDevToolsOpen());
-        timer = undefined;
-      }, 150);
-    };
-    window.addEventListener('resize', onResize);
-    return () => {
-      window.removeEventListener('resize', onResize);
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, []);
 
   const toggleTheme = useCallback(() => {
     setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
@@ -663,18 +551,9 @@ export default function App() {
   const normalizedSuspectScore = normalizeLegacyScore(data?.securitySignals?.suspectScore);
   const riskTier: RiskLevel = resolveRiskTier(normalizedSuspectScore);
 
-  // 8-row Smart Signals grid model (null-safe: renders only inside the data block)
+  // 4-signal core grid model (null-safe: renders only inside the data block)
   const activeSignals = data?.securitySignals ?? null;
-  const signalRows =
-    activeSignals && data
-      ? buildSignalRows(
-          activeSignals,
-          devToolsOpen,
-          data.location.publicIp,
-          data.browserDevice.os,
-          data.browserDevice.platform
-        )
-      : [];
+  const signalRows = activeSignals ? buildSignalRows(activeSignals) : [];
 
   return (
     <div
@@ -1183,13 +1062,13 @@ export default function App() {
           </section>
         )}
 
-        {/* Dedicated Smart Signals & Threat Analysis (2x2 Grid) + Hardware & Rendering Entropy (2x3 Grid) */}
+        {/* Dedicated Smart Signals & Threat Analysis (4-signal core grid) + Hardware & Rendering Entropy (2x3 Grid) */}
         {data && data.securitySignals && data.hardwareSignals && (
           <section
             id="signals"
             className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch"
           >
-            {/* LEFT CARD: Smart Signals & Threat Analysis (2x2 Scannable Tile Grid) */}
+            {/* LEFT CARD: Smart Signals & Threat Analysis (4-signal core grid) */}
             <div className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6 flex flex-col justify-between">
               <div>
                 <div className="flex items-center justify-between gap-3 pb-3.5 border-b border-[#E5E7EB] flex-wrap">
@@ -1218,11 +1097,25 @@ export default function App() {
                   </span>
                 </div>
 
-                {/* 8-Row Swiss Hairline Signal Grid */}
-                <div className="mt-4 border border-[#E5E7EB] rounded-xl overflow-hidden divide-y divide-[#E5E7EB]">
-                  {signalRows.map((row) => {
+                {/* 4-Signal Core Swiss Tile Grid */}
+                <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 border border-[#E5E7EB] rounded-xl overflow-hidden">
+                  {signalRows.map((row, index) => {
                     const { key, ...rowProps } = row;
-                    return <SignalRow key={key} {...rowProps} />;
+                    const tileBorderClass =
+                      index === 0
+                        ? 'border-b sm:border-r border-[#E5E7EB]'
+                        : index === 1
+                        ? 'border-b border-[#E5E7EB]'
+                        : index === 2
+                        ? 'border-b sm:border-b-0 sm:border-r border-[#E5E7EB]'
+                        : 'border-[#E5E7EB]';
+                    return (
+                      <SignalRow
+                        key={key}
+                        {...rowProps}
+                        className={tileBorderClass}
+                      />
+                    );
                   })}
                 </div>
               </div>
