@@ -46,6 +46,33 @@ export interface IspNetworkClassification {
   matchedReason: string | null;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Smart Signals — 4-signal threat grid, every tile rated strictly out of 10   */
+/* -------------------------------------------------------------------------- */
+
+export type SmartSignalId = 'incognito' | 'bot' | 'vpn' | 'vm';
+
+export type SmartSignalLevel = 'low' | 'medium' | 'high';
+
+export interface SmartSignal {
+  id: SmartSignalId;
+  title: string;
+  status: string;
+  /** Strictly 0..10, one decimal-free integer scale. */
+  scoreOutOf10: number;
+  /** e.g. `Low Risk • 0/10`, `Medium Risk • 4/10`, `High Risk • 8/10`. */
+  riskLabel: string;
+  level: SmartSignalLevel;
+  detail: string;
+}
+
+export interface SmartSignals {
+  incognito: SmartSignal;
+  bot: SmartSignal;
+  vpn: SmartSignal;
+  vm: SmartSignal;
+}
+
 export interface SecuritySignals {
   isBot: boolean;
   botSignals: string[];
@@ -90,6 +117,24 @@ export interface SecuritySignals {
   devToolsOpen?: boolean;
   distinctIpsLastHour?: number;
   visitsLastHour?: number;
+
+  /* Final 4-signal upgrade: private browsing, bot, network, VM integrity */
+  isIncognito?: boolean;
+  /** Which physical probe produced the incognito verdict. */
+  incognitoMethod?: string;
+  /** `quota - usage`, in GiB (10.0 normal vs 9.0 private on Chromium 147+). */
+  headroomGiB?: number | null;
+  /** IndexedDB strict/relaxed commit ratio (< 1.25 means RAM-backed, i.e. private). */
+  idbDurabilityRatio?: number | null;
+  isHeadless?: boolean;
+  botReason?: string;
+  webdriver?: boolean;
+  cdpDetected?: boolean;
+  isOsTampered?: boolean;
+  /** Server-computed 4-signal grid, each tile rated out of 10. */
+  smartSignals?: SmartSignals;
+  /** Composite badge text, e.g. `Medium Risk • 4/10`. */
+  riskBadgeText?: string;
 }
 
 export interface LocationInfo {
@@ -174,4 +219,10 @@ export interface IntelVisitorResponse {
   statistics: VisitStatistics;
   visitHistory: VisitHistoryRecord[];
   historyBackup?: SignedHistoryBackup;
+  /* Mirrored at the top level so clients can read them without digging. */
+  isIncognito?: boolean;
+  suspectScore?: number;
+  riskLevel?: RiskLevel;
+  riskBadgeText?: string;
+  smartSignals?: SmartSignals;
 }
