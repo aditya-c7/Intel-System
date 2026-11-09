@@ -2239,11 +2239,6 @@ function sanitizeAndReinforceSecuritySignals(
       ? raw.vmReason.trim().slice(0, 200)
       : '';
   const devToolsOpen = Boolean(raw?.devToolsOpen);
-  // Incognito cross-reference: a device recognized purely through its hardware fingerprint
-  // means no first-party cookie / storage token survived — treat as incognito or cleared.
-  const incognitoOrCleared =
-    Boolean(raw?.incognitoOrCleared) ||
-    recognitionSource === 'Hardware Fingerprint (Cookie-less / Incognito)';
   // Forward-compatibility pass-through for the masked GPU flag (kept as pure pass-through so
   // the per-visit history row mapping keeps reading securitySignals.cloudOrMaskedGpu).
   const cloudOrMaskedGpu = Boolean(
@@ -2251,6 +2246,8 @@ function sanitizeAndReinforceSecuritySignals(
       ?.cloudOrMaskedGpu
   );
 
+  // Persistence mode resolution order is fixed: hardware-fingerprint recovery wins, then a
+  // private / restricted storage context, else a first-party cookie.
   let persistenceMode: SecuritySignals['persistenceMode'] = 'First-Party Cookie';
   if (recognitionSource === 'Hardware Fingerprint (Cookie-less / Incognito)') {
     persistenceMode = 'Hardware ID Recovered';
@@ -2258,8 +2255,18 @@ function sanitizeAndReinforceSecuritySignals(
     persistenceMode = 'Private / Restricted Storage';
   }
 
-  // Task 2 — 0..10 suspect score with a fixed weighted breakdown, capped at 10 and
-  // clamped at 0. Each condition family contributes only its own weight.
+  // Incognito cross-reference: a device recognized purely through its hardware fingerprint
+  // means no first-party cookie / storage token survived — treat as incognito or cleared.
+  // Exhaustive: raw client flag, the hardware-fingerprint recognition path, or a persistence
+  // mode that resolves to 'Hardware ID Recovered' all count as incognito / cleared storage.
+  const incognitoOrCleared =
+    Boolean(raw?.incognitoOrCleared) ||
+    recognitionSource === 'Hardware Fingerprint (Cookie-less / Incognito)' ||
+    persistenceMode === 'Hardware ID Recovered';
+
+  // Task 2 — 0..10 suspect score with a fixed weighted breakdown from the four Smart
+  // Signals: bot +3, VPN/proxy/WebRTC +2, VM/cloud-masked-GPU +2, incognito +1 (max 8).
+  // Capped at 10 and clamped at 0; each condition family contributes only its own weight.
   let suspectScore = 0;
   const riskFactors: string[] = [];
 
@@ -2301,14 +2308,6 @@ function sanitizeAndReinforceSecuritySignals(
     );
   }
 
-  // User-Agent / platform tampering: +1
-  if (tamperDetected) {
-    suspectScore += 1;
-    riskFactors.push(
-      `User-Agent / platform tampering detected (+1): ${tamperReasons[0] || 'mismatched fingerprint components'}`
-    );
-  }
-
   // Incognito / private browsing or cleared storage: +1
   if (incognitoLikely || incognitoOrCleared) {
     suspectScore += 1;
@@ -2319,25 +2318,6 @@ function sanitizeAndReinforceSecuritySignals(
         ? 'visitor recovered from a cookie-less / incognito session through the hardware fingerprint'
         : 'private or restricted browser storage environment';
     riskFactors.push(`Incognito / private browsing indicators (+1): ${incognitoDetail}`);
-  }
-
-  // Developer tools active, privacy / canvas farbling hardening, or high visit velocity: +1
-  if (devToolsOpen || privacyProtected || velocity.highVelocity) {
-    suspectScore += 1;
-    const hardeningDetail = devToolsOpen
-      ? 'developer tools were open while signals were collected'
-      : privacyProtected
-      ? privacyDetail || 'privacy protection limited canvas / WebGL reporting'
-      : `high visit velocity (${velocity.distinctIpsLastHour} distinct IPs across ${velocity.visitsLastHour} visits in the last hour)`;
-    riskFactors.push(
-      `Developer tools active, privacy / farbling hardening, or high visit velocity (+1): ${hardeningDetail}`
-    );
-  }
-
-  if (velocity.highVelocity) {
-    riskFactors.push(
-      `High velocity / IP rotation (+1): ${velocity.distinctIpsLastHour} distinct IPs across ${velocity.visitsLastHour} visits in the last hour`
-    );
   }
 
   suspectScore = Math.max(0, Math.min(10, suspectScore));

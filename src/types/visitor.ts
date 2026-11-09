@@ -59,6 +59,10 @@ export interface SecuritySignals {
   tamperDetected: boolean;
   tamperReasons: string[];
   incognitoLikely: boolean;
+  /** 0..1 confidence from the composite private-browsing probe. */
+  incognitoConfidence?: number;
+  /** Human-readable evidence list for the incognito verdict. */
+  incognitoDetail?: string;
   storageQuotaMb: number | null;
   persistenceMode: PersistenceMode;
   /** Threat / risk rating on a 0/10 to 10/10 scale (Task 2). */

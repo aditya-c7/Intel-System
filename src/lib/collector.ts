@@ -1045,191 +1045,126 @@ function detectVirtualMachine(
 }
 
 /**
- * Task 3d - Live DevTools window-geometry detection.
- * Only desktop (non-touch) contexts are evaluated; mobile and tablet layouts return
- * false because their outer/inner deltas are small.
+ * Private / Incognito browsing assessment.
+ *
+ * Modern Chromium (Chrome 120+) no longer reports a tiny storage quota in an
+ * off-the-record profile: it now exposes a large dynamic virtual quota, so the
+ * historical `quota < 1400 MB` check silently returned "Standard Window" even
+ * inside Incognito. This probe combines the storage signals that still differ
+ * between a normal and an off-the-record profile and returns a confidence value
+ * instead of one brittle boolean. It never throws and completes in a few ms.
  */
-export function computeDevToolsOpen(): boolean {
-  if (typeof window === 'undefined') return false;
-  if (typeof navigator === 'undefined') return false;
-  const isDesktopContext =
-    navigator.maxTouchPoints === 0 || /Win|Mac|Linux/i.test(navigator.platform);
-  if (!isDesktopContext) return false;
-  try {
-    const widthDiff = window.outerWidth - window.innerWidth;
-    const heightDiff = window.outerHeight - window.innerHeight;
-    return window.outerWidth > 0 && (widthDiff > 160 || heightDiff > 220);
-  } catch {
-    return false;
-  }
+export interface PrivateBrowsingAssessment {
+  likely: boolean;
+  confidence: number;
+  quotaMb: number | null;
+  reasons: string[];
 }
 
-/**
- * Task 3f - Privacy shielding inspection.
- * Deterministic canvas farbling pixel probe, ad-blocker DOM bait element probe and
- * Brave privacy browser detection. Every suggested element is removed again in a
- * finally block.
- */
-async function inspectPrivacyShielding(): Promise<{
-  canvasFarblingDetected: boolean;
-  adBlockerDetected: boolean;
-  privacyDetail: string;
-}> {
-  let canvasFarblingDetected = false;
-  let adBlockerDetected = false;
-  const causes: string[] = [];
+export async function detectPrivateBrowsing(
+  hasStoredIdentity: boolean
+): Promise<PrivateBrowsingAssessment> {
+  const reasons: string[] = [];
+  let score = 0;
+  let quotaMb: number | null = null;
+  let quotaBytes: number | null = null;
 
-  // Deterministic 8x8 canvas noise probe: farbling engines (Brave, CanvasBlocker,
-  // Libre Wolf) corrupt pixel readbacks of an exactly known solid fill color.
+  const storage =
+    typeof navigator !== 'undefined' ? (navigator.storage as StorageManager | undefined) : undefined;
+
+  // A granted persistent-storage permission can only exist in a normal profile,
+  // so it is decisive negative evidence.
+  if (storage && typeof storage.persisted === 'function') {
+    try {
+      if (await storage.persisted()) {
+        return {
+          likely: false,
+          confidence: 0,
+          quotaMb: null,
+          reasons: ['Persistent storage already granted (normal profile)'],
+        };
+      }
+    } catch {
+      // Ignore and continue with the composite probe.
+    }
+  }
+
+  if (storage && typeof storage.estimate === 'function') {
+    try {
+      const estimate = await storage.estimate();
+      if (typeof estimate.quota === 'number' && estimate.quota > 0) {
+        quotaBytes = estimate.quota;
+        quotaMb = Math.round(estimate.quota / (1024 * 1024));
+      }
+    } catch {
+      // Ignore storage estimate failures.
+    }
+  }
+
+  // Chromium computes a normal profile quota from free disk space (tens to
+  // hundreds of GB) while an off-the-record profile is capped far lower (~10 GB).
+  const heapLimit =
+    typeof performance !== 'undefined'
+      ? (performance as unknown as { memory?: { jsHeapSizeLimit?: number } }).memory
+          ?.jsHeapSizeLimit ?? null
+      : null;
+
+  if (quotaBytes !== null) {
+    if (quotaMb !== null && quotaMb < 20_480) {
+      score += 0.35;
+      reasons.push(`Restricted storage quota (${quotaMb} MB)`);
+    }
+    if (heapLimit && quotaBytes / heapLimit < 4) {
+      score += 0.45;
+      reasons.push(
+        `Storage quota is only ${(quotaBytes / heapLimit).toFixed(1)}x the JS heap limit`
+      );
+    }
+  }
+
+  // The Topics API is explicitly rejected in off-the-record contexts on Chromium
+  // 115+, which is a useful corroborating signal when the API exists at all.
   if (typeof document !== 'undefined') {
-    try {
-      const canvas = document.createElement('canvas');
-      canvas.width = 8;
-      canvas.height = 8;
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.fillStyle = 'rgb(255, 102, 0)';
-        ctx.fillRect(0, 0, 8, 8);
-        const pixel = ctx.getImageData(2, 2, 1, 1).data;
-        if (pixel[0] !== 255 || pixel[1] !== 102 || pixel[2] !== 0) {
-          canvasFarblingDetected = true;
-          causes.push('Canvas farbling pixel corruption');
-        }
-      }
-    } catch {
-      // Pixel readback is restricted in this environment. Never treat that alone as
-      // farbling evidence, only note it.
-      causes.push('Canvas pixel readback restricted');
-    }
-  }
-
-  // DOM bait element probe: known ad classnames are hidden or removed by
-  // uBlock-style blockers before layout runs.
-  if (typeof document !== 'undefined' && document.body) {
-    const baitElement = document.createElement('div');
-    baitElement.className = 'adsbox ad-banner doubleclick pub_300x250';
-    try {
-      baitElement.style.width = '1px';
-      baitElement.style.height = '1px';
-      baitElement.style.position = 'absolute';
-      baitElement.style.top = '-9999px';
-      document.body.appendChild(baitElement);
-      const hiddenByLayout = baitElement.offsetHeight === 0;
-      const baitDisplay =
-        typeof window !== 'undefined' && typeof window.getComputedStyle === 'function'
-          ? window.getComputedStyle(baitElement).display
-          : '';
-      if (hiddenByLayout || baitDisplay === 'none') {
-        adBlockerDetected = true;
-        causes.push('Ad-blocker hidden bait element');
-      }
-    } finally {
+    const topics = (document as unknown as { browsingTopics?: () => Promise<unknown> })
+      .browsingTopics;
+    if (typeof topics === 'function') {
       try {
-        if (baitElement.parentNode) {
-          baitElement.parentNode.removeChild(baitElement);
+        await topics.call(document);
+      } catch (err) {
+        const name = err instanceof DOMException ? err.name : '';
+        if (name === 'NotAllowedError') {
+          score += 0.35;
+          reasons.push('Browsing Topics API rejected in this context');
         }
-      } catch {
-        // Ignore cleanup failures
       }
     }
   }
 
-  // Brave ships privacy shielding (Shields plus farbling), but the browser flag
-  // alone is NOT an ad-blocker confirmation.
-  const navLike =
-    typeof navigator !== 'undefined' ? (navigator as unknown as { brave?: unknown }) : null;
-  if (navLike && Boolean(navLike.brave)) {
-    causes.push('Brave browser detected');
+  // A first-party identity that survived a previous load is strong negative
+  // evidence (a fresh private window starts with empty storage).
+  if (hasStoredIdentity) {
+    score -= 0.55;
+    reasons.push('Existing first-party identity present');
   }
 
-  return {
-    canvasFarblingDetected,
-    adBlockerDetected,
-    privacyDetail: causes.join('; '),
-  };
-}
-
-/**
- * Task 3g - Short-budget WebRTC STUN probe that compares the local ICE public
- * candidate address with the HTTP-visible IP. A different public srflx address is
- * a strong VPN / proxy signal; mDNS (".local") or matching addresses are clean.
- */
-async function probeWebRtcLeak(
-  httpIp: string | null | undefined
-): Promise<{ candidateIp: string | null; webrtcLeak: boolean; webrtcDetail: string }> {
-  if (typeof RTCPeerConnection === 'undefined') {
-    return { candidateIp: null, webrtcLeak: false, webrtcDetail: 'STUN unavailable in this environment' };
-  }
-
-  let peerConnection: RTCPeerConnection | null = null;
+  let cookieIdentityPresent = false;
   try {
-    peerConnection = new RTCPeerConnection({
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-    });
-
-    const candidateLines: string[] = [];
-    peerConnection.onicecandidate = (event) => {
-      const candidate = event && event.candidate ? event.candidate.candidate : '';
-      if (candidate) {
-        candidateLines.push(candidate);
-      }
-    };
-
-    try {
-      peerConnection.createDataChannel('intel-stun-probe');
-    } catch {
-      // DataChannel is optional for ICE gathering
-    }
-
-    const offer = await peerConnection.createOffer();
-    await peerConnection.setLocalDescription(offer);
-
-    // Short collection budget: ICE gathering finishes well inside a second.
-    await new Promise<null>((resolve) => setTimeout(() => resolve(null), 800));
-
-    // Prefer the srflx (server-reflexive) candidate; fall back to the first one.
-    const srflxLine = candidateLines.find((line) => line.includes('typ srflx'));
-    const chosenLine = srflxLine || candidateLines[0] || '';
-
-    let candidateIp: string | null = null;
-    if (chosenLine) {
-      const parts = chosenLine.split(' ');
-      const directIp = parts[4] || '';
-      if (/^[0-9]{1,3}(\.[0-9]{1,3}){3}$/.test(directIp)) {
-        candidateIp = directIp;
-      } else {
-        const fallbackMatch = chosenLine.match(/([0-9]{1,3}(\.[0-9]{1,3}){3})/);
-        candidateIp = fallbackMatch && fallbackMatch[0] ? fallbackMatch[0] : null;
-      }
-    }
-
-    const trimmedHttpIp = typeof httpIp === 'string' ? httpIp.trim() : '';
-    const httpIpIsReal =
-      trimmedHttpIp.length > 0 &&
-      !/^unknown$/i.test(trimmedHttpIp) &&
-      trimmedHttpIp.toLowerCase() !== 'unavailable';
-    const mdnsMasked = candidateIp !== null && candidateIp.endsWith('.local');
-
-    let webrtcLeak = false;
-    let webrtcDetail = 'STUN matches HTTP IP or mDNS Masked';
-    if (candidateIp && !mdnsMasked && httpIpIsReal && candidateIp !== trimmedHttpIp) {
-      webrtcLeak = true;
-      webrtcDetail = `STUN IP ${candidateIp} != HTTP IP ${trimmedHttpIp}`;
-    }
-
-    return { candidateIp, webrtcLeak, webrtcDetail };
+    cookieIdentityPresent = /(?:^|;\s*)intel_client_vid=/.test(document.cookie || '');
   } catch {
-    // STUN blocked, permissions denied or an unsupported browser build.
-    return { candidateIp: null, webrtcLeak: false, webrtcDetail: 'STUN unavailable in this environment' };
-  } finally {
-    if (peerConnection) {
-      try {
-        peerConnection.close();
-      } catch {
-        // Ignore close errors
-      }
-    }
+    cookieIdentityPresent = false;
   }
+  if (cookieIdentityPresent) {
+    score -= 0.35;
+    reasons.push('First-party identity cookie present');
+  }
+
+  const confidence = Math.max(0, Math.min(1, Number(score.toFixed(2))));
+  return {
+    likely: confidence >= 0.6,
+    confidence,
+    quotaMb,
+    reasons,
+  };
 }
 
 /**
@@ -1385,41 +1320,10 @@ export async function evaluateSecuritySignals(
   }
   const tamperDetected = tamperReasons.length > 0;
 
-  // 4. Private Mode / Storage Quota Inspection (Task 3e heuristics)
-  let storageQuotaMb: number | null = null;
-  let incognitoLikely = false;
-  if (nav?.storage && typeof nav.storage.estimate === 'function') {
-    try {
-      const estimate = await nav.storage.estimate();
-      if (typeof estimate.quota === 'number' && estimate.quota > 0) {
-        storageQuotaMb = Math.round(estimate.quota / (1024 * 1024));
-        // Desktop browsers grant multi-gigabyte quotas in normal mode, so a tiny
-        // quota is a strong private / ephemeral profile signal.
-        const desktopRestrictedQuota =
-          browserDevice.deviceType === 'Desktop' &&
-          storageQuotaMb > 0 &&
-          storageQuotaMb < 1400;
-        // Bonus heuristic (applies regardless of device type): when the granted
-        // quota sits below roughly 2.5x the JS heap limit the partition is
-        // almost certainly ephemeral.
-        const perfMemory =
-          typeof performance !== 'undefined'
-            ? (performance as unknown as { memory?: { jsHeapSizeLimit?: number } }).memory
-            : undefined;
-        const jsHeapSizeLimit =
-          perfMemory && typeof perfMemory.jsHeapSizeLimit === 'number'
-            ? perfMemory.jsHeapSizeLimit
-            : null;
-        const heapRatioRestrictedQuota =
-          jsHeapSizeLimit !== null && estimate.quota < jsHeapSizeLimit * 2.5;
-        if (desktopRestrictedQuota || heapRatioRestrictedQuota) {
-          incognitoLikely = true;
-        }
-      }
-    } catch {
-      // Ignore storage estimate error
-    }
-  }
+  // 4. Private Mode / Incognito Inspection (composite, modern-Chromium safe)
+  const privateBrowsing = await detectPrivateBrowsing(hasStoredIdentity);
+  const storageQuotaMb = privateBrowsing.quotaMb;
+  let incognitoLikely = privateBrowsing.likely;
 
   let localStorageAvailable = true;
   try {
@@ -1445,18 +1349,7 @@ export async function evaluateSecuritySignals(
   // 5. Virtual Machine / Hypervisor Detection
   const vmStatus = detectVirtualMachine(hardwareSignals, browserDevice);
 
-  // 6. Live DevTools Geometry Probe (desktop contexts only)
-  const devToolsOpen = computeDevToolsOpen();
-
-  // 7. Privacy Shielding & WebRTC STUN Leak Probes
-  const [privacyInspection, webrtcProbe] = await Promise.all([
-    inspectPrivacyShielding(),
-    probeWebRtcLeak(clientGeoHint?.ip ?? null),
-  ]);
-  const privacyProtected =
-    privacyInspection.canvasFarblingDetected || privacyInspection.adBlockerDetected;
-
-  // 8. Composite Suspect & Risk Score (0-10)
+  // 6. Composite Suspect & Risk Score (0-10) — four core Smart Signals only
   let rawScore = 0;
   const riskFactors: string[] = [];
 
@@ -1466,12 +1359,10 @@ export async function evaluateSecuritySignals(
       `Automation / headless signal (+3): ${botSignals[0] || 'automation runtime detected'}`
     );
   }
-  if (vpnSuspected || webrtcProbe.webrtcLeak) {
+  if (vpnSuspected) {
     rawScore += 2;
-    const vpnDetail =
-      (vpnSuspected && vpnReasons.length > 0 ? vpnReasons[0] : webrtcProbe.webrtcDetail) ||
-      'proxy network signal';
-    riskFactors.push(`VPN / proxy or WebRTC leak (+2): ${vpnDetail}`);
+    const vpnDetail = vpnReasons[0] || 'proxy network signal';
+    riskFactors.push(`VPN / proxy network (+2): ${vpnDetail}`);
   }
   if (vmStatus.isVirtualMachine || cloudOrMaskedGpu) {
     rawScore += 2;
@@ -1483,11 +1374,7 @@ export async function evaluateSecuritySignals(
         : 'Cloud / Masked GPU environment';
     riskFactors.push(`Virtualization / cloud GPU signal (+2): ${virtualDetail}`);
   }
-  if (tamperDetected) {
-    rawScore += 1;
-    riskFactors.push(`Environment spoofing (+1): ${tamperReasons[0] || 'UA / platform conflicts'}`);
-  }
-  if (incognitoLikely || incognitoOrCleared) {
+  if (incognitoLikely) {
     rawScore += 1;
     const storageDetail =
       storageQuotaMb !== null
@@ -1496,17 +1383,6 @@ export async function evaluateSecuritySignals(
         ? 'first-party storage write blocked'
         : 'restricted storage';
     riskFactors.push(`Private / ephemeral storage (+1): ${storageDetail}`);
-  }
-  if (devToolsOpen || privacyProtected) {
-    rawScore += 1;
-    const privacyScoreFactors: string[] = [];
-    if (privacyProtected) {
-      privacyScoreFactors.push(privacyInspection.privacyDetail || 'privacy shielding detected');
-    }
-    if (devToolsOpen) {
-      privacyScoreFactors.push('DevTools open via window geometry');
-    }
-    riskFactors.push(`Privacy shielding / DevTools open (+1): ${privacyScoreFactors.join('; ')}`);
   }
 
   const suspectScore = Math.min(10, rawScore);
@@ -1536,18 +1412,12 @@ export async function evaluateSecuritySignals(
     networkType,
     isConsumerBroadband,
     isDatacenterOrHosting,
-    /* Task 3 - deep technical detection payloads */
-    webrtcLeak: webrtcProbe.webrtcLeak,
-    webrtcCandidateIp: webrtcProbe.candidateIp,
-    webrtcDetail: webrtcProbe.webrtcDetail,
-    privacyProtected,
-    privacyDetail: privacyInspection.privacyDetail,
-    adBlockerDetected: privacyInspection.adBlockerDetected,
-    canvasFarblingDetected: privacyInspection.canvasFarblingDetected,
+    /* Incognito confidence + explanation (client probe) */
+    incognitoConfidence: privateBrowsing.confidence,
+    incognitoDetail: privateBrowsing.reasons.join('; '),
     incognitoOrCleared: false,
     isVirtualMachine: vmStatus.isVirtualMachine,
     vmReason: vmStatus.vmReason,
-    devToolsOpen,
     distinctIpsLastHour: undefined,
     visitsLastHour: undefined,
   };
