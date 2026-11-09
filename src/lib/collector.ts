@@ -1068,6 +1068,8 @@ export async function detectPrivateBrowsing(
   let score = 0;
   let quotaMb: number | null = null;
   let quotaBytes: number | null = null;
+  let usageBytes = 0;
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
 
   const storage =
     typeof navigator !== 'undefined' ? (navigator.storage as StorageManager | undefined) : undefined;
@@ -1092,6 +1094,9 @@ export async function detectPrivateBrowsing(
   if (storage && typeof storage.estimate === 'function') {
     try {
       const estimate = await storage.estimate();
+      if (typeof estimate.usage === 'number' && estimate.usage > 0) {
+        usageBytes = estimate.usage;
+      }
       if (typeof estimate.quota === 'number' && estimate.quota > 0) {
         quotaBytes = estimate.quota;
         quotaMb = Math.round(estimate.quota / (1024 * 1024));
@@ -1110,22 +1115,40 @@ export async function detectPrivateBrowsing(
       : null;
 
   if (quotaBytes !== null) {
-    // Chromium computes a normal-profile quota from free disk space (typically
-    // 15x-80x the JS heap limit) while an off-the-record profile is capped far
-    // lower (about 2x-6x). The band avoids flagging tiny-quota non-browser
-    // shells (Electron/WebView) that report a ratio below 1.
-    const quotaRatio = heapLimit ? quotaBytes / heapLimit : null;
-    if (quotaRatio !== null && quotaRatio >= 1 && quotaRatio < 6) {
-      score += 0.6;
-      reasons.push(
-        `Storage quota is only ${quotaRatio.toFixed(1)}x the JS heap limit (off-the-record profile range)`
-      );
-    } else if (quotaRatio !== null && quotaRatio >= 1 && quotaMb !== null && quotaMb < 20_480) {
-      score += 0.3;
-      reasons.push(`Restricted storage quota (${quotaMb} MB)`);
-    } else if (quotaRatio === null && quotaMb !== null && quotaMb >= 2_048 && quotaMb < 20_480) {
-      score += 0.3;
-      reasons.push(`Restricted storage quota (${quotaMb} MB)`);
+    // Chrome 147+ deliberately hides Incognito behind a fake quota: normal tabs
+    // report `usage + 10 GiB` and private tabs report `usage + 9 GiB`, so the raw
+    // quota is identical-looking in both modes. The headroom (quota - usage) still
+    // separates them cleanly: 10 GiB vs 9 GiB. Older Chromium used a disk-sized
+    // normal quota and a small RAM-derived private quota, which this band also
+    // catches. Embedded shells (Electron/WebView) expose a tiny fixed quota, so
+    // they are excluded instead of being misread as private.
+    const headroomBytes = Math.max(0, quotaBytes - usageBytes);
+    const headroomGiB = headroomBytes / (1024 * 1024 * 1024);
+    const isEmbeddedShell = /Electron|HeadlessChrome|; wv\)|FBAN|FBAV/i.test(ua);
+    const NORMAL_FLOOR_GIB = 9.5; // midpoint between the 9 GiB private and 10 GiB normal caps
+
+    if (!isEmbeddedShell) {
+      if (headroomGiB >= NORMAL_FLOOR_GIB) {
+        return {
+          likely: false,
+          confidence: 0,
+          quotaMb,
+          reasons: [
+            `Storage headroom ${headroomGiB.toFixed(1)} GiB matches a normal profile`,
+          ],
+        };
+      }
+      if (headroomGiB >= 0.5) {
+        score += 0.85;
+        reasons.push(
+          `Storage headroom ${headroomGiB.toFixed(1)} GiB is below the normal-profile floor (private profile range)`
+        );
+      }
+    } else if (heapLimit && quotaBytes / heapLimit < 6) {
+      // Fallback for embedded shells only: a memory-bound quota is still a weak
+      // indicator, but it can never be decisive on its own.
+      score += 0.2;
+      reasons.push('Memory-bound storage quota');
     }
   }
 
