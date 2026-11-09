@@ -907,7 +907,12 @@ function classifyIspNetwork(isp: string, org: string, asn: string): IspNetworkCl
   }
 
   return {
-    brandName: cleanIsp || cleanOrg || 'Unknown ISP',
+    brandName:
+      cleanIsp && !/^unknown$|^unknown isp$/i.test(cleanIsp)
+        ? cleanIsp
+        : cleanOrg && !/^unknown$|^unknown isp$/i.test(cleanOrg)
+        ? cleanOrg
+        : 'Unknown ISP',
     networkType: 'Residential Broadband',
     isConsumerBroadband: false,
     isDatacenterOrHosting: false,
@@ -2042,7 +2047,7 @@ const SERVER_TIMEZONE_ALIAS_MAP: Record<string, string> = {
 function normalizeServerTimezoneId(tz: string | null | undefined): string {
   if (!tz || typeof tz !== 'string') return '';
   const cleaned = tz.trim().toLowerCase();
-  if (!cleaned || cleaned === 'unknown') return '';
+  if (!cleaned || cleaned === 'unknown' || cleaned === 'unavailable') return '';
   return SERVER_TIMEZONE_ALIAS_MAP[cleaned] || cleaned;
 }
 
