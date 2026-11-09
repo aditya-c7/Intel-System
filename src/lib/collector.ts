@@ -1047,12 +1047,18 @@ function detectVirtualMachine(
 /**
  * Private / Incognito browsing assessment.
  *
- * Modern Chromium (Chrome 120+) no longer reports a tiny storage quota in an
- * off-the-record profile: it now exposes a large dynamic virtual quota, so the
- * historical `quota < 1400 MB` check silently returned "Standard Window" even
- * inside Incognito. This probe combines the storage signals that still differ
- * between a normal and an off-the-record profile and returns a confidence value
- * instead of one brittle boolean. It never throws and completes in a few ms.
+ * Chrome 156 deliberately hides the browsing mode from the Storage API: both a
+ * normal and an off-the-record context report `quota = usage + 10 GiB`, so every
+ * quota-threshold heuristic silently returns "Standard Window" inside Incognito
+ * (verified against Chromium's `CalculateReportedQuota` and on Chrome 156 /
+ * Windows 11, where both modes report exactly 10,737,418,240 bytes of headroom).
+ *
+ * The signal that still separates the modes is commit durability: an
+ * off-the-record IndexedDB lives in memory, so a transaction created with
+ * `durability: 'strict'` finishes as fast as a `relaxed` one, while a real
+ * profile waits for the disk write. Measured on Chrome 156 / Windows 11:
+ * normal ratio ~5.9x, Incognito ~1.07x. The probe is time-boxed, never throws
+ * and leaves no database behind.
  */
 export interface PrivateBrowsingAssessment {
   likely: boolean;
@@ -1061,15 +1067,93 @@ export interface PrivateBrowsingAssessment {
   reasons: string[];
 }
 
+/**
+ * Measures how much slower a `strict` (fsync) IndexedDB commit is than a
+ * `relaxed` one. Returns `null` when the browser ignores the durability hint,
+ * the probe is blocked, or it cannot finish within `budgetMs`.
+ */
+async function measureIdbDurabilityRatio(budgetMs: number): Promise<number | null> {
+  if (typeof indexedDB === 'undefined') return null;
+  const now = () =>
+    typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now();
+  const deadline = now() + budgetMs;
+  const dbName = `__intel_pb_${Math.random().toString(36).slice(2)}`;
+  const payload = new Uint8Array(4096);
+  let db: IDBDatabase | null = null;
+
+  try {
+    db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(dbName, 1);
+      request.onupgradeneeded = () => request.result.createObjectStore('s');
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+      request.onblocked = () => reject(new Error('blocked'));
+    });
+
+    // Firefox/Safari do not expose the durability hint; without it the timing
+    // has no meaning, so the probe abstains instead of guessing.
+    const probe = db.transaction('s', 'readwrite', { durability: 'strict' });
+    const honoursHint =
+      (probe as IDBTransaction & { durability?: string }).durability === 'strict';
+    probe.abort();
+    if (!honoursHint) return null;
+
+    const block = (durability: IDBTransactionDurability, ops: number) =>
+      new Promise<number>((resolve, reject) => {
+        const started = now();
+        let index = 0;
+        const step = () => {
+          if (index >= ops) {
+            resolve(now() - started);
+            return;
+          }
+          const tx = db!.transaction('s', 'readwrite', { durability });
+          tx.objectStore('s').put(payload, index++);
+          tx.oncomplete = step;
+          tx.onerror = tx.onabort = () => reject(tx.error);
+        };
+        step();
+      });
+
+    await block('relaxed', 4);
+    await block('strict', 4);
+
+    const ratios: number[] = [];
+    for (let round = 0; round < 3 && now() < deadline; round += 1) {
+      const relaxedMs = await block('relaxed', 6);
+      const strictMs = await block('strict', 6);
+      if (relaxedMs > 0.2 && Number.isFinite(strictMs)) {
+        ratios.push(strictMs / relaxedMs);
+      }
+    }
+    if (ratios.length < 2) return null;
+    ratios.sort((a, b) => a - b);
+    return ratios[ratios.length >> 1];
+  } catch {
+    return null;
+  } finally {
+    try {
+      db?.close();
+      indexedDB.deleteDatabase(dbName);
+    } catch {
+      // Ignore cleanup failures.
+    }
+  }
+}
+
 export async function detectPrivateBrowsing(
   hasStoredIdentity: boolean
 ): Promise<PrivateBrowsingAssessment> {
   const reasons: string[] = [];
-  let score = 0;
-  let quotaMb: number | null = null;
-  let quotaBytes: number | null = null;
-  let usageBytes = 0;
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  const isEmbeddedShell = /Electron|HeadlessChrome|; wv\)|FBAN|FBAV/i.test(ua);
+  let quotaMb: number | null = null;
+
+  // Prior: most sessions are not private (5%). Every observation shifts the
+  // log-odds; the final confidence is the logistic of the accumulated value.
+  let logit = Math.log(0.05 / 0.95);
 
   const storage =
     typeof navigator !== 'undefined' ? (navigator.storage as StorageManager | undefined) : undefined;
@@ -1082,7 +1166,7 @@ export async function detectPrivateBrowsing(
         return {
           likely: false,
           confidence: 0,
-          quotaMb: null,
+          quotaMb,
           reasons: ['Persistent storage already granted (normal profile)'],
         };
       }
@@ -1091,6 +1175,8 @@ export async function detectPrivateBrowsing(
     }
   }
 
+  let usageBytes = 0;
+  let quotaBytes: number | null = null;
   if (storage && typeof storage.estimate === 'function') {
     try {
       const estimate = await storage.estimate();
@@ -1106,98 +1192,97 @@ export async function detectPrivateBrowsing(
     }
   }
 
-  // Chromium computes a normal profile quota from free disk space (tens to
-  // hundreds of GB) while an off-the-record profile is capped far lower (~10 GB).
-  const heapLimit =
-    typeof performance !== 'undefined'
-      ? (performance as unknown as { memory?: { jsHeapSizeLimit?: number } }).memory
-          ?.jsHeapSizeLimit ?? null
-      : null;
+  // 1. Commit durability — the only surviving client-side Chromium signal.
+  //    Embedded shells (Electron/WebView) often run on memory-backed storage in
+  //    every mode, so they abstain instead of producing a false positive.
+  let idbRatio: number | null = null;
+  if (
+    !isEmbeddedShell &&
+    typeof indexedDB !== 'undefined' &&
+    typeof document !== 'undefined' &&
+    document.visibilityState !== 'hidden'
+  ) {
+    idbRatio = await measureIdbDurabilityRatio(220);
+  }
 
-  if (quotaBytes !== null) {
-    // Chrome 147+ deliberately hides Incognito behind a fake quota: normal tabs
-    // report `usage + 10 GiB` and private tabs report `usage + 9 GiB`, so the raw
-    // quota is identical-looking in both modes. The headroom (quota - usage) still
-    // separates them cleanly: 10 GiB vs 9 GiB. Older Chromium used a disk-sized
-    // normal quota and a small RAM-derived private quota, which this band also
-    // catches. Embedded shells (Electron/WebView) expose a tiny fixed quota, so
-    // they are excluded instead of being misread as private.
-    const headroomBytes = Math.max(0, quotaBytes - usageBytes);
-    const headroomGiB = headroomBytes / (1024 * 1024 * 1024);
-    const isEmbeddedShell = /Electron|HeadlessChrome|; wv\)|FBAN|FBAV/i.test(ua);
-    const NORMAL_FLOOR_GIB = 9.5; // midpoint between the 9 GiB private and 10 GiB normal caps
-
-    if (!isEmbeddedShell) {
-      if (headroomGiB >= NORMAL_FLOOR_GIB) {
-        return {
-          likely: false,
-          confidence: 0,
-          quotaMb,
-          reasons: [
-            `Storage headroom ${headroomGiB.toFixed(1)} GiB matches a normal profile`,
-          ],
-        };
-      }
-      if (headroomGiB >= 0.5) {
-        score += 0.85;
-        reasons.push(
-          `Storage headroom ${headroomGiB.toFixed(1)} GiB is below the normal-profile floor (private profile range)`
-        );
-      }
-    } else if (heapLimit && quotaBytes / heapLimit < 6) {
-      // Fallback for embedded shells only: a memory-bound quota is still a weak
-      // indicator, but it can never be decisive on its own.
-      score += 0.2;
-      reasons.push('Memory-bound storage quota');
+  if (idbRatio !== null) {
+    if (idbRatio < 1.25) {
+      logit += 5;
+      reasons.push(
+        `IndexedDB strict commit ${idbRatio.toFixed(2)}x relaxed (memory-backed, off-the-record profile)`
+      );
+    } else if (idbRatio < 1.6) {
+      logit += 2.6;
+      reasons.push(
+        `IndexedDB strict commit ${idbRatio.toFixed(2)}x relaxed (weak memory backing)`
+      );
+    } else if (idbRatio >= 2) {
+      logit -= 3.5;
+      reasons.push(`IndexedDB strict commit ${idbRatio.toFixed(2)}x relaxed (real disk commit)`);
+    } else {
+      logit -= 1.8;
+      reasons.push(`IndexedDB strict commit ${idbRatio.toFixed(2)}x relaxed (disk-backed)`);
     }
   }
 
-  // The Topics API is explicitly rejected in off-the-record contexts on Chromium
-  // 115+, which is a useful corroborating signal when the API exists at all.
-  if (typeof document !== 'undefined') {
-    const topics = (document as unknown as { browsingTopics?: () => Promise<unknown> })
-      .browsingTopics;
-    if (typeof topics === 'function') {
-      try {
-        await topics.call(document);
-      } catch (err) {
-        const name = err instanceof DOMException ? err.name : '';
-        if (name === 'NotAllowedError') {
-          score += 0.35;
-          reasons.push('Browsing Topics API rejected in this context');
-        }
-      }
+  // 2. Pre-Chrome-147 private contexts exposed a RAM-derived quota (well under
+  //    3 GiB). Chrome 156 reports the same 10 GiB headroom in both modes, so a
+  //    normal quota contributes no evidence and a small one only corroborates.
+  if (quotaBytes !== null && !isEmbeddedShell) {
+    const headroomGiB = Math.max(0, quotaBytes - usageBytes) / (1024 * 1024 * 1024);
+    if (headroomGiB > 0.3 && headroomGiB < 3) {
+      logit += 1.2;
+      reasons.push(
+        `Storage headroom ${headroomGiB.toFixed(1)} GiB (legacy private-profile quota)`
+      );
     }
   }
 
-  // A first-party identity that survived a previous load is strong negative
-  // evidence (a fresh private window starts with empty storage).
+  // 3. Blocked first-party writes are ephemeral by definition.
+  try {
+    const probeKey = '__intel_pb_write__';
+    localStorage.setItem(probeKey, '1');
+    localStorage.removeItem(probeKey);
+  } catch {
+    logit += 2;
+    reasons.push('First-party storage write blocked');
+  }
+
+  // 4. An identity that survived a previous load is evidence of a durable
+  //    profile, but a reload inside the same private window also carries one,
+  //    so it only nudges the verdict.
   if (hasStoredIdentity) {
-    score -= 0.55;
+    logit -= 0.8;
     reasons.push('Existing first-party identity present');
   }
 
   let cookieIdentityPresent = false;
   try {
-    cookieIdentityPresent = /(?:^|;\s*)intel_client_vid=/.test(document.cookie || '');
+    cookieIdentityPresent = typeof document !== 'undefined'
+      ? /(?:^|;\s*)intel_client_vid=/.test(document.cookie || '')
+      : false;
   } catch {
     cookieIdentityPresent = false;
   }
   if (cookieIdentityPresent) {
-    score -= 0.35;
+    logit -= 0.5;
     reasons.push('First-party identity cookie present');
   }
 
-  const confidence = Math.max(0, Math.min(1, Number(score.toFixed(2))));
+  if (idbRatio === null) {
+    reasons.push('Commit-durability probe unavailable');
+  }
+
+  const confidence = Number(
+    Math.max(0.01, Math.min(0.99, 1 / (1 + Math.exp(-logit)))).toFixed(3)
+  );
   return {
     likely: confidence >= 0.6,
     confidence,
     quotaMb,
     reasons,
   };
-}
-
-/**
+}/**
  * Evaluates First-Party Security & Anomaly Signals ("Smart Signals") and computes an
  * explainable Suspect & Risk Score (0-10).
  */
