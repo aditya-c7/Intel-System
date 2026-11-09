@@ -1003,62 +1003,290 @@ export async function collectHardwareSignals(
 }
 
 /**
- * Task 3c - Virtual machine / hypervisor environment detection.
- * Combines WebGL GPU hypervisor signatures with desktop hardware anomalies
- * that are typical of virtualized compute instances.
+ * Virtual machine & OS integrity verdict.
  */
-function detectVirtualMachine(
-  hardwareSignals: HardwareSignals,
-  browserDevice: BrowserDeviceInfo
-): { isVirtualMachine: boolean; vmReason: string } {
-  const gpuVendor = (hardwareSignals.gpuVendor || '').trim();
-  const gpuRenderer = (hardwareSignals.gpuRenderer || '').trim();
-  const gpuSignature = `${gpuVendor} ${gpuRenderer}`.trim();
+export interface VmAndIntegritySignals {
+  isVirtualMachine: boolean;
+  isOsTampered: boolean;
+  vmReason: string;
+  gpuVendor: string;
+  gpuRenderer: string;
+}
 
-  const hypervisorMatch = gpuSignature.match(
-    /vmware|virtualbox|vbox|parallels|qemu|virtio|llvmpipe|softpipe|swiftshader|microsoft basic render|mesa offscreen/i
-  );
-  const hypervisorToken = hypervisorMatch ? hypervisorMatch[0] : null;
-  if (hypervisorToken) {
-    return {
-      isVirtualMachine: true,
-      vmReason: `Hypervisor GPU signature (${hypervisorToken.toLowerCase()})`,
-    };
+/**
+ * Bot & automation verdict.
+ */
+export interface BotAutomationSignals {
+  isBot: boolean;
+  isHeadless: boolean;
+  botReason: string;
+  webdriver: boolean;
+  cdpDetected: boolean;
+}
+
+/**
+ * Incognito / private-browsing verdict produced by the multi-engine physics probe.
+ */
+export interface IncognitoDetectionResult {
+  isPrivate: boolean;
+  browserName: string;
+  method: string;
+  quotaBytes: number | null;
+  headroomGiB: number | null;
+  idbDurabilityRatio: number | null;
+}
+
+const GIB_BYTES = 1024 * 1024 * 1024;
+
+/**
+ * Engine fingerprint probe.
+ *
+ * `Number.prototype.toFixed` rejects a negative digit count with an engine-specific
+ * RangeError message whose length identifies the JavaScript engine:
+ * 51 = V8, 25 = SpiderMonkey, 44/43 = JavaScriptCore.
+ */
+function getEngineErrorLength(): number {
+  try {
+    return parseInt('-1', 10).toFixed(-1).length;
+  } catch (error) {
+    if (error instanceof Error) {
+      return error.message.length;
+    }
+    return 0;
+  }
+}
+
+/**
+ * Returns true when `property` on `proto` is still a native accessor.
+ * An overridden getter (anti-detect proxy) fails the `[native code]` check.
+ */
+function isNativeAccessor(proto: object | undefined, property: string): boolean {
+  try {
+    if (!proto) return true;
+    const descriptor = Object.getOwnPropertyDescriptor(proto, property);
+    if (!descriptor) return true;
+    if (typeof descriptor.get !== 'function') return false;
+    return /\[native code\]/.test(Function.prototype.toString.call(descriptor.get));
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Virtual machine / hypervisor + OS identity integrity detection.
+ * Matches WebGL vendor/renderer strings against known hypervisor GPUs, then
+ * cross-checks the claimed User-Agent OS against the platform, GPU and the
+ * native Navigator accessors (anti-detect proxy detection).
+ */
+export function detectVmAndIntegrity(
+  gpuVendor: string,
+  gpuRenderer: string
+): VmAndIntegritySignals {
+  const vendor = (gpuVendor || '').trim();
+  const renderer = (gpuRenderer || '').trim();
+  const signature = `${vendor} ${renderer}`.toLowerCase();
+
+  const vmSignatures: Array<{ pattern: RegExp; label: string }> = [
+    { pattern: /vmware|svga3d/, label: 'VMware SVGA3D Virtual GPU' },
+    { pattern: /virtualbox|vbox/, label: 'Oracle VirtualBox Virtual GPU' },
+    { pattern: /parallels/, label: 'Parallels Virtual GPU' },
+    { pattern: /qemu|virtio|virgl|bochs/, label: 'QEMU / VirtIO Virtual GPU' },
+    {
+      pattern: /hyper-v|microsoft remote display/,
+      label: 'Microsoft Hyper-V Remote Display Adapter',
+    },
+    { pattern: /citrix|xen/, label: 'Citrix / Xen Virtual GPU' },
+    { pattern: /swiftshader/, label: 'Google SwiftShader Software Renderer' },
+    {
+      pattern: /llvmpipe|softpipe|mesa offscreen|software rasterizer/,
+      label: 'Mesa / LLVMpipe Software Rasterizer',
+    },
+  ];
+
+  let isVirtualMachine = false;
+  let vmReason = '';
+
+  for (const rule of vmSignatures) {
+    if (rule.pattern.test(signature)) {
+      isVirtualMachine = true;
+      vmReason = rule.label;
+      break;
+    }
   }
 
-  const isDesktopPlatform = /Win|Mac|Linux/i.test(browserDevice.platform || '');
-  if (hardwareSignals.cpuCores != null && hardwareSignals.cpuCores <= 2 && isDesktopPlatform) {
-    return {
-      isVirtualMachine: true,
-      vmReason: `Low core count (${hardwareSignals.cpuCores}) on desktop platform`,
-    };
+  // Microsoft Basic Render Driver is only suspicious on constrained hardware
+  // (a software fallback on a real workstation is legitimate).
+  if (!isVirtualMachine && signature.includes('microsoft basic render')) {
+    let cpuCores: number | null = null;
+    let screenWidth = 0;
+    let screenHeight = 0;
+    try {
+      cpuCores =
+        typeof navigator !== 'undefined' && typeof navigator.hardwareConcurrency === 'number'
+          ? navigator.hardwareConcurrency
+          : null;
+      screenWidth =
+        typeof window !== 'undefined' && window.screen ? Number(window.screen.width) : 0;
+      screenHeight =
+        typeof window !== 'undefined' && window.screen ? Number(window.screen.height) : 0;
+    } catch {
+      // Ignore hostile hardware proxies.
+    }
+    const tinyScreen =
+      (screenWidth === 800 && screenHeight === 600) ||
+      (screenWidth === 1024 && screenHeight === 768);
+    if ((cpuCores !== null && cpuCores <= 2) || tinyScreen) {
+      isVirtualMachine = true;
+      vmReason = 'Microsoft Basic Render Driver on constrained virtual hardware';
+    }
   }
 
-  if (gpuVendor === 'Unavailable' && browserDevice.deviceType === 'Desktop') {
-    return {
-      isVirtualMachine: true,
-      vmReason: 'GPU vendor unavailable on desktop',
-    };
+  let ua = '';
+  let platform = '';
+  try {
+    if (typeof navigator !== 'undefined') {
+      ua = navigator.userAgent || '';
+      platform = navigator.platform || '';
+    }
+  } catch {
+    // Ignore hostile navigator proxies.
+  }
+  const claimsWindows = /Windows NT/i.test(ua);
+  const claimsMac = /Macintosh|Mac OS X/i.test(ua);
+  const claimsLinux = /Linux/i.test(ua) && !/Android/i.test(ua);
+
+  const osMismatches: string[] = [];
+  if (claimsWindows && /MacIntel|Linux|iPhone|iPad/i.test(platform)) {
+    osMismatches.push(`Windows User-Agent with ${platform || 'unknown'} platform`);
+  }
+  if (claimsMac && /Win32|Win64|Linux/i.test(platform)) {
+    osMismatches.push(`macOS User-Agent with ${platform || 'unknown'} platform`);
+  }
+  if (claimsLinux && /Win32|Win64|MacIntel/i.test(platform)) {
+    osMismatches.push(`Linux User-Agent with ${platform || 'unknown'} platform`);
+  }
+  if ((claimsWindows || claimsLinux) && /apple m[1-9]|apple gpu/.test(signature)) {
+    osMismatches.push('Apple Silicon GPU renderer on a non-Apple User-Agent');
+  }
+  if (claimsMac && /direct3d|d3d11/.test(signature)) {
+    osMismatches.push('Direct3D renderer on a macOS User-Agent');
   }
 
-  return { isVirtualMachine: false, vmReason: '' };
+  const navProto = typeof Navigator !== 'undefined' ? Navigator.prototype : undefined;
+  if (!isNativeAccessor(navProto, 'userAgent') || !isNativeAccessor(navProto, 'platform')) {
+    osMismatches.push('Navigator prototype getter overridden (Anti-detect proxy)');
+  }
+
+  const isOsTampered = osMismatches.length > 0;
+  if (!vmReason) {
+    vmReason = isOsTampered ? osMismatches[0] : 'Physical GPU & Consistent OS Identity';
+  }
+
+  return {
+    isVirtualMachine,
+    isOsTampered,
+    vmReason,
+    gpuVendor: vendor,
+    gpuRenderer: renderer,
+  };
+}
+
+const CDP_GLOBAL_KEY_PATTERN =
+  /^cdc_|^\$cdc_|^__\$webdriverAsyncExecutor|^__webdriver|^__selenium|^__fxdriver|^__playwright|^__pwInitScripts|^_phantom|^callPhantom|^domAutomation/i;
+
+/**
+ * Bot & automation detection.
+ * Checks `navigator.webdriver`, Chrome DevTools Protocol / WebDriver bindings on
+ * `window` and `document`, a patched `Navigator.prototype.webdriver` getter,
+ * headless User-Agents, software GPUs, zero outer geometry and empty languages.
+ */
+export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignals {
+  const nav = typeof navigator !== 'undefined' ? navigator : undefined;
+  let ua = '';
+  let webdriver = false;
+  try {
+    if (nav) {
+      ua = nav.userAgent || '';
+      webdriver = nav.webdriver === true;
+    }
+  } catch {
+    // Ignore hostile navigator proxies.
+  }
+
+  let cdpDetected = false;
+  const scanTarget = (target: object | undefined): void => {
+    if (!target || cdpDetected) return;
+    try {
+      for (const key of Object.keys(target as Record<string, unknown>)) {
+        if (CDP_GLOBAL_KEY_PATTERN.test(key)) {
+          cdpDetected = true;
+          return;
+        }
+      }
+    } catch {
+      // Ignore hostile proxies over the global object.
+    }
+  };
+  scanTarget(typeof window !== 'undefined' ? window : undefined);
+  scanTarget(typeof document !== 'undefined' ? document : undefined);
+
+  const navProto = typeof Navigator !== 'undefined' ? Navigator.prototype : undefined;
+  const webdriverGetterTampered = !isNativeAccessor(navProto, 'webdriver');
+
+  const headlessUa = /HeadlessChrome|PhantomJS|SlimerJS/i.test(ua);
+  const softwareGpu = /swiftshader|llvmpipe|mesa offscreen/i.test((gpuRenderer || '').toLowerCase());
+  let zeroGeometry = false;
+  let emptyLanguages = false;
+  try {
+    zeroGeometry =
+      typeof window !== 'undefined' && (window.outerWidth === 0 || window.outerHeight === 0);
+    emptyLanguages = !nav || !Array.isArray(nav.languages) || nav.languages.length === 0;
+  } catch {
+    // Ignore hostile window proxies.
+  }
+  const isHeadless = headlessUa || softwareGpu || zeroGeometry;
+
+  let isBot = false;
+  let botReason = 'Verified human runtime & native DOM prototypes';
+
+  if (webdriver) {
+    isBot = true;
+    botReason = 'navigator.webdriver flag is enabled (WebDriver controlled session)';
+  } else if (cdpDetected) {
+    isBot = true;
+    botReason = 'Chrome DevTools Protocol binding exposed on window/document';
+  } else if (webdriverGetterTampered) {
+    isBot = true;
+    botReason = 'Navigator.prototype.webdriver getter overridden (anti-detect automation patch)';
+  } else if (headlessUa) {
+    isBot = true;
+    botReason = 'Headless browser User-Agent signature detected';
+  } else if (softwareGpu) {
+    isBot = true;
+    botReason = `Software GPU renderer (${gpuRenderer || 'unknown'})`;
+  } else if (zeroGeometry) {
+    isBot = true;
+    botReason = 'Zero outer window geometry (headless viewport)';
+  } else if (emptyLanguages) {
+    isBot = true;
+    botReason = 'navigator.languages array is empty';
+  }
+
+  return { isBot, isHeadless, botReason, webdriver, cdpDetected };
 }
 
 /**
  * Private / Incognito browsing assessment.
  *
- * Chrome 156 deliberately hides the browsing mode from the Storage API: both a
- * normal and an off-the-record context report `quota = usage + 10 GiB`, so every
- * quota-threshold heuristic silently returns "Standard Window" inside Incognito
- * (verified against Chromium's `CalculateReportedQuota` and on Chrome 156 /
- * Windows 11, where both modes report exactly 10,737,418,240 bytes of headroom).
- *
- * The signal that still separates the modes is commit durability: an
- * off-the-record IndexedDB lives in memory, so a transaction created with
- * `durability: 'strict'` finishes as fast as a `relaxed` one, while a real
- * profile waits for the disk write. Measured on Chrome 156 / Windows 11:
- * normal ratio ~5.9x, Incognito ~1.07x. The probe is time-boxed, never throws
- * and leaves no database behind.
+ * Modern Chromium no longer differs in raw quota: both a normal and an
+ * off-the-record context report `quota = usage + 10 GiB`. The surviving physics
+ * are (a) headroom on Chrome 147+ (normal `usage + 10.0 GiB`, Incognito
+ * `usage + 9.0 GiB`), (b) the legacy `webkitTemporaryStorage` quota versus the
+ * JS heap limit, and (c) IndexedDB commit durability: an off-the-record store
+ * lives in RAM, so a `strict` (fsync) transaction finishes as fast as a
+ * `relaxed` one. Firefox and Safari are probed through OPFS / IndexedDB
+ * restrictions instead. Every probe is time-boxed, never throws and leaves no
+ * database behind.
  */
 export interface PrivateBrowsingAssessment {
   likely: boolean;
@@ -1067,190 +1295,673 @@ export interface PrivateBrowsingAssessment {
   reasons: string[];
 }
 
+const IDB_PAYLOAD_BYTES = 16384;
+const IDB_WRITES_PER_BLOCK = 12;
+const IDB_MAX_ROUNDS = 9;
+const IDB_MIN_ROUNDS = 5;
+const IDB_BUDGET_MS = 450;
+const IDB_SAFETY_TIMEOUT_MS = 900;
+
 /**
- * Measures how much slower a `strict` (fsync) IndexedDB commit is than a
- * `relaxed` one. Returns `null` when the browser ignores the durability hint,
- * the probe is blocked, or it cannot finish within `budgetMs`.
+ * Normalises a thrown DOMException / Error into a testable name + message pair.
  */
-async function measureIdbDurabilityRatio(budgetMs: number): Promise<number | null> {
+function errorLooksLike(error: unknown, pattern: RegExp): boolean {
+  if (!error) return false;
+  if (error instanceof Error) {
+    return pattern.test(error.name) || pattern.test(error.message);
+  }
+  if (typeof error === 'object') {
+    const record = error as Record<string, unknown>;
+    const name = typeof record.name === 'string' ? record.name : '';
+    const message = typeof record.message === 'string' ? record.message : '';
+    return pattern.test(name) || pattern.test(message);
+  }
+  return pattern.test(String(error));
+}
+
+/**
+ * Measures the median `strict / relaxed` IndexedDB commit ratio on Chromium.
+ * Returns `null` when the browser ignores the `durability` hint (Firefox /
+ * Safari), the probe is blocked, or it cannot finish inside the time budget.
+ * The database is always closed and deleted through the `settled`-guarded
+ * `finish()`, even when the safety timeout wins the race.
+ */
+async function probeChromiumIdbDurability(): Promise<number | null> {
   if (typeof indexedDB === 'undefined') return null;
+
   const now = () =>
     typeof performance !== 'undefined' && typeof performance.now === 'function'
       ? performance.now()
       : Date.now();
-  const deadline = now() + budgetMs;
-  const dbName = `__intel_pb_${Math.random().toString(36).slice(2)}`;
-  const payload = new Uint8Array(4096);
+  const dbName = `__intel_idb_dur_${Math.random().toString(36).slice(2)}`;
+  const payload = new Uint8Array(IDB_PAYLOAD_BYTES);
   let db: IDBDatabase | null = null;
+  let settled = false;
 
-  try {
-    db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(dbName, 1);
-      request.onupgradeneeded = () => request.result.createObjectStore('s');
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-      request.onblocked = () => reject(new Error('blocked'));
-    });
+  const finish = (value: number | null): number | null => {
+    if (!settled) {
+      settled = true;
+      try {
+        db?.close();
+      } catch {
+        // Ignore cleanup failures.
+      }
+      try {
+        indexedDB.deleteDatabase(dbName);
+      } catch {
+        // Ignore cleanup failures.
+      }
+      db = null;
+    }
+    return value;
+  };
 
-    // Firefox/Safari do not expose the durability hint; without it the timing
-    // has no meaning, so the probe abstains instead of guessing.
-    const probe = db.transaction('s', 'readwrite', { durability: 'strict' });
-    const honoursHint =
-      (probe as IDBTransaction & { durability?: string }).durability === 'strict';
-    probe.abort();
-    if (!honoursHint) return null;
-
-    const block = (durability: IDBTransactionDurability, ops: number) =>
-      new Promise<number>((resolve, reject) => {
-        const started = now();
-        let index = 0;
-        const step = () => {
-          if (index >= ops) {
-            resolve(now() - started);
-            return;
-          }
-          const tx = db!.transaction('s', 'readwrite', { durability });
-          tx.objectStore('s').put(payload, index++);
-          tx.oncomplete = step;
-          tx.onerror = tx.onabort = () => reject(tx.error);
-        };
-        step();
+  const measured = (async (): Promise<number | null> => {
+    try {
+      db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(dbName, 1);
+        request.onupgradeneeded = () => request.result.createObjectStore('s');
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+        request.onblocked = () => reject(new Error('blocked'));
       });
 
-    await block('relaxed', 4);
-    await block('strict', 4);
+      if (settled) return null;
 
-    const ratios: number[] = [];
-    for (let round = 0; round < 3 && now() < deadline; round += 1) {
-      const relaxedMs = await block('relaxed', 6);
-      const strictMs = await block('strict', 6);
-      if (relaxedMs > 0.2 && Number.isFinite(strictMs)) {
-        ratios.push(strictMs / relaxedMs);
+      const probe = db.transaction('s', 'readwrite', { durability: 'strict' });
+      const honoursHint =
+        (probe as IDBTransaction & { durability?: string }).durability === 'strict';
+      probe.abort();
+      if (!honoursHint) return null;
+
+      const block = (durability: IDBTransactionDurability, ops: number) =>
+        new Promise<number>((resolve, reject) => {
+          const started = now();
+          let index = 0;
+          const step = () => {
+            if (settled || index >= ops) {
+              resolve(now() - started);
+              return;
+            }
+            const tx = db!.transaction('s', 'readwrite', { durability });
+            tx.objectStore('s').put(payload, index);
+            index += 1;
+            tx.oncomplete = step;
+            tx.onerror = tx.onabort = () => reject(tx.error);
+          };
+          step();
+        });
+
+      // Warm-up blocks so the first fsync does not skew the ratio.
+      await block('relaxed', IDB_WRITES_PER_BLOCK);
+      await block('strict', IDB_WRITES_PER_BLOCK);
+
+      const deadline = now() + IDB_BUDGET_MS;
+      const ratios: number[] = [];
+      for (let round = 0; round < IDB_MAX_ROUNDS && now() < deadline; round += 1) {
+        const relaxedMs = await block('relaxed', IDB_WRITES_PER_BLOCK);
+        const strictMs = await block('strict', IDB_WRITES_PER_BLOCK);
+        if (relaxedMs > 0.2 && Number.isFinite(strictMs)) {
+          ratios.push(strictMs / relaxedMs);
+        }
+        if (ratios.length >= IDB_MIN_ROUNDS) {
+          const sorted = [...ratios].sort((a, b) => a - b);
+          const median = sorted[sorted.length >> 1];
+          if (median < 1.25 || median >= 2) break;
+        }
       }
-    }
-    if (ratios.length < 2) return null;
-    ratios.sort((a, b) => a - b);
-    return ratios[ratios.length >> 1];
-  } catch {
-    return null;
-  } finally {
-    try {
-      db?.close();
-      indexedDB.deleteDatabase(dbName);
+      if (ratios.length === 0) return null;
+      const sorted = [...ratios].sort((a, b) => a - b);
+      return sorted[sorted.length >> 1];
     } catch {
-      // Ignore cleanup failures.
+      return null;
     }
+  })();
+
+  const timeout = new Promise<number | null>((resolve) => {
+    setTimeout(() => resolve(null), IDB_SAFETY_TIMEOUT_MS);
+  });
+
+  const ratio = await Promise.race([measured, timeout]);
+  return finish(ratio);
+}
+
+/**
+ * Probes the Origin Private File System entry point. A rejected promise is the
+ * private-mode signal on Firefox (SecurityError) and Safari (transient reason).
+ */
+async function probeOpfsDirectory(): Promise<
+  { status: 'resolved' } | { status: 'rejected'; error: unknown } | { status: 'unsupported' }
+> {
+  const storage =
+    typeof navigator !== 'undefined'
+      ? (navigator.storage as (StorageManager & { getDirectory?: () => Promise<unknown> }) | undefined)
+      : undefined;
+  if (!storage || typeof storage.getDirectory !== 'function') {
+    return { status: 'unsupported' };
+  }
+  try {
+    await storage.getDirectory();
+    return { status: 'resolved' };
+  } catch (error) {
+    return { status: 'rejected', error };
   }
 }
 
-export async function detectPrivateBrowsing(
-  hasStoredIdentity: boolean
-): Promise<PrivateBrowsingAssessment> {
-  const reasons: string[] = [];
-  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
-  const isEmbeddedShell = /Electron|HeadlessChrome|; wv\)|FBAN|FBAV/i.test(ua);
-  let quotaMb: number | null = null;
+/**
+ * Firefox IndexedDB probe: a private window refuses the open with
+ * `InvalidStateError`. Returns `null` when the probe is inconclusive.
+ */
+async function probeFirefoxIdbPrivacy(): Promise<boolean | null> {
+  if (typeof indexedDB === 'undefined') return null;
+  const dbName = '__intel_ff_priv';
 
-  // Prior: most sessions are not private (5%). Every observation shifts the
-  // log-odds; the final confidence is the logistic of the accumulated value.
-  let logit = Math.log(0.05 / 0.95);
-
-  const storage =
-    typeof navigator !== 'undefined' ? (navigator.storage as StorageManager | undefined) : undefined;
-
-  // A granted persistent-storage permission can only exist in a normal profile,
-  // so it is decisive negative evidence.
-  if (storage && typeof storage.persisted === 'function') {
-    try {
-      if (await storage.persisted()) {
-        return {
-          likely: false,
-          confidence: 0,
-          quotaMb,
-          reasons: ['Persistent storage already granted (normal profile)'],
-        };
+  return new Promise<boolean | null>((resolve) => {
+    let settled = false;
+    const finish = (value: boolean | null): void => {
+      if (settled) return;
+      settled = true;
+      try {
+        indexedDB.deleteDatabase(dbName);
+      } catch {
+        // Ignore cleanup failures.
       }
-    } catch {
-      // Ignore and continue with the composite probe.
+      resolve(value);
+    };
+
+    const timer = setTimeout(() => finish(null), 700);
+
+    let request: IDBOpenDBRequest;
+    try {
+      request = indexedDB.open(dbName, 1);
+    } catch (error) {
+      clearTimeout(timer);
+      finish(errorLooksLike(error, /InvalidStateError/) ? true : null);
+      return;
     }
+
+    request.onupgradeneeded = () => {
+      try {
+        request.result.createObjectStore('s');
+      } catch {
+        // Ignore store creation failures.
+      }
+    };
+    request.onsuccess = () => {
+      clearTimeout(timer);
+      try {
+        request.result.close();
+      } catch {
+        // Ignore close failures.
+      }
+      finish(false);
+    };
+    request.onerror = () => {
+      clearTimeout(timer);
+      finish(errorLooksLike(request.error, /InvalidStateError/) ? true : null);
+    };
+    request.onblocked = () => {
+      clearTimeout(timer);
+      finish(null);
+    };
+  });
+}
+
+/**
+ * Safari IndexedDB probe: private windows reject Blob values with
+ * "Blobs are not yet supported". Returns `null` when inconclusive.
+ */
+async function probeSafariIdbBlob(): Promise<boolean | null> {
+  if (typeof indexedDB === 'undefined' || typeof Blob === 'undefined') return null;
+  const dbName = '__intel_sf_blob';
+
+  return new Promise<boolean | null>((resolve) => {
+    let settled = false;
+    const finish = (value: boolean | null): void => {
+      if (settled) return;
+      settled = true;
+      try {
+        indexedDB.deleteDatabase(dbName);
+      } catch {
+        // Ignore cleanup failures.
+      }
+      resolve(value);
+    };
+    const fromError = (error: unknown): boolean | null =>
+      errorLooksLike(error, /are not yet supported/i) ? true : null;
+
+    const timer = setTimeout(() => finish(null), 700);
+
+    let request: IDBOpenDBRequest;
+    try {
+      request = indexedDB.open(dbName, 1);
+    } catch (error) {
+      clearTimeout(timer);
+      finish(fromError(error));
+      return;
+    }
+
+    request.onupgradeneeded = () => {
+      try {
+        request.result.createObjectStore('b');
+      } catch {
+        // Ignore store creation failures.
+      }
+    };
+    request.onsuccess = () => {
+      const db = request.result;
+      let tx: IDBTransaction;
+      try {
+        tx = db.transaction('b', 'readwrite');
+      } catch (error) {
+        clearTimeout(timer);
+        try {
+          db.close();
+        } catch {
+          // Ignore close failures.
+        }
+        finish(fromError(error));
+        return;
+      }
+      const closeDb = () => {
+        clearTimeout(timer);
+        try {
+          db.close();
+        } catch {
+          // Ignore close failures.
+        }
+      };
+      tx.oncomplete = () => {
+        closeDb();
+        finish(false);
+      };
+      tx.onerror = tx.onabort = () => {
+        closeDb();
+        finish(fromError(tx.error));
+      };
+      try {
+        tx.objectStore('b').put(new Blob(['intel']), 'probe');
+      } catch (error) {
+        closeDb();
+        finish(fromError(error));
+      }
+    };
+    request.onerror = () => {
+      clearTimeout(timer);
+      finish(fromError(request.error));
+    };
+    request.onblocked = () => {
+      clearTimeout(timer);
+      finish(null);
+    };
+  });
+}
+
+/**
+ * Legacy Chromium temporary-storage quota (`queryUsageAndQuota`).
+ * Returns `null` when the API is absent or silent.
+ */
+async function queryWebkitTemporaryQuota(): Promise<number | null> {
+  const webkit =
+    typeof navigator !== 'undefined'
+      ? (
+          navigator as unknown as {
+            webkitTemporaryStorage?: {
+              queryUsageAndQuota?: (
+                success: (usage: number, quota: number) => void,
+                error?: (error: unknown) => void
+              ) => void;
+            };
+          }
+        ).webkitTemporaryStorage
+      : undefined;
+  const query = webkit?.queryUsageAndQuota;
+  if (!webkit || typeof query !== 'function') return null;
+
+  return new Promise<number | null>((resolve) => {
+    let settled = false;
+    const finish = (value: number | null): void => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), 400);
+    try {
+      query.call(
+        webkit,
+        (_usage: number, quota: number) => {
+          clearTimeout(timer);
+          finish(typeof quota === 'number' && Number.isFinite(quota) && quota > 0 ? quota : null);
+        },
+        () => {
+          clearTimeout(timer);
+          finish(null);
+        }
+      );
+    } catch {
+      clearTimeout(timer);
+      finish(null);
+    }
+  });
+}
+
+/**
+ * Reads V8's `performance.memory.jsHeapSizeLimit` when exposed.
+ */
+function readJsHeapSizeLimit(): number | null {
+  try {
+    const memory =
+      typeof performance !== 'undefined'
+        ? (performance as unknown as { memory?: { jsHeapSizeLimit?: number } }).memory
+        : undefined;
+    const limit = memory?.jsHeapSizeLimit;
+    return typeof limit === 'number' && Number.isFinite(limit) && limit > 0 ? limit : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolves a human-readable browser name for the engine family.
+ */
+function resolveBrowserName(
+  engine: 'chromium' | 'firefox' | 'safari',
+  ua: string,
+  nav: Navigator | undefined
+): string {
+  try {
+    if (engine === 'firefox') return 'Firefox';
+    if (engine === 'safari') return 'Safari';
+    const brave = nav ? (nav as unknown as { brave?: unknown }).brave : undefined;
+    if (brave !== undefined) return 'Brave';
+    if (/Edg\//.test(ua)) return 'Microsoft Edge';
+    if (/OPR\//.test(ua)) return 'Opera';
+    return 'Chrome';
+  } catch {
+    return 'Unknown';
+  }
+}
+
+/**
+ * Multi-engine private-browsing detection.
+ *
+ * The JS engine is fingerprinted through the `toFixed` RangeError length and
+ * cross-checked against the User-Agent. Firefox and Safari expose private mode
+ * as a blocked OPFS / IndexedDB write; Chromium is resolved through three
+ * independent physics vectors (storage headroom, legacy temp quota, commit
+ * durability). Never throws and always fills all six result fields.
+ */
+export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
+  const nav = typeof navigator !== 'undefined' ? navigator : undefined;
+  let ua = '';
+  try {
+    ua = nav?.userAgent || '';
+  } catch {
+    ua = '';
+  }
+  const engineErrorLength = getEngineErrorLength();
+
+  const uaChromium = /Chrome|Chromium|Edg|OPR|Brave/.test(ua);
+  const uaFirefox = /Firefox/.test(ua);
+  const uaSafari = /Safari/.test(ua) && !/Chrome|Chromium|Edg|OPR/.test(ua);
+
+  let engine: 'chromium' | 'firefox' | 'safari';
+  if (engineErrorLength === 25 && uaFirefox) {
+    engine = 'firefox';
+  } else if ((engineErrorLength === 44 || engineErrorLength === 43) && uaSafari) {
+    engine = 'safari';
+  } else if (engineErrorLength === 51 && uaChromium) {
+    engine = 'chromium';
+  } else if (uaFirefox) {
+    engine = 'firefox';
+  } else if (uaSafari) {
+    engine = 'safari';
+  } else {
+    engine = 'chromium';
   }
 
-  let usageBytes = 0;
+  const browserName = resolveBrowserName(engine, ua, nav);
+
   let quotaBytes: number | null = null;
+  let usageBytes = 0;
+  let storage: StorageManager | undefined;
+  try {
+    storage = nav?.storage;
+  } catch {
+    storage = undefined;
+  }
   if (storage && typeof storage.estimate === 'function') {
     try {
       const estimate = await storage.estimate();
-      if (typeof estimate.usage === 'number' && estimate.usage > 0) {
-        usageBytes = estimate.usage;
-      }
       if (typeof estimate.quota === 'number' && estimate.quota > 0) {
         quotaBytes = estimate.quota;
-        quotaMb = Math.round(estimate.quota / (1024 * 1024));
+      }
+      if (typeof estimate.usage === 'number' && estimate.usage > 0) {
+        usageBytes = estimate.usage;
       }
     } catch {
       // Ignore storage estimate failures.
     }
   }
+  const headroomGiB =
+    quotaBytes !== null ? Math.max(0, quotaBytes - usageBytes) / GIB_BYTES : null;
 
-  // 1. Commit durability — the only surviving client-side Chromium signal.
-  //    Embedded shells (Electron/WebView) often run on memory-backed storage in
-  //    every mode, so they abstain instead of producing a false positive.
-  let idbRatio: number | null = null;
-  if (
-    !isEmbeddedShell &&
-    typeof indexedDB !== 'undefined' &&
-    typeof document !== 'undefined' &&
-    document.visibilityState !== 'hidden'
-  ) {
-    idbRatio = await measureIdbDurabilityRatio(220);
-  }
+  try {
+    if (engine === 'firefox') {
+      const opfs = await probeOpfsDirectory();
+      if (opfs.status === 'resolved') {
+        return {
+          isPrivate: false,
+          browserName,
+          method: 'firefox-opfs-resolved',
+          quotaBytes,
+          headroomGiB,
+          idbDurabilityRatio: null,
+        };
+      }
+      if (
+        opfs.status === 'rejected' &&
+        errorLooksLike(opfs.error, /Security error|SecurityError|InvalidStateError/)
+      ) {
+        return {
+          isPrivate: true,
+          browserName,
+          method: 'firefox-opfs-rejected',
+          quotaBytes,
+          headroomGiB,
+          idbDurabilityRatio: null,
+        };
+      }
 
-  if (idbRatio !== null) {
-    if (idbRatio < 1.25) {
-      logit += 5;
-      reasons.push(
-        `IndexedDB strict commit ${idbRatio.toFixed(2)}x relaxed (memory-backed, off-the-record profile)`
-      );
-    } else if (idbRatio < 1.6) {
-      logit += 2.6;
-      reasons.push(
-        `IndexedDB strict commit ${idbRatio.toFixed(2)}x relaxed (weak memory backing)`
-      );
-    } else if (idbRatio >= 2) {
-      logit -= 3.5;
-      reasons.push(`IndexedDB strict commit ${idbRatio.toFixed(2)}x relaxed (real disk commit)`);
-    } else {
-      logit -= 1.8;
-      reasons.push(`IndexedDB strict commit ${idbRatio.toFixed(2)}x relaxed (disk-backed)`);
+      const idbPrivate = await probeFirefoxIdbPrivacy();
+      if (idbPrivate !== null) {
+        return {
+          isPrivate: idbPrivate,
+          browserName,
+          method: 'firefox-idb-probe',
+          quotaBytes,
+          headroomGiB,
+          idbDurabilityRatio: null,
+        };
+      }
+      return {
+        isPrivate: false,
+        browserName,
+        method: 'firefox-standard-verified',
+        quotaBytes,
+        headroomGiB,
+        idbDurabilityRatio: null,
+      };
     }
-  }
 
-  // 2. Pre-Chrome-147 private contexts exposed a RAM-derived quota (well under
-  //    3 GiB). Chrome 156 reports the same 10 GiB headroom in both modes, so a
-  //    normal quota contributes no evidence and a small one only corroborates.
-  if (quotaBytes !== null && !isEmbeddedShell) {
-    const headroomGiB = Math.max(0, quotaBytes - usageBytes) / (1024 * 1024 * 1024);
-    if (headroomGiB > 0.3 && headroomGiB < 3) {
-      logit += 1.2;
-      reasons.push(
-        `Storage headroom ${headroomGiB.toFixed(1)} GiB (legacy private-profile quota)`
-      );
+    if (engine === 'safari') {
+      const opfs = await probeOpfsDirectory();
+      if (opfs.status === 'resolved') {
+        return {
+          isPrivate: false,
+          browserName,
+          method: 'safari-opfs-resolved',
+          quotaBytes,
+          headroomGiB,
+          idbDurabilityRatio: null,
+        };
+      }
+      if (
+        opfs.status === 'rejected' &&
+        errorLooksLike(opfs.error, /unknown transient reason|SecurityError|NotAllowedError/i)
+      ) {
+        return {
+          isPrivate: true,
+          browserName,
+          method: 'safari-opfs-rejected',
+          quotaBytes,
+          headroomGiB,
+          idbDurabilityRatio: null,
+        };
+      }
+
+      const blobPrivate = await probeSafariIdbBlob();
+      return {
+        isPrivate: blobPrivate === true,
+        browserName,
+        method: 'safari-idb-blob',
+        quotaBytes,
+        headroomGiB,
+        idbDurabilityRatio: null,
+      };
     }
+
+    // Vector A — headroom physics (normal = usage + 10.0 GiB, private = + 9.0 GiB).
+    if (quotaBytes !== null) {
+      const headroomBytes = quotaBytes - usageBytes;
+      if (headroomBytes > 0 && headroomBytes < 9.5 * GIB_BYTES) {
+        return {
+          isPrivate: true,
+          browserName,
+          method: 'chromium-headroom-below-9.5gib',
+          quotaBytes,
+          headroomGiB,
+          idbDurabilityRatio: null,
+        };
+      }
+    }
+
+    // Vector B — legacy temp-storage quota versus the V8 heap ceiling.
+    const webkitQuota = await queryWebkitTemporaryQuota();
+    const heapLimit = readJsHeapSizeLimit();
+    if (
+      webkitQuota !== null &&
+      heapLimit !== null &&
+      webkitQuota < 2 * heapLimit &&
+      webkitQuota < 9.5 * GIB_BYTES
+    ) {
+      return {
+        isPrivate: true,
+        browserName,
+        method: 'chromium-webkit-temp-quota',
+        quotaBytes,
+        headroomGiB,
+        idbDurabilityRatio: null,
+      };
+    }
+
+    // Vector C — commit durability, only decisive outside the normal headroom band.
+    const idbDurabilityRatio = await probeChromiumIdbDurability();
+    const headroomInNormalBand =
+      headroomGiB !== null && headroomGiB >= 9.85 && headroomGiB <= 10.15;
+    if (idbDurabilityRatio !== null && idbDurabilityRatio < 1.25 && !headroomInNormalBand) {
+      return {
+        isPrivate: true,
+        browserName,
+        method: 'chromium-idb-durability-ratio',
+        quotaBytes,
+        headroomGiB,
+        idbDurabilityRatio,
+      };
+    }
+
+    return {
+      isPrivate: false,
+      browserName,
+      method: 'chromium-standard-verified',
+      quotaBytes,
+      headroomGiB,
+      idbDurabilityRatio,
+    };
+  } catch {
+    return {
+      isPrivate: false,
+      browserName,
+      method: 'probe-error',
+      quotaBytes,
+      headroomGiB,
+      idbDurabilityRatio: null,
+    };
+  }
+}
+
+const EMBEDDED_SHELL_PATTERN = /Electron|HeadlessChrome|; wv\)|FBAN|FBAV/i;
+
+/**
+ * A granted persistent-storage permission can only exist in a normal profile,
+ * so it is decisive negative evidence.
+ */
+async function hasPersistedStorageGrant(): Promise<boolean> {
+  const storage =
+    typeof navigator !== 'undefined' ? (navigator.storage as StorageManager | undefined) : undefined;
+  if (!storage || typeof storage.persisted !== 'function') return false;
+  try {
+    return await storage.persisted();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Confidence / evidence plumbing around the engine verdict. Embedded shells
+ * (Electron/WebView) often run on memory-backed storage in every mode, so the
+ * engine verdict abstains there instead of producing a false positive.
+ */
+async function assessPrivateBrowsing(
+  hasStoredIdentity: boolean,
+  verdict: IncognitoDetectionResult
+): Promise<PrivateBrowsingAssessment> {
+  const reasons: string[] = [];
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent : '';
+  const isEmbeddedShell = EMBEDDED_SHELL_PATTERN.test(ua);
+  const quotaMb =
+    verdict.quotaBytes !== null ? Math.round(verdict.quotaBytes / (1024 * 1024)) : null;
+
+  let likely = verdict.isPrivate;
+  let logit = verdict.isPrivate ? 3.2 : -3.2;
+
+  reasons.push(`Engine verdict: ${verdict.browserName} via ${verdict.method}`);
+
+  if (isEmbeddedShell) {
+    likely = false;
+    logit = Math.log(0.05 / 0.95);
+    reasons.push('Embedded shell runtime (Electron/WebView) — engine verdict abstained');
+  } else if (verdict.headroomGiB !== null) {
+    reasons.push(`Storage headroom ${verdict.headroomGiB.toFixed(2)} GiB`);
+  }
+  if (!isEmbeddedShell && verdict.idbDurabilityRatio !== null) {
+    reasons.push(`IndexedDB strict commit ${verdict.idbDurabilityRatio.toFixed(2)}x relaxed`);
   }
 
-  // 3. Blocked first-party writes are ephemeral by definition.
+  // Blocked first-party writes are ephemeral by definition.
   try {
     const probeKey = '__intel_pb_write__';
     localStorage.setItem(probeKey, '1');
     localStorage.removeItem(probeKey);
   } catch {
     logit += 2;
+    likely = true;
     reasons.push('First-party storage write blocked');
   }
 
-  // 4. An identity that survived a previous load is evidence of a durable
-  //    profile, but a reload inside the same private window also carries one,
-  //    so it only nudges the verdict.
+  // An identity that survived a previous load is evidence of a durable profile,
+  // but a reload inside the same private window also carries one, so it only
+  // nudges the verdict.
   if (hasStoredIdentity) {
     logit -= 0.8;
     reasons.push('Existing first-party identity present');
@@ -1258,9 +1969,10 @@ export async function detectPrivateBrowsing(
 
   let cookieIdentityPresent = false;
   try {
-    cookieIdentityPresent = typeof document !== 'undefined'
-      ? /(?:^|;\s*)intel_client_vid=/.test(document.cookie || '')
-      : false;
+    cookieIdentityPresent =
+      typeof document !== 'undefined'
+        ? /(?:^|;\s*)intel_client_vid=/.test(document.cookie || '')
+        : false;
   } catch {
     cookieIdentityPresent = false;
   }
@@ -1269,19 +1981,29 @@ export async function detectPrivateBrowsing(
     reasons.push('First-party identity cookie present');
   }
 
-  if (idbRatio === null) {
-    reasons.push('Commit-durability probe unavailable');
-  }
-
   const confidence = Number(
     Math.max(0.01, Math.min(0.99, 1 / (1 + Math.exp(-logit)))).toFixed(3)
   );
-  return {
-    likely: confidence >= 0.6,
-    confidence,
-    quotaMb,
-    reasons,
-  };
+  return { likely, confidence, quotaMb, reasons };
+}
+
+/**
+ * Private / Incognito browsing assessment.
+ * Delegates the primary verdict to `detectIncognitoMode()` and layers the
+ * durable-identity / first-party-storage evidence on top.
+ */
+export async function detectPrivateBrowsing(
+  hasStoredIdentity: boolean
+): Promise<PrivateBrowsingAssessment> {
+  if (await hasPersistedStorageGrant()) {
+    return {
+      likely: false,
+      confidence: 0,
+      quotaMb: null,
+      reasons: ['Persistent storage already granted (normal profile)'],
+    };
+  }
+  return assessPrivateBrowsing(hasStoredIdentity, await detectIncognitoMode());
 }/**
  * Evaluates First-Party Security & Anomaly Signals ("Smart Signals") and computes an
  * explainable Suspect & Risk Score (0-10).
@@ -1292,49 +2014,9 @@ export async function evaluateSecuritySignals(
   clientGeoHint: ClientGeoHint | null,
   hasStoredIdentity: boolean
 ): Promise<SecuritySignals> {
-  const nav = typeof navigator !== 'undefined' ? navigator : undefined;
-  const win = typeof window !== 'undefined' ? (window as unknown as Record<string, unknown>) : {};
-  const ua = nav?.userAgent || '';
-
-  // 1. Automation & Headless Bot Detection
-  const botSignals: string[] = [];
-  if (nav?.webdriver === true) {
-    botSignals.push('navigator.webdriver is enabled');
-  }
-  if (!nav?.languages || nav.languages.length === 0) {
-    botSignals.push('navigator.languages array is empty');
-  }
-  if (
-    /SwiftShader|llvmpipe|Mesa OffScreen|Software Rasterizer/i.test(
-      hardwareSignals.gpuRenderer
-    )
-  ) {
-    botSignals.push(`Headless virtual GPU renderer (${hardwareSignals.gpuRenderer})`);
-  }
-  if (
-    win.__playwright ||
-    win.__pw_manual ||
-    win._phantom ||
-    win.callPhantom ||
-    win.__nightmare ||
-    win.domAutomation ||
-    win.domAutomationController
-  ) {
-    botSignals.push('Automation framework runtime global detected');
-  }
-  if (win.__webdriver_evaluate && typeof win.__webdriver_evaluate === 'function') {
-    botSignals.push('Selenium __webdriver_evaluate hook on window');
-  }
-  if (
-    typeof document !== 'undefined' &&
-    Boolean((document as unknown as Record<string, unknown>).__selenium_evaluate)
-  ) {
-    botSignals.push('Selenium __selenium_evaluate hook on document');
-  }
-  if (/Chrome|Chromium/i.test(ua) && !/Edg|OPR|Firefox/i.test(ua) && typeof win.chrome === 'undefined') {
-    botSignals.push('Missing window.chrome runtime object on Chromium UA');
-  }
-  const isBot = botSignals.length > 0;
+  // 1. Automation & Headless Bot Detection (CDP bindings, native prototype checks)
+  const botAssessment = detectBotAndAutomation(hardwareSignals.gpuRenderer);
+  const botSignals: string[] = botAssessment.isBot ? [botAssessment.botReason] : [];
 
   // 2. VPN / Proxy & Network Classification (Task 1 classifier)
   const browserTimezone = browserDevice.timezone || 'Unavailable';
@@ -1391,52 +2073,30 @@ export async function evaluateSecuritySignals(
   }
   const vpnSuspected = timezoneMismatch || datacenterAsn;
 
-  // 3. Browser & OS Tamper / Spoofing Detection
+  // 3. VM / Hypervisor & OS Identity Integrity (WebGL GPU + native accessors)
+  const vmStatus = detectVmAndIntegrity(hardwareSignals.gpuVendor, hardwareSignals.gpuRenderer);
   const tamperReasons: string[] = [];
-  const rawNavPlatform = nav?.platform || '';
-  const uaDataPlatform =
-    nav && (nav as unknown as { userAgentData?: NavigatorUAData }).userAgentData?.platform
-      ? (nav as unknown as { userAgentData: NavigatorUAData }).userAgentData.platform || ''
-      : '';
+  if (vmStatus.isVirtualMachine) {
+    tamperReasons.push(vmStatus.vmReason);
+  }
+  if (vmStatus.isOsTampered && !vmStatus.isVirtualMachine) {
+    tamperReasons.push(vmStatus.vmReason);
+  }
+  const tamperDetected = vmStatus.isOsTampered || vmStatus.isVirtualMachine;
 
-  const claimsIos = /iPhone|iPad|iPod/i.test(ua);
-  const claimsAndroid = /Android/i.test(ua);
-  const claimsMac = /Macintosh|Mac OS X/i.test(ua) && !claimsIos;
-  const claimsWin = /Windows NT/i.test(ua);
-
-  if (claimsIos && /Win32|Win64|Linux x86_64/i.test(rawNavPlatform)) {
-    tamperReasons.push(`User-Agent claims iOS but navigator.platform is ${rawNavPlatform}`);
-  }
-  if (claimsAndroid && /Win32|Win64|MacIntel/i.test(rawNavPlatform)) {
-    tamperReasons.push(`User-Agent claims Android but navigator.platform is ${rawNavPlatform}`);
-  }
-  if ((claimsIos || claimsAndroid) && hardwareSignals.maxTouchPoints === 0) {
-    tamperReasons.push('Mobile User-Agent reported with 0 touch points (maxTouchPoints = 0)');
-  }
-  if (claimsWin && /MacIntel|iPhone|iPad|Linux arm/i.test(rawNavPlatform)) {
-    tamperReasons.push(`User-Agent claims Windows but navigator.platform is ${rawNavPlatform}`);
-  }
-  if (
-    claimsWin &&
-    /Apple/i.test(hardwareSignals.gpuVendor) &&
-    /Apple M[1-9]|Apple GPU/i.test(hardwareSignals.gpuRenderer)
-  ) {
-    tamperReasons.push('User-Agent claims Windows on Apple Silicon GPU hardware');
-  }
-  if (claimsMac && /Win32|Win64|Linux/i.test(rawNavPlatform)) {
-    tamperReasons.push(`User-Agent claims macOS but navigator.platform is ${rawNavPlatform}`);
-  }
-  if (
-    uaDataPlatform &&
-    ((claimsWin && /macOS|Android|iOS|Linux/i.test(uaDataPlatform)) ||
-      (claimsMac && /Windows|Android|Linux/i.test(uaDataPlatform)))
-  ) {
-    tamperReasons.push(`User-Agent OS conflicts with Client Hints platform (${uaDataPlatform})`);
-  }
-  const tamperDetected = tamperReasons.length > 0;
-
-  // 4. Private Mode / Incognito Inspection (composite, modern-Chromium safe)
-  const privateBrowsing = await detectPrivateBrowsing(hasStoredIdentity);
+  // 4. Private Mode / Incognito Inspection (multi-engine physics)
+  const incognito = await detectIncognitoMode();
+  const privateBrowsing = (await hasPersistedStorageGrant())
+    ? {
+        likely: false,
+        confidence: 0,
+        quotaMb:
+          incognito.quotaBytes !== null
+            ? Math.round(incognito.quotaBytes / (1024 * 1024))
+            : null,
+        reasons: ['Persistent storage already granted (normal profile)'],
+      }
+    : await assessPrivateBrowsing(hasStoredIdentity, incognito);
   const storageQuotaMb = privateBrowsing.quotaMb;
   let incognitoLikely = privateBrowsing.likely;
 
@@ -1461,14 +2121,11 @@ export async function evaluateSecuritySignals(
     ? 'First-Party Cookie'
     : 'First-Party Cookie';
 
-  // 5. Virtual Machine / Hypervisor Detection
-  const vmStatus = detectVirtualMachine(hardwareSignals, browserDevice);
-
-  // 6. Composite Suspect & Risk Score (0-10) — four core Smart Signals only
+  // 5. Composite Suspect & Risk Score (0-10) — four core Smart Signals only
   let rawScore = 0;
   const riskFactors: string[] = [];
 
-  if (isBot) {
+  if (botAssessment.isBot) {
     rawScore += 3;
     riskFactors.push(
       `Automation / headless signal (+3): ${botSignals[0] || 'automation runtime detected'}`
@@ -1505,7 +2162,7 @@ export async function evaluateSecuritySignals(
     suspectScore >= 7 ? 'High' : suspectScore >= 3 ? 'Medium' : 'Low';
 
   return {
-    isBot,
+    isBot: botAssessment.isBot,
     botSignals,
     vpnSuspected,
     timezoneMismatch,
@@ -1517,6 +2174,10 @@ export async function evaluateSecuritySignals(
     tamperDetected,
     tamperReasons,
     incognitoLikely,
+    isIncognito: incognitoLikely,
+    incognitoMethod: incognito.method,
+    headroomGiB: incognito.headroomGiB,
+    idbDurabilityRatio: incognito.idbDurabilityRatio,
     storageQuotaMb,
     persistenceMode,
     suspectScore,
@@ -1530,9 +2191,21 @@ export async function evaluateSecuritySignals(
     /* Incognito confidence + explanation (client probe) */
     incognitoConfidence: privateBrowsing.confidence,
     incognitoDetail: privateBrowsing.reasons.join('; '),
-    incognitoOrCleared: false,
+    incognitoOrCleared,
+    /* VM / OS integrity verdict */
     isVirtualMachine: vmStatus.isVirtualMachine,
+    isOsTampered: vmStatus.isOsTampered,
     vmReason: vmStatus.vmReason,
+    /* Bot / automation verdict */
+    isHeadless: botAssessment.isHeadless,
+    botReason: botAssessment.botReason,
+    webdriver: botAssessment.webdriver,
+    cdpDetected: botAssessment.cdpDetected,
+    /* Removed probes are neutralised so downstream consumers see explicit falses. */
+    devToolsOpen: false,
+    adBlockerDetected: false,
+    webrtcLeak: false,
+    webrtcCandidateIp: null,
     distinctIpsLastHour: undefined,
     visitsLastHour: undefined,
   };
