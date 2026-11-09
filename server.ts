@@ -2367,6 +2367,18 @@ function sanitizeAndReinforceSecuritySignals(
       vmReason,
       devToolsOpen,
       incognitoOrCleared,
+      // Client-side composite private-browsing probe (confidence 0..1 + evidence)
+      incognitoConfidence: Math.max(
+        0,
+        Math.min(
+          1,
+          typeof raw?.incognitoConfidence === 'number' && Number.isFinite(raw.incognitoConfidence)
+            ? raw.incognitoConfidence
+            : 0
+        )
+      ),
+      incognitoDetail:
+        typeof raw?.incognitoDetail === 'string' ? raw.incognitoDetail.trim().slice(0, 240) : '',
       // Task 3 — visit velocity / IP rotation
       distinctIpsLastHour: velocity.distinctIpsLastHour,
       visitsLastHour: velocity.visitsLastHour,
