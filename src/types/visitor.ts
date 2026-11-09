@@ -7,6 +7,13 @@ export interface BrowserDeviceInfo {
   pixelRatio: string;
   language: string;
   timezone: string;
+  /* Storage-physics incognito verdict mirrored onto the device info. */
+  incognito?: boolean;
+  isIncognito?: boolean;
+  privateMode?: boolean;
+  incognitoMethod?: string;
+  idbDurabilityRatio?: number | null;
+  opfsFlushMs?: number | null;
 }
 
 export interface HardwareSignals {
@@ -120,12 +127,18 @@ export interface SecuritySignals {
 
   /* Final 4-signal upgrade: private browsing, bot, network, VM integrity */
   isIncognito?: boolean;
+  /** Alias of `isIncognito` (collector / server cross-mode verdict). */
+  incognito?: boolean;
+  /** Alias of `isIncognito`. */
+  privateMode?: boolean;
   /** Which physical probe produced the incognito verdict. */
   incognitoMethod?: string;
-  /** `quota - usage`, in GiB (10.0 normal vs 9.0 private on Chromium 147+). */
+  /** `quota - usage`, in GiB (2dp; Chrome 156 reports 10.00 in every mode). */
   headroomGiB?: number | null;
-  /** IndexedDB strict/relaxed commit ratio (< 1.25 means RAM-backed, i.e. private). */
+  /** IndexedDB strict/relaxed commit ratio (< 1.30 means RAM-backed, i.e. private). */
   idbDurabilityRatio?: number | null;
+  /** Median OPFS sync-access-handle `flush()` time in ms from the worker probe. */
+  opfsFlushMs?: number | null;
   isHeadless?: boolean;
   botReason?: string;
   webdriver?: boolean;
@@ -221,6 +234,7 @@ export interface IntelVisitorResponse {
   historyBackup?: SignedHistoryBackup;
   /* Mirrored at the top level so clients can read them without digging. */
   isIncognito?: boolean;
+  incognito?: boolean;
   suspectScore?: number;
   riskLevel?: RiskLevel;
   riskBadgeText?: string;

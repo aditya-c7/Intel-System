@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { identifyCurrentVisitor } from './lib/collector';
+import { identifyCurrentVisitor, detectIncognitoMode } from './lib/collector';
 import type {
   IntelVisitorResponse,
   NetworkType,
@@ -371,17 +371,22 @@ function SignalRow(row: SignalRowModel & { className?: string }) {
  * Client-side fallback mirror of the server's 4-signal engine. Only used when the API
  * response predates `smartSignals`; scores, statuses and labels match server.ts exactly.
  */
-function buildClientSignalRows(signals: SecuritySignals): SignalRowModel[] {
+function buildClientSignalRows(
+  signals: SecuritySignals,
+  incognitoConfirmed = false
+): SignalRowModel[] {
   const isBotDetected = Boolean(signals.isBot || signals.webdriver || signals.cdpDetected);
   const isHeadlessDetected = Boolean(signals.isHeadless);
   const isDatacenterAsn = Boolean(signals.datacenterAsn);
   const hasTzMismatch = Boolean(signals.timezoneMismatch);
   const isVm = Boolean(signals.isVirtualMachine);
   const isTampered = Boolean(signals.isOsTampered);
-  const isIncognito = Boolean(
-    signals.isIncognito ??
-      (signals.incognitoLikely || signals.persistenceMode === 'Hardware ID Recovered')
-  );
+  const isIncognito =
+    incognitoConfirmed ||
+    Boolean(
+      signals.isIncognito ??
+        (signals.incognitoLikely || signals.persistenceMode === 'Hardware ID Recovered')
+    );
   const ispBrand = signals.brandName?.trim() || '';
 
   const incognitoScore = isIncognito ? 4 : 0;
@@ -391,10 +396,12 @@ function buildClientSignalRows(signals: SecuritySignals): SignalRowModel[] {
   const vmScore = isVm && isTampered ? 8 : isVm ? 7 : isTampered ? 6 : 0;
 
   const incognitoDetail = isIncognito
-    ? `Ephemeral memory-backed storage profile (${
-        signals.incognitoMethod || '9.0 GiB quota headroom deficit'
+    ? `Ephemeral RAM storage detected (${
+        signals.incognitoMethod || 'In-memory LevelDB / Cookie-less known hwid'
       })`
-    : 'Persistent disk-backed browser storage & 10.0 GiB standard quota verified';
+    : `Persistent disk-backed storage verified (${
+        signals.incognitoMethod || 'Standard profile'
+      })`;
   const botDetail =
     signals.botReason ||
     (isBotDetected
@@ -477,20 +484,35 @@ function buildClientSignalRows(signals: SecuritySignals): SignalRowModel[] {
 /**
  * Builds the 4-signal core grid. The server-computed smart signals win whenever present;
  * otherwise the identical client-side derivation is used as an accurate fallback.
+ *
+ * A confirmed incognito verdict (from either side of the payload) may never be downgraded
+ * by a stale server tile: when the server still reports a 0/10 incognito tile the row is
+ * MERGED — server wording/detail kept, status + score + label forced to the private verdict.
  */
 function buildSignalRows(
   signals: SecuritySignals,
-  serverSignals?: SmartSignals | null
+  serverSignals?: SmartSignals | null,
+  incognitoConfirmed = false
 ): SignalRowModel[] {
   if (serverSignals) {
-    return [
+    const rows = [
       serverSignals.incognito,
       serverSignals.bot,
       serverSignals.vpn,
       serverSignals.vm,
     ].map(smartSignalToRow);
+    if (incognitoConfirmed && rows[0].riskScore <= 0) {
+      rows[0] = {
+        ...rows[0],
+        statusLabel: 'Incognito / Private Mode',
+        riskScore: 4,
+        riskLabel: 'Medium Risk • 4/10',
+        dotClass: TONE_DOT_CLASS[toneForScore(4)],
+      };
+    }
+    return rows;
   }
-  return buildClientSignalRows(signals);
+  return buildClientSignalRows(signals, incognitoConfirmed);
 }
 
 export default function App() {
@@ -539,6 +561,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    // Start the module-cached storage-physics probe before any network panel mounts or
+    // fires a speed test, so its main-thread timing is not skewed. Never blocks rendering.
+    void detectIncognitoMode();
     loadVisitorData(false);
   }, [loadVisitorData]);
 
@@ -629,7 +654,24 @@ export default function App() {
   // computed grid is preferred; the client mirror covers older responses.
   const activeSignals = data?.securitySignals ?? null;
   const serverSmartSignals = data?.smartSignals ?? data?.securitySignals?.smartSignals ?? null;
-  const signalRows = activeSignals ? buildSignalRows(activeSignals, serverSmartSignals) : [];
+  // A private verdict from either side wins — the incognito tile must never fall back to
+  // "Standard Window" when the client device object, the client signals, or either server
+  // smart-signal copy reports an incognito score.
+  const incognitoConfirmed = Boolean(
+    data &&
+      (data.browserDevice?.incognito ||
+        data.browserDevice?.isIncognito ||
+        data.browserDevice?.privateMode ||
+        data.securitySignals?.isIncognito ||
+        data.securitySignals?.incognito ||
+        data.securitySignals?.privateMode ||
+        data.securitySignals?.incognitoLikely ||
+        (data.smartSignals?.incognito?.scoreOutOf10 ?? 0) > 0 ||
+        (data.securitySignals?.smartSignals?.incognito?.scoreOutOf10 ?? 0) > 0)
+  );
+  const signalRows = activeSignals
+    ? buildSignalRows(activeSignals, serverSmartSignals, incognitoConfirmed)
+    : [];
 
   return (
     <div

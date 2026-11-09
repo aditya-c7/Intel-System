@@ -884,6 +884,10 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
     timezone = 'Unavailable';
   }
 
+  // Attach the storage-physics verdict to the device-info object as well, so any
+  // consumer that only reads browserDevice still sees the incognito aliases.
+  const incognitoVerdict = await detectIncognitoMode();
+
   return {
     browser,
     os,
@@ -893,6 +897,12 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
     pixelRatio,
     language,
     timezone,
+    incognito: incognitoVerdict.isPrivate,
+    isIncognito: incognitoVerdict.isPrivate,
+    privateMode: incognitoVerdict.isPrivate,
+    incognitoMethod: incognitoVerdict.method,
+    idbDurabilityRatio: incognitoVerdict.idbDurabilityRatio,
+    opfsFlushMs: incognitoVerdict.opfsFlushMs,
   };
 }
 
@@ -1034,7 +1044,15 @@ export interface IncognitoDetectionResult {
   quotaBytes: number | null;
   headroomGiB: number | null;
   idbDurabilityRatio: number | null;
+  opfsFlushMs: number | null;
 }
+
+/**
+ * Module-level cache for the storage-physics probe. The probe is started eagerly at
+ * module load (bottom of this file) so it runs on an idle main thread; every later call
+ * — App mount, evaluateSecuritySignals, identifyCurrentVisitor — reuses the same promise.
+ */
+let cachedIncognitoPromise: Promise<IncognitoDetectionResult> | null = null;
 
 const GIB_BYTES = 1024 * 1024 * 1024;
 
@@ -1295,13 +1313,6 @@ export interface PrivateBrowsingAssessment {
   reasons: string[];
 }
 
-const IDB_PAYLOAD_BYTES = 16384;
-const IDB_WRITES_PER_BLOCK = 12;
-const IDB_MAX_ROUNDS = 9;
-const IDB_MIN_ROUNDS = 5;
-const IDB_BUDGET_MS = 450;
-const IDB_SAFETY_TIMEOUT_MS = 900;
-
 /**
  * Normalises a thrown DOMException / Error into a testable name + message pair.
  */
@@ -1320,110 +1331,213 @@ function errorLooksLike(error: unknown, pattern: RegExp): boolean {
 }
 
 /**
- * Measures the median `strict / relaxed` IndexedDB commit ratio on Chromium.
- * Returns `null` when the browser ignores the `durability` hint (Firefox /
- * Safari), the probe is blocked, or it cannot finish inside the time budget.
- * The database is always closed and deleted through the `settled`-guarded
- * `finish()`, even when the safety timeout wins the race.
+ * Layer 1 — Chromium IndexedDB commit-durability physics (detectIncognito v1.9.0).
+ *
+ * A normal profile fsyncs `strict` transactions to disk, so `strict` commits are
+ * measurably slower than `relaxed` ones. An off-the-record profile keeps IndexedDB
+ * in RAM and the ratio collapses toward 1.0. Returns the median
+ * `strict / relaxed` ratio, or `null` when the browser ignores the durability hint
+ * or the probe cannot finish inside its budget. The database is always closed and
+ * deleted through the `settled`-guarded `finish()`.
  */
 async function probeChromiumIdbDurability(): Promise<number | null> {
   if (typeof indexedDB === 'undefined') return null;
+  const PAYLOAD = 16384;
+  const WRITES = 15;
+  const ROUNDS = 15;
+  const MIN_ROUNDS = 7;
+  const CAP_MS = 1000;
+  const dbName = '__di_' + Math.random().toString(36).slice(2);
+  const payload = new Uint8Array(PAYLOAD);
 
-  const now = () =>
-    typeof performance !== 'undefined' && typeof performance.now === 'function'
-      ? performance.now()
-      : Date.now();
-  const dbName = `__intel_idb_dur_${Math.random().toString(36).slice(2)}`;
-  const payload = new Uint8Array(IDB_PAYLOAD_BYTES);
-  let db: IDBDatabase | null = null;
-  let settled = false;
-
-  const finish = (value: number | null): number | null => {
-    if (!settled) {
+  return new Promise<number | null>((resolve) => {
+    let settled = false;
+    const finish = (val: number | null, db?: IDBDatabase) => {
+      if (settled) return;
       settled = true;
-      try {
-        db?.close();
-      } catch {
-        // Ignore cleanup failures.
-      }
-      try {
-        indexedDB.deleteDatabase(dbName);
-      } catch {
-        // Ignore cleanup failures.
-      }
-      db = null;
-    }
-    return value;
-  };
-
-  const measured = (async (): Promise<number | null> => {
+      try { db?.close(); } catch { /* ignore */ }
+      try { indexedDB.deleteDatabase(dbName); } catch { /* ignore */ }
+      resolve(val);
+    };
+    const safetyTimer = setTimeout(() => finish(null), 1400);
     try {
-      db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(dbName, 1);
-        request.onupgradeneeded = () => request.result.createObjectStore('s');
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-        request.onblocked = () => reject(new Error('blocked'));
-      });
+      const req = indexedDB.open(dbName, 1);
+      req.onupgradeneeded = () => { req.result.createObjectStore('s'); };
+      req.onerror = () => { clearTimeout(safetyTimer); finish(null); };
+      req.onsuccess = () => {
+        const db = req.result;
+        let honored = false;
+        try {
+          const t = (db as unknown as {
+            transaction: (store: string, mode: string, opts: { durability: string }) => IDBTransaction & { durability?: string };
+          }).transaction('s', 'readwrite', { durability: 'strict' });
+          honored = t.durability === 'strict';
+          t.abort();
+        } catch { honored = false; }
+        if (!honored) { clearTimeout(safetyTimer); finish(null, db); return; }
 
-      if (settled) return null;
+        const block = (durability: 'strict' | 'relaxed'): Promise<number> =>
+          new Promise((res, rej) => {
+            const t0 = performance.now();
+            let i = 0;
+            const step = (): void => {
+              if (i === WRITES) { res(performance.now() - t0); return; }
+              const tx = (db as unknown as {
+                transaction: (store: string, mode: string, opts: { durability: string }) => IDBTransaction;
+              }).transaction('s', 'readwrite', { durability });
+              tx.objectStore('s').put(payload, i);
+              i++;
+              tx.oncomplete = step;
+              tx.onerror = tx.onabort = () => rej(tx.error);
+            };
+            step();
+          });
 
-      const probe = db.transaction('s', 'readwrite', { durability: 'strict' });
-      const honoursHint =
-        (probe as IDBTransaction & { durability?: string }).durability === 'strict';
-      probe.abort();
-      if (!honoursHint) return null;
-
-      const block = (durability: IDBTransactionDurability, ops: number) =>
-        new Promise<number>((resolve, reject) => {
-          const started = now();
-          let index = 0;
-          const step = () => {
-            if (settled || index >= ops) {
-              resolve(now() - started);
-              return;
-            }
-            const tx = db!.transaction('s', 'readwrite', { durability });
-            tx.objectStore('s').put(payload, index);
-            index += 1;
-            tx.oncomplete = step;
-            tx.onerror = tx.onabort = () => reject(tx.error);
-          };
-          step();
-        });
-
-      // Warm-up blocks so the first fsync does not skew the ratio.
-      await block('relaxed', IDB_WRITES_PER_BLOCK);
-      await block('strict', IDB_WRITES_PER_BLOCK);
-
-      const deadline = now() + IDB_BUDGET_MS;
-      const ratios: number[] = [];
-      for (let round = 0; round < IDB_MAX_ROUNDS && now() < deadline; round += 1) {
-        const relaxedMs = await block('relaxed', IDB_WRITES_PER_BLOCK);
-        const strictMs = await block('strict', IDB_WRITES_PER_BLOCK);
-        if (relaxedMs > 0.2 && Number.isFinite(strictMs)) {
-          ratios.push(strictMs / relaxedMs);
-        }
-        if (ratios.length >= IDB_MIN_ROUNDS) {
-          const sorted = [...ratios].sort((a, b) => a - b);
-          const median = sorted[sorted.length >> 1];
-          if (median < 1.25 || median >= 2) break;
-        }
-      }
-      if (ratios.length === 0) return null;
-      const sorted = [...ratios].sort((a, b) => a - b);
-      return sorted[sorted.length >> 1];
-    } catch {
-      return null;
-    }
-  })();
-
-  const timeout = new Promise<number | null>((resolve) => {
-    setTimeout(() => resolve(null), IDB_SAFETY_TIMEOUT_MS);
+        void (async () => {
+          const start = performance.now();
+          await block('relaxed');
+          await block('strict'); // warm-up discarded
+          const ratios: number[] = [];
+          for (let r = 0; r < ROUNDS; r++) {
+            const rel = await block('relaxed');
+            const str = await block('strict');
+            ratios.push(rel > 0 ? str / rel : Infinity);
+            if (ratios.length >= MIN_ROUNDS && performance.now() - start >= CAP_MS) break;
+          }
+          ratios.sort((a, b) => a - b);
+          const median = ratios.length > 0 ? ratios[ratios.length >> 1] : null;
+          clearTimeout(safetyTimer);
+          finish(median !== null && Number.isFinite(median) ? Number(median.toFixed(3)) : null, db);
+        })().catch(() => { clearTimeout(safetyTimer); finish(null, db); });
+      };
+    } catch { clearTimeout(safetyTimer); finish(null); }
   });
+}
 
-  const ratio = await Promise.race([measured, timeout]);
-  return finish(ratio);
+interface OpfsFlushProbeResult {
+  medianFlushMs: number;
+  flushToWriteRatio: number;
+}
+
+/**
+ * Layer 2 — Chromium OPFS synchronous-access-handle flush physics.
+ *
+ * A dedicated inline Blob worker opens an OPFS file through `createSyncAccessHandle()`,
+ * warms up one `write` + `flush`, then times 9 rounds of a 32 KiB `write()` and a
+ * `flush()`. On a disk-backed profile `flush()` costs real I/O; inside an off-the-record
+ * context the write-back goes to RAM and the flush median collapses. The worker and the
+ * OPFS entry are always released, on every path.
+ */
+async function probeChromiumOpfsWorkerFlush(): Promise<OpfsFlushProbeResult | null> {
+  if (typeof Worker === 'undefined' || typeof Blob === 'undefined' || typeof URL === 'undefined') {
+    return null;
+  }
+  const storage =
+    typeof navigator !== 'undefined'
+      ? (navigator.storage as (StorageManager & { getDirectory?: () => Promise<unknown> }) | undefined)
+      : undefined;
+  if (!storage || typeof storage.getDirectory !== 'function') return null;
+
+  // Generated on the main thread so cleanup also works when the worker is terminated
+  // mid-probe by the 600 ms timeout (a terminated worker never runs its own finally).
+  const opfsEntryName = '__intel_opfs_' + Math.random().toString(36).slice(2);
+
+  const workerSource = `
+    self.onmessage = async () => {
+      let root = null;
+      let access = null;
+      const name = '${opfsEntryName}';
+      try {
+        root = await navigator.storage.getDirectory();
+        const handle = await root.getFileHandle(name, { create: true });
+        if (typeof handle.createSyncAccessHandle !== 'function') {
+          self.postMessage(null);
+          return;
+        }
+        access = await handle.createSyncAccessHandle();
+        const buffer = new Uint8Array(32768);
+        const writeMs = [];
+        const flushMs = [];
+        for (let warm = 0; warm < 1; warm++) {
+          access.write(buffer, { at: 0 });
+          access.flush();
+        }
+        for (let round = 0; round < 9; round++) {
+          const w0 = performance.now();
+          access.write(buffer, { at: 0 });
+          const w1 = performance.now();
+          access.flush();
+          const w2 = performance.now();
+          writeMs.push(w1 - w0);
+          flushMs.push(w2 - w1);
+        }
+        writeMs.sort((a, b) => a - b);
+        flushMs.sort((a, b) => a - b);
+        const medianWrite = writeMs[writeMs.length >> 1];
+        const medianFlush = flushMs[flushMs.length >> 1];
+        self.postMessage({
+          medianFlushMs: Number(medianFlush.toFixed(4)),
+          flushToWriteRatio: Number((medianWrite > 0 ? medianFlush / medianWrite : 0).toFixed(3)),
+        });
+      } catch {
+        self.postMessage(null);
+      } finally {
+        try { if (access) access.close(); } catch (e) { /* ignore */ }
+        try { if (root) await root.removeEntry(name); } catch (e) { /* ignore */ }
+      }
+    };
+  `;
+
+  let blobUrl: string | null = null;
+  let worker: Worker | null = null;
+
+  return new Promise<OpfsFlushProbeResult | null>((resolve) => {
+    let settled = false;
+    const finish = (value: OpfsFlushProbeResult | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { worker?.terminate(); } catch { /* ignore */ }
+      try { if (blobUrl) URL.revokeObjectURL(blobUrl); } catch { /* ignore */ }
+      // Best-effort OPFS cleanup on the main thread: the worker may have been
+      // terminated before its own finally block could remove the entry.
+      void (async () => {
+        try {
+          const dir = (await storage.getDirectory?.()) as
+            | { removeEntry?: (name: string) => Promise<void> }
+            | undefined;
+          await dir?.removeEntry?.(opfsEntryName);
+        } catch {
+          /* ignore */
+        }
+      })();
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), 600);
+
+    try {
+      blobUrl = URL.createObjectURL(new Blob([workerSource], { type: 'text/javascript' }));
+      worker = new Worker(blobUrl);
+      worker.onmessage = (event: MessageEvent) => {
+        const data = (event.data ?? null) as OpfsFlushProbeResult | null;
+        if (
+          data &&
+          typeof data.medianFlushMs === 'number' &&
+          Number.isFinite(data.medianFlushMs) &&
+          typeof data.flushToWriteRatio === 'number' &&
+          Number.isFinite(data.flushToWriteRatio)
+        ) {
+          finish(data);
+        } else {
+          finish(null);
+        }
+      };
+      worker.onerror = () => finish(null);
+      worker.postMessage('run');
+    } catch {
+      finish(null);
+    }
+  });
 }
 
 /**
@@ -1454,7 +1568,7 @@ async function probeOpfsDirectory(): Promise<
  */
 async function probeFirefoxIdbPrivacy(): Promise<boolean | null> {
   if (typeof indexedDB === 'undefined') return null;
-  const dbName = '__intel_ff_priv';
+  const dbName = 'inPrivate';
 
   return new Promise<boolean | null>((resolve) => {
     let settled = false;
@@ -1496,9 +1610,10 @@ async function probeFirefoxIdbPrivacy(): Promise<boolean | null> {
       }
       finish(false);
     };
-    request.onerror = () => {
+    request.onerror = (event: Event) => {
+      event.preventDefault?.();
       clearTimeout(timer);
-      finish(errorLooksLike(request.error, /InvalidStateError/) ? true : null);
+      finish(request.error?.name === 'InvalidStateError' ? true : null);
     };
     request.onblocked = () => {
       clearTimeout(timer);
@@ -1543,7 +1658,7 @@ async function probeSafariIdbBlob(): Promise<boolean | null> {
 
     request.onupgradeneeded = () => {
       try {
-        request.result.createObjectStore('b');
+        request.result.createObjectStore('t', { autoIncrement: true });
       } catch {
         // Ignore store creation failures.
       }
@@ -1552,7 +1667,7 @@ async function probeSafariIdbBlob(): Promise<boolean | null> {
       const db = request.result;
       let tx: IDBTransaction;
       try {
-        tx = db.transaction('b', 'readwrite');
+        tx = db.transaction('t', 'readwrite');
       } catch (error) {
         clearTimeout(timer);
         try {
@@ -1580,7 +1695,7 @@ async function probeSafariIdbBlob(): Promise<boolean | null> {
         finish(fromError(tx.error));
       };
       try {
-        tx.objectStore('b').put(new Blob(['intel']), 'probe');
+        tx.objectStore('t').put(new Blob());
       } catch (error) {
         closeDb();
         finish(fromError(error));
@@ -1674,230 +1789,258 @@ function resolveBrowserName(
     if (engine === 'safari') return 'Safari';
     const brave = nav ? (nav as unknown as { brave?: unknown }).brave : undefined;
     if (brave !== undefined) return 'Brave';
-    if (/Edg\//.test(ua)) return 'Microsoft Edge';
+    if (/Edg\//.test(ua)) return 'Edge';
     if (/OPR\//.test(ua)) return 'Opera';
-    return 'Chrome';
+    if (/Chrome|Chromium/.test(ua)) return 'Chrome';
+    return 'Browser';
   } catch {
-    return 'Unknown';
+    return 'Browser';
   }
 }
 
 /**
- * Multi-engine private-browsing detection.
+ * Multi-engine private-browsing detection (3 layers, no quota veto).
  *
  * The JS engine is fingerprinted through the `toFixed` RangeError length and
  * cross-checked against the User-Agent. Firefox and Safari expose private mode
  * as a blocked OPFS / IndexedDB write; Chromium is resolved through three
- * independent physics vectors (storage headroom, legacy temp quota, commit
- * durability). Never throws and always fills all six result fields.
+ * independent physics vectors: quota headroom, legacy temp quota, and (never
+ * vetoed) storage physics — IndexedDB `strict` commit durability plus an OPFS
+ * worker `flush()` timing probe. Chrome 156+ forces `quota = usage + 10.00 GiB`
+ * in both modes, so the headroom band is never allowed to veto layers 3C.
+ * Never throws and always fills all seven result fields. The promise is cached
+ * at module level, so the eager module-load call and every later caller share
+ * one probe run.
  */
 export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
-  const nav = typeof navigator !== 'undefined' ? navigator : undefined;
-  let ua = '';
-  try {
-    ua = nav?.userAgent || '';
-  } catch {
-    ua = '';
-  }
-  const engineErrorLength = getEngineErrorLength();
+  if (cachedIncognitoPromise) return cachedIncognitoPromise;
 
-  const uaChromium = /Chrome|Chromium|Edg|OPR|Brave/.test(ua);
-  const uaFirefox = /Firefox/.test(ua);
-  const uaSafari = /Safari/.test(ua) && !/Chrome|Chromium|Edg|OPR/.test(ua);
-
-  let engine: 'chromium' | 'firefox' | 'safari';
-  if (engineErrorLength === 25 && uaFirefox) {
-    engine = 'firefox';
-  } else if ((engineErrorLength === 44 || engineErrorLength === 43) && uaSafari) {
-    engine = 'safari';
-  } else if (engineErrorLength === 51 && uaChromium) {
-    engine = 'chromium';
-  } else if (uaFirefox) {
-    engine = 'firefox';
-  } else if (uaSafari) {
-    engine = 'safari';
-  } else {
-    engine = 'chromium';
-  }
-
-  const browserName = resolveBrowserName(engine, ua, nav);
-
-  let quotaBytes: number | null = null;
-  let usageBytes = 0;
-  let storage: StorageManager | undefined;
-  try {
-    storage = nav?.storage;
-  } catch {
-    storage = undefined;
-  }
-  if (storage && typeof storage.estimate === 'function') {
+  cachedIncognitoPromise = (async (): Promise<IncognitoDetectionResult> => {
+    const nav = typeof navigator !== 'undefined' ? navigator : undefined;
+    let ua = '';
     try {
-      const estimate = await storage.estimate();
-      if (typeof estimate.quota === 'number' && estimate.quota > 0) {
-        quotaBytes = estimate.quota;
-      }
-      if (typeof estimate.usage === 'number' && estimate.usage > 0) {
-        usageBytes = estimate.usage;
-      }
+      ua = nav?.userAgent || '';
     } catch {
-      // Ignore storage estimate failures.
+      ua = '';
     }
-  }
-  const headroomGiB =
-    quotaBytes !== null ? Math.max(0, quotaBytes - usageBytes) / GIB_BYTES : null;
+    const feid = getEngineErrorLength();
 
-  try {
-    if (engine === 'firefox') {
-      const opfs = await probeOpfsDirectory();
-      if (opfs.status === 'resolved') {
-        return {
-          isPrivate: false,
-          browserName,
-          method: 'firefox-opfs-resolved',
-          quotaBytes,
-          headroomGiB,
-          idbDurabilityRatio: null,
-        };
-      }
-      if (
-        opfs.status === 'rejected' &&
-        errorLooksLike(opfs.error, /Security error|SecurityError|InvalidStateError/)
-      ) {
-        return {
-          isPrivate: true,
-          browserName,
-          method: 'firefox-opfs-rejected',
-          quotaBytes,
-          headroomGiB,
-          idbDurabilityRatio: null,
-        };
-      }
+    const isV8 = feid === 51 || /Chrome|Chromium|Edg|OPR|Brave/i.test(ua);
+    const isSpiderMonkey = feid === 25 || /Firefox/i.test(ua);
+    const isJSC =
+      feid === 44 || feid === 43 || (/Safari/i.test(ua) && !/Chrome|Chromium|Edg|OPR/i.test(ua));
 
-      const idbPrivate = await probeFirefoxIdbPrivacy();
-      if (idbPrivate !== null) {
+    let engine: 'chromium' | 'firefox' | 'safari';
+    if (isV8) {
+      engine = 'chromium';
+    } else if (isSpiderMonkey) {
+      engine = 'firefox';
+    } else if (isJSC) {
+      engine = 'safari';
+    } else {
+      engine = 'chromium';
+    }
+
+    const browserName = resolveBrowserName(engine, ua, nav);
+
+    let quotaBytes: number | null = null;
+    let usageBytes = 0;
+    let storage: StorageManager | undefined;
+    try {
+      storage = nav?.storage;
+    } catch {
+      storage = undefined;
+    }
+    if (storage && typeof storage.estimate === 'function') {
+      try {
+        const estimate = await storage.estimate();
+        if (typeof estimate.quota === 'number' && estimate.quota > 0) {
+          quotaBytes = estimate.quota;
+        }
+        if (typeof estimate.usage === 'number' && estimate.usage > 0) {
+          usageBytes = estimate.usage;
+        }
+      } catch {
+        // Ignore storage estimate failures.
+      }
+    }
+
+    // Chrome 156's StaticStorageQuota patch reports `usage + 10.00 GiB` in BOTH
+    // modes, so this headroom is reported as evidence but never vetoes a probe.
+    const headroomBytes = quotaBytes !== null ? quotaBytes - usageBytes : null;
+    const headroomGiB =
+      headroomBytes !== null ? Number((Math.max(0, headroomBytes) / GIB_BYTES).toFixed(2)) : null;
+
+    try {
+      if (engine === 'firefox') {
+        const opfs = await probeOpfsDirectory();
+        if (opfs.status === 'resolved') {
+          return {
+            isPrivate: false,
+            browserName,
+            method: 'firefox-opfs-resolved',
+            quotaBytes,
+            headroomGiB,
+            idbDurabilityRatio: null,
+            opfsFlushMs: null,
+          };
+        }
+        if (
+          opfs.status === 'rejected' &&
+          errorLooksLike(opfs.error, /Security error|SecurityError|InvalidStateError/)
+        ) {
+          return {
+            isPrivate: true,
+            browserName,
+            method: 'firefox-opfs-rejected',
+            quotaBytes,
+            headroomGiB,
+            idbDurabilityRatio: null,
+            opfsFlushMs: null,
+          };
+        }
+
+        // No OPFS at all (older Firefox) — the `inPrivate` IndexedDB open refuses
+        // with InvalidStateError inside a private window.
+        const idbPrivate = await probeFirefoxIdbPrivacy();
         return {
-          isPrivate: idbPrivate,
+          isPrivate: idbPrivate === true,
           browserName,
           method: 'firefox-idb-probe',
           quotaBytes,
           headroomGiB,
           idbDurabilityRatio: null,
+          opfsFlushMs: null,
         };
       }
-      return {
-        isPrivate: false,
-        browserName,
-        method: 'firefox-standard-verified',
-        quotaBytes,
-        headroomGiB,
-        idbDurabilityRatio: null,
-      };
-    }
 
-    if (engine === 'safari') {
-      const opfs = await probeOpfsDirectory();
-      if (opfs.status === 'resolved') {
+      if (engine === 'safari') {
+        const opfs = await probeOpfsDirectory();
+        if (opfs.status === 'resolved') {
+          return {
+            isPrivate: false,
+            browserName,
+            method: 'safari-opfs-resolved',
+            quotaBytes,
+            headroomGiB,
+            idbDurabilityRatio: null,
+            opfsFlushMs: null,
+          };
+        }
+        if (
+          opfs.status === 'rejected' &&
+          errorLooksLike(opfs.error, /unknown transient reason|SecurityError|NotAllowedError/i)
+        ) {
+          return {
+            isPrivate: true,
+            browserName,
+            method: 'safari-opfs-rejected',
+            quotaBytes,
+            headroomGiB,
+            idbDurabilityRatio: null,
+            opfsFlushMs: null,
+          };
+        }
+
+        // Private Safari still opens IndexedDB but rejects Blob values with
+        // "Blobs are not yet supported".
+        const blobPrivate = await probeSafariIdbBlob();
         return {
-          isPrivate: false,
+          isPrivate: blobPrivate === true,
           browserName,
-          method: 'safari-opfs-resolved',
+          method: 'safari-idb-blob',
           quotaBytes,
           headroomGiB,
           idbDurabilityRatio: null,
+          opfsFlushMs: null,
         };
       }
+
+      // 3A — quota headroom physics (never a veto, only positive evidence).
+      if (headroomBytes !== null && headroomBytes > 0 && headroomBytes < 9.5 * GIB_BYTES) {
+        return {
+          isPrivate: true,
+          browserName,
+          method: `chromium-quota-headroom (${headroomGiB} GiB)`,
+          quotaBytes,
+          headroomGiB,
+          idbDurabilityRatio: null,
+          opfsFlushMs: null,
+        };
+      }
+
+      // 3B — legacy temp-storage quota versus the V8 heap ceiling.
+      const webkitQuota = await queryWebkitTemporaryQuota();
+      const heapLimit = readJsHeapSizeLimit();
       if (
-        opfs.status === 'rejected' &&
-        errorLooksLike(opfs.error, /unknown transient reason|SecurityError|NotAllowedError/i)
+        webkitQuota !== null &&
+        heapLimit !== null &&
+        webkitQuota < 2 * heapLimit &&
+        webkitQuota < 9.5 * GIB_BYTES
       ) {
         return {
           isPrivate: true,
           browserName,
-          method: 'safari-opfs-rejected',
+          method: 'chromium-webkit-temp-quota',
           quotaBytes,
           headroomGiB,
           idbDurabilityRatio: null,
+          opfsFlushMs: null,
         };
       }
 
-      const blobPrivate = await probeSafariIdbBlob();
-      return {
-        isPrivate: blobPrivate === true,
-        browserName,
-        method: 'safari-idb-blob',
-        quotaBytes,
-        headroomGiB,
-        idbDurabilityRatio: null,
-      };
-    }
+      // 3C — storage physics. This layer is NEVER vetoed by a 10.00 GiB headroom:
+      // Chrome 156 reports that headroom in both normal and off-the-record modes.
+      const idbRatio = await probeChromiumIdbDurability();
+      const opfsProbe = await probeChromiumOpfsWorkerFlush();
+      const opfsFlushMs = opfsProbe ? opfsProbe.medianFlushMs : null;
 
-    // Vector A — headroom physics (normal = usage + 10.0 GiB, private = + 9.0 GiB).
-    if (quotaBytes !== null) {
-      const headroomBytes = quotaBytes - usageBytes;
-      if (headroomBytes > 0 && headroomBytes < 9.5 * GIB_BYTES) {
+      const idbIndicatesIncognito = idbRatio !== null && idbRatio < 1.3;
+      const opfsIndicatesIncognito =
+        opfsProbe !== null &&
+        (opfsProbe.medianFlushMs < 0.12 || opfsProbe.flushToWriteRatio < 0.85);
+
+      if (
+        idbIndicatesIncognito ||
+        (idbRatio === null && opfsIndicatesIncognito) ||
+        (idbRatio !== null && idbRatio < 1.42 && opfsIndicatesIncognito)
+      ) {
         return {
           isPrivate: true,
           browserName,
-          method: 'chromium-headroom-below-9.5gib',
+          method: idbIndicatesIncognito
+            ? `idb-memenv-durability-ratio (${idbRatio}x)`
+            : `opfs-ram-flush (${opfsFlushMs}ms)`,
           quotaBytes,
           headroomGiB,
-          idbDurabilityRatio: null,
+          idbDurabilityRatio: idbRatio,
+          opfsFlushMs,
         };
       }
-    }
 
-    // Vector B — legacy temp-storage quota versus the V8 heap ceiling.
-    const webkitQuota = await queryWebkitTemporaryQuota();
-    const heapLimit = readJsHeapSizeLimit();
-    if (
-      webkitQuota !== null &&
-      heapLimit !== null &&
-      webkitQuota < 2 * heapLimit &&
-      webkitQuota < 9.5 * GIB_BYTES
-    ) {
       return {
-        isPrivate: true,
+        isPrivate: false,
         browserName,
-        method: 'chromium-webkit-temp-quota',
+        method: `disk-persisted-verified (IDB ${idbRatio ?? 'n/a'}x)`,
+        quotaBytes,
+        headroomGiB,
+        idbDurabilityRatio: idbRatio,
+        opfsFlushMs,
+      };
+    } catch {
+      return {
+        isPrivate: false,
+        browserName,
+        method: 'probe-error',
         quotaBytes,
         headroomGiB,
         idbDurabilityRatio: null,
+        opfsFlushMs: null,
       };
     }
+  })();
 
-    // Vector C — commit durability, only decisive outside the normal headroom band.
-    const idbDurabilityRatio = await probeChromiumIdbDurability();
-    const headroomInNormalBand =
-      headroomGiB !== null && headroomGiB >= 9.85 && headroomGiB <= 10.15;
-    if (idbDurabilityRatio !== null && idbDurabilityRatio < 1.25 && !headroomInNormalBand) {
-      return {
-        isPrivate: true,
-        browserName,
-        method: 'chromium-idb-durability-ratio',
-        quotaBytes,
-        headroomGiB,
-        idbDurabilityRatio,
-      };
-    }
-
-    return {
-      isPrivate: false,
-      browserName,
-      method: 'chromium-standard-verified',
-      quotaBytes,
-      headroomGiB,
-      idbDurabilityRatio,
-    };
-  } catch {
-    return {
-      isPrivate: false,
-      browserName,
-      method: 'probe-error',
-      quotaBytes,
-      headroomGiB,
-      idbDurabilityRatio: null,
-    };
-  }
+  return cachedIncognitoPromise;
 }
 
 const EMBEDDED_SHELL_PATTERN = /Electron|HeadlessChrome|; wv\)|FBAN|FBAV/i;
@@ -2173,11 +2316,14 @@ export async function evaluateSecuritySignals(
     vpnReasons,
     tamperDetected,
     tamperReasons,
-    incognitoLikely,
-    isIncognito: incognitoLikely,
+    incognitoLikely: incognito.isPrivate,
+    isIncognito: incognito.isPrivate,
+    incognito: incognito.isPrivate,
+    privateMode: incognito.isPrivate,
     incognitoMethod: incognito.method,
     headroomGiB: incognito.headroomGiB,
     idbDurabilityRatio: incognito.idbDurabilityRatio,
+    opfsFlushMs: incognito.opfsFlushMs,
     storageQuotaMb,
     persistenceMode,
     suspectScore,
@@ -2316,6 +2462,9 @@ export async function identifyCurrentVisitor(options?: {
       ? 'manual_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8)
       : CURRENT_PAGE_LOAD_ID;
 
+    // Module-cached: this is the same probe run that started at module load.
+    const incog = await detectIncognitoMode();
+
     const response = await fetch('/api/visitor/identify', {
       method: 'POST',
       headers: {
@@ -2332,6 +2481,13 @@ export async function identifyCurrentVisitor(options?: {
         hardwareSignals,
         securitySignals,
         clientGeoHint,
+        // Top-level mirrors so no server-side spelling path can miss the verdict.
+        incognito: incog.isPrivate,
+        isIncognito: incog.isPrivate,
+        privateMode: incog.isPrivate,
+        incognitoMethod: incog.method,
+        idbDurabilityRatio: incog.idbDurabilityRatio,
+        opfsFlushMs: incog.opfsFlushMs,
       }),
     });
 
@@ -2355,4 +2511,11 @@ export async function identifyCurrentVisitor(options?: {
   });
 
   return inFlightRequest;
+}
+
+// Start the storage-physics probe as soon as the module loads — before App mounts and
+// before NetworkStabilityPanel fires its first download/upload speed test, so the
+// main-thread timing is not skewed by network/speed-test contention.
+if (typeof window !== 'undefined' && typeof indexedDB !== 'undefined') {
+  void detectIncognitoMode();
 }

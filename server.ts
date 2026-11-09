@@ -1242,6 +1242,27 @@ function sanitizeBrowserDevice(input: Partial<BrowserDeviceInfo> | undefined): B
   const deviceType: BrowserDeviceInfo['deviceType'] =
     rawType && validDeviceTypes.includes(rawType) ? rawType : 'Unknown';
 
+  // The collector mirrors its storage-physics verdict onto the device object; these
+  // aliases are carried through untouched so the client tile can read them.
+  const incognitoAlias =
+    typeof input?.incognito === 'boolean' ||
+    typeof input?.isIncognito === 'boolean' ||
+    typeof input?.privateMode === 'boolean'
+      ? Boolean(input?.incognito ?? input?.isIncognito ?? input?.privateMode)
+      : undefined;
+  const incognitoMethod =
+    typeof input?.incognitoMethod === 'string' && input.incognitoMethod.trim()
+      ? input.incognitoMethod.trim().slice(0, 120)
+      : undefined;
+  const idbDurabilityRatio =
+    typeof input?.idbDurabilityRatio === 'number' && Number.isFinite(input.idbDurabilityRatio)
+      ? Number(input.idbDurabilityRatio)
+      : undefined;
+  const opfsFlushMs =
+    typeof input?.opfsFlushMs === 'number' && Number.isFinite(input.opfsFlushMs)
+      ? Number(input.opfsFlushMs)
+      : undefined;
+
   return {
     browser: safeStr(input?.browser, 'Unknown'),
     os: safeStr(input?.os, 'Unknown'),
@@ -1251,6 +1272,12 @@ function sanitizeBrowserDevice(input: Partial<BrowserDeviceInfo> | undefined): B
     pixelRatio: safeStr(input?.pixelRatio, 'Unavailable'),
     language: safeStr(input?.language, 'Unavailable'),
     timezone: safeStr(input?.timezone, 'Unavailable'),
+    incognito: incognitoAlias,
+    isIncognito: incognitoAlias,
+    privateMode: incognitoAlias,
+    incognitoMethod,
+    idbDurabilityRatio,
+    opfsFlushMs,
   };
 }
 
@@ -2165,6 +2192,8 @@ interface IncognitoCrossModeContext {
   hadPersistentClientState?: boolean;
   existingHwidVisitor?: boolean;
   clientReportedIncognito?: boolean;
+  /** Case B — an earlier visit by this same physical device (last 7 days) used a different visitor id. */
+  crossSessionEphemeral?: boolean;
 }
 
 function sanitizeAndReinforceSecuritySignals(
@@ -2318,6 +2347,10 @@ function sanitizeAndReinforceSecuritySignals(
     typeof raw?.idbDurabilityRatio === 'number' && Number.isFinite(raw.idbDurabilityRatio)
       ? Number(raw.idbDurabilityRatio)
       : null;
+  const opfsFlushMs =
+    typeof raw?.opfsFlushMs === 'number' && Number.isFinite(raw.opfsFlushMs)
+      ? Number(raw.opfsFlushMs)
+      : null;
   // Forward-compatibility pass-through for the masked GPU flag (kept as pure pass-through so
   // the per-visit history row mapping keeps reading securitySignals.cloudOrMaskedGpu).
   const cloudOrMaskedGpu = Boolean(
@@ -2343,13 +2376,15 @@ function sanitizeAndReinforceSecuritySignals(
     recognitionSource === 'Hardware Fingerprint (Cookie-less / Incognito)' ||
     persistenceMode === 'Hardware ID Recovered';
 
-  // Final incognito verdict: the client's own storage probe, or the server-side cross-mode
-  // proof — a hardware-fingerprint recovery with no surviving cookie / localStorage state.
+  // Final incognito verdict: the client's own storage probe, or the server-side cross-session
+  // proof — an ephemeral context with no surviving cookie / localStorage / signed backup.
   const clientReportedIncognito =
     Boolean(incognitoContext.clientReportedIncognito) || incognitoLikely;
-  const isIncognito =
-    clientReportedIncognito ||
-    Boolean(!incognitoContext.hadPersistentClientState && incognitoContext.existingHwidVisitor);
+  const serverCrossModeIncognito = Boolean(
+    !incognitoContext.hadPersistentClientState &&
+      (incognitoContext.existingHwidVisitor || incognitoContext.crossSessionEphemeral)
+  );
+  const isIncognito = Boolean(clientReportedIncognito || serverCrossModeIncognito);
 
   const tierFor = (score: number): RiskLevel =>
     score >= 7 ? 'High' : score >= 3 ? 'Medium' : 'Low';
@@ -2368,12 +2403,10 @@ function sanitizeAndReinforceSecuritySignals(
     riskLabel: `${tierFor(incognitoScore)} Risk • ${incognitoScore}/10`,
     level: levelFor(incognitoScore),
     detail: isIncognito
-      ? clientReportedIncognito
-        ? `Ephemeral memory-backed storage profile (${
-            incognitoMethod || '9.0 GiB quota headroom deficit'
-          })`
-        : 'Returning Hardware ID (hwid) detected with wiped cookies & localStorage'
-      : 'Persistent disk-backed browser storage & 10.0 GiB standard quota verified',
+      ? `Ephemeral RAM storage detected (${
+          incognitoMethod || 'In-memory LevelDB / Cookie-less known hwid'
+        })`
+      : `Persistent disk-backed storage verified (${incognitoMethod || 'Standard profile'})`,
   };
 
   // Tile 2 — Bot & Automation Detection (9 / 7 / 0)
@@ -2554,9 +2587,12 @@ function sanitizeAndReinforceSecuritySignals(
         typeof raw?.incognitoDetail === 'string' ? raw.incognitoDetail.trim().slice(0, 240) : '',
       // Final 4-signal upgrade — private browsing, bot, network, VM integrity
       isIncognito,
+      incognito: isIncognito,
+      privateMode: isIncognito,
       incognitoMethod,
       headroomGiB,
       idbDurabilityRatio,
+      opfsFlushMs,
       isHeadless,
       botReason,
       webdriver,
@@ -2598,8 +2634,12 @@ app.post('/api/visitor/identify', async (req, res) => {
       /** Alternate / legacy incognito spellings a client may post at the top level. */
       incognito?: boolean;
       isIncognito?: boolean;
-      browserInfo?: { incognito?: boolean } | null;
-      telemetry?: { incognito?: boolean } | null;
+      privateMode?: boolean;
+      incognitoMethod?: string;
+      idbDurabilityRatio?: number | null;
+      opfsFlushMs?: number | null;
+      browserInfo?: { incognito?: boolean; isIncognito?: boolean } | null;
+      telemetry?: { incognito?: boolean; isIncognito?: boolean } | null;
     };
 
     const {
@@ -3064,25 +3104,69 @@ app.post('/api/visitor/identify', async (req, res) => {
     const historyBackupValid = Boolean(validBackupForStats);
     const hadPersistentClientState = Boolean(cookieVid || bodyVisitorId || historyBackupValid);
 
-    const rawSecuritySignalsCompat = rawSecuritySignals as
-      | (Partial<SecuritySignals> & { incognito?: boolean })
-      | null
-      | undefined;
     // Accept every incognito spelling this app (and its legacy payloads) can post:
-    // top-level, browserInfo.*, telemetry.*, securitySignals.incognito / .isIncognito, and the
-    // collector's own private-browsing probe verdict.
+    // top-level, browserInfo.*, telemetry.*, securitySignals.* and any alias.
     const clientReportedIncognito = Boolean(
-      requestBody.incognito ??
-        requestBody.isIncognito ??
-        requestBody.browserInfo?.incognito ??
-        requestBody.telemetry?.incognito ??
-        rawSecuritySignalsCompat?.incognito ??
-        rawSecuritySignals?.isIncognito ??
-        rawSecuritySignals?.incognitoLikely
+      requestBody.incognito ?? requestBody.isIncognito ?? requestBody.privateMode ??
+      requestBody.browserInfo?.incognito ?? requestBody.browserInfo?.isIncognito ??
+      requestBody.telemetry?.incognito ?? requestBody.telemetry?.isIncognito ??
+      rawSecuritySignals?.isIncognito ?? rawSecuritySignals?.incognito ??
+      rawSecuritySignals?.privateMode ?? rawSecuritySignals?.incognitoLikely
     );
 
+    // Fingerprint.com-style ephemeral-storage correlation. Only meaningful when NO persistent
+    // client state survived (no verified cookie, no verified body visitor id, no signed backup).
+    // Case A is the existing `hwid_...` lookup hit (`existingHwidVisitor`). Case B looks for an
+    // earlier visit by this same physical device inside the last 7 days that belongs to a
+    // DIFFERENT visitor id — `visitors.hardware_id` is the persisted GPU-derived identity
+    // column (there is no GPU renderer column on `visits`), so it is matched together with the
+    // per-visit columns the schema actually has: public_ip, screen_resolution, browser, os.
+    let crossSessionEphemeral = false;
+    if (!hadPersistentClientState && !existingHwidVisitor && hardwareId) {
+      try {
+        const sevenDaysAgoUtc = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+        const earlierDeviceVisit = db
+          .prepare(
+            `SELECT v.visitor_id
+             FROM visits v
+             JOIN visitors pv ON pv.visitor_id = v.visitor_id
+             WHERE v.visitor_id != ?
+               AND pv.hardware_id = ?
+               AND v.public_ip = ?
+               AND v.screen_resolution = ?
+               AND v.browser = ?
+               AND v.os = ?
+               AND v.visited_at_utc >= ?
+             ORDER BY v.visited_at_utc DESC
+             LIMIT 1`
+          )
+          .get(
+            visitorId,
+            hardwareId,
+            location.publicIp,
+            browserDevice.screenResolution,
+            browserDevice.browser,
+            browserDevice.os,
+            sevenDaysAgoUtc
+          ) as { visitor_id: string } | undefined;
+        crossSessionEphemeral = Boolean(earlierDeviceVisit);
+      } catch {
+        // A correlation query failure must never 500 the identify endpoint.
+        crossSessionEphemeral = false;
+      }
+    }
+
+    const securitySignalsInput: Partial<SecuritySignals> | null | undefined =
+      rawSecuritySignals || requestBody.incognitoMethod
+        ? {
+            ...(rawSecuritySignals ?? {}),
+            // Top-level method spelling is honoured when securitySignals omitted it.
+            incognitoMethod: rawSecuritySignals?.incognitoMethod ?? requestBody.incognitoMethod,
+          }
+        : rawSecuritySignals;
+
     const securitySignals = sanitizeAndReinforceSecuritySignals(
-      rawSecuritySignals,
+      securitySignalsInput,
       browserDevice,
       hardwareSignals,
       location,
@@ -3090,7 +3174,12 @@ app.post('/api/visitor/identify', async (req, res) => {
       recognitionSource,
       classification,
       { visitsLastHour, distinctIpsLastHour },
-      { hadPersistentClientState, existingHwidVisitor, clientReportedIncognito }
+      {
+        hadPersistentClientState,
+        existingHwidVisitor,
+        clientReportedIncognito,
+        crossSessionEphemeral,
+      }
     );
 
     // Every history row always carries suspectScore / riskLevel / recognitionSource so the UI
@@ -3171,6 +3260,7 @@ app.post('/api/visitor/identify', async (req, res) => {
       historyBackup,
       // Top-level mirrors so clients can read the 4-signal verdict without digging.
       isIncognito: securitySignals.isIncognito,
+      incognito: securitySignals.isIncognito,
       suspectScore: securitySignals.suspectScore,
       riskLevel: securitySignals.riskLevel,
       riskBadgeText: securitySignals.riskBadgeText,
