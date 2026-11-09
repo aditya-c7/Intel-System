@@ -1503,11 +1503,30 @@ var SERVER_TIMEZONE_ALIAS_MAP = {
   "etc/utc": "utc",
   "etc/gmt": "utc"
 };
+var TIMEZONE_ALIAS_MAP = {
+  "Asia/Calcutta": "Asia/Kolkata",
+  "Asia/Katmandu": "Asia/Kathmandu",
+  "Asia/Saigon": "Asia/Ho_Chi_Minh",
+  "Asia/Rangoon": "Asia/Yangon",
+  "Europe/Kiev": "Europe/Kyiv",
+  "Europe/Uzhgorod": "Europe/Kyiv",
+  "Europe/Zaporozhye": "Europe/Kyiv",
+  "US/Eastern": "America/New_York",
+  "US/Central": "America/Chicago",
+  "US/Mountain": "America/Denver",
+  "US/Pacific": "America/Los_Angeles"
+};
+function normalizeTimezone(tz) {
+  if (!tz || typeof tz !== "string") return "";
+  const trimmed = tz.trim();
+  if (!trimmed) return "";
+  return TIMEZONE_ALIAS_MAP[trimmed] || trimmed;
+}
 function normalizeServerTimezoneId(tz) {
   if (!tz || typeof tz !== "string") return "";
-  const cleaned = tz.trim().toLowerCase();
-  if (!cleaned || cleaned === "unknown" || cleaned === "unavailable") return "";
-  return SERVER_TIMEZONE_ALIAS_MAP[cleaned] || cleaned;
+  const canonical = normalizeTimezone(tz).toLowerCase();
+  if (!canonical || canonical === "unknown" || canonical === "unavailable") return "";
+  return SERVER_TIMEZONE_ALIAS_MAP[canonical] || canonical;
 }
 function sanitizeHardwareSignals(raw, browserDevice) {
   const safeStr = (val, fallback, maxLen = 140) => typeof val === "string" && val.trim().length > 0 ? val.trim().slice(0, maxLen) : fallback;
@@ -1536,9 +1555,13 @@ function sanitizeHardwareSignals(raw, browserDevice) {
     architecture: safeStr(raw?.architecture, browserDevice.os, 80)
   };
 }
-function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals, location, ipTimezoneHint, recognitionSource, classification, velocity) {
+function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals, location, ipTimezoneHint, recognitionSource, classification, velocity, incognitoContext = {}) {
   const safeStrArray = (arr) => Array.isArray(arr) ? arr.filter((item) => typeof item === "string" && item.trim().length > 0).map((s) => s.trim().slice(0, 180)).slice(0, 10) : [];
-  const isBot = Boolean(raw?.isBot);
+  const webdriver = Boolean(raw?.webdriver);
+  const cdpDetected = Boolean(raw?.cdpDetected);
+  const isBot = Boolean(raw?.isBot || webdriver || cdpDetected);
+  const isHeadless = Boolean(raw?.isHeadless);
+  const botReason = typeof raw?.botReason === "string" && raw.botReason.trim() ? raw.botReason.trim().slice(0, 200) : "";
   const botSignals = safeStrArray(raw?.botSignals);
   const browserTimezone = typeof raw?.browserTimezone === "string" && raw.browserTimezone.trim() ? raw.browserTimezone.trim().slice(0, 80) : browserDevice.timezone || "UTC";
   const ipTimezone = ipTimezoneHint || (typeof raw?.ipTimezone === "string" && raw.ipTimezone.trim() && raw.ipTimezone !== "Unavailable" ? raw.ipTimezone.trim().slice(0, 80) : "Unavailable");
@@ -1564,20 +1587,26 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     vpnReasons.push("Cloud / Masked GPU environment");
   }
   const vpnSuspected = Boolean(raw?.vpnSuspected) || timezoneMismatch || datacenterAsn;
+  const clientTzCanonical = normalizeTimezone(browserTimezone);
+  const ipTzCanonical = normalizeTimezone(ipTimezone === "Unavailable" ? "" : ipTimezone);
+  const hasTzMismatch = Boolean(
+    clientTzCanonical && ipTzCanonical && clientTzCanonical.toLowerCase() !== ipTzCanonical.toLowerCase()
+  );
   const tamperDetected = Boolean(raw?.tamperDetected);
   const tamperReasons = safeStrArray(raw?.tamperReasons);
   const incognitoLikely = Boolean(raw?.incognitoLikely);
   const storageQuotaMb = typeof raw?.storageQuotaMb === "number" && Number.isFinite(raw.storageQuotaMb) && raw.storageQuotaMb > 0 ? Math.round(raw.storageQuotaMb) : null;
-  const webrtcLeak = Boolean(raw?.webrtcLeak);
   const webrtcCandidateIp = typeof raw?.webrtcCandidateIp === "string" && raw.webrtcCandidateIp.trim() ? raw.webrtcCandidateIp.trim().slice(0, 64) : null;
   const webrtcDetail = typeof raw?.webrtcDetail === "string" && raw.webrtcDetail.trim() ? raw.webrtcDetail.trim().slice(0, 200) : "";
   const privacyProtected = Boolean(raw?.privacyProtected);
   const privacyDetail = typeof raw?.privacyDetail === "string" && raw.privacyDetail.trim() ? raw.privacyDetail.trim().slice(0, 200) : "";
-  const adBlockerDetected = Boolean(raw?.adBlockerDetected);
   const canvasFarblingDetected = Boolean(raw?.canvasFarblingDetected);
   const isVirtualMachine = Boolean(raw?.isVirtualMachine);
+  const isOsTampered = Boolean(raw?.isOsTampered);
   const vmReason = typeof raw?.vmReason === "string" && raw.vmReason.trim() ? raw.vmReason.trim().slice(0, 200) : "";
-  const devToolsOpen = Boolean(raw?.devToolsOpen);
+  const incognitoMethod = typeof raw?.incognitoMethod === "string" && raw.incognitoMethod.trim() ? raw.incognitoMethod.trim().slice(0, 120) : "";
+  const headroomGiB = typeof raw?.headroomGiB === "number" && Number.isFinite(raw.headroomGiB) ? Number(raw.headroomGiB) : null;
+  const idbDurabilityRatio = typeof raw?.idbDurabilityRatio === "number" && Number.isFinite(raw.idbDurabilityRatio) ? Number(raw.idbDurabilityRatio) : null;
   const cloudOrMaskedGpu = Boolean(
     raw?.cloudOrMaskedGpu
   );
@@ -1588,38 +1617,90 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     persistenceMode = "Private / Restricted Storage";
   }
   const incognitoOrCleared = Boolean(raw?.incognitoOrCleared) || recognitionSource === "Hardware Fingerprint (Cookie-less / Incognito)" || persistenceMode === "Hardware ID Recovered";
-  let suspectScore = 0;
+  const clientReportedIncognito = Boolean(incognitoContext.clientReportedIncognito) || incognitoLikely;
+  const isIncognito = clientReportedIncognito || Boolean(!incognitoContext.hadPersistentClientState && incognitoContext.existingHwidVisitor);
+  const tierFor = (score) => score >= 7 ? "High" : score >= 3 ? "Medium" : "Low";
+  const levelFor = (score) => score >= 7 ? "high" : score >= 3 ? "medium" : "low";
+  const incognitoScore = isIncognito ? 4 : 0;
+  const incognitoSignal = {
+    id: "incognito",
+    title: "Incognito / Private Browsing",
+    status: isIncognito ? "Incognito / Private Mode" : "Standard Window",
+    scoreOutOf10: incognitoScore,
+    riskLabel: `${tierFor(incognitoScore)} Risk \u2022 ${incognitoScore}/10`,
+    level: levelFor(incognitoScore),
+    detail: isIncognito ? clientReportedIncognito ? `Ephemeral memory-backed storage profile (${incognitoMethod || "9.0 GiB quota headroom deficit"})` : "Returning Hardware ID (hwid) detected with wiped cookies & localStorage" : "Persistent disk-backed browser storage & 10.0 GiB standard quota verified"
+  };
+  const botScore = isBot ? 9 : isHeadless ? 7 : 0;
+  const botSignal = {
+    id: "bot",
+    title: "Bot & Automation Detection",
+    status: isBot ? "Bot / Automated" : isHeadless ? "Cloud / Headless" : "Verified Human",
+    scoreOutOf10: botScore,
+    riskLabel: `${tierFor(botScore)} Risk \u2022 ${botScore}/10`,
+    level: levelFor(botScore),
+    detail: botReason || (isBot ? "WebDriver / CDP automation runtime detected" : isHeadless ? "Headless rendering context without an attached physical display" : "No automation, WebDriver, CDP hooks, or headless runtime detected")
+  };
+  const isDatacenterAsn = datacenterAsn;
+  const ispBrand = classification.brandName || location.isp || "Unknown ISP";
+  const asnSuffix = location.asn !== "Unknown" ? ` \u2022 ${location.asn}` : "";
+  const vpnScore = isDatacenterAsn && hasTzMismatch ? 8 : isDatacenterAsn ? 6 : hasTzMismatch ? 5 : 0;
+  const vpnSignal = {
+    id: "vpn",
+    title: "VPN / Proxy & Network Type",
+    status: isDatacenterAsn ? "VPN / Datacenter Proxy" : hasTzMismatch ? "VPN / Timezone Relay" : ispBrand !== "Unknown ISP" ? `Standard ISP (${ispBrand})` : "Standard ISP",
+    scoreOutOf10: vpnScore,
+    riskLabel: `${tierFor(vpnScore)} Risk \u2022 ${vpnScore}/10`,
+    level: levelFor(vpnScore),
+    detail: isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} verified against browser timezone ${browserTimezone}`
+  };
+  const isVm = isVirtualMachine;
+  const isTampered = isOsTampered;
+  const vmScore = isVm && isTampered ? 8 : isVm ? 7 : isTampered ? 6 : 0;
+  const vmSignal = {
+    id: "vm",
+    title: "Virtual Machine & OS Integrity",
+    status: isVm && isTampered ? "Virtual Machine / Spoofed OS" : isVm ? "Virtual Machine / Hypervisor" : isTampered ? "Spoofed OS / Tampered UA" : "Physical Hardware",
+    scoreOutOf10: vmScore,
+    riskLabel: `${tierFor(vmScore)} Risk \u2022 ${vmScore}/10`,
+    level: levelFor(vmScore),
+    detail: vmReason || (isTampered ? tamperReasons[0] || "Operating-system / User-Agent tampering detected" : "Unmasked physical GPU & consistent OS platform verified")
+  };
+  const smartSignals = {
+    incognito: incognitoSignal,
+    bot: botSignal,
+    vpn: vpnSignal,
+    vm: vmSignal
+  };
+  const rawCompositePoints = (isBot ? 5 : isHeadless ? 4 : 0) + (isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0) + (vmScore > 0 ? 3 : 0) + (isIncognito ? 2 : 0);
+  const suspectScore = Math.min(10, rawCompositePoints);
+  const riskLevel = tierFor(suspectScore);
+  const riskBadgeText = `${riskLevel} Risk \u2022 ${suspectScore}/10`;
   const riskFactors = [];
   if (isBot) {
-    suspectScore += 3;
     riskFactors.push(
-      `Automated browser / bot runtime detected (+3): ${botSignals[0] || "headless or scripted browser signatures"}`
+      `Automated browser / bot runtime detected (+5): ${botReason || botSignals[0] || "WebDriver / CDP automation signatures"}`
+    );
+  } else if (isHeadless) {
+    riskFactors.push(
+      `Headless browser environment (+4): ${botReason || "no physical display attached"}`
     );
   }
-  if (vpnSuspected || webrtcLeak) {
-    suspectScore += 2;
-    let vpnDetail = vpnReasons[0] || "";
-    if (!vpnDetail && webrtcLeak) {
-      vpnDetail = webrtcCandidateIp ? `WebRTC leak exposed candidate IP ${webrtcCandidateIp}` : webrtcDetail || "WebRTC ICE candidates bypassed the expected network path";
-    }
-    if (!vpnDetail) {
-      vpnDetail = `anomalous network path (${location.isp})`;
-    }
-    riskFactors.push(`VPN / proxy network or WebRTC leak detected (+2): ${vpnDetail}`);
-  }
-  if (isVirtualMachine || cloudOrMaskedGpu) {
-    suspectScore += 2;
+  if (isDatacenterAsn) {
     riskFactors.push(
-      `Virtual machine or masked GPU environment (+2): ${isVirtualMachine ? vmReason || "VM indicators present in the hardware signals" : "cloud environment with a masked or generic GPU signature"}`
+      `Datacenter / hosting network detected (+3): ${vpnReasons[0] || ispBrand}`
+    );
+  } else if (hasTzMismatch) {
+    riskFactors.push(
+      `Browser timezone differs from IP geolocation (+2): ${clientTzCanonical} vs ${ipTzCanonical}`
     );
   }
-  if (incognitoLikely || incognitoOrCleared) {
-    suspectScore += 1;
-    const incognitoDetail = storageQuotaMb !== null ? `${storageQuotaMb} MB storage quota indicates a private browsing context` : incognitoOrCleared && !incognitoLikely ? "visitor recovered from a cookie-less / incognito session through the hardware fingerprint" : "private or restricted browser storage environment";
-    riskFactors.push(`Incognito / private browsing indicators (+1): ${incognitoDetail}`);
+  if (vmScore > 0) {
+    riskFactors.push(`Virtual machine / tampered OS (+3): ${vmSignal.detail}`);
   }
-  suspectScore = Math.max(0, Math.min(10, suspectScore));
-  const riskLevel = suspectScore >= 7 ? "High" : suspectScore >= 3 ? "Medium" : "Low";
+  if (isIncognito) {
+    riskFactors.push(`Incognito / ephemeral storage (+2): ${incognitoSignal.detail}`);
+  }
   const securitySignalsCore = {
     isBot,
     botSignals,
@@ -1648,16 +1729,18 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       isConsumerBroadband: classification.isConsumerBroadband,
       isDatacenterOrHosting: classification.isDatacenterOrHosting,
       // Task 3 — deep technical detection signals
-      webrtcLeak,
+      webrtcLeak: false,
       webrtcCandidateIp,
       webrtcDetail,
       privacyProtected,
       privacyDetail,
-      adBlockerDetected,
+      // Deprecated scoring inputs kept inert for response-shape backward compatibility.
+      adBlockerDetected: false,
+      devToolsOpen: false,
       canvasFarblingDetected,
       isVirtualMachine,
       vmReason,
-      devToolsOpen,
+      isOsTampered,
       incognitoOrCleared,
       // Client-side composite private-browsing probe (confidence 0..1 + evidence)
       incognitoConfidence: Math.max(
@@ -1668,7 +1751,18 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
         )
       ),
       incognitoDetail: typeof raw?.incognitoDetail === "string" ? raw.incognitoDetail.trim().slice(0, 240) : "",
-      // Task 3 — visit velocity / IP rotation
+      // Final 4-signal upgrade — private browsing, bot, network, VM integrity
+      isIncognito,
+      incognitoMethod,
+      headroomGiB,
+      idbDurabilityRatio,
+      isHeadless,
+      botReason,
+      webdriver,
+      cdpDetected,
+      smartSignals,
+      riskBadgeText,
+      // Task 3 — visit velocity / IP rotation (display only, never scored)
       distinctIpsLastHour: velocity.distinctIpsLastHour,
       visitsLastHour: velocity.visitsLastHour
     }
@@ -1676,6 +1770,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
 }
 app.post("/api/visitor/identify", async (req, res) => {
   try {
+    const requestBody = req.body || {};
     const {
       pageLoadId,
       storedVisitorId,
@@ -1686,7 +1781,7 @@ app.post("/api/visitor/identify", async (req, res) => {
       hardwareSignals: rawHardwareSignals,
       securitySignals: rawSecuritySignals,
       clientGeoHint
-    } = req.body || {};
+    } = requestBody;
     const safePageLoadId = typeof pageLoadId === "string" && pageLoadId.trim().length > 0 ? pageLoadId.trim().slice(0, 80) : "pl_" + crypto.randomBytes(8).toString("hex");
     const browserDevice = sanitizeBrowserDevice(rawBrowserDevice);
     const hardwareSignals = sanitizeHardwareSignals(rawHardwareSignals, browserDevice);
@@ -1742,6 +1837,7 @@ app.post("/api/visitor/identify", async (req, res) => {
     const cookieToken = req.cookies?.intel_http_token;
     let existingVisitor;
     let recognitionSource = "New First-Party ID";
+    let existingHwidVisitor = false;
     const cookieVerified = Boolean(cookieVid && verifyVisitorToken(cookieVid, cookieToken));
     const storageVerified = Boolean(
       storedVisitorId && verifyVisitorToken(storedVisitorId, storedVisitorToken)
@@ -1810,6 +1906,7 @@ app.post("/api/visitor/identify", async (req, res) => {
       const hwMatchedVisitor = db.prepare("SELECT * FROM visitors WHERE hardware_id = ?").get(hardwareId);
       if (hwMatchedVisitor) {
         existingVisitor = hwMatchedVisitor;
+        existingHwidVisitor = true;
         recognitionSource = "Hardware Fingerprint (Cookie-less / Incognito)";
       }
     }
@@ -1981,7 +2078,13 @@ app.post("/api/visitor/identify", async (req, res) => {
     }
     const visitsLastHour = Math.max(1, lastHourVisitRows.length);
     const distinctIpsLastHour = lastHourIpSet.size;
-    const velocityFlag = visitsLastHour >= 8 || distinctIpsLastHour > 1;
+    const bodyVisitorId = storageVerified ? storedVisitorId ?? null : null;
+    const historyBackupValid = Boolean(validBackupForStats);
+    const hadPersistentClientState = Boolean(cookieVid || bodyVisitorId || historyBackupValid);
+    const rawSecuritySignalsCompat = rawSecuritySignals;
+    const clientReportedIncognito = Boolean(
+      requestBody.incognito ?? requestBody.isIncognito ?? requestBody.browserInfo?.incognito ?? requestBody.telemetry?.incognito ?? rawSecuritySignalsCompat?.incognito ?? rawSecuritySignals?.isIncognito ?? rawSecuritySignals?.incognitoLikely
+    );
     const securitySignals = sanitizeAndReinforceSecuritySignals(
       rawSecuritySignals,
       browserDevice,
@@ -1990,7 +2093,8 @@ app.post("/api/visitor/identify", async (req, res) => {
       ipTimezoneHint,
       recognitionSource,
       classification,
-      { visitsLastHour, distinctIpsLastHour, highVelocity: velocityFlag }
+      { visitsLastHour, distinctIpsLastHour },
+      { hadPersistentClientState, existingHwidVisitor, clientReportedIncognito }
     );
     const visitHistory = rawVisits.map((r) => {
       const storedSuspectScore = typeof r.suspect_score === "number" && Number.isFinite(r.suspect_score) ? normalizeLegacySuspectScore(r.suspect_score) : null;
@@ -2048,7 +2152,13 @@ app.post("/api/visitor/identify", async (req, res) => {
       securitySignals,
       statistics,
       visitHistory,
-      historyBackup
+      historyBackup,
+      // Top-level mirrors so clients can read the 4-signal verdict without digging.
+      isIncognito: securitySignals.isIncognito,
+      suspectScore: securitySignals.suspectScore,
+      riskLevel: securitySignals.riskLevel,
+      riskBadgeText: securitySignals.riskBadgeText,
+      smartSignals: securitySignals.smartSignals
     };
     res.json(payload);
   } catch (err) {
