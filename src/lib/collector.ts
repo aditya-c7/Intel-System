@@ -1110,15 +1110,22 @@ export async function detectPrivateBrowsing(
       : null;
 
   if (quotaBytes !== null) {
-    if (quotaMb !== null && quotaMb < 20_480) {
-      score += 0.35;
-      reasons.push(`Restricted storage quota (${quotaMb} MB)`);
-    }
-    if (heapLimit && quotaBytes / heapLimit < 4) {
-      score += 0.45;
+    // Chromium computes a normal-profile quota from free disk space (typically
+    // 15x-80x the JS heap limit) while an off-the-record profile is capped far
+    // lower (about 2x-6x). The band avoids flagging tiny-quota non-browser
+    // shells (Electron/WebView) that report a ratio below 1.
+    const quotaRatio = heapLimit ? quotaBytes / heapLimit : null;
+    if (quotaRatio !== null && quotaRatio >= 1 && quotaRatio < 6) {
+      score += 0.6;
       reasons.push(
-        `Storage quota is only ${(quotaBytes / heapLimit).toFixed(1)}x the JS heap limit`
+        `Storage quota is only ${quotaRatio.toFixed(1)}x the JS heap limit (off-the-record profile range)`
       );
+    } else if (quotaRatio !== null && quotaRatio >= 1 && quotaMb !== null && quotaMb < 20_480) {
+      score += 0.3;
+      reasons.push(`Restricted storage quota (${quotaMb} MB)`);
+    } else if (quotaRatio === null && quotaMb !== null && quotaMb >= 2_048 && quotaMb < 20_480) {
+      score += 0.3;
+      reasons.push(`Restricted storage quota (${quotaMb} MB)`);
     }
   }
 
