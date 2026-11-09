@@ -5,6 +5,8 @@ import type {
   NetworkType,
   RiskLevel,
   SecuritySignals,
+  SmartSignal,
+  SmartSignals,
 } from './types/visitor';
 import { LocationMap } from './components/LocationMap';
 import { NetworkStabilityPanel } from './components/NetworkStabilityPanel';
@@ -290,6 +292,13 @@ interface SignalRowModel {
   statusLabel: string;
   tooltip: string;
   riskScore: number;
+  /** Server-provided `${Tier} Risk • ${score}/10` line, preferred when present. */
+  riskLabel?: string;
+}
+
+function toneForScore(score: number): SignalTone {
+  const tier = resolveSignalRiskTier(score);
+  return tier === 'High' ? 'bad' : tier === 'Medium' ? 'warn' : 'ok';
 }
 
 function createSignalRow(
@@ -301,6 +310,23 @@ function createSignalRow(
   return {
     ...rest,
     dotClass: TONE_DOT_CLASS[tone],
+  };
+}
+
+/**
+ * Converts one server-computed Smart Signal into the shared tile model, preserving the
+ * server's exact status wording and out-of-10 rating line.
+ */
+function smartSignalToRow(signal: SmartSignal): SignalRowModel {
+  return {
+    key: signal.id,
+    dotClass: TONE_DOT_CLASS[toneForScore(signal.scoreOutOf10)],
+    title: signal.title,
+    caption: signal.detail,
+    statusLabel: signal.status,
+    tooltip: `${signal.title} • ${signal.detail}`,
+    riskScore: signal.scoreOutOf10,
+    riskLabel: signal.riskLabel,
   };
 }
 
@@ -335,95 +361,136 @@ function SignalRow(row: SignalRowModel & { className?: string }) {
       <span
         className={`text-[11px] font-mono font-semibold tabular-nums ${TONE_TEXT_CLASS[riskTone]}`}
       >
-        {`${riskTier} Risk • ${row.riskScore}/10`}
+        {row.riskLabel ?? `${riskTier} Risk • ${row.riskScore}/10`}
       </span>
     </div>
   );
 }
 
 /**
- * Builds the 4-signal core grid: Incognito / Private Browsing, Bot &
- * Automation, VPN / Proxy & Network Type, and Virtual Machine &
- * Environment Integrity.
+ * Client-side fallback mirror of the server's 4-signal engine. Only used when the API
+ * response predates `smartSignals`; scores, statuses and labels match server.ts exactly.
  */
-function buildSignalRows(signals: SecuritySignals): SignalRowModel[] {
-  const botCloud = Boolean(signals.datacenterAsn && signals.cloudOrMaskedGpu);
-  const cloudOrMaskedGpu = Boolean(signals.cloudOrMaskedGpu);
-  const incognitoEphemeral =
-    signals.incognitoLikely ||
-    Boolean(signals.incognitoOrCleared) ||
-    signals.persistenceMode === 'Hardware ID Recovered' ||
-    signals.persistenceMode === 'Private / Restricted Storage';
+function buildClientSignalRows(signals: SecuritySignals): SignalRowModel[] {
+  const isBotDetected = Boolean(signals.isBot || signals.webdriver || signals.cdpDetected);
+  const isHeadlessDetected = Boolean(signals.isHeadless);
+  const isDatacenterAsn = Boolean(signals.datacenterAsn);
+  const hasTzMismatch = Boolean(signals.timezoneMismatch);
+  const isVm = Boolean(signals.isVirtualMachine);
+  const isTampered = Boolean(signals.isOsTampered);
+  const isIncognito = Boolean(
+    signals.isIncognito ??
+      (signals.incognitoLikely || signals.persistenceMode === 'Hardware ID Recovered')
+  );
+  const ispBrand = signals.brandName?.trim() || '';
+
+  const incognitoScore = isIncognito ? 4 : 0;
+  const botScore = isBotDetected ? 9 : isHeadlessDetected ? 7 : 0;
+  const vpnScore =
+    isDatacenterAsn && hasTzMismatch ? 8 : isDatacenterAsn ? 6 : hasTzMismatch ? 5 : 0;
+  const vmScore = isVm && isTampered ? 8 : isVm ? 7 : isTampered ? 6 : 0;
+
+  const incognitoDetail = isIncognito
+    ? `Ephemeral memory-backed storage profile (${
+        signals.incognitoMethod || '9.0 GiB quota headroom deficit'
+      })`
+    : 'Persistent disk-backed browser storage & 10.0 GiB standard quota verified';
+  const botDetail =
+    signals.botReason ||
+    (isBotDetected
+      ? 'WebDriver / CDP automation runtime detected'
+      : isHeadlessDetected
+      ? 'Headless rendering context without an attached physical display'
+      : 'No automation, WebDriver, CDP hooks, or headless runtime detected');
+  const vpnDetail =
+    vpnScore > 0
+      ? signals.vpnReasons[0] ||
+        (isDatacenterAsn
+          ? `Datacenter / hosting ASN detected on ${ispBrand || 'this network'}`
+          : `Browser timezone (${signals.browserTimezone}) differs from IP geolocation timezone (${signals.ipTimezone})`)
+      : `${ispBrand || 'Standard ISP'} • ${
+          signals.networkType ?? 'Residential Broadband'
+        } verified against browser timezone ${signals.browserTimezone}`;
+  const vmDetail =
+    signals.vmReason ||
+    (isTampered
+      ? signals.tamperReasons[0] || 'Operating-system / User-Agent tampering detected'
+      : 'Unmasked physical GPU & consistent OS platform verified');
 
   return [
-    // Tile 1: Incognito / Private Browsing
     createSignalRow({
       key: 'incognito',
-      tone: incognitoEphemeral ? 'warn' : 'ok',
+      tone: toneForScore(incognitoScore),
       title: 'Incognito / Private Browsing',
-      caption: incognitoEphemeral
-        ? 'No persistent first-party storage or cookie survived this session'
-        : 'Persistent storage and first-party cookies active',
-      statusLabel: incognitoEphemeral ? 'Incognito / Private Mode' : 'Standard Window',
+      caption: incognitoDetail,
+      statusLabel: isIncognito ? 'Incognito / Private Mode' : 'Standard Window',
       tooltip: `Persistence Mode: ${signals.persistenceMode}`,
-      riskScore: incognitoEphemeral ? 4 : 0,
+      riskScore: incognitoScore,
     }),
-
-    // Tile 2: Bot & Automation
     createSignalRow({
       key: 'bot',
-      tone: signals.isBot ? 'bad' : botCloud ? 'warn' : 'ok',
-      title: 'Bot & Automation',
-      caption:
-        signals.botSignals[0] ??
-        (signals.isBot
-          ? 'Automation runtime hooks detected'
-          : botCloud
-          ? 'Cloud / Masked GPU environment'
-          : 'Interactive human session verified'),
-      statusLabel: signals.isBot
+      tone: toneForScore(botScore),
+      title: 'Bot & Automation Detection',
+      caption: botDetail,
+      statusLabel: isBotDetected
         ? 'Bot / Automated'
-        : botCloud
+        : isHeadlessDetected
         ? 'Cloud / Headless'
         : 'Verified Human',
-      tooltip: signals.isBot
-        ? signals.botSignals.length > 0
-          ? signals.botSignals.join(' • ')
-          : 'Automation hooks or headless WebDriver detected'
-        : botCloud
-        ? 'Datacenter ASN with masked or unavailable WebGL GPU (no automation hooks detected)'
-        : 'No automation, headless WebDriver, or virtual GPU hooks detected',
-      riskScore: signals.isBot || (signals.datacenterAsn && signals.cloudOrMaskedGpu) ? 8 : 0,
+      tooltip: signals.botSignals.length > 0 ? signals.botSignals.join(' • ') : botDetail,
+      riskScore: botScore,
     }),
-
-    // Tile 3: VPN / Proxy & Network Type
     createSignalRow({
       key: 'vpn',
-      tone: signals.vpnSuspected ? 'warn' : 'ok',
+      tone: toneForScore(vpnScore),
       title: 'VPN / Proxy & Network Type',
-      caption: signals.vpnSuspected
-        ? (signals.vpnReasons[0] ?? 'Timezone or datacenter ASN mismatch detected')
-        : `${signals.brandName ?? 'Unknown ISP'} • ${
-            signals.networkType ?? 'Residential Broadband'
-          }`,
-      statusLabel: signals.vpnSuspected ? 'VPN / Proxy' : 'Standard ISP',
-      tooltip: signals.vpnReasons.length > 0
-        ? signals.vpnReasons.join(' • ')
-        : `Browser TZ (${signals.browserTimezone}) matches IP TZ (${signals.ipTimezone})`,
-      riskScore: signals.vpnSuspected ? 6 : 0,
+      caption: vpnDetail,
+      statusLabel: isDatacenterAsn
+        ? 'VPN / Datacenter Proxy'
+        : hasTzMismatch
+        ? 'VPN / Timezone Relay'
+        : ispBrand
+        ? `Standard ISP (${ispBrand})`
+        : 'Standard ISP',
+      tooltip: signals.vpnReasons.length > 0 ? signals.vpnReasons.join(' • ') : vpnDetail,
+      riskScore: vpnScore,
     }),
-
-    // Tile 4: Virtual Machine & Environment Integrity
     createSignalRow({
       key: 'vm',
-      tone: signals.isVirtualMachine ? 'warn' : 'ok',
-      title: 'Virtual Machine & Environment Integrity',
-      caption: signals.vmReason ?? 'Bare-metal GPU & CPU profile',
-      statusLabel: signals.isVirtualMachine ? 'Virtual Machine' : 'Physical Hardware',
-      tooltip: signals.vmReason ?? 'No hypervisor or virtualization markers detected',
-      riskScore: signals.isVirtualMachine || cloudOrMaskedGpu ? 7 : 0,
+      tone: toneForScore(vmScore),
+      title: 'Virtual Machine & OS Integrity',
+      caption: vmDetail,
+      statusLabel:
+        isVm && isTampered
+          ? 'Virtual Machine / Spoofed OS'
+          : isVm
+          ? 'Virtual Machine / Hypervisor'
+          : isTampered
+          ? 'Spoofed OS / Tampered UA'
+          : 'Physical Hardware',
+      tooltip: vmDetail,
+      riskScore: vmScore,
     }),
   ];
+}
+
+/**
+ * Builds the 4-signal core grid. The server-computed smart signals win whenever present;
+ * otherwise the identical client-side derivation is used as an accurate fallback.
+ */
+function buildSignalRows(
+  signals: SecuritySignals,
+  serverSignals?: SmartSignals | null
+): SignalRowModel[] {
+  if (serverSignals) {
+    return [
+      serverSignals.incognito,
+      serverSignals.bot,
+      serverSignals.vpn,
+      serverSignals.vm,
+    ].map(smartSignalToRow);
+  }
+  return buildClientSignalRows(signals);
 }
 
 export default function App() {
@@ -547,13 +614,22 @@ export default function App() {
     ? `${data.hardwareSignals.gpuVendor} • ${data.hardwareSignals.gpuRenderer}`
     : '';
 
-  // Normalized 0..10 threat score + derived risk tier (legacy scale converted)
-  const normalizedSuspectScore = normalizeLegacyScore(data?.securitySignals?.suspectScore);
-  const riskTier: RiskLevel = resolveRiskTier(normalizedSuspectScore);
+  // Normalized 0..10 threat score + derived risk tier (legacy scale converted). The server's
+  // top-level mirrors win; older payloads fall back to securitySignals.
+  const normalizedSuspectScore = normalizeLegacyScore(
+    data?.suspectScore ?? data?.securitySignals?.suspectScore
+  );
+  const riskTier: RiskLevel = data?.riskLevel ?? resolveRiskTier(normalizedSuspectScore);
+  const riskBadgeText =
+    data?.riskBadgeText ??
+    data?.securitySignals?.riskBadgeText ??
+    `${riskTier} Risk • ${normalizedSuspectScore}/10`;
 
-  // 4-signal core grid model (null-safe: renders only inside the data block)
+  // 4-signal core grid model (null-safe: renders only inside the data block). The server's
+  // computed grid is preferred; the client mirror covers older responses.
   const activeSignals = data?.securitySignals ?? null;
-  const signalRows = activeSignals ? buildSignalRows(activeSignals) : [];
+  const serverSmartSignals = data?.smartSignals ?? data?.securitySignals?.smartSignals ?? null;
+  const signalRows = activeSignals ? buildSignalRows(activeSignals, serverSmartSignals) : [];
 
   return (
     <div
@@ -1093,7 +1169,7 @@ export default function App() {
                     ) : (
                       <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
                     )}
-                    <span>{`${riskTier} Risk • ${normalizedSuspectScore}/10`}</span>
+                    <span>{riskBadgeText}</span>
                   </span>
                 </div>
 
@@ -1127,7 +1203,7 @@ export default function App() {
                     Trust Meter
                   </span>
                   <span className="text-xs font-mono tabular-nums text-slate-500 truncate">
-                    • {riskTier} Risk (Score {normalizedSuspectScore}/10)
+                    • {riskBadgeText}
                   </span>
                 </div>
 

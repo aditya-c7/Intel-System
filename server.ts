@@ -19,6 +19,9 @@ import type {
   VisitHistoryRecord,
   SignedHistoryBackup,
   IntelVisitorResponse,
+  SmartSignal,
+  SmartSignals,
+  SmartSignalLevel,
 } from './src/types/visitor';
 
 dotenv.config();
@@ -2044,11 +2047,43 @@ const SERVER_TIMEZONE_ALIAS_MAP: Record<string, string> = {
   'etc/gmt': 'utc',
 };
 
+/**
+ * Canonical IANA timezone aliases. The client and the IP geolocation provider frequently
+ * disagree only because one of them reports a legacy alias (e.g. Asia/Calcutta) — mapping both
+ * sides through this table removes those false-positive VPN / timezone-relay mismatches.
+ */
+const TIMEZONE_ALIAS_MAP: Record<string, string> = {
+  'Asia/Calcutta': 'Asia/Kolkata',
+  'Asia/Katmandu': 'Asia/Kathmandu',
+  'Asia/Saigon': 'Asia/Ho_Chi_Minh',
+  'Asia/Rangoon': 'Asia/Yangon',
+  'Europe/Kiev': 'Europe/Kyiv',
+  'Europe/Uzhgorod': 'Europe/Kyiv',
+  'Europe/Zaporozhye': 'Europe/Kyiv',
+  'US/Eastern': 'America/New_York',
+  'US/Central': 'America/Chicago',
+  'US/Mountain': 'America/Denver',
+  'US/Pacific': 'America/Los_Angeles',
+};
+
+/**
+ * Trims a timezone identifier and canonicalizes legacy aliases, preserving the caller's
+ * casing for known ids. Falsy / non-string input resolves to an empty string.
+ */
+function normalizeTimezone(tz?: string | null): string {
+  if (!tz || typeof tz !== 'string') return '';
+  const trimmed = tz.trim();
+  if (!trimmed) return '';
+  return TIMEZONE_ALIAS_MAP[trimmed] || trimmed;
+}
+
 function normalizeServerTimezoneId(tz: string | null | undefined): string {
   if (!tz || typeof tz !== 'string') return '';
-  const cleaned = tz.trim().toLowerCase();
-  if (!cleaned || cleaned === 'unknown' || cleaned === 'unavailable') return '';
-  return SERVER_TIMEZONE_ALIAS_MAP[cleaned] || cleaned;
+  // Delegate alias resolution to normalizeTimezone so the two helpers never drift, then fold
+  // to the lowercase comparison form this server-side matcher has always used.
+  const canonical = normalizeTimezone(tz).toLowerCase();
+  if (!canonical || canonical === 'unknown' || canonical === 'unavailable') return '';
+  return SERVER_TIMEZONE_ALIAS_MAP[canonical] || canonical;
 }
 
 function sanitizeHardwareSignals(
@@ -2121,6 +2156,17 @@ function sanitizeHardwareSignals(
   };
 }
 
+/**
+ * Incognito cross-mode context, resolved by the identify handler before any row is written:
+ * a hardware-fingerprint recovery with no surviving cookie / localStorage state is proof of an
+ * ephemeral (private) browsing context even when the client probe stays silent.
+ */
+interface IncognitoCrossModeContext {
+  hadPersistentClientState?: boolean;
+  existingHwidVisitor?: boolean;
+  clientReportedIncognito?: boolean;
+}
+
 function sanitizeAndReinforceSecuritySignals(
   raw: Partial<SecuritySignals> | null | undefined,
   browserDevice: BrowserDeviceInfo,
@@ -2129,7 +2175,8 @@ function sanitizeAndReinforceSecuritySignals(
   ipTimezoneHint: string,
   recognitionSource: IntelVisitorResponse['recognitionSource'],
   classification: IspNetworkClassification,
-  velocity: { visitsLastHour: number; distinctIpsLastHour: number; highVelocity: boolean }
+  velocity: { visitsLastHour: number; distinctIpsLastHour: number },
+  incognitoContext: IncognitoCrossModeContext = {}
 ): SecuritySignals {
   const safeStrArray = (arr: unknown): string[] =>
     Array.isArray(arr)
@@ -2139,7 +2186,16 @@ function sanitizeAndReinforceSecuritySignals(
           .slice(0, 10)
       : [];
 
-  const isBot = Boolean(raw?.isBot);
+  // Bot / automation: client flags only. `isBot` is the union of the explicit bot verdict,
+  // the WebDriver handshake and the CDP (Chrome DevTools Protocol) runtime probe.
+  const webdriver = Boolean(raw?.webdriver);
+  const cdpDetected = Boolean(raw?.cdpDetected);
+  const isBot = Boolean(raw?.isBot || webdriver || cdpDetected);
+  const isHeadless = Boolean(raw?.isHeadless);
+  const botReason =
+    typeof raw?.botReason === 'string' && raw.botReason.trim()
+      ? raw.botReason.trim().slice(0, 200)
+      : '';
   const botSignals = safeStrArray(raw?.botSignals);
 
   const browserTimezone =
@@ -2203,6 +2259,17 @@ function sanitizeAndReinforceSecuritySignals(
   }
   const vpnSuspected = Boolean(raw?.vpnSuspected) || timezoneMismatch || datacenterAsn;
 
+  // Smart-signal timezone comparison: both sides are canonicalized through normalizeTimezone so
+  // a legacy alias (Asia/Calcutta vs Asia/Kolkata, US/Pacific vs America/Los_Angeles) is never
+  // mis-reported as a timezone relay. Casing is folded for the comparison only.
+  const clientTzCanonical = normalizeTimezone(browserTimezone);
+  const ipTzCanonical = normalizeTimezone(ipTimezone === 'Unavailable' ? '' : ipTimezone);
+  const hasTzMismatch = Boolean(
+    clientTzCanonical &&
+      ipTzCanonical &&
+      clientTzCanonical.toLowerCase() !== ipTzCanonical.toLowerCase()
+  );
+
   const tamperDetected = Boolean(raw?.tamperDetected);
   const tamperReasons = safeStrArray(raw?.tamperReasons);
 
@@ -2216,8 +2283,9 @@ function sanitizeAndReinforceSecuritySignals(
 
   // Task 3 — deep technical detection signals read off the raw collector payload with the
   // same forward-compat wrapping the original cloudOrMaskedGpu pass-through used, so
-  // absent / unknown fields normalize to safe defaults instead of undefined.
-  const webrtcLeak = Boolean(raw?.webrtcLeak);
+  // absent / unknown fields normalize to safe defaults instead of undefined. The deprecated
+  // DevTools / ad-blocker / WebRTC / visit-velocity points are no longer scored: their fields
+  // survive as inert values purely for response-shape backward compatibility.
   const webrtcCandidateIp =
     typeof raw?.webrtcCandidateIp === 'string' && raw.webrtcCandidateIp.trim()
       ? raw.webrtcCandidateIp.trim().slice(0, 64)
@@ -2231,14 +2299,25 @@ function sanitizeAndReinforceSecuritySignals(
     typeof raw?.privacyDetail === 'string' && raw.privacyDetail.trim()
       ? raw.privacyDetail.trim().slice(0, 200)
       : '';
-  const adBlockerDetected = Boolean(raw?.adBlockerDetected);
   const canvasFarblingDetected = Boolean(raw?.canvasFarblingDetected);
   const isVirtualMachine = Boolean(raw?.isVirtualMachine);
+  const isOsTampered = Boolean(raw?.isOsTampered);
   const vmReason =
     typeof raw?.vmReason === 'string' && raw.vmReason.trim()
       ? raw.vmReason.trim().slice(0, 200)
       : '';
-  const devToolsOpen = Boolean(raw?.devToolsOpen);
+  const incognitoMethod =
+    typeof raw?.incognitoMethod === 'string' && raw.incognitoMethod.trim()
+      ? raw.incognitoMethod.trim().slice(0, 120)
+      : '';
+  const headroomGiB =
+    typeof raw?.headroomGiB === 'number' && Number.isFinite(raw.headroomGiB)
+      ? Number(raw.headroomGiB)
+      : null;
+  const idbDurabilityRatio =
+    typeof raw?.idbDurabilityRatio === 'number' && Number.isFinite(raw.idbDurabilityRatio)
+      ? Number(raw.idbDurabilityRatio)
+      : null;
   // Forward-compatibility pass-through for the masked GPU flag (kept as pure pass-through so
   // the per-visit history row mapping keeps reading securitySignals.cloudOrMaskedGpu).
   const cloudOrMaskedGpu = Boolean(
@@ -2264,65 +2343,157 @@ function sanitizeAndReinforceSecuritySignals(
     recognitionSource === 'Hardware Fingerprint (Cookie-less / Incognito)' ||
     persistenceMode === 'Hardware ID Recovered';
 
-  // Task 2 — 0..10 suspect score with a fixed weighted breakdown from the four Smart
-  // Signals: bot +3, VPN/proxy/WebRTC +2, VM/cloud-masked-GPU +2, incognito +1 (max 8).
-  // Capped at 10 and clamped at 0; each condition family contributes only its own weight.
-  let suspectScore = 0;
+  // Final incognito verdict: the client's own storage probe, or the server-side cross-mode
+  // proof — a hardware-fingerprint recovery with no surviving cookie / localStorage state.
+  const clientReportedIncognito =
+    Boolean(incognitoContext.clientReportedIncognito) || incognitoLikely;
+  const isIncognito =
+    clientReportedIncognito ||
+    Boolean(!incognitoContext.hadPersistentClientState && incognitoContext.existingHwidVisitor);
+
+  const tierFor = (score: number): RiskLevel =>
+    score >= 7 ? 'High' : score >= 3 ? 'Medium' : 'Low';
+  const levelFor = (score: number): SmartSignalLevel =>
+    score >= 7 ? 'high' : score >= 3 ? 'medium' : 'low';
+
+  /* ---- 4-signal Smart Signals grid, every tile rated strictly out of 10 ---- */
+
+  // Tile 1 — Incognito / Private Browsing (4)
+  const incognitoScore = isIncognito ? 4 : 0;
+  const incognitoSignal: SmartSignal = {
+    id: 'incognito',
+    title: 'Incognito / Private Browsing',
+    status: isIncognito ? 'Incognito / Private Mode' : 'Standard Window',
+    scoreOutOf10: incognitoScore,
+    riskLabel: `${tierFor(incognitoScore)} Risk • ${incognitoScore}/10`,
+    level: levelFor(incognitoScore),
+    detail: isIncognito
+      ? clientReportedIncognito
+        ? `Ephemeral memory-backed storage profile (${
+            incognitoMethod || '9.0 GiB quota headroom deficit'
+          })`
+        : 'Returning Hardware ID (hwid) detected with wiped cookies & localStorage'
+      : 'Persistent disk-backed browser storage & 10.0 GiB standard quota verified',
+  };
+
+  // Tile 2 — Bot & Automation Detection (9 / 7 / 0)
+  const botScore = isBot ? 9 : isHeadless ? 7 : 0;
+  const botSignal: SmartSignal = {
+    id: 'bot',
+    title: 'Bot & Automation Detection',
+    status: isBot ? 'Bot / Automated' : isHeadless ? 'Cloud / Headless' : 'Verified Human',
+    scoreOutOf10: botScore,
+    riskLabel: `${tierFor(botScore)} Risk • ${botScore}/10`,
+    level: levelFor(botScore),
+    detail:
+      botReason ||
+      (isBot
+        ? 'WebDriver / CDP automation runtime detected'
+        : isHeadless
+        ? 'Headless rendering context without an attached physical display'
+        : 'No automation, WebDriver, CDP hooks, or headless runtime detected'),
+  };
+
+  // Tile 3 — VPN / Proxy & Network Type (8 / 6 / 5 / 0)
+  const isDatacenterAsn = datacenterAsn;
+  const ispBrand = classification.brandName || location.isp || 'Unknown ISP';
+  const asnSuffix = location.asn !== 'Unknown' ? ` • ${location.asn}` : '';
+  const vpnScore =
+    isDatacenterAsn && hasTzMismatch ? 8 : isDatacenterAsn ? 6 : hasTzMismatch ? 5 : 0;
+  const vpnSignal: SmartSignal = {
+    id: 'vpn',
+    title: 'VPN / Proxy & Network Type',
+    status: isDatacenterAsn
+      ? 'VPN / Datacenter Proxy'
+      : hasTzMismatch
+      ? 'VPN / Timezone Relay'
+      : ispBrand !== 'Unknown ISP'
+      ? `Standard ISP (${ispBrand})`
+      : 'Standard ISP',
+    scoreOutOf10: vpnScore,
+    riskLabel: `${tierFor(vpnScore)} Risk • ${vpnScore}/10`,
+    level: levelFor(vpnScore),
+    detail:
+      isDatacenterAsn && hasTzMismatch
+        ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})`
+        : isDatacenterAsn
+        ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}`
+        : hasTzMismatch
+        ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})`
+        : `${ispBrand} • ${classification.networkType} verified against browser timezone ${browserTimezone}`,
+  };
+
+  // Tile 4 — Virtual Machine & OS Integrity (8 / 7 / 6 / 0)
+  const isVm = isVirtualMachine;
+  const isTampered = isOsTampered;
+  const vmScore = isVm && isTampered ? 8 : isVm ? 7 : isTampered ? 6 : 0;
+  const vmSignal: SmartSignal = {
+    id: 'vm',
+    title: 'Virtual Machine & OS Integrity',
+    status:
+      isVm && isTampered
+        ? 'Virtual Machine / Spoofed OS'
+        : isVm
+        ? 'Virtual Machine / Hypervisor'
+        : isTampered
+        ? 'Spoofed OS / Tampered UA'
+        : 'Physical Hardware',
+    scoreOutOf10: vmScore,
+    riskLabel: `${tierFor(vmScore)} Risk • ${vmScore}/10`,
+    level: levelFor(vmScore),
+    detail:
+      vmReason ||
+      (isTampered
+        ? tamperReasons[0] || 'Operating-system / User-Agent tampering detected'
+        : 'Unmasked physical GPU & consistent OS platform verified'),
+  };
+
+  const smartSignals: SmartSignals = {
+    incognito: incognitoSignal,
+    bot: botSignal,
+    vpn: vpnSignal,
+    vm: vmSignal,
+  };
+
+  // Composite — bot/headless 5|4, network 3|2, VM/tampered-OS 3, incognito 2 (strictly ≤ 10).
+  const rawCompositePoints =
+    (isBot ? 5 : isHeadless ? 4 : 0) +
+    (isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0) +
+    (vmScore > 0 ? 3 : 0) +
+    (isIncognito ? 2 : 0);
+  const suspectScore = Math.min(10, rawCompositePoints);
+  const riskLevel: SecuritySignals['riskLevel'] = tierFor(suspectScore);
+  const riskBadgeText = `${riskLevel} Risk • ${suspectScore}/10`;
+
+  // Risk factors mirror the composite weights that actually fired. The deprecated DevTools /
+  // ad-blocker / WebRTC / visit-velocity points are intentionally absent.
   const riskFactors: string[] = [];
-
-  // Automated browsers / bots: +3
   if (isBot) {
-    suspectScore += 3;
     riskFactors.push(
-      `Automated browser / bot runtime detected (+3): ${
-        botSignals[0] || 'headless or scripted browser signatures'
+      `Automated browser / bot runtime detected (+5): ${
+        botReason || botSignals[0] || 'WebDriver / CDP automation signatures'
       }`
     );
-  }
-
-  // VPN / proxy / anonymizing network or WebRTC leak: +2 (timezone mismatch and a
-  // datacenter-classified network both fold into vpnSuspected above).
-  if (vpnSuspected || webrtcLeak) {
-    suspectScore += 2;
-    let vpnDetail = vpnReasons[0] || '';
-    if (!vpnDetail && webrtcLeak) {
-      vpnDetail = webrtcCandidateIp
-        ? `WebRTC leak exposed candidate IP ${webrtcCandidateIp}`
-        : webrtcDetail || 'WebRTC ICE candidates bypassed the expected network path';
-    }
-    if (!vpnDetail) {
-      vpnDetail = `anomalous network path (${location.isp})`;
-    }
-    riskFactors.push(`VPN / proxy network or WebRTC leak detected (+2): ${vpnDetail}`);
-  }
-
-  // Virtual machine or cloud / masked GPU environment: +2
-  if (isVirtualMachine || cloudOrMaskedGpu) {
-    suspectScore += 2;
+  } else if (isHeadless) {
     riskFactors.push(
-      `Virtual machine or masked GPU environment (+2): ${
-        isVirtualMachine
-          ? vmReason || 'VM indicators present in the hardware signals'
-          : 'cloud environment with a masked or generic GPU signature'
-      }`
+      `Headless browser environment (+4): ${botReason || 'no physical display attached'}`
     );
   }
-
-  // Incognito / private browsing or cleared storage: +1
-  if (incognitoLikely || incognitoOrCleared) {
-    suspectScore += 1;
-    const incognitoDetail =
-      storageQuotaMb !== null
-        ? `${storageQuotaMb} MB storage quota indicates a private browsing context`
-        : incognitoOrCleared && !incognitoLikely
-        ? 'visitor recovered from a cookie-less / incognito session through the hardware fingerprint'
-        : 'private or restricted browser storage environment';
-    riskFactors.push(`Incognito / private browsing indicators (+1): ${incognitoDetail}`);
+  if (isDatacenterAsn) {
+    riskFactors.push(
+      `Datacenter / hosting network detected (+3): ${vpnReasons[0] || ispBrand}`
+    );
+  } else if (hasTzMismatch) {
+    riskFactors.push(
+      `Browser timezone differs from IP geolocation (+2): ${clientTzCanonical} vs ${ipTzCanonical}`
+    );
   }
-
-  suspectScore = Math.max(0, Math.min(10, suspectScore));
-  const riskLevel: SecuritySignals['riskLevel'] =
-    suspectScore >= 7 ? 'High' : suspectScore >= 3 ? 'Medium' : 'Low';
+  if (vmScore > 0) {
+    riskFactors.push(`Virtual machine / tampered OS (+3): ${vmSignal.detail}`);
+  }
+  if (isIncognito) {
+    riskFactors.push(`Incognito / ephemeral storage (+2): ${incognitoSignal.detail}`);
+  }
 
   const securitySignalsCore: SecuritySignals = {
     isBot,
@@ -2356,16 +2527,18 @@ function sanitizeAndReinforceSecuritySignals(
       isConsumerBroadband: classification.isConsumerBroadband,
       isDatacenterOrHosting: classification.isDatacenterOrHosting,
       // Task 3 — deep technical detection signals
-      webrtcLeak,
+      webrtcLeak: false,
       webrtcCandidateIp,
       webrtcDetail,
       privacyProtected,
       privacyDetail,
-      adBlockerDetected,
+      // Deprecated scoring inputs kept inert for response-shape backward compatibility.
+      adBlockerDetected: false,
+      devToolsOpen: false,
       canvasFarblingDetected,
       isVirtualMachine,
       vmReason,
-      devToolsOpen,
+      isOsTampered,
       incognitoOrCleared,
       // Client-side composite private-browsing probe (confidence 0..1 + evidence)
       incognitoConfidence: Math.max(
@@ -2379,7 +2552,18 @@ function sanitizeAndReinforceSecuritySignals(
       ),
       incognitoDetail:
         typeof raw?.incognitoDetail === 'string' ? raw.incognitoDetail.trim().slice(0, 240) : '',
-      // Task 3 — visit velocity / IP rotation
+      // Final 4-signal upgrade — private browsing, bot, network, VM integrity
+      isIncognito,
+      incognitoMethod,
+      headroomGiB,
+      idbDurabilityRatio,
+      isHeadless,
+      botReason,
+      webdriver,
+      cdpDetected,
+      smartSignals,
+      riskBadgeText,
+      // Task 3 — visit velocity / IP rotation (display only, never scored)
       distinctIpsLastHour: velocity.distinctIpsLastHour,
       visitsLastHour: velocity.visitsLastHour,
     } as Partial<SecuritySignals> & { cloudOrMaskedGpu?: boolean }),
@@ -2388,17 +2572,7 @@ function sanitizeAndReinforceSecuritySignals(
 
 app.post('/api/visitor/identify', async (req, res) => {
   try {
-    const {
-      pageLoadId,
-      storedVisitorId,
-      storedVisitorToken,
-      clientSessionId,
-      clientHistoryBackup,
-      browserDevice: rawBrowserDevice,
-      hardwareSignals: rawHardwareSignals,
-      securitySignals: rawSecuritySignals,
-      clientGeoHint,
-    } = (req.body || {}) as {
+    const requestBody = (req.body || {}) as {
       pageLoadId?: string;
       storedVisitorId?: string | null;
       storedVisitorToken?: string | null;
@@ -2421,7 +2595,24 @@ app.post('/api/visitor/identify', async (req, res) => {
         timezone?: string;
         isVpnOrHosting?: boolean;
       } | null;
+      /** Alternate / legacy incognito spellings a client may post at the top level. */
+      incognito?: boolean;
+      isIncognito?: boolean;
+      browserInfo?: { incognito?: boolean } | null;
+      telemetry?: { incognito?: boolean } | null;
     };
+
+    const {
+      pageLoadId,
+      storedVisitorId,
+      storedVisitorToken,
+      clientSessionId,
+      clientHistoryBackup,
+      browserDevice: rawBrowserDevice,
+      hardwareSignals: rawHardwareSignals,
+      securitySignals: rawSecuritySignals,
+      clientGeoHint,
+    } = requestBody;
 
     const safePageLoadId =
       typeof pageLoadId === 'string' && pageLoadId.trim().length > 0
@@ -2534,6 +2725,9 @@ app.post('/api/visitor/identify', async (req, res) => {
 
     let existingVisitor: VisitorRow | undefined;
     let recognitionSource: IntelVisitorResponse['recognitionSource'] = 'New First-Party ID';
+    // True only when this request recovered an ALREADY EXISTING row purely by hardware
+    // fingerprint — i.e. no cookie / localStorage identity survived.
+    let existingHwidVisitor = false;
 
     const cookieVerified = Boolean(cookieVid && verifyVisitorToken(cookieVid, cookieToken));
     const storageVerified = Boolean(
@@ -2632,6 +2826,7 @@ app.post('/api/visitor/identify', async (req, res) => {
 
       if (hwMatchedVisitor) {
         existingVisitor = hwMatchedVisitor;
+        existingHwidVisitor = true;
         recognitionSource = 'Hardware Fingerprint (Cookie-less / Incognito)';
       }
     }
@@ -2861,7 +3056,30 @@ app.post('/api/visitor/identify', async (req, res) => {
     }
     const visitsLastHour = Math.max(1, lastHourVisitRows.length);
     const distinctIpsLastHour = lastHourIpSet.size;
-    const velocityFlag = visitsLastHour >= 8 || distinctIpsLastHour > 1;
+
+    // Incognito cross-mode inputs. Persistent client state means a verified first-party cookie,
+    // a verified body visitor id, or a valid signed history backup. When none of those survived
+    // AND this request recovered an existing hardware-ID row, the browsing context is ephemeral.
+    const bodyVisitorId = storageVerified ? storedVisitorId ?? null : null;
+    const historyBackupValid = Boolean(validBackupForStats);
+    const hadPersistentClientState = Boolean(cookieVid || bodyVisitorId || historyBackupValid);
+
+    const rawSecuritySignalsCompat = rawSecuritySignals as
+      | (Partial<SecuritySignals> & { incognito?: boolean })
+      | null
+      | undefined;
+    // Accept every incognito spelling this app (and its legacy payloads) can post:
+    // top-level, browserInfo.*, telemetry.*, securitySignals.incognito / .isIncognito, and the
+    // collector's own private-browsing probe verdict.
+    const clientReportedIncognito = Boolean(
+      requestBody.incognito ??
+        requestBody.isIncognito ??
+        requestBody.browserInfo?.incognito ??
+        requestBody.telemetry?.incognito ??
+        rawSecuritySignalsCompat?.incognito ??
+        rawSecuritySignals?.isIncognito ??
+        rawSecuritySignals?.incognitoLikely
+    );
 
     const securitySignals = sanitizeAndReinforceSecuritySignals(
       rawSecuritySignals,
@@ -2871,7 +3089,8 @@ app.post('/api/visitor/identify', async (req, res) => {
       ipTimezoneHint,
       recognitionSource,
       classification,
-      { visitsLastHour, distinctIpsLastHour, highVelocity: velocityFlag }
+      { visitsLastHour, distinctIpsLastHour },
+      { hadPersistentClientState, existingHwidVisitor, clientReportedIncognito }
     );
 
     // Every history row always carries suspectScore / riskLevel / recognitionSource so the UI
@@ -2950,6 +3169,12 @@ app.post('/api/visitor/identify', async (req, res) => {
       statistics,
       visitHistory,
       historyBackup,
+      // Top-level mirrors so clients can read the 4-signal verdict without digging.
+      isIncognito: securitySignals.isIncognito,
+      suspectScore: securitySignals.suspectScore,
+      riskLevel: securitySignals.riskLevel,
+      riskBadgeText: securitySignals.riskBadgeText,
+      smartSignals: securitySignals.smartSignals,
     };
 
     res.json(payload);
