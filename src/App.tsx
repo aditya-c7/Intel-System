@@ -1,6 +1,11 @@
-import { useEffect, useState, useCallback } from 'react';
-import { identifyCurrentVisitor } from './lib/collector';
-import type { IntelVisitorResponse, RiskLevel } from './types/visitor';
+import { useEffect, useState, useCallback, type ReactNode } from 'react';
+import { identifyCurrentVisitor, computeDevToolsOpen } from './lib/collector';
+import type {
+  IntelVisitorResponse,
+  NetworkType,
+  RiskLevel,
+  SecuritySignals,
+} from './types/visitor';
 import { LocationMap } from './components/LocationMap';
 import { NetworkStabilityPanel } from './components/NetworkStabilityPanel';
 import { CpuActivityPanel } from './components/CpuActivityPanel';
@@ -27,8 +32,10 @@ import {
   CalendarClock,
   Bot,
   GlobeLock,
-  MonitorCheck,
+  Terminal,
   Database,
+  Radar,
+  Shield,
   CircuitBoard,
   HardDrive,
   Palette,
@@ -240,9 +247,275 @@ function formatStorageQuotaCaption(quotaMb: number | null | undefined): string {
   }
   if (quotaMb >= 1024) {
     const gb = (quotaMb / 1024).toFixed(1);
-    return `~${gb} GB browser quota active`;
+    return `Persistent quota (~${gb} GB)`;
   }
-  return `~${Math.round(quotaMb)} MB browser quota active`;
+  return `Persistent quota (~${Math.round(quotaMb)} MB)`;
+}
+
+/**
+ * Maps legacy 0..100 suspect scores to the current 0..10 scale.
+ */
+function normalizeLegacyScore(score: number | null | undefined): number {
+  const s = typeof score === 'number' && Number.isFinite(score) ? score : 0;
+  return s > 10 ? Math.round(s / 10) : s;
+}
+
+/**
+ * Derives the risk tier from a normalized 0..10 score.
+ */
+function resolveRiskTier(score: number): RiskLevel {
+  if (score >= 7) return 'High';
+  if (score >= 3) return 'Medium';
+  return 'Low';
+}
+
+/**
+ * Subtle Swiss-technical badge classes per retail network type.
+ */
+const NETWORK_TYPE_BADGE_CLASS: Record<NetworkType, string> = {
+  'Residential Broadband': 'bg-emerald-50 text-emerald-700 border border-emerald-100',
+  'Cellular / 5G': 'bg-blue-50 text-blue-700 border border-blue-100',
+  Satellite: 'bg-violet-50 text-violet-700 border border-violet-100',
+  'Cloud / Datacenter': 'bg-slate-100 text-slate-600 border border-slate-200',
+};
+
+type SignalTone = 'ok' | 'warn' | 'bad';
+
+const TONE_CHIP_CLASS: Record<SignalTone, string> = {
+  ok: 'bg-emerald-50/60 border-emerald-200 text-emerald-600',
+  warn: 'bg-amber-50/60 border-amber-200 text-amber-600',
+  bad: 'bg-rose-50/60 border-rose-200 text-rose-600',
+};
+
+const TONE_DOT_CLASS: Record<SignalTone, string> = {
+  ok: 'bg-emerald-500',
+  warn: 'bg-amber-500',
+  bad: 'bg-rose-500',
+};
+
+const TONE_TEXT_CLASS: Record<SignalTone, string> = {
+  ok: 'text-emerald-700',
+  warn: 'text-amber-700',
+  bad: 'text-rose-700',
+};
+
+interface SignalRowModel {
+  key: string;
+  icon: ReactNode;
+  chipClass: string;
+  dotClass: string;
+  statusTextClass: string;
+  title: string;
+  caption: string;
+  statusLabel: string;
+  tooltip: string;
+}
+
+function createSignalRow(
+  params: Omit<SignalRowModel, 'chipClass' | 'dotClass' | 'statusTextClass'> & {
+    tone: SignalTone;
+  }
+): SignalRowModel {
+  const { tone, ...rest } = params;
+  return {
+    ...rest,
+    chipClass: TONE_CHIP_CLASS[tone],
+    dotClass: TONE_DOT_CLASS[tone],
+    statusTextClass: TONE_TEXT_CLASS[tone],
+  };
+}
+
+/**
+ * Single hairline row for the Smart Signals Swiss grid
+ * (left: icon chip + title + caption, right: colored dot + status label).
+ */
+function SignalRow(row: SignalRowModel) {
+  return (
+    <div
+      className="grid grid-cols-[1fr_auto] items-center gap-3 min-h-[52px] px-3 py-2.5"
+      title={row.tooltip}
+    >
+      <div className="flex items-start gap-2.5 min-w-0">
+        <div
+          className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border ${row.chipClass}`}
+        >
+          {row.icon}
+        </div>
+        <div className="min-w-0">
+          <span className="block text-xs font-semibold text-[#111827] truncate">
+            {row.title}
+          </span>
+          <span className="block text-[11px] text-slate-500 truncate mt-0.5">
+            {row.caption}
+          </span>
+        </div>
+      </div>
+      <span
+        className={`flex items-center gap-1.5 text-[11px] font-mono font-semibold whitespace-nowrap shrink-0 ${row.statusTextClass}`}
+      >
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${row.dotClass}`} />
+        {row.statusLabel}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Builds the 8-row Smart Signals grid: Bot & Automation, VPN/Proxy & Network
+ * Type, Virtual Machine, DevTools, Incognito & Storage, Privacy Shield,
+ * WebRTC STUN leak, and Visit Velocity & OS Integrity.
+ */
+function buildSignalRows(
+  signals: SecuritySignals,
+  devToolsOpen: boolean,
+  httpIp: string,
+  browserOs: string,
+  browserPlatform: string
+): SignalRowModel[] {
+  const botCloud = Boolean(signals.datacenterAsn && signals.cloudOrMaskedGpu);
+  const incognitoEphemeral =
+    signals.incognitoLikely ||
+    Boolean(signals.incognitoOrCleared) ||
+    signals.persistenceMode === 'Hardware ID Recovered';
+  const highVelocity =
+    (signals.visitsLastHour ?? 0) >= 8 || (signals.distinctIpsLastHour ?? 0) > 1;
+  const httpIpKnown = Boolean(httpIp) && httpIp !== 'Unavailable';
+
+  return [
+    // Row 1: Bot & Automation Detection
+    createSignalRow({
+      key: 'bot',
+      icon: <Bot className="w-4 h-4" />,
+      tone: signals.isBot ? 'bad' : botCloud ? 'warn' : 'ok',
+      title: 'Bot & Automation Detection',
+      caption: signals.isBot
+        ? (signals.botSignals[0] ?? 'Automation runtime hooks detected')
+        : botCloud
+        ? 'Cloud / Masked GPU environment'
+        : 'Interactive human session verified',
+      statusLabel: signals.isBot
+        ? 'Bot / Automated'
+        : botCloud
+        ? 'Cloud / Headless'
+        : 'Verified Human',
+      tooltip: signals.isBot
+        ? signals.botSignals.length > 0
+          ? signals.botSignals.join(' • ')
+          : 'Automation hooks or headless WebDriver detected'
+        : botCloud
+        ? 'Datacenter ASN with masked or unavailable WebGL GPU (no automation hooks detected)'
+        : 'No automation, headless WebDriver, or virtual GPU hooks detected',
+    }),
+
+    // Row 2: VPN, Proxy & Network Type
+    createSignalRow({
+      key: 'vpn',
+      icon: <GlobeLock className="w-4 h-4" />,
+      tone: signals.vpnSuspected ? 'warn' : 'ok',
+      title: 'VPN, Proxy & Network Type',
+      caption: signals.vpnSuspected
+        ? `TZ mismatch (${signals.browserTimezone} vs ${signals.ipTimezone}) or Cloud Datacenter ASN`
+        : `Standard ISP (${
+            signals.networkType ?? 'Residential Broadband'
+          } • ${signals.brandName ?? 'Unknown ISP'})`,
+      statusLabel: signals.vpnSuspected ? 'VPN / Proxy' : 'Standard ISP',
+      tooltip: signals.vpnReasons.length > 0
+        ? signals.vpnReasons.join(' • ')
+        : `Browser TZ (${signals.browserTimezone}) matches IP TZ (${signals.ipTimezone})`,
+    }),
+
+    // Row 3: Virtual Machine & Hypervisor
+    createSignalRow({
+      key: 'vm',
+      icon: <Cpu className="w-4 h-4" />,
+      tone: signals.isVirtualMachine ? 'warn' : 'ok',
+      title: 'Virtual Machine & Hypervisor',
+      caption: signals.vmReason ?? 'Bare-metal GPU & CPU profile',
+      statusLabel: signals.isVirtualMachine ? 'Virtual / Hypervisor' : 'Physical Hardware',
+      tooltip: signals.vmReason ?? 'No hypervisor or virtualization markers detected',
+    }),
+
+    // Row 4: Developer Tools Detection (live viewport state)
+    createSignalRow({
+      key: 'devtools',
+      icon: <Terminal className="w-4 h-4" />,
+      tone: devToolsOpen ? 'warn' : 'ok',
+      title: 'Developer Tools Detection',
+      caption: devToolsOpen ? 'Docked inspector viewport detected' : 'Normal viewport geometry',
+      statusLabel: devToolsOpen ? 'DevTools Active' : 'Closed',
+      tooltip: devToolsOpen
+        ? 'Docked DevTools panel detected via viewport geometry'
+        : 'Viewport proportions match a normal browsing window',
+    }),
+
+    // Row 5: Incognito & Ephemeral Storage
+    createSignalRow({
+      key: 'storage',
+      icon: <Database className="w-4 h-4" />,
+      tone: incognitoEphemeral ? 'warn' : 'ok',
+      title: 'Incognito & Ephemeral Storage',
+      caption: incognitoEphemeral
+        ? 'Private window or cleared storage'
+        : formatStorageQuotaCaption(signals.storageQuotaMb),
+      statusLabel: incognitoEphemeral ? 'Incognito / Ephemeral' : 'Standard Window',
+      tooltip: `Persistence Mode: ${signals.persistenceMode}`,
+    }),
+
+    // Row 6: Privacy Shield & Ad-Blocker
+    createSignalRow({
+      key: 'privacy',
+      icon: <Shield className="w-4 h-4" />,
+      tone: signals.privacyProtected ? 'warn' : 'ok',
+      title: 'Privacy Shield & Ad-Blocker',
+      caption: signals.privacyDetail ?? 'Unmodified canvas & DOM APIs',
+      statusLabel: signals.privacyProtected ? 'Privacy Shield Active' : 'Standard Telemetry',
+      tooltip:
+        signals.privacyDetail ??
+        'Canvas, WebGL & DOM telemetry APIs unmodified (no farbling or blocking detected)',
+    }),
+
+    // Row 7: WebRTC STUN IP Leak
+    createSignalRow({
+      key: 'webrtc',
+      icon: <Wifi className="w-4 h-4" />,
+      tone: signals.webrtcLeak ? 'bad' : 'ok',
+      title: 'WebRTC STUN IP Leak',
+      caption: signals.webrtcLeak
+        ? httpIpKnown
+          ? `STUN IP ${signals.webrtcCandidateIp ?? 'Unknown'} != HTTP IP ${httpIp}`
+          : (signals.webrtcDetail || 'WebRTC STUN candidate IP differs from HTTP IP')
+        : (signals.webrtcDetail || 'STUN matches HTTP IP or mDNS Masked'),
+      statusLabel: signals.webrtcLeak ? 'WebRTC IP Leak' : 'No IP Leak',
+      tooltip:
+        signals.webrtcDetail ??
+        (signals.webrtcLeak
+          ? 'STUN candidate IP differs from the HTTP-facing public IP'
+          : 'STUN matches HTTP IP or mDNS Masked'),
+    }),
+
+    // Row 8: Visit Velocity & OS Integrity (tamper + velocity merged)
+    createSignalRow({
+      key: 'velocity',
+      icon: <Radar className="w-4 h-4" />,
+      tone: signals.tamperDetected ? 'bad' : highVelocity ? 'warn' : 'ok',
+      title: 'Visit Velocity & OS Integrity',
+      caption: signals.tamperDetected
+        ? (signals.tamperReasons[0] ?? 'User-Agent contradicts platform')
+        : highVelocity
+        ? `${signals.distinctIpsLastHour ?? 0} IPs across ${signals.visitsLastHour ?? 0} visits (1h)`
+        : 'Normal rate, consistent device identity',
+      statusLabel: signals.tamperDetected
+        ? 'Spoofed UA'
+        : highVelocity
+        ? 'High Velocity / IP Rotation'
+        : 'Authentic',
+      tooltip: signals.tamperDetected
+        ? signals.tamperReasons.length > 0
+          ? signals.tamperReasons.join(' • ')
+          : 'User-Agent contradicts host platform'
+        : `User-Agent (${browserOs}) matches platform (${browserPlatform}) • Normal visit velocity`,
+    }),
+  ];
 }
 
 export default function App() {
@@ -254,6 +527,7 @@ export default function App() {
   const [copiedHwId, setCopiedHwId] = useState<boolean>(false);
   const [selectedVisitIndex, setSelectedVisitIndex] = useState<number>(0);
   const [theme, setTheme] = useState<ThemeMode>(resolveInitialTheme);
+  const [devToolsOpen, setDevToolsOpen] = useState<boolean>(false);
 
   useEffect(() => {
     const isDark = theme === 'dark';
@@ -265,6 +539,25 @@ export default function App() {
       // localStorage unavailable
     }
   }, [theme]);
+
+  // Live DevTools detection: seed the initial state, then re-check on a
+  // debounced resize so opening a docked inspector flips the row immediately.
+  useEffect(() => {
+    setDevToolsOpen(computeDevToolsOpen());
+    let timer: number | undefined;
+    const onResize = () => {
+      if (timer !== undefined) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        setDevToolsOpen(computeDevToolsOpen());
+        timer = undefined;
+      }, 150);
+    };
+    window.addEventListener('resize', onResize);
+    return () => {
+      window.removeEventListener('resize', onResize);
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, []);
 
   const toggleTheme = useCallback(() => {
     setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
@@ -345,6 +638,11 @@ export default function App() {
   );
   const ispDisplay = formatCleanIspDisplay(activeIsp, activeOrg, activeAsn);
 
+  // Retail ISP brand (server-classified) + network type badge for the ISP/ASN tile
+  const ispBrandLabel = data?.securitySignals?.brandName || ispDisplay.shortLabel;
+  const networkType = data?.securitySignals?.networkType;
+  const networkTypeBadgeClass = networkType ? NETWORK_TYPE_BADGE_CLASS[networkType] : '';
+
   const activeLatitude =
     activeVisit && typeof activeVisit.latitude === 'number'
       ? activeVisit.latitude
@@ -360,14 +658,23 @@ export default function App() {
   const rawGpuTooltip = data?.hardwareSignals
     ? `${data.hardwareSignals.gpuVendor} • ${data.hardwareSignals.gpuRenderer}`
     : '';
-  const isCloudMaskedGpu = Boolean(
-    data?.securitySignals?.datacenterAsn &&
-      (data?.hardwareSignals?.gpuVendor === 'Unavailable' ||
-        /^Standard (GPU|WebGL|Hardware)/i.test(data?.hardwareSignals?.gpuVendor || '') ||
-        cleanGpuName === 'Standard GPU' ||
-        data?.securitySignals?.vpnReasons?.some((r) => /Cloud \/ Masked GPU/i.test(r)))
-  );
-  const botCloudMasked = Boolean(data?.securitySignals?.cloudOrMaskedGpu) || isCloudMaskedGpu;
+
+  // Normalized 0..10 threat score + derived risk tier (legacy scale converted)
+  const normalizedSuspectScore = normalizeLegacyScore(data?.securitySignals?.suspectScore);
+  const riskTier: RiskLevel = resolveRiskTier(normalizedSuspectScore);
+
+  // 8-row Smart Signals grid model (null-safe: renders only inside the data block)
+  const activeSignals = data?.securitySignals ?? null;
+  const signalRows =
+    activeSignals && data
+      ? buildSignalRows(
+          activeSignals,
+          devToolsOpen,
+          data.location.publicIp,
+          data.browserDevice.os,
+          data.browserDevice.platform
+        )
+      : [];
 
   return (
     <div
@@ -677,11 +984,25 @@ export default function App() {
                           </div>
                           <div className="min-w-0 flex-1">
                             <span className="block text-[11px] text-slate-500">ISP / ASN</span>
-                            <span
-                              className="block text-xs sm:text-sm font-semibold text-[#111827] truncate"
-                              title={ispDisplay.fullTooltip}
-                            >
-                              {ispDisplay.shortLabel}
+                            <span className="flex flex-wrap gap-1.5 items-center min-w-0">
+                              <span
+                                className="text-xs sm:text-sm font-semibold text-[#111827] truncate"
+                                title={
+                                  networkType
+                                    ? `${ispDisplay.fullTooltip} • ${networkType}`
+                                    : ispDisplay.fullTooltip
+                                }
+                              >
+                                {ispBrandLabel}
+                              </span>
+                              {networkType && (
+                                <span
+                                  className={`text-[10px] font-mono uppercase tracking-wide rounded px-1.5 py-0.5 ${networkTypeBadgeClass}`}
+                                  title={`Network type: ${networkType}`}
+                                >
+                                  {networkType}
+                                </span>
+                              )}
                             </span>
                           </div>
                         </div>
@@ -881,219 +1202,28 @@ export default function App() {
 
                   <span
                     className={`inline-flex items-center gap-1.5 text-xs font-mono font-semibold ${
-                      data.securitySignals.riskLevel === 'High'
+                      riskTier === 'High'
                         ? 'text-rose-700'
-                        : data.securitySignals.riskLevel === 'Medium'
+                        : riskTier === 'Medium'
                         ? 'text-amber-700'
                         : 'text-emerald-700'
                     }`}
                   >
-                    {data.securitySignals.riskLevel === 'High' ? (
+                    {riskTier === 'High' ? (
                       <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
                     ) : (
                       <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
                     )}
-                    <span>
-                      {data.securitySignals.riskLevel} Risk • {data.securitySignals.suspectScore}
-                      /100
-                    </span>
+                    <span>{`${riskTier} Risk • ${normalizedSuspectScore}/10`}</span>
                   </span>
                 </div>
 
-                {/* 2x2 Visual Signal Tile Grid */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5 mt-4">
-                  {/* Signal 1: Bot Check */}
-                  <div
-                    className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0"
-                    title={
-                      data.securitySignals.botSignals.length > 0
-                        ? data.securitySignals.botSignals.join(' • ')
-                        : botCloudMasked
-                        ? 'Datacenter ASN with masked or unavailable WebGL GPU (no automation hooks detected)'
-                        : 'No automation, headless WebDriver, or virtual GPU hooks detected'
-                    }
-                  >
-                    <div
-                      className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 border ${
-                        data.securitySignals.isBot
-                          ? 'bg-rose-50 border-rose-200 text-rose-600'
-                          : botCloudMasked
-                          ? 'bg-amber-50/60 border-amber-200 text-amber-600'
-                          : 'bg-emerald-50/60 border-emerald-200 text-emerald-600'
-                      }`}
-                    >
-                      <Bot className="w-4 h-4" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-semibold text-[#111827] truncate">
-                          Bot Check
-                        </span>
-                        <span
-                          className={`inline-flex items-center gap-1.5 text-[11px] font-mono font-semibold shrink-0 ${
-                            data.securitySignals.isBot
-                              ? 'text-rose-700'
-                              : botCloudMasked
-                              ? 'text-amber-700'
-                              : 'text-emerald-700'
-                          }`}
-                        >
-                          <span
-                            className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                              data.securitySignals.isBot
-                                ? 'bg-rose-500'
-                                : botCloudMasked
-                                ? 'bg-amber-500'
-                                : 'bg-emerald-500'
-                            }`}
-                          />
-                          {data.securitySignals.isBot
-                            ? 'Bot / Automated'
-                            : botCloudMasked
-                            ? 'Cloud / Headless'
-                            : 'Verified Human'}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-500 truncate mt-1">
-                        {data.securitySignals.isBot
-                          ? 'Automation runtime hooks detected'
-                          : botCloudMasked
-                          ? 'Cloud / Masked GPU environment'
-                          : 'No automation or headless hooks'}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Signal 2: VPN / Proxy */}
-                  <div
-                    className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0"
-                    title={
-                      data.securitySignals.vpnReasons.length > 0
-                        ? data.securitySignals.vpnReasons.join(' • ')
-                        : `Browser TZ (${data.securitySignals.browserTimezone}) matches IP TZ (${data.securitySignals.ipTimezone})`
-                    }
-                  >
-                    <div
-                      className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 border ${
-                        data.securitySignals.vpnSuspected
-                          ? 'bg-amber-50/60 border-amber-200 text-amber-700'
-                          : 'bg-emerald-50/60 border-emerald-200 text-emerald-600'
-                      }`}
-                    >
-                      <GlobeLock className="w-4 h-4" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-semibold text-[#111827] truncate">
-                          VPN / Proxy
-                        </span>
-                        <span
-                          className={`text-[11px] font-mono font-semibold shrink-0 ${
-                            data.securitySignals.vpnSuspected
-                              ? 'text-amber-700'
-                              : 'text-emerald-700'
-                          }`}
-                        >
-                          {data.securitySignals.vpnSuspected ? 'VPN / Proxy' : 'Standard ISP'}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-500 truncate mt-1">
-                        {data.securitySignals.timezoneMismatch
-                          ? `TZ mismatch (${data.securitySignals.browserTimezone})`
-                          : isCloudMaskedGpu
-                          ? 'Cloud / Masked GPU environment'
-                          : data.securitySignals.datacenterAsn
-                          ? 'Datacenter or cloud ASN'
-                          : 'Timezone & ISP match location'}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Signal 3: OS Integrity */}
-                  <div
-                    className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0"
-                    title={
-                      data.securitySignals.tamperReasons.length > 0
-                        ? data.securitySignals.tamperReasons.join(' • ')
-                        : `User-Agent (${data.browserDevice.os}) matches platform (${data.browserDevice.platform})`
-                    }
-                  >
-                    <div
-                      className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 border ${
-                        data.securitySignals.tamperDetected
-                          ? 'bg-rose-50 border-rose-200 text-rose-600'
-                          : 'bg-emerald-50/60 border-emerald-200 text-emerald-600'
-                      }`}
-                    >
-                      <MonitorCheck className="w-4 h-4" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-semibold text-[#111827] truncate">
-                          OS Integrity
-                        </span>
-                        <span
-                          className={`text-[11px] font-mono font-semibold shrink-0 ${
-                            data.securitySignals.tamperDetected
-                              ? 'text-rose-700'
-                              : 'text-emerald-700'
-                          }`}
-                        >
-                          {data.securitySignals.tamperDetected ? 'Spoofed UA' : 'Authentic'}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-500 truncate mt-1">
-                        {data.securitySignals.tamperDetected
-                          ? 'UA differs from platform or GPU'
-                          : 'UA matches platform & GPU'}
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Signal 4: Storage Mode */}
-                  <div
-                    className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0"
-                    title={`Persistence Mode: ${data.securitySignals.persistenceMode}`}
-                  >
-                    <div
-                      className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 border ${
-                        data.securitySignals.persistenceMode === 'Hardware ID Recovered'
-                          ? 'bg-blue-50/60 border-blue-200 text-[#2563EB]'
-                          : data.securitySignals.incognitoLikely
-                          ? 'bg-amber-50/60 border-amber-200 text-amber-700'
-                          : 'bg-emerald-50/60 border-emerald-200 text-emerald-600'
-                      }`}
-                    >
-                      <Database className="w-4 h-4" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-semibold text-[#111827] truncate">
-                          Storage Mode
-                        </span>
-                        <span
-                          className={`text-[11px] font-mono font-semibold shrink-0 ${
-                            data.securitySignals.persistenceMode === 'Hardware ID Recovered'
-                              ? 'text-[#2563EB]'
-                              : data.securitySignals.incognitoLikely
-                              ? 'text-amber-700'
-                              : 'text-emerald-700'
-                          }`}
-                        >
-                          {data.securitySignals.persistenceMode === 'Hardware ID Recovered'
-                            ? 'HWID Recovered'
-                            : data.securitySignals.incognitoLikely
-                            ? 'Incognito / Reset'
-                            : 'Persistent'}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-500 truncate mt-1">
-                        {data.securitySignals.persistenceMode === 'Hardware ID Recovered'
-                          ? 'Cookie-less HWID link active'
-                          : formatStorageQuotaCaption(data.securitySignals.storageQuotaMb)}
-                      </p>
-                    </div>
-                  </div>
+                {/* 8-Row Swiss Hairline Signal Grid */}
+                <div className="mt-4 border border-[#E5E7EB] rounded-xl overflow-hidden divide-y divide-[#E5E7EB]">
+                  {signalRows.map((row) => {
+                    const { key, ...rowProps } = row;
+                    return <SignalRow key={key} {...rowProps} />;
+                  })}
                 </div>
               </div>
 
@@ -1104,22 +1234,21 @@ export default function App() {
                     Trust Meter
                   </span>
                   <span className="text-xs font-mono tabular-nums text-slate-500 truncate">
-                    • {data.securitySignals.riskLevel} Risk (Score{' '}
-                    {data.securitySignals.suspectScore}/100)
+                    • {riskTier} Risk (Score {normalizedSuspectScore}/10)
                   </span>
                 </div>
 
                 <div className="w-28 sm:w-36 h-2 rounded-full bg-slate-100 overflow-hidden shrink-0 border border-[#E5E7EB]">
                   <div
                     className={`h-full transition-all duration-300 ${
-                      data.securitySignals.riskLevel === 'High'
+                      riskTier === 'High'
                         ? 'bg-rose-600'
-                        : data.securitySignals.riskLevel === 'Medium'
+                        : riskTier === 'Medium'
                         ? 'bg-amber-500'
                         : 'bg-emerald-500'
                     }`}
                     style={{
-                      width: `${Math.max(8, 100 - data.securitySignals.suspectScore)}%`,
+                      width: `${Math.max(8, 100 - normalizedSuspectScore * 10)}%`,
                     }}
                   />
                 </div>
@@ -1302,18 +1431,14 @@ export default function App() {
                     const rowOrg = formatValidNetworkField(visit.org);
                     const rowAsn = formatValidNetworkField(visit.asn);
                     const rowIspFormatted = formatCleanIspDisplay(rowIsp, rowOrg, rowAsn);
-                    const rowScore = visit.suspectScore ?? 0;
+                    const rowScore = normalizeLegacyScore(visit.suspectScore);
                     const rowRisk: RiskLevel =
                       visit.riskLevel === 'High' ||
                       visit.riskLevel === 'Medium' ||
                       visit.riskLevel === 'Low'
                         ? visit.riskLevel
-                        : rowScore >= 70
-                        ? 'High'
-                        : rowScore >= 35
-                        ? 'Medium'
-                        : 'Low';
-                    const rowRiskLabel = `${rowRisk === 'Medium' ? 'Med' : rowRisk} · ${rowScore}/100`;
+                        : resolveRiskTier(rowScore);
+                    const rowRiskLabel = `${rowRisk === 'Medium' ? 'Med' : rowRisk} • ${rowScore}/10`;
                     const rowRiskDotClass =
                       rowRisk === 'High'
                         ? 'bg-rose-500'
