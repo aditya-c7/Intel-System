@@ -615,6 +615,79 @@ function normalizeIspAndOrg(rawIspInput, rawOrgInput, rawAsnInput, explicitHosti
     isVpnOrHosting
   };
 }
+var CLOUD_PROVIDER_ASN_NUMBERS = /* @__PURE__ */ new Set([
+  396178,
+  15169,
+  16509,
+  14618,
+  13335,
+  14061,
+  9009,
+  60068,
+  24940,
+  63949,
+  16276,
+  8075,
+  20473
+]);
+function classifyIspNetwork(isp, org, asn) {
+  const cleanIsp = typeof isp === "string" ? isp.trim() : "";
+  const cleanOrg = typeof org === "string" ? org.trim() : "";
+  const cleanAsn = typeof asn === "string" ? asn.trim().toUpperCase() : "";
+  const keywordHaystack = `${cleanIsp} ${cleanOrg}`;
+  const asnNumbers = /* @__PURE__ */ new Set();
+  const asnTokenRegex = /\bAS(\d{1,10})\b/gi;
+  let asnTokenMatch;
+  while ((asnTokenMatch = asnTokenRegex.exec(`${cleanAsn} ${keywordHaystack}`)) !== null) {
+    const parsedAsn = Number.parseInt(asnTokenMatch[1], 10);
+    if (Number.isFinite(parsedAsn)) asnNumbers.add(parsedAsn);
+  }
+  const matchConsumerRule = (brand, networkType, asns, keywords) => {
+    const asnHit = asns.find((a) => asnNumbers.has(a));
+    const keywordHit = keywords !== null && keywords.test(keywordHaystack);
+    if (asnHit === void 0 && !keywordHit) return null;
+    return {
+      brandName: brand,
+      networkType,
+      isConsumerBroadband: true,
+      isDatacenterOrHosting: false,
+      matchedReason: asnHit !== void 0 ? `ASN AS${asnHit}` : `ISP metadata keyword ${String(keywords)}`
+    };
+  };
+  const consumerMatch = (
+    // US consumer broadband (Residential Broadband)
+    matchConsumerRule("Xfinity (Comcast)", "Residential Broadband", [7922, 7015, 7016], /comcast|xfinity/i) || matchConsumerRule("Spectrum (Charter)", "Residential Broadband", [20115, 11426, 10796], /charter|spectrum/i) || matchConsumerRule("AT&T Fiber", "Residential Broadband", [7018, 20057], /at&t|att services|sbcglobal/i) || matchConsumerRule("Verizon Fios", "Residential Broadband", [701, 19262], /fios|mci communications|verizon online/i) || matchConsumerRule("Optimum", "Residential Broadband", [6128, 19108], /optimum|cablevision|altice|suddenlink/i) || matchConsumerRule("Cox", "Residential Broadband", [22773], /\bcox\b/i) || matchConsumerRule("Frontier / CenturyLink", "Residential Broadband", [5650, 209], null) || matchConsumerRule("Google Fiber", "Residential Broadband", [16591], /google fiber|gfiber/i) || // US 5G home internet (Cellular / 5G)
+    matchConsumerRule("Verizon 5G Home", "Cellular / 5G", [6167, 22394], /cellco|verizon wireless/i) || matchConsumerRule("T-Mobile 5G Home", "Cellular / 5G", [21928], /t-mobile|tmobile/i) || // Satellite
+    matchConsumerRule("Starlink (SpaceX)", "Satellite", [14593], /starlink|spacex/i) || // India consumer broadband (Residential Broadband)
+    matchConsumerRule("Jio (Reliance Jio)", "Residential Broadband", [55836], /reliance jio|\bjio\b/i) || matchConsumerRule("Airtel Xstream", "Residential Broadband", [24560, 45609, 9498], /bharti airtel|\bairtel\b/i) || matchConsumerRule("ACT Fibernet", "Residential Broadband", [24309], /act fibernet|atria convergence/i) || matchConsumerRule("BSNL Broadband", "Residential Broadband", [9829], /\bbsnl\b|bharat sanchar/i) || matchConsumerRule("Tata Play / Hathway", "Residential Broadband", [], /tata play|tata sky broadband|hathway|excitel/i)
+  );
+  if (consumerMatch) {
+    return consumerMatch;
+  }
+  const cloudAsnHit = Array.from(asnNumbers).find((n) => CLOUD_PROVIDER_ASN_NUMBERS.has(n));
+  const cloudKeywords = /google llc|google cloud|amazonaws|cloudflare|digitalocean|hetzner|m247|datacamp|linode|ovh|choopa|vultr|leaseweb|hostinger|contabo|akamai/i;
+  if (cloudAsnHit !== void 0 || cloudKeywords.test(keywordHaystack)) {
+    return {
+      brandName: "Cloud Provider / Datacenter",
+      networkType: "Cloud / Datacenter",
+      isConsumerBroadband: false,
+      isDatacenterOrHosting: true,
+      matchedReason: cloudAsnHit !== void 0 ? `ASN AS${cloudAsnHit}` : `ISP metadata keyword ${String(cloudKeywords)}`
+    };
+  }
+  return {
+    brandName: cleanIsp || cleanOrg || "Unknown ISP",
+    networkType: "Residential Broadband",
+    isConsumerBroadband: false,
+    isDatacenterOrHosting: false,
+    matchedReason: null
+  };
+}
+function normalizeLegacySuspectScore(rawSuspectScore) {
+  if (!Number.isFinite(rawSuspectScore)) return 0;
+  if (rawSuspectScore <= 10) return Math.max(0, rawSuspectScore);
+  return Math.max(0, Math.min(10, Math.round(rawSuspectScore / 10)));
+}
 async function lookupVerifiedGeolocation(visitorIp, isPublic) {
   if (!isPublic || !visitorIp || visitorIp === "Unavailable") {
     return {
@@ -1463,7 +1536,7 @@ function sanitizeHardwareSignals(raw, browserDevice) {
     architecture: safeStr(raw?.architecture, browserDevice.os, 80)
   };
 }
-function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals, location, ipTimezoneHint, recognitionSource) {
+function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals, location, ipTimezoneHint, recognitionSource, classification, velocity) {
   const safeStrArray = (arr) => Array.isArray(arr) ? arr.filter((item) => typeof item === "string" && item.trim().length > 0).map((s) => s.trim().slice(0, 180)).slice(0, 10) : [];
   const isBot = Boolean(raw?.isBot);
   const botSignals = safeStrArray(raw?.botSignals);
@@ -1473,12 +1546,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const normIpTz = normalizeServerTimezoneId(ipTimezone);
   const serverTzMismatch = Boolean(normBrowserTz && normIpTz && normBrowserTz !== normIpTz);
   const timezoneMismatch = Boolean(raw?.timezoneMismatch) || serverTzMismatch;
-  const combinedNet = `${location.isp || ""} ${location.org || ""} ${location.asn || ""}`;
-  const isCloudOrDatacenterNetwork = Boolean(location.isVpnOrHosting) || /google|gcp|as15169|as396982|aws|amazon|digitalocean|cloudflare|m247|hetzner|azure|microsoft|linode|vultr|ovh|oracle|datacenter|hosting|cloud/i.test(
-    combinedNet
-  );
+  const isCloudOrDatacenterNetwork = classification.isDatacenterOrHosting || Boolean(location.isVpnOrHosting);
   const isGpuMaskedOrUnavailable = !hardwareSignals.gpuVendor || hardwareSignals.gpuVendor === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuVendor) || !hardwareSignals.gpuRenderer || hardwareSignals.gpuRenderer === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuRenderer);
-  const datacenterAsn = Boolean(raw?.datacenterAsn) || isCloudOrDatacenterNetwork;
+  const datacenterAsn = classification.isConsumerBroadband ? false : isCloudOrDatacenterNetwork;
   const vpnReasons = safeStrArray(raw?.vpnReasons);
   if (timezoneMismatch && !vpnReasons.some((r) => r.toLowerCase().includes("timezone"))) {
     vpnReasons.push(
@@ -1498,6 +1568,20 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const tamperReasons = safeStrArray(raw?.tamperReasons);
   const incognitoLikely = Boolean(raw?.incognitoLikely);
   const storageQuotaMb = typeof raw?.storageQuotaMb === "number" && Number.isFinite(raw.storageQuotaMb) && raw.storageQuotaMb > 0 ? Math.round(raw.storageQuotaMb) : null;
+  const webrtcLeak = Boolean(raw?.webrtcLeak);
+  const webrtcCandidateIp = typeof raw?.webrtcCandidateIp === "string" && raw.webrtcCandidateIp.trim() ? raw.webrtcCandidateIp.trim().slice(0, 64) : null;
+  const webrtcDetail = typeof raw?.webrtcDetail === "string" && raw.webrtcDetail.trim() ? raw.webrtcDetail.trim().slice(0, 200) : "";
+  const privacyProtected = Boolean(raw?.privacyProtected);
+  const privacyDetail = typeof raw?.privacyDetail === "string" && raw.privacyDetail.trim() ? raw.privacyDetail.trim().slice(0, 200) : "";
+  const adBlockerDetected = Boolean(raw?.adBlockerDetected);
+  const canvasFarblingDetected = Boolean(raw?.canvasFarblingDetected);
+  const isVirtualMachine = Boolean(raw?.isVirtualMachine);
+  const vmReason = typeof raw?.vmReason === "string" && raw.vmReason.trim() ? raw.vmReason.trim().slice(0, 200) : "";
+  const devToolsOpen = Boolean(raw?.devToolsOpen);
+  const incognitoOrCleared = Boolean(raw?.incognitoOrCleared) || recognitionSource === "Hardware Fingerprint (Cookie-less / Incognito)";
+  const cloudOrMaskedGpu = Boolean(
+    raw?.cloudOrMaskedGpu
+  );
   let persistenceMode = "First-Party Cookie";
   if (recognitionSource === "Hardware Fingerprint (Cookie-less / Incognito)") {
     persistenceMode = "Hardware ID Recovered";
@@ -1507,34 +1591,53 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   let suspectScore = 0;
   const riskFactors = [];
   if (isBot) {
-    suspectScore += 45;
-    riskFactors.push(botSignals[0] || "Headless / automated browser runtime detected");
-  }
-  if (timezoneMismatch) {
-    suspectScore += 25;
-    riskFactors.push(`Timezone mismatch (${browserTimezone} vs ${ipTimezone})`);
-  }
-  if (datacenterAsn) {
-    suspectScore += 15;
+    suspectScore += 3;
     riskFactors.push(
-      isGpuMaskedOrUnavailable ? `Cloud / Masked GPU environment (${location.isp})` : `Datacenter or VPN network ASN (${location.isp})`
+      `Automated browser / bot runtime detected (+3): ${botSignals[0] || "headless or scripted browser signatures"}`
+    );
+  }
+  if (vpnSuspected || webrtcLeak) {
+    suspectScore += 2;
+    let vpnDetail = vpnReasons[0] || "";
+    if (!vpnDetail && webrtcLeak) {
+      vpnDetail = webrtcCandidateIp ? `WebRTC leak exposed candidate IP ${webrtcCandidateIp}` : webrtcDetail || "WebRTC ICE candidates bypassed the expected network path";
+    }
+    if (!vpnDetail) {
+      vpnDetail = `anomalous network path (${location.isp})`;
+    }
+    riskFactors.push(`VPN / proxy network or WebRTC leak detected (+2): ${vpnDetail}`);
+  }
+  if (isVirtualMachine || cloudOrMaskedGpu) {
+    suspectScore += 2;
+    riskFactors.push(
+      `Virtual machine or masked GPU environment (+2): ${isVirtualMachine ? vmReason || "VM indicators present in the hardware signals" : "cloud environment with a masked or generic GPU signature"}`
     );
   }
   if (tamperDetected) {
-    suspectScore += 15;
-    riskFactors.push(tamperReasons[0] || "User-Agent / platform mismatch detected");
-  }
-  if (incognitoLikely) {
-    suspectScore += 10;
+    suspectScore += 1;
     riskFactors.push(
-      storageQuotaMb !== null ? `Restricted storage quota (${storageQuotaMb} MB) indicates private browsing` : "Private or restricted browser storage environment"
+      `User-Agent / platform tampering detected (+1): ${tamperReasons[0] || "mismatched fingerprint components"}`
     );
   }
-  suspectScore = Math.min(100, suspectScore);
-  const riskLevel = suspectScore >= 50 ? "High" : suspectScore >= 20 ? "Medium" : "Low";
-  const cloudOrMaskedGpu = Boolean(
-    raw?.cloudOrMaskedGpu
-  );
+  if (incognitoLikely || incognitoOrCleared) {
+    suspectScore += 1;
+    const incognitoDetail = storageQuotaMb !== null ? `${storageQuotaMb} MB storage quota indicates a private browsing context` : incognitoOrCleared && !incognitoLikely ? "visitor recovered from a cookie-less / incognito session through the hardware fingerprint" : "private or restricted browser storage environment";
+    riskFactors.push(`Incognito / private browsing indicators (+1): ${incognitoDetail}`);
+  }
+  if (devToolsOpen || privacyProtected || velocity.highVelocity) {
+    suspectScore += 1;
+    const hardeningDetail = devToolsOpen ? "developer tools were open while signals were collected" : privacyProtected ? privacyDetail || "privacy protection limited canvas / WebGL reporting" : `high visit velocity (${velocity.distinctIpsLastHour} distinct IPs across ${velocity.visitsLastHour} visits in the last hour)`;
+    riskFactors.push(
+      `Developer tools active, privacy / farbling hardening, or high visit velocity (+1): ${hardeningDetail}`
+    );
+  }
+  if (velocity.highVelocity) {
+    riskFactors.push(
+      `High velocity / IP rotation (+1): ${velocity.distinctIpsLastHour} distinct IPs across ${velocity.visitsLastHour} visits in the last hour`
+    );
+  }
+  suspectScore = Math.max(0, Math.min(10, suspectScore));
+  const riskLevel = suspectScore >= 7 ? "High" : suspectScore >= 3 ? "Medium" : "Low";
   const securitySignalsCore = {
     isBot,
     botSignals,
@@ -1555,7 +1658,29 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   };
   return {
     ...securitySignalsCore,
-    ...{ cloudOrMaskedGpu }
+    ...{
+      cloudOrMaskedGpu,
+      // Task 1 — ISP brand & network classification from the server-resolved location
+      brandName: classification.brandName,
+      networkType: classification.networkType,
+      isConsumerBroadband: classification.isConsumerBroadband,
+      isDatacenterOrHosting: classification.isDatacenterOrHosting,
+      // Task 3 — deep technical detection signals
+      webrtcLeak,
+      webrtcCandidateIp,
+      webrtcDetail,
+      privacyProtected,
+      privacyDetail,
+      adBlockerDetected,
+      canvasFarblingDetected,
+      isVirtualMachine,
+      vmReason,
+      devToolsOpen,
+      incognitoOrCleared,
+      // Task 3 — visit velocity / IP rotation
+      distinctIpsLastHour: velocity.distinctIpsLastHour,
+      visitsLastHour: velocity.visitsLastHour
+    }
   };
 }
 app.post("/api/visitor/identify", async (req, res) => {
@@ -1621,6 +1746,7 @@ app.post("/api/visitor/identify", async (req, res) => {
         isLocationVerified: true
       };
     }
+    const classification = classifyIspNetwork(location.isp, location.org, location.asn);
     const cookieVid = req.cookies?.intel_http_vid;
     const cookieToken = req.cookies?.intel_http_token;
     let existingVisitor;
@@ -1848,19 +1974,38 @@ app.post("/api/visitor/identify", async (req, res) => {
          LIMIT 50`
     ).all(visitorId);
     const ipTimezoneHint = typeof clientGeoHint?.timezone === "string" && clientGeoHint.timezone.trim() || vercelGeo.timezone || "";
+    const oneHourAgoMs = Date.now() - 3600 * 1e3;
+    const lastHourVisitRows = rawVisits.filter((r) => {
+      const visitedAtMs = Date.parse(String(r.visited_at_utc || ""));
+      return Number.isFinite(visitedAtMs) && visitedAtMs >= oneHourAgoMs;
+    });
+    const lastHourIpSet = /* @__PURE__ */ new Set();
+    for (const lastHourRow of lastHourVisitRows) {
+      const lastHourIp = String(lastHourRow.public_ip || "").trim();
+      if (lastHourIp && lastHourIp !== "Unavailable") lastHourIpSet.add(lastHourIp);
+    }
+    const currentVisitIp = String(location.publicIp || "").trim();
+    if (currentVisitIp && currentVisitIp !== "Unavailable") {
+      lastHourIpSet.add(currentVisitIp);
+    }
+    const visitsLastHour = Math.max(1, lastHourVisitRows.length);
+    const distinctIpsLastHour = lastHourIpSet.size;
+    const velocityFlag = visitsLastHour >= 8 || distinctIpsLastHour > 1;
     const securitySignals = sanitizeAndReinforceSecuritySignals(
       rawSecuritySignals,
       browserDevice,
       hardwareSignals,
       location,
       ipTimezoneHint,
-      recognitionSource
+      recognitionSource,
+      classification,
+      { visitsLastHour, distinctIpsLastHour, highVelocity: velocityFlag }
     );
     const visitHistory = rawVisits.map((r) => {
-      const storedSuspectScore = typeof r.suspect_score === "number" && Number.isFinite(r.suspect_score) ? Math.max(0, Math.min(100, Math.round(r.suspect_score))) : null;
+      const storedSuspectScore = typeof r.suspect_score === "number" && Number.isFinite(r.suspect_score) ? normalizeLegacySuspectScore(r.suspect_score) : null;
       const isCurrentVisitRow = String(r.page_load_id || "") === safePageLoadId;
       const rowSuspectScore = storedSuspectScore !== null ? storedSuspectScore : isCurrentVisitRow ? securitySignals.suspectScore : 0;
-      const rowRiskLevel = rowSuspectScore >= 50 ? "High" : rowSuspectScore >= 20 ? "Medium" : "Low";
+      const rowRiskLevel = rowSuspectScore >= 7 ? "High" : rowSuspectScore >= 3 ? "Medium" : "Low";
       const rowRecognitionSource = isCurrentVisitRow ? recognitionSource : "Cookie";
       const rowCloudOrMaskedGpu = isCurrentVisitRow ? Boolean(
         securitySignals.cloudOrMaskedGpu
@@ -1944,9 +2089,9 @@ app.get("/api/visitor/history/:visitorId", (req, res) => {
        LIMIT 50`
   ).all(requestedVisitorId);
   const visits = rawVisits.map((row) => {
-    const storedSuspectScore = typeof row.suspect_score === "number" && Number.isFinite(row.suspect_score) ? Math.max(0, Math.min(100, Math.round(row.suspect_score))) : 0;
+    const storedSuspectScore = typeof row.suspect_score === "number" && Number.isFinite(row.suspect_score) ? normalizeLegacySuspectScore(row.suspect_score) : 0;
     const storedRecognitionSource = typeof row.recognition_source === "string" && row.recognition_source.trim() ? row.recognition_source : "Cookie";
-    const rowRiskLevel = storedSuspectScore >= 50 ? "High" : storedSuspectScore >= 20 ? "Medium" : "Low";
+    const rowRiskLevel = storedSuspectScore >= 7 ? "High" : storedSuspectScore >= 3 ? "Medium" : "Low";
     return {
       ...row,
       suspectScore: storedSuspectScore,
