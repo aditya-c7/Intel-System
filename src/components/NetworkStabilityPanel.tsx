@@ -9,7 +9,7 @@ interface PingSample {
   failed: boolean;
 }
 
-type SpeedTestPhase = 'idle' | 'downloading' | 'uploading' | 'cooldown' | 'error';
+type SpeedTestPhase = 'idle' | 'downloading' | 'uploading' | 'cooldown' | 'cancelled' | 'error';
 
 interface SpeedTestState {
   phase: SpeedTestPhase;
@@ -25,20 +25,53 @@ type HttpErrorWithStatus = Error & { status?: number };
 const Y_LEVELS = [0, 150, 300, 450, 600] as const;
 const MAX_Y_MS = 600;
 const FIVE_MINUTES_MS = 5 * 60 * 1000; // 300,000 ms rolling five-minute timeline
-const SAMPLE_INTERVAL_MS = 1500; // 1.5s RTT measurement interval
+const SAMPLE_INTERVAL_MS = 5000; // 5s visible RTT measurement interval (serialized, configurable)
 
-// 30-second full Ookla-grade speed analysis (15s Download + 15s Upload) followed by a 10-second cooldown pause before repeating
-const DOWNLOAD_PHASE_DURATION_MS = 15000; // 15.0 seconds active download analysis
-const UPLOAD_PHASE_DURATION_MS = 15000; // 15.0 seconds active upload analysis
-const PAUSE_AFTER_TEST_MS = 10000; // 10.0 seconds cooldown pause after the test completes
+// One-shot, bounded speed analysis. ONE explicit Start = ONE download phase + ONE upload phase.
+// No automatic repeat, no hidden-tab transfers, no uncapped fallback.
+const DOWNLOAD_PHASE_DURATION_MS = 8000; // 8s maximum download phase
+const UPLOAD_PHASE_DURATION_MS = 6000; // 6s maximum upload phase
+const RUN_COOLDOWN_MS = 60000; // 60s minimum interval between starts (server enforces durably)
+const MAX_MONITOR_DURATION_MS = 15 * 60 * 1000; // auto-pause live monitoring after 15 minutes
+const FALLBACK_MAX_DOWNLOAD_BYTES = 16 * 1024 * 1024; // 16 MiB aggregate download budget per run
+const FALLBACK_MAX_UPLOAD_BYTES = 8 * 1024 * 1024; // 8 MiB aggregate upload budget per run
 const ODOMETER_UPDATE_INTERVAL_MS = 250; // Smooth 250ms live odometer updates
-const CONCURRENT_STREAMS = 3; // 3 streams leave 3 dedicated browser connection slots free for zero-queue RTT probes
+const CONCURRENT_STREAMS = 2; // Policy maximum: 2 parallel transfer requests per run
 
 // Stateless-serverless (Vercel) hardening: every speed-test request stays far below the 4.5 MB
 // body cap, and every failure path keeps the test running instead of stalling at 0.00 Mbps.
-const SPEED_TEST_CHUNK_BYTES_MAX = 1048576; // hard 1 MiB cap per download/upload request chunk
+const SPEED_TEST_CHUNK_BYTES_MAX = 262144; // hard 256 KiB cap per download/upload request chunk
 const SPEED_TEST_413_FALLBACK_BYTES = 262144; // 256 KiB one-shot retry payload after an HTTP 413
 const SPEED_TEST_INIT_TIMEOUT_MS = 4000; // speed-test/init call must never stall the test loop
+const LAST_RUN_STORAGE_KEY = 'intel_speedtest_last_v1'; // display-only restore across remounts
+
+function readPersistedSpeedTest(): SpeedTestState | null {
+  try {
+    const raw = window.sessionStorage.getItem(LAST_RUN_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<SpeedTestState>;
+    const downloadMbps = typeof parsed.downloadMbps === 'number' ? parsed.downloadMbps : null;
+    const uploadMbps = typeof parsed.uploadMbps === 'number' ? parsed.uploadMbps : null;
+    if (downloadMbps === null && uploadMbps === null) return null;
+    return {
+      phase: 'cooldown',
+      downloadMbps,
+      uploadMbps,
+      testedAtLabel: typeof parsed.testedAtLabel === 'string' ? parsed.testedAtLabel : null,
+      error: null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function persistSpeedTestResult(result: SpeedTestState): void {
+  try {
+    window.sessionStorage.setItem(LAST_RUN_STORAGE_KEY, JSON.stringify(result));
+  } catch {
+    // Storage unavailable (private mode / quota) - results remain in memory.
+  }
+}
 
 function formatClockTimestamp(ms: number): string {
   const d = new Date(ms);
@@ -170,13 +203,19 @@ export function NetworkStabilityPanel() {
   // Responsive SVG width measured from actual container so mobile graphs are never squeezed
   const [chartWidth, setChartWidth] = useState<number>(560);
 
-  const [speedTest, setSpeedTest] = useState<SpeedTestState>({
-    phase: 'idle',
-    downloadMbps: null,
-    uploadMbps: null,
-    testedAtLabel: null,
-    error: null,
-  });
+  const [speedTest, setSpeedTest] = useState<SpeedTestState>(
+    () =>
+      readPersistedSpeedTest() ?? {
+        phase: 'idle',
+        downloadMbps: null,
+        uploadMbps: null,
+        testedAtLabel: null,
+        error: null,
+      }
+  );
+  const [cooldownUntilMs, setCooldownUntilMs] = useState<number | null>(null);
+  const [cooldownNowMs, setCooldownNowMs] = useState<number>(() => Date.now());
+  const [monitorAutoPaused, setMonitorAutoPaused] = useState<boolean>(false);
 
   const sampleCounterRef = useRef<number>(0);
   const latestRttMsRef = useRef<number>(180);
@@ -188,6 +227,11 @@ export function NetworkStabilityPanel() {
   const chartWrapperRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const activeXhrsRef = useRef<Set<XMLHttpRequest>>(new Set());
+  // One-shot speed-test control: single in-flight guard + abort handle for hard cancellation.
+  const testAbortRef = useRef<AbortController | null>(null);
+  const isTestStartingRef = useRef<boolean>(false);
+  const lastProbeFailedRef = useRef<boolean>(false);
+  const monitorStartedAtRef = useRef<number>(Date.now());
 
   // Measure actual chart container width via ResizeObserver so mobile renders 1:1 without shrinking
   useEffect(() => {
@@ -364,6 +408,7 @@ export function NetworkStabilityPanel() {
       latestRttMsRef.current = Math.round(latestRttMsRef.current * 0.6 + clampedRtt * 0.4);
 
       const recordedAtMs = Date.now();
+      lastProbeFailedRef.current = false;
       isOnlineRef.current = true;
       setIsOnline(true);
       setWindowEndMs(recordedAtMs);
@@ -381,6 +426,7 @@ export function NetworkStabilityPanel() {
       });
     } catch {
       const recordedAtMs = Date.now();
+      lastProbeFailedRef.current = true;
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         isOnlineRef.current = false;
         setIsOnline(false);
@@ -1014,175 +1060,11 @@ export function NetworkStabilityPanel() {
     [sendUploadChunkXhr]
   );
 
-  // Continuous loop: 30s Speed Analysis (15s Download + 15s Upload) -> 10s Cooldown -> Repeat
+  // One-shot speed test: ONE Start -> ONE download phase -> ONE upload phase -> terminal result.
+  // Abort in-flight work on unmount/hidden/offline. Cancelled or interrupted runs never restart.
   useEffect(() => {
-    if (!isRunning) {
-      return;
-    }
-
-    let cancelled = false;
-    const loopAbortController = new AbortController();
-    let pauseTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const runLoop = async () => {
-      while (!cancelled && !loopAbortController.signal.aborted) {
-        if (
-          typeof document !== 'undefined' &&
-          document.visibilityState === 'hidden'
-        ) {
-          await new Promise((r) => setTimeout(r, 1500));
-          continue;
-        }
-
-        // Skip the test only when BOTH the browser flag and the measured HTTP probes agree the
-        // connection is down — a falsely-offline navigator flag alone must never strand the
-        // speed test at 'Starting...' / 0.00 Mbps.
-        if (
-          typeof navigator !== 'undefined' &&
-          !navigator.onLine &&
-          !isOnlineRef.current
-        ) {
-          await new Promise((r) => setTimeout(r, 1500));
-          continue;
-        }
-
-        let maxDlBytes = 1024 * 1024 * 1024;
-        let maxUlBytes = 512 * 1024 * 1024;
-        let testToken = '';
-
-        // INIT with stateless-serverless resilience: a short 4s timeout guards the request so a
-        // cold, missing, or hanging endpoint can never stall the UI at 'Starting...' / 0.00 Mbps.
-        // Any failure, non-2xx status, or missing token falls through to a client-generated
-        // fallback token and the download/upload streams run exactly the same.
-        const initController = new AbortController();
-        const abortInitOnLoopAbort = () => initController.abort();
-        loopAbortController.signal.addEventListener('abort', abortInitOnLoopAbort);
-        const initTimeoutId = setTimeout(() => initController.abort(), SPEED_TEST_INIT_TIMEOUT_MS);
-
-        try {
-          const stored = getFirstPartyStorage();
-          const initResp = await fetch('/api/network/speed-test/init', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            credentials: 'same-origin',
-            body: JSON.stringify({
-              visitorId: stored.visitorId,
-              sessionId: stored.sessionId,
-            }),
-            signal: initController.signal,
-          });
-
-          const initData = (await initResp.json().catch(() => ({}))) as {
-            ok?: boolean;
-            token?: string;
-            maxDownloadBytes?: number;
-            maxUploadBytes?: number;
-          };
-
-          if (initResp.ok && typeof initData.token === 'string' && initData.token.length > 0) {
-            testToken = initData.token;
-            maxDlBytes = initData.maxDownloadBytes || maxDlBytes;
-            maxUlBytes = initData.maxUploadBytes || maxUlBytes;
-          }
-        } catch {
-          // Any init failure lands in the fallback path below — the test still runs.
-        } finally {
-          clearTimeout(initTimeoutId);
-          loopAbortController.signal.removeEventListener('abort', abortInitOnLoopAbort);
-        }
-
-        if (cancelled || loopAbortController.signal.aborted) break;
-
-        if (!testToken) {
-          testToken = `st_client_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-        }
-
-        // Phase results fall back to whatever is already on screen if a phase throws
-        // unexpectedly (only possible on master abort in practice), so partial results are
-        // always shown and the state machine always reaches a running-or-completed state.
-        let dlMbps: number | null = null;
-        let ulMbps: number | null = null;
-
-        try {
-          // 1. 15-Second Download Phase
-          setSpeedTest((prev) => ({
-            ...prev,
-            phase: 'downloading',
-            error: null,
-          }));
-
-          dlMbps = await runSustainedDownload15s(
-            testToken,
-            maxDlBytes,
-            loopAbortController.signal
-          );
-
-          if (cancelled || loopAbortController.signal.aborted) break;
-
-          // 2. 15-Second Upload Phase
-          setSpeedTest((prev) => ({
-            ...prev,
-            downloadMbps: dlMbps ?? prev.downloadMbps,
-            phase: 'uploading',
-          }));
-
-          ulMbps = await runSustainedUpload15s(
-            testToken,
-            maxUlBytes,
-            loopAbortController.signal
-          );
-
-          if (cancelled || loopAbortController.signal.aborted) break;
-
-          // 3. Finalize 30-second analysis & hold for 10-second cooldown before repeating
-          setSpeedTest((prev) => ({
-            ...prev,
-            phase: 'cooldown',
-            downloadMbps: dlMbps ?? prev.downloadMbps,
-            uploadMbps: ulMbps ?? prev.uploadMbps,
-            testedAtLabel: formatClockTimestamp(Date.now()),
-            error: null,
-          }));
-        } catch (err) {
-          if (cancelled || loopAbortController.signal.aborted) break;
-          // Never dead-end in a stuck state: land in a completed cooldown holding the partial
-          // values already on screen; the next loop iteration retries automatically.
-          setSpeedTest((prev) => ({
-            ...prev,
-            phase: 'cooldown',
-            testedAtLabel: formatClockTimestamp(Date.now()),
-            error:
-              err instanceof Error && err.message
-                ? err.message
-                : 'Speed test interrupted.',
-          }));
-        } finally {
-          // Fire-and-forget completion ping for backend bookkeeping — its outcome (or absence)
-          // must never block or break the UI state machine; Mbps come from measured samples.
-          fetch('/api/network/speed-test/complete', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token: testToken }),
-          }).catch(() => {});
-        }
-
-        if (cancelled || loopAbortController.signal.aborted) break;
-
-        // Wait 10 seconds cooldown after the 15s Download + 15s Upload test finishes, then repeat
-        await new Promise<void>((resolve) => {
-          pauseTimer = setTimeout(resolve, PAUSE_AFTER_TEST_MS);
-        });
-      }
-    };
-
-    runLoop();
-
-    return () => {
-      cancelled = true;
-      loopAbortController.abort();
-      if (pauseTimer) {
-        clearTimeout(pauseTimer);
-      }
+    const abortTest = () => {
+      testAbortRef.current?.abort();
       for (const xhr of activeXhrsRef.current) {
         try {
           xhr.abort();
@@ -1192,22 +1074,244 @@ export function NetworkStabilityPanel() {
       }
       activeXhrsRef.current.clear();
     };
-  }, [isRunning, runSustainedDownload15s, runSustainedUpload15s]);
+    const onVisibility = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        abortTest();
+      }
+    };
+    const onOffline = () => {
+      isOnlineRef.current = false;
+      setIsOnline(false);
+      abortTest();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('offline', onOffline);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('offline', onOffline);
+      abortTest();
+    };
+  }, []);
 
-  // Serialized non-overlapping live polling for RTT graph (1.5s cadence) and smooth timeline clock (500ms)
+  // Cooldown countdown (display only; the control re-enables but never auto-starts a test).
+  useEffect(() => {
+    if (cooldownUntilMs === null) return;
+    const id = setInterval(() => {
+      if (Date.now() >= cooldownUntilMs) {
+        setCooldownUntilMs(null);
+      } else {
+        setCooldownNowMs(Date.now());
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [cooldownUntilMs]);
+
+  const runSpeedTestOnce = useCallback(async () => {
+    const controller = new AbortController();
+    testAbortRef.current = controller;
+
+    let maxDlBytes = FALLBACK_MAX_DOWNLOAD_BYTES;
+    let maxUlBytes = FALLBACK_MAX_UPLOAD_BYTES;
+    let testToken = '';
+
+    setSpeedTest((prev) => ({ ...prev, phase: 'downloading', error: null }));
+
+    const initController = new AbortController();
+    const abortInitOnTestAbort = () => initController.abort();
+    controller.signal.addEventListener('abort', abortInitOnTestAbort);
+    const initTimeoutId = setTimeout(() => initController.abort(), SPEED_TEST_INIT_TIMEOUT_MS);
+
+    try {
+      const stored = getFirstPartyStorage();
+      const initResp = await fetch('/api/network/speed-test/init', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ visitorId: stored.visitorId, sessionId: stored.sessionId }),
+        signal: initController.signal,
+      });
+      const initData = (await initResp.json().catch(() => ({}))) as {
+        ok?: boolean;
+        token?: string;
+        maxDownloadBytes?: number;
+        maxUploadBytes?: number;
+      };
+      if (initResp.ok && typeof initData.token === 'string' && initData.token.length > 0) {
+        testToken = initData.token;
+        if (typeof initData.maxDownloadBytes === 'number' && initData.maxDownloadBytes > 0) {
+          maxDlBytes = Math.min(initData.maxDownloadBytes, FALLBACK_MAX_DOWNLOAD_BYTES);
+        }
+        if (typeof initData.maxUploadBytes === 'number' && initData.maxUploadBytes > 0) {
+          maxUlBytes = Math.min(initData.maxUploadBytes, FALLBACK_MAX_UPLOAD_BYTES);
+        }
+      }
+    } catch {
+      // Init/admission failure must never fall back to an uncapped test.
+    } finally {
+      clearTimeout(initTimeoutId);
+      controller.signal.removeEventListener('abort', abortInitOnTestAbort);
+    }
+
+    if (controller.signal.aborted) {
+      isTestStartingRef.current = false;
+      testAbortRef.current = null;
+      setSpeedTest((prev) => ({ ...prev, phase: 'cancelled', error: 'Speed test cancelled.' }));
+      return;
+    }
+
+    if (!testToken) {
+      isTestStartingRef.current = false;
+      testAbortRef.current = null;
+      setSpeedTest((prev) => ({
+        ...prev,
+        phase: 'error',
+        error: 'Speed test could not start (server admission unavailable). Try again shortly.',
+      }));
+      setCooldownUntilMs(Date.now() + RUN_COOLDOWN_MS);
+      return;
+    }
+
+    let dlMbps: number | null = null;
+    let ulMbps: number | null = null;
+
+    try {
+      dlMbps = await runSustainedDownload15s(testToken, maxDlBytes, controller.signal);
+      if (controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+
+      setSpeedTest((prev) => ({
+        ...prev,
+        downloadMbps: dlMbps ?? prev.downloadMbps,
+        phase: 'uploading',
+      }));
+
+      try {
+        ulMbps = await runSustainedUpload15s(testToken, maxUlBytes, controller.signal);
+      } catch (uploadErr) {
+        if (controller.signal.aborted) throw uploadErr;
+        // Retain the completed download and label the upload honestly.
+        const partial: SpeedTestState = {
+          phase: 'cooldown',
+          downloadMbps: dlMbps,
+          uploadMbps: null,
+          testedAtLabel: formatClockTimestamp(Date.now()),
+          error: 'Upload interrupted; download result retained.',
+        };
+        setSpeedTest(partial);
+        persistSpeedTestResult(partial);
+        return;
+      }
+
+      if (controller.signal.aborted) throw new DOMException('Cancelled', 'AbortError');
+
+      const finished: SpeedTestState = {
+        phase: 'cooldown',
+        downloadMbps: dlMbps,
+        uploadMbps: ulMbps,
+        testedAtLabel: formatClockTimestamp(Date.now()),
+        error: null,
+      };
+      setSpeedTest(finished);
+      persistSpeedTestResult(finished);
+    } catch (err) {
+      if (controller.signal.aborted) {
+        setSpeedTest((prev) => ({
+          ...prev,
+          phase: 'cancelled',
+          downloadMbps: dlMbps ?? prev.downloadMbps,
+          error: 'Speed test cancelled.',
+        }));
+      } else {
+        setSpeedTest((prev) => ({
+          ...prev,
+          phase: 'error',
+          downloadMbps: dlMbps ?? prev.downloadMbps,
+          error: err instanceof Error && err.message ? err.message : 'Speed test interrupted.',
+        }));
+      }
+    } finally {
+      if (testToken) {
+        fetch('/api/network/speed-test/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: testToken }),
+        }).catch(() => {});
+      }
+      testAbortRef.current = null;
+      isTestStartingRef.current = false;
+      if (!controller.signal.aborted) {
+        setCooldownUntilMs(Date.now() + RUN_COOLDOWN_MS);
+        setCooldownNowMs(Date.now());
+      }
+    }
+  }, [runSustainedDownload15s, runSustainedUpload15s]);
+
+  const startSpeedTest = useCallback(() => {
+    // Immediate in-flight guard before awaiting anything: a fast double click starts only one run.
+    if (isTestStartingRef.current) return;
+    if (speedTest.phase === 'downloading' || speedTest.phase === 'uploading') return;
+    if (cooldownUntilMs !== null && Date.now() < cooldownUntilMs) return;
+    isTestStartingRef.current = true;
+    void runSpeedTestOnce();
+  }, [cooldownUntilMs, runSpeedTestOnce, speedTest.phase]);
+
+  const cancelSpeedTest = useCallback(() => {
+    testAbortRef.current?.abort();
+    for (const xhr of activeXhrsRef.current) {
+      try {
+        xhr.abort();
+      } catch {
+        // Ignore
+      }
+    }
+    activeXhrsRef.current.clear();
+  }, []);
+
+  const toggleMonitor = useCallback(() => {
+    setIsRunning((prev) => {
+      if (!prev) {
+        setMonitorAutoPaused(false);
+        monitorStartedAtRef.current = Date.now();
+      }
+      return !prev;
+    });
+  }, []);
+
+  // Serialized, visibility-aware live polling (5s visible cadence) with capped exponential
+  // backoff on persistent failures and a hard 15-minute continuous-monitoring cap.
   useEffect(() => {
     if (!isRunning) return;
 
     let active = true;
     let nextProbeTimer: ReturnType<typeof setTimeout> | null = null;
+    let consecutiveFailures = 0;
+    monitorStartedAtRef.current = Date.now();
 
     const runProbeLoop = async () => {
       while (active) {
+        if (Date.now() - monitorStartedAtRef.current >= MAX_MONITOR_DURATION_MS) {
+          setMonitorAutoPaused(true);
+          setIsRunning(false);
+          break;
+        }
+
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+          await new Promise<void>((resolve) => {
+            nextProbeTimer = setTimeout(resolve, 1000);
+          });
+          continue;
+        }
+
         const startedAt = Date.now();
         await executePingProbe();
         if (!active) break;
+
+        consecutiveFailures = lastProbeFailedRef.current
+          ? Math.min(consecutiveFailures + 1, 4)
+          : 0;
+
+        const delay = Math.min(30000, SAMPLE_INTERVAL_MS * Math.pow(2, consecutiveFailures));
         const elapsed = Date.now() - startedAt;
-        const waitMs = Math.max(350, SAMPLE_INTERVAL_MS - elapsed);
+        const waitMs = Math.max(350, delay - elapsed);
         await new Promise<void>((resolve) => {
           nextProbeTimer = setTimeout(resolve, waitMs);
         });
@@ -1383,6 +1487,10 @@ export function NetworkStabilityPanel() {
       ? Math.max(22, Math.min(78, (activeTooltipX / svgWidth) * 100))
       : 50;
 
+  // Cooldown remaining (display only; Start re-enables but never auto-runs).
+  const cooldownRemainingMs =
+    cooldownUntilMs !== null ? Math.max(0, cooldownUntilMs - cooldownNowMs) : 0;
+
   return (
     <div className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6 flex flex-col justify-between">
       <div>
@@ -1405,8 +1513,15 @@ export function NetworkStabilityPanel() {
 
             <button
               type="button"
-              onClick={() => setIsRunning((prev) => !prev)}
+              onClick={toggleMonitor}
               className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-300 rounded whitespace-nowrap shrink-0 cursor-pointer"
+              title={
+                isRunning
+                  ? 'Stop live RTT monitoring (does not affect speed-test state)'
+                  : monitorAutoPaused
+                  ? 'Resume live monitoring (paused after 15 minutes)'
+                  : 'Start live RTT monitoring'
+              }
             >
               {isRunning ? (
                 <>
@@ -1416,7 +1531,7 @@ export function NetworkStabilityPanel() {
               ) : (
                 <>
                   <Play className="w-3 h-3 fill-current" />
-                  <span>Start</span>
+                  <span>{monitorAutoPaused ? 'Resume' : 'Start'}</span>
                 </>
               )}
             </button>
@@ -1640,7 +1755,7 @@ export function NetworkStabilityPanel() {
         </div>
       </div>
 
-      {/* Bottom Section: 10s Server Speed Analysis (5s Download + 5s Upload) + 3s Pause with Odometer Animation */}
+      {/* Bottom Section: explicit one-shot server speed test (8s download + 6s upload, bounded budgets) */}
       <div className="mt-4 pt-3.5 border-t border-slate-200 space-y-2.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-1.5">
@@ -1652,13 +1767,47 @@ export function NetworkStabilityPanel() {
 
           <span className="text-[11px] font-mono tabular-nums text-slate-500">
             {speedTest.phase === 'downloading'
-              ? 'Analyzing Download...'
+              ? 'Testing download...'
               : speedTest.phase === 'uploading'
-              ? 'Analyzing Upload...'
+              ? 'Testing upload...'
+              : speedTest.phase === 'cancelled'
+              ? 'Cancelled'
               : speedTest.testedAtLabel
               ? `Updated ${speedTest.testedAtLabel}`
-              : 'Starting...'}
+              : 'Ready (not run)'}
           </span>
+        </div>
+
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <p className="text-[10px] text-slate-500 leading-snug">
+            Estimated speed to this server. Limited-data test: at most ~24 MB per run.
+          </p>
+          {speedTest.phase === 'downloading' || speedTest.phase === 'uploading' ? (
+            <button
+              type="button"
+              onClick={cancelSpeedTest}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Square className="w-3 h-3 fill-current" />
+              <span>Cancel test</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={startSpeedTest}
+              disabled={cooldownRemainingMs > 0}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-300 rounded whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Play className="w-3 h-3 fill-current" />
+              <span>
+                {cooldownRemainingMs > 0
+                  ? `Run again in ${Math.ceil(cooldownRemainingMs / 1000)}s`
+                  : speedTest.testedAtLabel
+                  ? 'Run again'
+                  : 'Start speed test'}
+              </span>
+            </button>
+          )}
         </div>
 
         {speedTest.error && (
