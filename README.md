@@ -37,8 +37,8 @@ Intel System is a first-party visitor intelligence dashboard that brings browser
 - Public IP, ISP, ASN, and geolocation.
 - Interactive Leaflet map.
 - Browser, OS, CPU, GPU, memory, and display information.
-- Live RTT, jitter, and packet-loss monitoring.
-- Multi-stream upload and download speed tests.
+- Live RTT, jitter, and failed-HTTP-probe monitoring (5s while visible, paused when hidden or offline).
+- Manual one-shot speed tests with server-enforced budgets, cooldown, cancellation, and a kill switch.
 - CPU pressure monitoring through the W3C Compute Pressure API.
 
 ### Visit history
@@ -47,6 +47,8 @@ Intel System is a first-party visitor intelligence dashboard that brings browser
 - Server-signed history backup for serverless continuity.
 
 > Browser fingerprinting and threat detection rely on heuristic signals. Results can vary with browser privacy settings, proxies, extensions, and platform capabilities.
+
+Speed tests are estimates for the path to this server, not guaranteed ISP line speeds. One explicit Start runs one bounded download phase and one bounded upload phase (16 MiB / 8 MiB and 8 s / 6 s by default), then stops. There is no automatic repeat and no hidden-tab transfer. Limits, runtime configuration, durable quotas, and cost tradeoffs are documented in [CLOUDFLARE.md](./CLOUDFLARE.md).
 
 ## Tech
 

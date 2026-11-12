@@ -46,9 +46,79 @@ var SPEED_TEST_POLICY = {
   // signed run token lifetime; no post-expiry grace
   tokenMaxAgeMs: 120 * 1e3,
   // stateless HMAC freshness window
-  tokenClockSkewMs: 60 * 1e3
+  tokenClockSkewMs: 60 * 1e3,
   // tolerance for slightly future issuedAtMs
+  maxRequestsPerRun: 400
+  // hard request-count backstop per run (including denied attempts)
 };
+function readRuntimeValue(runtimeEnv, name) {
+  if (runtimeEnv) {
+    const value = runtimeEnv[name];
+    if (typeof value === "string") return value.trim();
+  }
+  return (process.env[name] || "").trim();
+}
+function readPolicyNumber(runtimeEnv, name, min, max) {
+  const raw = readRuntimeValue(runtimeEnv, name);
+  if (!raw) return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < min || value > max) return null;
+  return value;
+}
+function effectiveSpeedTestPolicy(runtimeEnv) {
+  const policy = { ...SPEED_TEST_POLICY };
+  const cooldownSeconds = readPolicyNumber(runtimeEnv, "SPEED_TEST_COOLDOWN_SECONDS", 0, 3600);
+  if (cooldownSeconds !== null) policy.cooldownMs = Math.floor(cooldownSeconds * 1e3);
+  const visitorRuns = readPolicyNumber(runtimeEnv, "SPEED_TEST_VISITOR_RUNS_PER_HOUR", 1, 60);
+  if (visitorRuns !== null) policy.runsPerVisitorPerHour = Math.floor(visitorRuns);
+  const ipRuns = readPolicyNumber(runtimeEnv, "SPEED_TEST_IP_RUNS_PER_HOUR", 1, 300);
+  if (ipRuns !== null) policy.runsPerIpPerHour = Math.floor(ipRuns);
+  const dailyMiB = readPolicyNumber(runtimeEnv, "SPEED_TEST_DAILY_BUDGET_MIB", 24, 4096);
+  if (dailyMiB !== null) policy.dailySiteBudgetBytes = Math.floor(dailyMiB * 1024 * 1024);
+  return policy;
+}
+function speedTestDisabled(runtimeEnv) {
+  const raw = (readRuntimeValue(runtimeEnv, "SPEED_TEST_DISABLED") || readRuntimeValue(runtimeEnv, "SPEED_TEST_KILL_SWITCH")).toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+}
+function speedTestHmacSecret() {
+  return process.env.VISITOR_HMAC_SECRET || "intel-system-default-hmac-secret-v1";
+}
+function verifySpeedTransferGrant(token, raw) {
+  const parts = raw.split(".");
+  if (parts.length !== 2) return null;
+  const [payload, sig] = parts;
+  const expected = crypto.createHmac("sha256", token).update(`grant:${payload}`).digest("hex");
+  if (sig.length !== expected.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (typeof parsed.runId !== "string" || parsed.phase !== "download" && parsed.phase !== "upload") {
+      return null;
+    }
+    if (!Number.isFinite(parsed.bytes) || parsed.bytes < 0 || !Number.isFinite(parsed.expiresAtMs)) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+function readSpeedAdmission(value) {
+  const parts = value.split(".");
+  if (parts.length !== 2) return null;
+  const [payload, sig] = parts;
+  const expected = crypto.createHmac("sha256", speedTestHmacSecret()).update(`admission:${payload}`).digest("hex");
+  if (sig.length !== expected.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (typeof parsed.runId !== "string" || !Number.isFinite(parsed.expiresAtMs)) return null;
+    return { runId: parsed.runId, expiresAtMs: parsed.expiresAtMs };
+  } catch {
+    return null;
+  }
+}
 var SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES = SPEED_TEST_POLICY.maxDownloadBytes;
 var SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES = SPEED_TEST_POLICY.maxUploadBytes;
 var SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES = SPEED_TEST_POLICY.maxRequestBytes;
@@ -57,7 +127,6 @@ var SPEED_TEST_CONCURRENT_STREAMS = SPEED_TEST_POLICY.concurrentStreams;
 var SPEED_TEST_TOKEN_TTL_MS = SPEED_TEST_POLICY.tokenTtlMs;
 var SPEED_TEST_TOKEN_MAX_AGE_MS = SPEED_TEST_POLICY.tokenMaxAgeMs;
 var SPEED_TEST_TOKEN_CLOCK_SKEW_MS = SPEED_TEST_POLICY.tokenClockSkewMs;
-var SPEED_TEST_HMAC_SECRET = process.env.VISITOR_HMAC_SECRET || "intel-system-default-hmac-secret-v1";
 var SPEED_TEST_MIN_STREAM_BYTES = SPEED_TEST_POLICY.minRequestBytes;
 var SPEED_TEST_STREAM_CHUNK_BYTES = SPEED_TEST_POLICY.maxRequestBytes;
 var SPEED_TEST_REPORTED_CONCURRENT_STREAMS = SPEED_TEST_POLICY.concurrentStreams;
@@ -997,10 +1066,6 @@ var ipTestTimestamps = /* @__PURE__ */ new Map();
 var lastStartByVisitor = /* @__PURE__ */ new Map();
 var dailyReservedBytes = /* @__PURE__ */ new Map();
 var RATE_WINDOW_MS = 60 * 60 * 1e3;
-function speedTestDisabled() {
-  const raw = (process.env.SPEED_TEST_DISABLED || process.env.SPEED_TEST_KILL_SWITCH || "").trim().toLowerCase();
-  return raw === "1" || raw === "true" || raw === "yes";
-}
 function rejectWithRetry(res, status, code, message, retryAfterSeconds) {
   const retry = Math.max(1, Math.ceil(retryAfterSeconds));
   res.setHeader("Cache-Control", "no-store");
@@ -1010,10 +1075,10 @@ function rejectWithRetry(res, status, code, message, retryAfterSeconds) {
 function utcDayKey(nowMs) {
   return new Date(nowMs).toISOString().slice(0, 10);
 }
-function reserveDailyBudget(bytes, nowMs) {
+function reserveDailyBudget(bytes, nowMs, policy = SPEED_TEST_POLICY) {
   const dayKey = utcDayKey(nowMs);
   const reserved = dailyReservedBytes.get(dayKey) || 0;
-  if (reserved + bytes > SPEED_TEST_POLICY.dailySiteBudgetBytes) {
+  if (reserved + bytes > policy.dailySiteBudgetBytes) {
     const nextDayMs = Date.UTC(
       new Date(nowMs).getUTCFullYear(),
       new Date(nowMs).getUTCMonth(),
@@ -1089,12 +1154,12 @@ function pruneSpeedTestState(nowMs) {
     if (key !== today) dailyReservedBytes.delete(key);
   }
 }
-var SPEED_TEST_RUN_TOKEN_PATTERN = /^st_(\d{10,17})_([A-Za-z0-9]{2,40})_([0-9a-fA-F]{64})$/;
+var SPEED_TEST_RUN_TOKEN_PATTERN = /^st_(\d{10,17})_([A-Za-z0-9_]{2,40})_([0-9a-fA-F]{64})$/;
 var SPEED_TEST_LEGACY_TOKEN_PATTERN = /^st_(\d{10,17})_([0-9a-fA-F]{64})$/;
 function createSignedSpeedTestToken(runId = "") {
   const issuedAtMs = Date.now();
   const payload = runId ? `${issuedAtMs}:${runId}` : String(issuedAtMs);
-  const hmacHex = crypto.createHmac("sha256", SPEED_TEST_HMAC_SECRET).update(payload).digest("hex");
+  const hmacHex = crypto.createHmac("sha256", speedTestHmacSecret()).update(payload).digest("hex");
   return runId ? `st_${issuedAtMs}_${runId}_${hmacHex}` : `st_${issuedAtMs}_${hmacHex}`;
 }
 function verifySpeedTestToken(rawToken) {
@@ -1113,7 +1178,7 @@ function verifySpeedTestToken(rawToken) {
   const nowMs = Date.now();
   const fresh = issuedAtMs <= nowMs + SPEED_TEST_TOKEN_CLOCK_SKEW_MS && nowMs - issuedAtMs <= SPEED_TEST_TOKEN_MAX_AGE_MS;
   const payload = runId ? `${issuedAtMs}:${runId}` : String(issuedAtMs);
-  const expectedHex = crypto.createHmac("sha256", SPEED_TEST_HMAC_SECRET).update(payload).digest("hex");
+  const expectedHex = crypto.createHmac("sha256", speedTestHmacSecret()).update(payload).digest("hex");
   const valid = providedHex.length === expectedHex.length && crypto.timingSafeEqual(Buffer.from(providedHex, "utf8"), Buffer.from(expectedHex, "utf8"));
   return { valid, issuedAtMs, fresh, runId };
 }
@@ -1224,14 +1289,21 @@ app.get("/api/network/download", (req, res) => {
     return;
   }
   const ledger = verification.ledger;
-  if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS) {
-    rejectWithRetry(res, 429, "CONCURRENT_STREAMS", "Concurrent stream limit reached for this run.", 1);
+  const grantHeader = firstHeaderValue(req.headers["x-intel-speed-grant"]);
+  const grant = grantHeader ? verifySpeedTransferGrant(token, grantHeader) : null;
+  if (grantHeader && (!grant || grant.phase !== "download" || grant.runId !== ledger.testId || grant.expiresAtMs < nowMs)) {
+    rejectWithRetry(res, 403, "GRANT_INVALID", "Invalid internal transfer authorization.", 60);
     return;
   }
-  const remainingBudget = SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES - ledger.downloadedBytes;
-  if (remainingBudget <= 0) {
-    rejectWithRetry(res, 429, "BUDGET_EXHAUSTED", "Download budget exhausted for this run.", 60);
-    return;
+  if (!grant) {
+    if (ledger.activeStreams >= SPEED_TEST_CONCURRENT_STREAMS) {
+      rejectWithRetry(res, 429, "CONCURRENT_STREAMS", "Concurrent stream limit reached for this run.", 1);
+      return;
+    }
+    if (SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES - ledger.downloadedBytes <= 0) {
+      rejectWithRetry(res, 429, "BUDGET_EXHAUSTED", "Download budget exhausted for this run.", 60);
+      return;
+    }
   }
   const headerBytes = Number(req.headers["x-speedtest-bytes"]);
   const requestedBytes = Number.isFinite(headerBytes) && headerBytes > 0 ? Math.floor(headerBytes) : parseInt(String(req.query.bytes || SPEED_TEST_STREAM_CHUNK_BYTES), 10);
@@ -1239,7 +1311,11 @@ app.get("/api/network/download", (req, res) => {
     SPEED_TEST_MIN_STREAM_BYTES,
     Math.min(SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES, requestedBytes)
   );
-  const targetBytes = Math.min(clampedRequest, remainingBudget);
+  const targetBytes = grant ? Math.max(0, Math.min(grant.bytes, SPEED_TEST_MAX_STREAM_DOWNLOAD_BYTES)) : Math.min(clampedRequest, SPEED_TEST_MAX_TOTAL_DOWNLOAD_BYTES - ledger.downloadedBytes);
+  if (targetBytes <= 0) {
+    rejectWithRetry(res, 429, "BUDGET_EXHAUSTED", "Download budget exhausted for this run.", 60);
+    return;
+  }
   const streamBuffer = Buffer.allocUnsafe(targetBytes);
   for (let offset = 0; offset < targetBytes; offset += HIGH_ENTROPY_64KB_CHUNK.length) {
     const toFill = Math.min(HIGH_ENTROPY_64KB_CHUNK.length, targetBytes - offset);
@@ -1256,18 +1332,18 @@ app.get("/api/network/download", (req, res) => {
   res.setHeader("Expires", "0");
   res.setHeader("Timing-Allow-Origin", "*");
   res.setHeader("X-Accel-Buffering", "no");
-  ledger.activeStreams += 1;
+  if (!grant) ledger.activeStreams += 1;
   let streamClosed = false;
   const cleanupStream = () => {
     if (streamClosed) return;
     streamClosed = true;
-    ledger.activeStreams = Math.max(0, ledger.activeStreams - 1);
+    if (!grant) ledger.activeStreams = Math.max(0, ledger.activeStreams - 1);
   };
   req.on("close", cleanupStream);
   res.on("close", cleanupStream);
   res.on("error", cleanupStream);
   res.on("finish", cleanupStream);
-  ledger.downloadedBytes += targetBytes;
+  if (!grant) ledger.downloadedBytes += targetBytes;
   res.end(streamBuffer);
 });
 var speedTestUploadRawParser = express.raw({ type: "*/*", limit: "4mb" });
@@ -1291,6 +1367,7 @@ var speedTestUploadBodyGuard = (req, res, next) => {
       if (!res.headersSent) {
         res.status(413).json({
           ok: false,
+          code: "UPLOAD_LIMIT_EXCEEDED",
           error: "Upload payload exceeds the 4 MB route limit.",
           receivedBytes: 0
         });
@@ -1334,6 +1411,13 @@ app.post("/api/network/upload", speedTestUploadBodyGuard, (req, res) => {
     return;
   }
   const ledger = verification.ledger;
+  const grantHeader = firstHeaderValue(req.headers["x-intel-speed-grant"]);
+  const grant = grantHeader ? verifySpeedTransferGrant(token, grantHeader) : null;
+  if (grantHeader && (!grant || grant.phase !== "upload" || grant.runId !== ledger.testId || grant.expiresAtMs < nowMs)) {
+    rejectWithRetry(res, 403, "GRANT_INVALID", "Invalid internal transfer authorization.", 60);
+    return;
+  }
+  const uploadRequestCap = grant ? Math.max(0, Math.min(grant.bytes, SPEED_TEST_MAX_STREAM_UPLOAD_BYTES)) : SPEED_TEST_MAX_STREAM_UPLOAD_BYTES;
   const bumpActiveStreams = (delta) => {
     if (!ledger) return;
     ledger.activeStreams = Math.max(0, ledger.activeStreams + delta);
@@ -1341,9 +1425,10 @@ app.post("/api/network/upload", speedTestUploadBodyGuard, (req, res) => {
   const contentLengthHeader = parseInt(String(req.headers["content-length"] || "0"), 10);
   if (platformBufferedBody || req.readableEnded || req.complete) {
     const receivedBytes = platformBufferedBody ? platformBufferedBody.byteLength : Number.isFinite(contentLengthHeader) && contentLengthHeader > 0 ? Math.min(contentLengthHeader, SPEED_TEST_MAX_STREAM_UPLOAD_BYTES) : 0;
-    if (receivedBytes > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES || ledger && ledger.uploadedBytes + receivedBytes > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
+    if (receivedBytes > uploadRequestCap || !grant && ledger && ledger.uploadedBytes + receivedBytes > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
       res.status(413).json({
         ok: false,
+        code: "UPLOAD_LIMIT_EXCEEDED",
         error: "Upload transfer limit exceeded.",
         receivedBytes: 0
       });
@@ -1392,13 +1477,14 @@ app.post("/api/network/upload", speedTestUploadBodyGuard, (req, res) => {
   req.on("data", (chunk) => {
     if (finished || exceededCap) return;
     const chunkLen = chunk.length;
-    if (streamReceivedBytes + chunkLen > SPEED_TEST_MAX_STREAM_UPLOAD_BYTES || ledger && ledger.uploadedBytes + chunkLen > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
+    if (streamReceivedBytes + chunkLen > uploadRequestCap || !grant && ledger && ledger.uploadedBytes + chunkLen > SPEED_TEST_MAX_TOTAL_UPLOAD_BYTES) {
       exceededCap = true;
       cleanupUpload();
       req.resume();
       if (!res.headersSent) {
         res.status(413).json({
           ok: false,
+          code: "UPLOAD_LIMIT_EXCEEDED",
           error: "Upload transfer limit exceeded.",
           receivedBytes: streamReceivedBytes
         });
@@ -1445,42 +1531,47 @@ app.post("/api/network/speed-test/init", (req, res) => {
     rejectWithRetry(res, 503, "SPEED_TEST_DISABLED", "Speed testing is temporarily disabled by the operator.", 3600);
     return;
   }
-  for (const [ledgerKey, ledger] of activeSpeedTests.entries()) {
-    if (ledger.ipKey === ipKey || ledger.visitorKey === visitorKey) {
-      activeSpeedTests.delete(ledgerKey);
+  const admissionHeader = firstHeaderValue(req.headers["x-intel-speed-admission"]);
+  const durableAdmission = admissionHeader ? readSpeedAdmission(admissionHeader) : null;
+  const policy = effectiveSpeedTestPolicy();
+  if (!durableAdmission || durableAdmission.expiresAtMs < nowMs) {
+    for (const [ledgerKey, ledger] of activeSpeedTests.entries()) {
+      if (ledger.ipKey === ipKey || ledger.visitorKey === visitorKey) {
+        activeSpeedTests.delete(ledgerKey);
+      }
     }
+    const lastStartMs = lastStartByVisitor.get(visitorKey) || 0;
+    const cooldownRemainingMs = lastStartMs + policy.cooldownMs - nowMs;
+    if (cooldownRemainingMs > 0) {
+      rejectWithRetry(res, 429, "COOLDOWN", "A speed test ran recently. Wait for the cooldown to finish.", Math.ceil(cooldownRemainingMs / 1e3));
+      return;
+    }
+    const visitorHistory = (visitorTestTimestamps.get(visitorKey) || []).filter(
+      (ts) => nowMs - ts < RATE_WINDOW_MS
+    );
+    if (visitorHistory.length >= policy.runsPerVisitorPerHour) {
+      const retrySec = Math.max(5, Math.ceil((RATE_WINDOW_MS - (nowMs - visitorHistory[0])) / 1e3));
+      rejectWithRetry(res, 429, "VISITOR_LIMIT", `Run limit reached (${policy.runsPerVisitorPerHour} per hour).`, retrySec);
+      return;
+    }
+    const ipHistory = (ipTestTimestamps.get(ipKey) || []).filter((ts) => nowMs - ts < RATE_WINDOW_MS);
+    if (ipHistory.length >= policy.runsPerIpPerHour) {
+      const retrySec = Math.max(5, Math.ceil((RATE_WINDOW_MS - (nowMs - ipHistory[0])) / 1e3));
+      rejectWithRetry(res, 429, "IP_LIMIT", "Shared-network run limit reached.", retrySec);
+      return;
+    }
+    const admission = reserveDailyBudget(SPEED_TEST_RUN_RESERVATION_BYTES, nowMs, policy);
+    if (!admission.ok) {
+      rejectWithRetry(res, 429, "DAILY_BUDGET", "Daily speed-test transfer budget exhausted. Try again after 00:00 UTC.", admission.retryAfterSeconds);
+      return;
+    }
+    visitorHistory.push(nowMs);
+    visitorTestTimestamps.set(visitorKey, visitorHistory);
+    ipHistory.push(nowMs);
+    ipTestTimestamps.set(ipKey, ipHistory);
+    lastStartByVisitor.set(visitorKey, nowMs);
   }
-  const lastStartMs = lastStartByVisitor.get(visitorKey) || 0;
-  const cooldownRemainingMs = lastStartMs + SPEED_TEST_POLICY.cooldownMs - nowMs;
-  if (cooldownRemainingMs > 0) {
-    rejectWithRetry(res, 429, "COOLDOWN", "A speed test ran recently. Wait for the cooldown to finish.", Math.ceil(cooldownRemainingMs / 1e3));
-    return;
-  }
-  const visitorHistory = (visitorTestTimestamps.get(visitorKey) || []).filter(
-    (ts) => nowMs - ts < RATE_WINDOW_MS
-  );
-  if (visitorHistory.length >= SPEED_TEST_POLICY.runsPerVisitorPerHour) {
-    const retrySec = Math.max(5, Math.ceil((RATE_WINDOW_MS - (nowMs - visitorHistory[0])) / 1e3));
-    rejectWithRetry(res, 429, "VISITOR_LIMIT", `Run limit reached (${SPEED_TEST_POLICY.runsPerVisitorPerHour} per hour).`, retrySec);
-    return;
-  }
-  const ipHistory = (ipTestTimestamps.get(ipKey) || []).filter((ts) => nowMs - ts < RATE_WINDOW_MS);
-  if (ipHistory.length >= SPEED_TEST_POLICY.runsPerIpPerHour) {
-    const retrySec = Math.max(5, Math.ceil((RATE_WINDOW_MS - (nowMs - ipHistory[0])) / 1e3));
-    rejectWithRetry(res, 429, "IP_LIMIT", "Shared-network run limit reached.", retrySec);
-    return;
-  }
-  const admission = reserveDailyBudget(SPEED_TEST_RUN_RESERVATION_BYTES, nowMs);
-  if (!admission.ok) {
-    rejectWithRetry(res, 429, "DAILY_BUDGET", "Daily speed-test transfer budget exhausted. Try again after 00:00 UTC.", admission.retryAfterSeconds);
-    return;
-  }
-  visitorHistory.push(nowMs);
-  visitorTestTimestamps.set(visitorKey, visitorHistory);
-  ipHistory.push(nowMs);
-  ipTestTimestamps.set(ipKey, ipHistory);
-  lastStartByVisitor.set(visitorKey, nowMs);
-  const runId = "r_" + crypto.randomBytes(9).toString("hex");
+  const runId = durableAdmission ? durableAdmission.runId : "r_" + crypto.randomBytes(9).toString("hex");
   const testId = runId;
   const expiresAtMs = nowMs + SPEED_TEST_TOKEN_TTL_MS;
   const token = createSignedSpeedTestToken(runId);
@@ -1508,14 +1599,14 @@ app.post("/api/network/speed-test/init", (req, res) => {
     serverRegion: regionLabel,
     serverRegionCode: regionCode,
     // Effective policy returned by init; the client must honor these values.
-    policy: { ...SPEED_TEST_POLICY },
-    concurrentStreams: SPEED_TEST_POLICY.concurrentStreams,
-    maxDownloadBytes: SPEED_TEST_POLICY.maxDownloadBytes,
-    maxUploadBytes: SPEED_TEST_POLICY.maxUploadBytes,
-    maxRequestBytes: SPEED_TEST_POLICY.maxRequestBytes,
-    downloadPhaseMs: SPEED_TEST_POLICY.downloadPhaseMs,
-    uploadPhaseMs: SPEED_TEST_POLICY.uploadPhaseMs,
-    cooldownSeconds: SPEED_TEST_POLICY.cooldownMs / 1e3
+    policy,
+    concurrentStreams: policy.concurrentStreams,
+    maxDownloadBytes: policy.maxDownloadBytes,
+    maxUploadBytes: policy.maxUploadBytes,
+    maxRequestBytes: policy.maxRequestBytes,
+    downloadPhaseMs: policy.downloadPhaseMs,
+    uploadPhaseMs: policy.uploadPhaseMs,
+    cooldownSeconds: policy.cooldownMs / 1e3
   });
 });
 app.post("/api/network/speed-test/complete", (req, res) => {

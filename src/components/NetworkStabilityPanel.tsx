@@ -1112,6 +1112,7 @@ export function NetworkStabilityPanel() {
 
     let maxDlBytes = FALLBACK_MAX_DOWNLOAD_BYTES;
     let maxUlBytes = FALLBACK_MAX_UPLOAD_BYTES;
+    let runCooldownMs = RUN_COOLDOWN_MS;
     let testToken = '';
 
     setSpeedTest((prev) => ({ ...prev, phase: 'downloading', error: null }));
@@ -1135,14 +1136,19 @@ export function NetworkStabilityPanel() {
         token?: string;
         maxDownloadBytes?: number;
         maxUploadBytes?: number;
+        cooldownSeconds?: number;
       };
       if (initResp.ok && typeof initData.token === 'string' && initData.token.length > 0) {
         testToken = initData.token;
+        // Honor the effective server policy; never exceed the built-in fallback ceilings.
         if (typeof initData.maxDownloadBytes === 'number' && initData.maxDownloadBytes > 0) {
           maxDlBytes = Math.min(initData.maxDownloadBytes, FALLBACK_MAX_DOWNLOAD_BYTES);
         }
         if (typeof initData.maxUploadBytes === 'number' && initData.maxUploadBytes > 0) {
           maxUlBytes = Math.min(initData.maxUploadBytes, FALLBACK_MAX_UPLOAD_BYTES);
+        }
+        if (typeof initData.cooldownSeconds === 'number' && Number.isFinite(initData.cooldownSeconds)) {
+          runCooldownMs = Math.max(0, Math.min(initData.cooldownSeconds * 1000, 10 * 60 * 1000));
         }
       }
     } catch {
@@ -1239,7 +1245,7 @@ export function NetworkStabilityPanel() {
       testAbortRef.current = null;
       isTestStartingRef.current = false;
       if (!controller.signal.aborted) {
-        setCooldownUntilMs(Date.now() + RUN_COOLDOWN_MS);
+        setCooldownUntilMs(Date.now() + runCooldownMs);
         setCooldownNowMs(Date.now());
       }
     }

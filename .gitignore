@@ -12,3 +12,6 @@ data/*.db-*
 
 # local research notes
 .research/
+
+# Wrangler local state
+.wrangler/
