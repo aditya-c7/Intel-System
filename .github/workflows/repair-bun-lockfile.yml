@@ -1,0 +1,36 @@
+name: Repair Bun lockfile
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/repair-bun-lockfile.yml]
+permissions:
+  contents: write
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Regenerate lockfile
+        run: bun install --lockfile-only
+      - name: Verify frozen installation
+        run: bun install --frozen-lockfile
+      - name: Commit only the repaired lockfile
+        run: |
+          if ! git diff --quiet -- bun.lock; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add bun.lock
+            git commit -m 'fix: synchronize Bun lockfile with package.json'
+            git push origin HEAD:main
+          fi
+      - name: Check build
+        run: bun run build
+      - name: Check types
+        if: always()
+        run: bun run lint
