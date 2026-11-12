@@ -1,0 +1,22 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "intel-system",
+  "main": "build/worker/index.js",
+  "compatibility_date": "2026-11-12",
+  "compatibility_flags": ["nodejs_compat"],
+  "build": {
+    "command": "npm run build && node scripts/build-worker.mjs",
+    "watch_dir": ["worker", "server.ts", "src", "scripts/build-worker.mjs"]
+  },
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api", "/api/*"]
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "VISITOR_STORE", "class_name": "VisitorStore" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VisitorStore"] }],
+  "observability": { "enabled": true }
+}
