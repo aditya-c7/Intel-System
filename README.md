@@ -7,12 +7,12 @@
 
 *Know the visitor. Understand the device. Inspect the network.*
 
-[![Live Demo](https://img.shields.io/badge/Live_Demo-Explore-22C55E?logo=vercel&logoColor=white)](https://intel-system-nine.vercel.app)
+[![Live Demo](https://img.shields.io/badge/Live_Demo-Explore-22C55E?logo=cloudflare&logoColor=white)](https://intel.adityahq.me)
 [![Visitor Identity](https://img.shields.io/badge/Visitor_Identity-First--Party-2563EB)](#visitor-intelligence)
 [![Threat Signals](https://img.shields.io/badge/Threat_Signals-Multi--Signal-DC2626)](#threat-analysis)
 [![Network](https://img.shields.io/badge/Network-Real--Time-0891B2)](#network--device-intelligence)
 [![Visit History](https://img.shields.io/badge/Visit_History-Persistent-059669)](#visit-history)
-[![Deployment](https://img.shields.io/badge/Deployment-Vercel-000000?logo=vercel&logoColor=white)](https://vercel.com/)
+[![Deployment](https://img.shields.io/badge/Deployment-Cloudflare_Workers-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/workers/)
 
 </div>
 
@@ -50,5 +50,5 @@ Intel System is a first-party visitor intelligence dashboard that brings browser
 
 ## Tech
 
-React 19 · TypeScript · Tailwind CSS v4 · Vite · Express · SQLite · Leaflet · Vercel Functions
+React 19 · TypeScript · Tailwind CSS v4 · Vite · Express · Cloudflare Workers · SQLite-backed Durable Objects · Leaflet
 
