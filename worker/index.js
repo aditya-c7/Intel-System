@@ -401,16 +401,20 @@ async function handleSpeedTest(request, env, ctx, pathname) {
       let forwardedRequest = forwarded;
       if (!token) {
         // The client posts the token in the JSON body; read it once and replay the same bytes.
-        const rawBody = await forwarded.text();
-        try {
-          const parsed = JSON.parse(rawBody);
-          if (typeof parsed?.token === 'string') token = parsed.token;
-        } catch {}
-        forwardedRequest = new Request(forwarded.url, {
-          method: 'POST',
-          headers: forwarded.headers,
-          body: rawBody,
-        });
+        // Bound the read so a hostile body cannot be buffered into Worker memory.
+        const declaredLength = Number(request.headers.get('Content-Length') || '0');
+        if (!Number.isFinite(declaredLength) || declaredLength <= 8192) {
+          const rawBody = await forwarded.text();
+          try {
+            const parsed = JSON.parse(rawBody);
+            if (typeof parsed?.token === 'string') token = parsed.token;
+          } catch {}
+          forwardedRequest = new Request(forwarded.url, {
+            method: 'POST',
+            headers: forwarded.headers,
+            body: rawBody,
+          });
+        }
       }
       const verified = verifySpeedTestToken(token);
       if (verified.valid && verified.fresh && verified.runId) {

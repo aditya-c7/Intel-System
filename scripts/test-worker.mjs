@@ -256,7 +256,31 @@ try {
   assert.equal(pageDuringKillSwitch.status, 200);
   await pageDuringKillSwitch.text();
 
-  console.log('Workers routing, identity/auth, durable quotas, budget enforcement, token validation, kill switch and restart persistence checks passed.');
+  // ------------------------------------------- phase D: per-visitor and shared-IP admission caps
+  await stop();
+  await rm(state, { recursive: true, force: true });
+  await start({ SPEED_TEST_COOLDOWN_SECONDS: '0', SPEED_TEST_VISITOR_RUNS_PER_HOUR: '1' });
+  assert.equal((await post('/api/network/speed-test/init', {})).status, 200);
+  await expectRejection(await post('/api/network/speed-test/init', {}), 429, 'VISITOR_LIMIT');
+
+  await stop();
+  await rm(state, { recursive: true, force: true });
+  await start({
+    SPEED_TEST_COOLDOWN_SECONDS: '0',
+    SPEED_TEST_VISITOR_RUNS_PER_HOUR: '60',
+    SPEED_TEST_IP_RUNS_PER_HOUR: '1',
+  });
+  assert.equal((await post('/api/network/speed-test/init', {})).status, 200);
+  await expectRejection(await post('/api/network/speed-test/init', {}), 429, 'IP_LIMIT');
+
+  // ------------------------------------------------------- phase E: site-wide UTC-day budget
+  await stop();
+  await rm(state, { recursive: true, force: true });
+  await start({ SPEED_TEST_COOLDOWN_SECONDS: '0', SPEED_TEST_DAILY_BUDGET_MIB: '24' });
+  assert.equal((await post('/api/network/speed-test/init', {})).status, 200);
+  await expectRejection(await post('/api/network/speed-test/init', {}), 429, 'DAILY_BUDGET');
+
+  console.log('Workers routing, identity/auth, durable quotas, budget enforcement, token validation, kill switch, admission caps and restart persistence checks passed.');
 } catch (error) {
   console.error(logs);
   throw error;

@@ -85,7 +85,7 @@ These figures are arithmetic estimates from the policy, not provider-metered mea
 
 ## Verification
 
-CI checks the build, deployment dry-run, actual local Workers API execution, authentication, durable quotas across a full local restart, per-run byte budgets under parallel and replayed requests, token tampering/expiry, upload media-type and size validation, the kill switch, SPA fallback, and visitor history persistence. A passing build is not proof of a successful production deployment; inspect CI results and then verify the live endpoints.
+CI checks the build, deployment dry-run, actual local Workers API execution, authentication, durable quotas across a full local restart, per-run byte budgets under parallel and replayed requests, token tampering/expiry, upload media-type and size validation, the kill switch, SPA fallback, and visitor history persistence. `npm run test:browser` additionally drives a real Chromium against a local Worker to confirm zero speed-test requests before Start, exactly one run per click (including a double click), no automatic repeat, result restore without a run, cancellation, and RTT tab-leader handover. It needs a system Chromium (`CHROMIUM_PATH` may point at one) and is skipped when none is installed. A passing build is not proof of a successful production deployment; inspect CI results and then verify the live endpoints.
 
 ```sh
 curl -i https://intel.adityahq.me/api/health

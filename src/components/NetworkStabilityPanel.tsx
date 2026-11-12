@@ -44,6 +44,46 @@ const SPEED_TEST_CHUNK_BYTES_MAX = 262144; // hard 256 KiB cap per download/uplo
 const SPEED_TEST_413_FALLBACK_BYTES = 262144; // 256 KiB one-shot retry payload after an HTTP 413
 const SPEED_TEST_INIT_TIMEOUT_MS = 4000; // speed-test/init call must never stall the test loop
 const LAST_RUN_STORAGE_KEY = 'intel_speedtest_last_v1'; // display-only restore across remounts
+const MONITOR_LEADER_KEY = 'intel_rtt_leader_v1'; // same-origin tab lease (not a security boundary)
+const MONITOR_LEADER_TTL_MS = 12000; // lease lifetime; renews on every probe (5s cadence)
+const MONITOR_CHANNEL_NAME = 'intel_rtt_samples_v1'; // share measured samples with mirroring tabs
+
+interface MonitorLease {
+  id: string;
+  expiresAtMs: number;
+}
+
+function readMonitorLease(): MonitorLease | null {
+  try {
+    const raw = window.localStorage.getItem(MONITOR_LEADER_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<MonitorLease>;
+    if (typeof parsed.id !== 'string' || typeof parsed.expiresAtMs !== 'number') return null;
+    return { id: parsed.id, expiresAtMs: parsed.expiresAtMs };
+  } catch {
+    return null;
+  }
+}
+
+function writeMonitorLease(id: string): void {
+  try {
+    window.localStorage.setItem(
+      MONITOR_LEADER_KEY,
+      JSON.stringify({ id, expiresAtMs: Date.now() + MONITOR_LEADER_TTL_MS })
+    );
+  } catch {
+    // Storage unavailable: polling continues without deduplication rather than deadlocking.
+  }
+}
+
+function releaseMonitorLease(id: string): void {
+  try {
+    const lease = readMonitorLease();
+    if (lease?.id === id) window.localStorage.removeItem(MONITOR_LEADER_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
+}
 
 function readPersistedSpeedTest(): SpeedTestState | null {
   try {
@@ -216,6 +256,10 @@ export function NetworkStabilityPanel() {
   const [cooldownUntilMs, setCooldownUntilMs] = useState<number | null>(null);
   const [cooldownNowMs, setCooldownNowMs] = useState<number>(() => Date.now());
   const [monitorAutoPaused, setMonitorAutoPaused] = useState<boolean>(false);
+  const [isMonitorLeader, setIsMonitorLeader] = useState<boolean>(true);
+  const tabIdRef = useRef<string>(
+    `tab_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`
+  );
 
   const sampleCounterRef = useRef<number>(0);
   const latestRttMsRef = useRef<number>(180);
@@ -1306,6 +1350,27 @@ export function NetworkStabilityPanel() {
           });
           continue;
         }
+        if (!isOnlineRef.current) {
+          // Explicitly offline: pause probing (and release the tab lease) until connectivity returns.
+          releaseMonitorLease(tabIdRef.current);
+          await new Promise<void>((resolve) => {
+            nextProbeTimer = setTimeout(resolve, 1000);
+          });
+          continue;
+        }
+
+        // One tab per origin performs the probes. The lease expires on its own, so closing a
+        // leader recovers automatically; this is a quota safeguard, not a security boundary.
+        const lease = readMonitorLease();
+        if (lease && lease.id !== tabIdRef.current && lease.expiresAtMs > Date.now()) {
+          setIsMonitorLeader(false);
+          await new Promise<void>((resolve) => {
+            nextProbeTimer = setTimeout(resolve, 1000);
+          });
+          continue;
+        }
+        writeMonitorLease(tabIdRef.current);
+        setIsMonitorLeader(true);
 
         const startedAt = Date.now();
         await executePingProbe();
@@ -1338,8 +1403,42 @@ export function NetworkStabilityPanel() {
         clearTimeout(nextProbeTimer);
       }
       clearInterval(clockTimer);
+      releaseMonitorLease(tabIdRef.current);
     };
   }, [isRunning, executePingProbe]);
+
+  // Mirroring tabs append the leader's measured samples so every open tab shows the same graph
+  // without issuing duplicate ping requests.
+  useEffect(() => {
+    if (!isRunning || typeof BroadcastChannel === 'undefined') return;
+    const channel = new BroadcastChannel(MONITOR_CHANNEL_NAME);
+    channel.onmessage = (event: MessageEvent) => {
+      const payload = event.data as { owner?: string; sample?: PingSample } | null;
+      if (!payload?.sample || payload.owner === tabIdRef.current) return;
+      const incoming = payload.sample;
+      setSamples((prev) =>
+        prev.some((sample) => sample.id === incoming.id && sample.timestampMs === incoming.timestampMs)
+          ? prev
+          : [...prev, incoming].slice(-600)
+      );
+    };
+    return () => channel.close();
+  }, [isRunning]);
+
+  const broadcastedSampleRef = useRef<string>('');
+  useEffect(() => {
+    if (!isRunning || typeof BroadcastChannel === 'undefined') return;
+    const latest = samples[samples.length - 1];
+    if (!latest) return;
+    const lease = readMonitorLease();
+    if (!lease || lease.id !== tabIdRef.current || lease.expiresAtMs < Date.now()) return;
+    const signature = `${latest.id}:${latest.timestampMs}`;
+    if (broadcastedSampleRef.current === signature) return;
+    broadcastedSampleRef.current = signature;
+    const channel = new BroadcastChannel(MONITOR_CHANNEL_NAME);
+    channel.postMessage({ owner: tabIdRef.current, sample: latest });
+    channel.close();
+  }, [samples, isRunning]);
 
   // Rolling 5-minute window bounds
   const windowStartMs = windowEndMs - FIVE_MINUTES_MS;
@@ -1516,6 +1615,15 @@ export function NetworkStabilityPanel() {
                 {isOnline ? 'Online' : 'Offline'}
               </strong>
             </span>
+
+            {isRunning && (
+              <span
+                className="text-[10px] font-mono text-slate-500"
+                title="Same-origin tabs share RTT polling through a leader lease; this is not a server security boundary."
+              >
+                {isMonitorLeader ? 'Probing this tab' : 'Mirroring another tab'}
+              </span>
+            )}
 
             <button
               type="button"
