@@ -100,7 +100,7 @@ export function LocationMap({
         center: [lat, lng],
         zoom,
         zoomControl: true,
-        attributionControl: true,
+        attributionControl: false,
         scrollWheelZoom: false,
       });
 
