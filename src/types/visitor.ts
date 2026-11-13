@@ -80,6 +80,30 @@ export interface SmartSignals {
   vm: SmartSignal;
 }
 
+/**
+ * Phase 1 — bot classification outcome. `good_bot` covers verified search /
+ * preview crawlers from their official ASN, `ai_agent` covers LLM crawlers and
+ * autonomous cloud-browser agents, `bad_bot` covers automation and spoofed UA.
+ */
+export type BotSubtype = 'human' | 'good_bot' | 'ai_agent' | 'bad_bot';
+
+/**
+ * Phase 4 — one-time cryptographic envelope attached to every identification
+ * payload. The server recomputes `signature` over the canonical string
+ * `INTEL_ENVELOPE_V1|timestamp|nonce|hardwareId|userAgent|platform|screenResolution|timezone`
+ * and rejects stale, modified or replayed requests.
+ */
+export interface SecurityEnvelope {
+  timestamp: number;
+  nonce: string;
+  signature: string;
+  userAgent: string;
+  platform: string;
+  screenResolution: string;
+  timezone: string;
+  protocol: string;
+}
+
 export interface SecuritySignals {
   isBot: boolean;
   botSignals: string[];
@@ -144,6 +168,27 @@ export interface SecuritySignals {
   webdriver?: boolean;
   cdpDetected?: boolean;
   isOsTampered?: boolean;
+
+  /* Phase 1 — bot / AI-agent subtype classification (server-computed) */
+  botSubtype?: BotSubtype;
+  botProvider?: string;
+  botCategory?: string;
+  botIdentityConfidence?: number;
+
+  /* Phase 2 — authoritative Tor exit relay + local abuse blocklist */
+  torExitNode?: boolean;
+  ipBlocklisted?: boolean;
+  ipBlocklistReasons?: string[];
+
+  /* Phase 3 — mobile emulator / simulator and cloud-container detection */
+  emulatorDetected?: boolean;
+  emulatorReason?: string;
+
+  /* Phase 4 — sealed request envelope verdicts */
+  tamperedRequest?: boolean;
+  replayDetected?: boolean;
+  requestIntegrityReason?: string;
+  requestNonce?: string;
   /** Server-computed 4-signal grid, each tile rated out of 10. */
   smartSignals?: SmartSignals;
   /** Composite badge text, e.g. `Medium Risk • 4/10`. */
