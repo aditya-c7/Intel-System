@@ -947,6 +947,57 @@ function readRequestHeader(headers: RawHeaderBag | null | undefined, name: strin
   return typeof raw === 'string' ? raw.trim() : '';
 }
 
+/** Coarse browser / tool family used to compare a signed UA with the HTTP header. */
+function detectUaFamily(userAgent: string): string {
+  const ua = userAgent.toLowerCase();
+  if (!ua) return '';
+  if (/edg\//.test(ua)) return 'edge';
+  if (/opr\/|opera/.test(ua)) return 'opera';
+  if (/firefox\/|fxios/.test(ua)) return 'firefox';
+  if (/chrome\/|crios|chromium\//.test(ua)) return 'chrome';
+  if (/safari\//.test(ua)) return 'safari';
+  if (/^curl\//.test(ua)) return 'curl';
+  if (/postmanruntime/.test(ua)) return 'postman';
+  if (/python-requests|python-urllib|aiohttp/.test(ua)) return 'python';
+  if (/^wget\//.test(ua)) return 'wget';
+  if (/^node-fetch|undici|axios/.test(ua)) return 'node';
+  return '';
+}
+
+/** Coarse operating-system family used to compare a signed UA with the HTTP header. */
+function detectUaOs(userAgent: string): string {
+  const ua = userAgent.toLowerCase();
+  if (/windows nt|win32|win64/.test(ua)) return 'windows';
+  if (/android/.test(ua)) return 'android';
+  if (/iphone|ipad|ipod/.test(ua)) return 'ios';
+  if (/macintosh|mac os x/.test(ua)) return 'macos';
+  if (/cros/.test(ua)) return 'chromeos';
+  if (/linux|x11/.test(ua)) return 'linux';
+  return '';
+}
+
+/**
+ * Compares the HTTP User-Agent header with the signed payload UA. Edge proxies may
+ * truncate long header values (Vercel cuts them at ~67 chars), so an exact match is not
+ * required: a clean prefix relationship is the same client, otherwise the browser family
+ * and OS must agree. Unknown signatures never trigger a tamper verdict.
+ */
+function userAgentsCompatible(headerUserAgent: string, payloadUserAgent: string): boolean {
+  const header = headerUserAgent.trim();
+  const payload = payloadUserAgent.trim();
+  if (!header || !payload || header === payload) return true;
+  const shorter = header.length <= payload.length ? header : payload;
+  const longer = header.length <= payload.length ? payload : header;
+  if (shorter.length >= 24 && longer.startsWith(shorter)) return true;
+  const headerFamily = detectUaFamily(header);
+  const payloadFamily = detectUaFamily(payload);
+  if (headerFamily && payloadFamily && headerFamily !== payloadFamily) return false;
+  const headerOs = detectUaOs(header);
+  const payloadOs = detectUaOs(payload);
+  if (headerOs && payloadOs && headerOs !== payloadOs) return false;
+  return true;
+}
+
 const GOOD_BOT_UA_RULES: Array<{
   pattern: RegExp;
   provider: string;
@@ -1449,8 +1500,11 @@ function verifySecurityEnvelope(args: {
   }
 
   // Header cross-check: the raw HTTP headers must agree with the signed JS payload.
+  // Edge proxies (including Vercel) may truncate long User-Agent headers, so an exact
+  // string comparison is unsafe. Compare the browser family and OS instead, and treat a
+  // prefix relationship as compatible (truncated header).
   const headerUserAgent = readRequestHeader(headers, 'user-agent');
-  if (headerUserAgent && envelopeUserAgent && headerUserAgent !== envelopeUserAgent) {
+  if (headerUserAgent && envelopeUserAgent && !userAgentsCompatible(headerUserAgent, envelopeUserAgent)) {
     tamperedRequest = true;
     reasons.push('HTTP User-Agent header contradicts JS payload');
   }
@@ -1936,15 +1990,7 @@ app.get('/api/health', (req, res) => {
     db.prepare('SELECT COUNT(*) AS count FROM visits').get() as { count: number }
   ).count;
   const { regionCode, regionLabel } = detectServerRegion(req);
-  const uaDebug = req.headers['x-intel-debug-ua'] === '1';
-  res.json({
-    status: 'ok',
-    visitorsCount,
-    visitsCount,
-    regionCode,
-    regionLabel,
-    ...(uaDebug ? { receivedUserAgent: String(req.headers['user-agent'] || '') } : {}),
-  });
+  res.json({ status: 'ok', visitorsCount, visitsCount, regionCode, regionLabel });
 });
 
 function extractVercelEdgeGeo(req: express.Request): {
@@ -3280,8 +3326,24 @@ app.post('/api/visitor/identify', async (req, res) => {
     });
 
     // Phase 1 — bot identity is resolved from the raw headers plus the server network identity.
+    // Edge proxies truncate long User-Agent headers, so the signed envelope carries the full UA;
+    // fall back to the raw header for older clients. A crawler/automation signature in the raw
+    // header always wins so a spoofed envelope cannot mask a bot.
+    const headerRequestUserAgent = readRequestHeader(rawRequestHeaders, 'user-agent');
+    const envelopeRequestUserAgent =
+      typeof requestBody.securityEnvelope?.userAgent === 'string'
+        ? requestBody.securityEnvelope.userAgent.trim()
+        : '';
+    const headerCarriesBotSignature =
+      Boolean(headerRequestUserAgent) &&
+      (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) ||
+        GOOD_BOT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)) ||
+        AI_AGENT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)));
+    const fullRequestUserAgent = headerCarriesBotSignature
+      ? headerRequestUserAgent
+      : envelopeRequestUserAgent || headerRequestUserAgent;
     const botClassification = classifyBotTraffic(
-      rawRequestHeaders,
+      { ...rawRequestHeaders, 'user-agent': fullRequestUserAgent },
       { org: location.org, isp: location.isp, asn: location.asn },
       {
         isBot: Boolean(
@@ -3304,7 +3366,13 @@ app.post('/api/visitor/identify', async (req, res) => {
     const torExitNode =
       isTorBulkListed(location.publicIp) || (await isTorExitNode(location.publicIp));
 
-    if (envelopeVerdict.tamperedRequest) {
+    // Only cryptographic tampering (modified signed payload) and nonce replay poison the IP
+    // ledger. A User-Agent header mismatch is deliberately excluded: edge proxies can rewrite
+    // or truncate headers, so it must never blocklist an otherwise normal visitor.
+    const signedPayloadTampered = /Payload integrity hash mismatch/i.test(
+      envelopeVerdict.requestIntegrityReason
+    );
+    if (signedPayloadTampered) {
       flagSuspiciousIp(
         location.publicIp,
         envelopeVerdict.requestIntegrityReason || 'Tampered request payload'

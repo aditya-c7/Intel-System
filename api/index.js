@@ -676,6 +676,46 @@ function readRequestHeader(headers, name) {
   const raw = Array.isArray(direct) ? direct.join(", ") : direct;
   return typeof raw === "string" ? raw.trim() : "";
 }
+function detectUaFamily(userAgent) {
+  const ua = userAgent.toLowerCase();
+  if (!ua) return "";
+  if (/edg\//.test(ua)) return "edge";
+  if (/opr\/|opera/.test(ua)) return "opera";
+  if (/firefox\/|fxios/.test(ua)) return "firefox";
+  if (/chrome\/|crios|chromium\//.test(ua)) return "chrome";
+  if (/safari\//.test(ua)) return "safari";
+  if (/^curl\//.test(ua)) return "curl";
+  if (/postmanruntime/.test(ua)) return "postman";
+  if (/python-requests|python-urllib|aiohttp/.test(ua)) return "python";
+  if (/^wget\//.test(ua)) return "wget";
+  if (/^node-fetch|undici|axios/.test(ua)) return "node";
+  return "";
+}
+function detectUaOs(userAgent) {
+  const ua = userAgent.toLowerCase();
+  if (/windows nt|win32|win64/.test(ua)) return "windows";
+  if (/android/.test(ua)) return "android";
+  if (/iphone|ipad|ipod/.test(ua)) return "ios";
+  if (/macintosh|mac os x/.test(ua)) return "macos";
+  if (/cros/.test(ua)) return "chromeos";
+  if (/linux|x11/.test(ua)) return "linux";
+  return "";
+}
+function userAgentsCompatible(headerUserAgent, payloadUserAgent) {
+  const header = headerUserAgent.trim();
+  const payload = payloadUserAgent.trim();
+  if (!header || !payload || header === payload) return true;
+  const shorter = header.length <= payload.length ? header : payload;
+  const longer = header.length <= payload.length ? payload : header;
+  if (shorter.length >= 24 && longer.startsWith(shorter)) return true;
+  const headerFamily = detectUaFamily(header);
+  const payloadFamily = detectUaFamily(payload);
+  if (headerFamily && payloadFamily && headerFamily !== payloadFamily) return false;
+  const headerOs = detectUaOs(header);
+  const payloadOs = detectUaOs(payload);
+  if (headerOs && payloadOs && headerOs !== payloadOs) return false;
+  return true;
+}
 var GOOD_BOT_UA_RULES = [
   {
     pattern: /googlebot/i,
@@ -1058,7 +1098,7 @@ function verifySecurityEnvelope(args) {
     if (replayDetected) reasons.push("Duplicate payload nonce (Replay Attack detected)");
   }
   const headerUserAgent = readRequestHeader(headers, "user-agent");
-  if (headerUserAgent && envelopeUserAgent && headerUserAgent !== envelopeUserAgent) {
+  if (headerUserAgent && envelopeUserAgent && !userAgentsCompatible(headerUserAgent, envelopeUserAgent)) {
     tamperedRequest = true;
     reasons.push("HTTP User-Agent header contradicts JS payload");
   }
@@ -1426,15 +1466,7 @@ app.get("/api/health", (req, res) => {
   const visitorsCount = db.prepare("SELECT COUNT(*) AS count FROM visitors").get().count;
   const visitsCount = db.prepare("SELECT COUNT(*) AS count FROM visits").get().count;
   const { regionCode, regionLabel } = detectServerRegion(req);
-  const uaDebug = req.headers["x-intel-debug-ua"] === "1";
-  res.json({
-    status: "ok",
-    visitorsCount,
-    visitsCount,
-    regionCode,
-    regionLabel,
-    ...uaDebug ? { receivedUserAgent: String(req.headers["user-agent"] || "") } : {}
-  });
+  res.json({ status: "ok", visitorsCount, visitsCount, regionCode, regionLabel });
 });
 function extractVercelEdgeGeo(req) {
   const decodeHeader = (val) => {
@@ -2164,8 +2196,12 @@ app.post("/api/visitor/identify", async (req, res) => {
       hardwareId,
       nowMs
     });
+    const headerRequestUserAgent = readRequestHeader(rawRequestHeaders, "user-agent");
+    const envelopeRequestUserAgent = typeof requestBody.securityEnvelope?.userAgent === "string" ? requestBody.securityEnvelope.userAgent.trim() : "";
+    const headerCarriesBotSignature = Boolean(headerRequestUserAgent) && (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) || GOOD_BOT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)) || AI_AGENT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)));
+    const fullRequestUserAgent = headerCarriesBotSignature ? headerRequestUserAgent : envelopeRequestUserAgent || headerRequestUserAgent;
     const botClassification = classifyBotTraffic(
-      rawRequestHeaders,
+      { ...rawRequestHeaders, "user-agent": fullRequestUserAgent },
       { org: location.org, isp: location.isp, asn: location.asn },
       {
         isBot: Boolean(
@@ -2179,7 +2215,10 @@ app.post("/api/visitor/identify", async (req, res) => {
     );
     void refreshTorBulkList();
     const torExitNode = isTorBulkListed(location.publicIp) || await isTorExitNode(location.publicIp);
-    if (envelopeVerdict.tamperedRequest) {
+    const signedPayloadTampered = /Payload integrity hash mismatch/i.test(
+      envelopeVerdict.requestIntegrityReason
+    );
+    if (signedPayloadTampered) {
       flagSuspiciousIp(
         location.publicIp,
         envelopeVerdict.requestIntegrityReason || "Tampered request payload"
