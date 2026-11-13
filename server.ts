@@ -1172,24 +1172,25 @@ function classifyBotTraffic(
   const isDesktopChromeOrSafari =
     /chrome\/|crios\/|safari\//i.test(ua) && !/mobile|android|iphone|ipad/i.test(ua);
   const missingFetchMetadata = !secFetchSite && !secFetchMode && !secFetchDest;
+  // Only a UA that claims a real desktop browser but supplies neither a language nor any
+  // fetch metadata is treated as automation. Requiring both keep older Safari builds (which
+  // predate Sec-Fetch support) and language-stripping privacy setups out of the bot verdict.
+  const headerAnomaly = isDesktopChromeOrSafari && missingFetchMetadata && !acceptLanguage;
 
   if (
     client.isBot ||
     client.webdriver ||
     client.cdpDetected ||
     AUTOMATION_UA_PATTERN.test(ua) ||
-    (isDesktopChromeOrSafari && (!acceptLanguage || missingFetchMetadata))
+    headerAnomaly
   ) {
     const reasons: string[] = [];
     if (client.isBot) reasons.push('Client reported an automated runtime');
     if (client.webdriver) reasons.push('WebDriver handshake detected');
     if (client.cdpDetected) reasons.push('Chrome DevTools Protocol binding detected');
     if (AUTOMATION_UA_PATTERN.test(ua)) reasons.push('Automation framework signature in user-agent');
-    if (isDesktopChromeOrSafari && !acceptLanguage) {
-      reasons.push('Desktop browser user-agent without accept-language');
-    }
-    if (isDesktopChromeOrSafari && missingFetchMetadata) {
-      reasons.push('Desktop browser user-agent without sec-fetch metadata');
+    if (headerAnomaly) {
+      reasons.push('Desktop browser user-agent without accept-language or sec-fetch metadata');
     }
     for (const signal of clientSignals.slice(0, 2)) reasons.push(signal);
     return {
@@ -1379,7 +1380,10 @@ function lookupSuspiciousIp(ip: string): { blocklisted: boolean; reasons: string
 /* Phase 4 — sealed request envelope verification                             */
 /* -------------------------------------------------------------------------- */
 
-const ENVELOPE_FRESHNESS_WINDOW_MS = 60 * 1000;
+// A signed payload may only be replayed inside the nonce window; anything older is stale.
+// The window is deliberately generous so a visitor whose system clock drifted (dead CMOS
+// battery, wrong timezone offset, throttled VM clock) is never labelled as tampered.
+const ENVELOPE_FRESHNESS_WINDOW_MS = 10 * 60 * 1000;
 const NONCE_TTL_MS = 15 * 60 * 1000;
 const NONCE_CACHE_MAX_ENTRIES = 5000;
 const seenEnvelopeNonces = new Map<string, number>();
@@ -1486,10 +1490,12 @@ function verifySecurityEnvelope(args: {
     }
   }
 
-  // Freshness: a timestamp-less payload is unverifiable, not tampered.
+  // Freshness: a timestamp-less payload is unverifiable, not tampered. A signed payload is
+  // only rejected when it is far outside the clock tolerance, so ordinary client clock drift
+  // never produces a tamper verdict; the nonce cache below covers replays inside the window.
   if (timestamp > 0 && Math.abs(nowMs - timestamp) > ENVELOPE_FRESHNESS_WINDOW_MS) {
     tamperedRequest = true;
-    reasons.push('Expired or replayed payload timestamp (>60s)');
+    reasons.push('Expired or replayed payload timestamp (>10m)');
   }
 
   // Replay: a nonce may be used exactly once inside the 15-minute window.
