@@ -2664,10 +2664,16 @@ function sanitizeAndReinforceSecuritySignals(
     scoreOutOf10: incognitoScore,
     riskLabel: `${tierFor(incognitoScore)} Risk • ${incognitoScore}/10`,
     level: levelFor(incognitoScore),
+    // The physical proof has to match the verdict: when the client probe itself reported a
+    // private context we can quote its method, but when the verdict comes only from the
+    // server's cross-session correlation the client advertised (or had) disk-backed storage,
+    // so quoting that method would contradict the tile.
     detail: isIncognito
-      ? `Ephemeral RAM storage detected (${
-          incognitoMethod || 'In-memory LevelDB / Cookie-less known hwid'
-        })`
+      ? clientReportedIncognito
+        ? `Ephemeral RAM storage detected (${
+            incognitoMethod || 'In-memory LevelDB / 10 GiB decoy quota'
+          })`
+        : 'Returning hardware ID (hwid) detected with wiped cookies & localStorage — ephemeral cookie jar'
       : `Persistent disk-backed storage verified (${incognitoMethod || 'Standard profile'})`,
   };
 
