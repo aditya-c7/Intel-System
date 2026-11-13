@@ -2410,13 +2410,13 @@ function sanitizeAndReinforceSecuritySignals(
 
   // Final incognito verdict: the client's own storage probe, or the server-side cross-session
   // proof — an ephemeral context with no surviving cookie / localStorage / signed backup.
+  // The Incognito tile is driven by the client's physical storage-commit probe. The
+  // server-side "known hardware without cookies" correlation is deliberately not enough on
+  // its own: a brand-new browser profile, cleared cookies or a cookie-blocking extension is
+  // indistinguishable from a private window and must not be labelled Incognito.
   const clientReportedIncognito =
     Boolean(incognitoContext.clientReportedIncognito) || incognitoLikely;
-  const serverCrossModeIncognito = Boolean(
-    !incognitoContext.hadPersistentClientState &&
-      (incognitoContext.existingHwidVisitor || incognitoContext.crossSessionEphemeral)
-  );
-  const isIncognito = Boolean(clientReportedIncognito || serverCrossModeIncognito);
+  const isIncognito = clientReportedIncognito;
 
   const tierFor = (score: number): RiskLevel =>
     score >= 7 ? 'High' : score >= 3 ? 'Medium' : 'Low';
@@ -2434,16 +2434,12 @@ function sanitizeAndReinforceSecuritySignals(
     scoreOutOf10: incognitoScore,
     riskLabel: `${tierFor(incognitoScore)} Risk • ${incognitoScore}/10`,
     level: levelFor(incognitoScore),
-    // The physical proof has to match the verdict: when the client probe itself reported a
-    // private context we can quote its method, but when the verdict comes only from the
-    // server's cross-session correlation the client advertised (or had) disk-backed storage,
-    // so quoting that method would contradict the tile.
+    // The physical proof must match the verdict: a private tile always quotes the client's
+    // own storage-commit probe method, a normal tile quotes the verified disk-backed path.
     detail: isIncognito
-      ? clientReportedIncognito
-        ? `Ephemeral RAM storage detected (${
-            incognitoMethod || 'In-memory LevelDB / 10 GiB decoy quota'
-          })`
-        : 'Returning hardware ID (hwid) detected with wiped cookies & localStorage — ephemeral cookie jar'
+      ? `Ephemeral RAM storage detected (${
+          incognitoMethod || 'In-memory LevelDB / 10 GiB decoy quota'
+        })`
       : `Persistent disk-backed storage verified (${incognitoMethod || 'Standard profile'})`,
   };
 

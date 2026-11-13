@@ -1644,10 +1644,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   }
   const incognitoOrCleared = Boolean(raw?.incognitoOrCleared) || recognitionSource === "Hardware Fingerprint (Cookie-less / Incognito)" || persistenceMode === "Hardware ID Recovered";
   const clientReportedIncognito = Boolean(incognitoContext.clientReportedIncognito) || incognitoLikely;
-  const serverCrossModeIncognito = Boolean(
-    !incognitoContext.hadPersistentClientState && (incognitoContext.existingHwidVisitor || incognitoContext.crossSessionEphemeral)
-  );
-  const isIncognito = Boolean(clientReportedIncognito || serverCrossModeIncognito);
+  const isIncognito = clientReportedIncognito;
   const tierFor = (score) => score >= 7 ? "High" : score >= 3 ? "Medium" : "Low";
   const levelFor = (score) => score >= 7 ? "high" : score >= 3 ? "medium" : "low";
   const incognitoScore = isIncognito ? 4 : 0;
@@ -1658,11 +1655,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     scoreOutOf10: incognitoScore,
     riskLabel: `${tierFor(incognitoScore)} Risk \u2022 ${incognitoScore}/10`,
     level: levelFor(incognitoScore),
-    // The physical proof has to match the verdict: when the client probe itself reported a
-    // private context we can quote its method, but when the verdict comes only from the
-    // server's cross-session correlation the client advertised (or had) disk-backed storage,
-    // so quoting that method would contradict the tile.
-    detail: isIncognito ? clientReportedIncognito ? `Ephemeral RAM storage detected (${incognitoMethod || "In-memory LevelDB / 10 GiB decoy quota"})` : "Returning hardware ID (hwid) detected with wiped cookies & localStorage \u2014 ephemeral cookie jar" : `Persistent disk-backed storage verified (${incognitoMethod || "Standard profile"})`
+    // The physical proof must match the verdict: a private tile always quotes the client's
+    // own storage-commit probe method, a normal tile quotes the verified disk-backed path.
+    detail: isIncognito ? `Ephemeral RAM storage detected (${incognitoMethod || "In-memory LevelDB / 10 GiB decoy quota"})` : `Persistent disk-backed storage verified (${incognitoMethod || "Standard profile"})`
   };
   const botScore = botSubtype === "bad_bot" ? spoofedCrawler ? 10 : 9 : botSubtype === "ai_agent" ? 8 : botSubtype === "good_bot" ? 2 : 0;
   const botStatus = botSubtype === "bad_bot" ? spoofedCrawler ? "Spoofed Crawler" : "Bot / Automated" : botSubtype === "ai_agent" ? "AI Agent \xB7 Cloud Browser" : botSubtype === "good_bot" ? "Good Bot \xB7 Search Crawler" : "Verified Human";
