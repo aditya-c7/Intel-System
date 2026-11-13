@@ -7,6 +7,7 @@ import type {
   RiskLevel,
   PersistenceMode,
   IntelVisitorResponse,
+  SecurityEnvelope,
   SignedHistoryBackup,
 } from '../types/visitor';
 
@@ -423,6 +424,51 @@ async function sha256Hex(input: string): Promise<string> {
   const part1 = (h1 >>> 0).toString(16).padStart(8, '0');
   const part2 = (h2 >>> 0).toString(16).padStart(8, '0');
   return `${part1}${part2}${part1}${part2}`;
+}
+
+/**
+ * Envelope-only SHA-256 helper (Phase 4).
+ *
+ * Unlike `sha256Hex`, this never substitutes a non-cryptographic digest: the server
+ * verifies the envelope with a real SHA-256, so a fake digest would be reported as a
+ * tampered request. When Web Crypto is unavailable this resolves to `''`, which the
+ * server treats as "unverifiable" rather than "tampered". Never throws.
+ */
+async function sha256EnvelopeSignature(input: string): Promise<string> {
+  try {
+    if (typeof crypto === 'undefined' || !crypto.subtle || typeof TextEncoder === 'undefined') {
+      return '';
+    }
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * 32 hex characters (16 cryptographically random bytes) for the envelope nonce.
+ * Falls back to a Math.random-derived value when `crypto.getRandomValues` is missing.
+ */
+function generateEnvelopeNonce(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+      const bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes)
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    }
+  } catch {
+    // Fallback below
+  }
+  let fallback = '';
+  while (fallback.length < 32) {
+    fallback += Math.random().toString(16).slice(2);
+  }
+  return fallback.slice(0, 32);
 }
 
 /**
@@ -1019,8 +1065,23 @@ export interface VmAndIntegritySignals {
   isVirtualMachine: boolean;
   isOsTampered: boolean;
   vmReason: string;
+  /** Phase 3 — mobile emulator / simulator verdict. */
+  emulatorDetected: boolean;
+  /** Phase 3 — evidence for the emulator verdict ('' when none). */
+  emulatorReason: string;
   gpuVendor: string;
   gpuRenderer: string;
+}
+
+/**
+ * Extra context for the Phase 3 emulator / cloud-container rules.
+ * Optional so the existing two-argument call sites keep working.
+ */
+export interface VmDetectionContext {
+  /** `BrowserDeviceInfo.screenResolution`, e.g. `1920 x 1080`. */
+  screenResolution?: string;
+  /** Result of the ISP classification in `evaluateSecuritySignals`. */
+  datacenterAsn?: boolean;
 }
 
 /**
@@ -1091,14 +1152,41 @@ function isNativeAccessor(proto: object | undefined, property: string): boolean 
 }
 
 /**
+ * Parses the width out of a `"1920 x 1080"` style screen resolution.
+ * Returns 0 for `Unavailable` / unparseable values.
+ */
+function parseScreenResolutionWidth(resolution: string | undefined): number {
+  if (!resolution) return 0;
+  const match = /(\d+)\s*[x×]\s*(\d+)/i.exec(resolution);
+  if (match) {
+    const width = Number(match[1]);
+    return Number.isFinite(width) && width > 0 ? width : 0;
+  }
+  const single = Number(resolution);
+  return Number.isFinite(single) && single > 0 ? single : 0;
+}
+
+/** Phase 3 — emulator / software-rasteriser GPU signatures. */
+const EMULATOR_GPU_PATTERN =
+  /android emulator opengl es translator|goldfish|ranchu|bluestacks|nox|ldplayer|memu|genymotion|virgl|apple software renderer|swiftshader|llvmpipe/i;
+
+/** Phase 3 — software renderers that imply a container / virtual display. */
+const SOFTWARE_RENDERER_PATTERN =
+  /android emulator opengl es translator|swiftshader|llvmpipe|virgl|apple software renderer|basic render driver/i;
+
+/**
  * Virtual machine / hypervisor + OS identity integrity detection.
  * Matches WebGL vendor/renderer strings against known hypervisor GPUs, then
  * cross-checks the claimed User-Agent OS against the platform, GPU and the
  * native Navigator accessors (anti-detect proxy detection).
+ *
+ * Phase 3 additionally classifies mobile emulators / simulators and
+ * cloud-container (masked GPU on a datacenter ASN) environments.
  */
 export function detectVmAndIntegrity(
   gpuVendor: string,
-  gpuRenderer: string
+  gpuRenderer: string,
+  context?: VmDetectionContext
 ): VmAndIntegritySignals {
   const vendor = (gpuVendor || '').trim();
   const renderer = (gpuRenderer || '').trim();
@@ -1169,6 +1257,81 @@ export function detectVmAndIntegrity(
   } catch {
     // Ignore hostile navigator proxies.
   }
+
+  // ---------------------------------------------------------------------------
+  // Phase 3 — mobile emulator / simulator and cloud-container classification.
+  // It only reads navigator/screen values already available above and never
+  // throws, so the existing VM / OS-tamper contract is unchanged.
+  // ---------------------------------------------------------------------------
+  let maxTouchPoints = 0;
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.maxTouchPoints === 'number') {
+      maxTouchPoints = Math.max(0, navigator.maxTouchPoints);
+    }
+  } catch {
+    // Ignore hostile navigator proxies.
+  }
+
+  let viewportWidth = parseScreenResolutionWidth(context?.screenResolution);
+  if (viewportWidth <= 0) {
+    try {
+      viewportWidth =
+        typeof window !== 'undefined' && window.screen ? Number(window.screen.width) || 0 : 0;
+    } catch {
+      viewportWidth = 0;
+    }
+  }
+
+  const mobileClaim = /Android|iPhone|iPad|iPod/i.exec(ua);
+  const claimsMobile = mobileClaim !== null;
+  // iPadOS reports platform `MacIntel` with real touch points; that is a genuine
+  // tablet, not a desktop platform masquerading as a phone.
+  const desktopPlatform =
+    /^(Win32|Win64|MacIntel|Linux x86_64|Linux i686)$/i.test(platform) &&
+    !(/^MacIntel$/i.test(platform) && maxTouchPoints > 0);
+
+  let emulatorDetected = false;
+  let emulatorReason = '';
+
+  if (claimsMobile && (desktopPlatform || maxTouchPoints === 0)) {
+    emulatorDetected = true;
+    emulatorReason = desktopPlatform
+      ? `Mobile User-Agent (${mobileClaim ? mobileClaim[0] : 'mobile'}) with a desktop platform (${platform})`
+      : `Mobile User-Agent (${mobileClaim ? mobileClaim[0] : 'mobile'}) with zero touch points`;
+  }
+
+  if (!emulatorDetected && claimsMobile && maxTouchPoints === 0 && viewportWidth >= 1000) {
+    emulatorDetected = true;
+    emulatorReason = `Mobile User-Agent with a ${viewportWidth}px desktop-class viewport and zero touch points`;
+  }
+
+  if (claimsMobile && EMULATOR_GPU_PATTERN.test(signature)) {
+    emulatorDetected = true;
+    emulatorReason = `Mobile User-Agent rendered by an emulator GPU (${renderer || vendor || 'masked renderer'})`;
+  }
+
+  if (emulatorDetected) {
+    // An emulated mobile runtime is reported as an emulator rather than as a
+    // desktop hypervisor, so the two Phase 3 tiles never double-count.
+    isVirtualMachine = false;
+    vmReason = emulatorReason;
+  } else if (!isVirtualMachine && !claimsMobile) {
+    // Cloud container: a desktop OS that hides its GPU while sitting on a
+    // datacenter ASN, or falls back to a software renderer.
+    const maskedGpu =
+      isMaskedOrUnavailableGpu(vendor, renderer) ||
+      /^unknown$/i.test(vendor) ||
+      /^unknown$/i.test(renderer);
+    const softwareRenderer = SOFTWARE_RENDERER_PATTERN.test(signature);
+    if (maskedGpu && (context?.datacenterAsn === true || softwareRenderer)) {
+      isVirtualMachine = true;
+      vmReason =
+        context?.datacenterAsn === true
+          ? 'Masked WebGL vendor on a datacenter ASN (cloud container)'
+          : 'Masked WebGL vendor with a software renderer (cloud container)';
+    }
+  }
+
   const claimsWindows = /Windows NT/i.test(ua);
   const claimsMac = /Macintosh|Mac OS X/i.test(ua);
   const claimsLinux = /Linux/i.test(ua) && !/Android/i.test(ua);
@@ -1204,6 +1367,8 @@ export function detectVmAndIntegrity(
     isVirtualMachine,
     isOsTampered,
     vmReason,
+    emulatorDetected,
+    emulatorReason,
     gpuVendor: vendor,
     gpuRenderer: renderer,
   };
@@ -2217,7 +2382,10 @@ export async function evaluateSecuritySignals(
   const vpnSuspected = timezoneMismatch || datacenterAsn;
 
   // 3. VM / Hypervisor & OS Identity Integrity (WebGL GPU + native accessors)
-  const vmStatus = detectVmAndIntegrity(hardwareSignals.gpuVendor, hardwareSignals.gpuRenderer);
+  const vmStatus = detectVmAndIntegrity(hardwareSignals.gpuVendor, hardwareSignals.gpuRenderer, {
+    screenResolution: browserDevice.screenResolution,
+    datacenterAsn,
+  });
   const tamperReasons: string[] = [];
   if (vmStatus.isVirtualMachine) {
     tamperReasons.push(vmStatus.vmReason);
@@ -2342,6 +2510,9 @@ export async function evaluateSecuritySignals(
     isVirtualMachine: vmStatus.isVirtualMachine,
     isOsTampered: vmStatus.isOsTampered,
     vmReason: vmStatus.vmReason,
+    /* Phase 3 — mobile emulator / cloud container verdict */
+    emulatorDetected: vmStatus.emulatorDetected,
+    emulatorReason: vmStatus.emulatorReason,
     /* Bot / automation verdict */
     isHeadless: botAssessment.isHeadless,
     botReason: botAssessment.botReason,
@@ -2465,10 +2636,35 @@ export async function identifyCurrentVisitor(options?: {
     // Module-cached: this is the same probe run that started at module load.
     const incog = await detectIncognitoMode();
 
+    // Phase 4 — sealed request envelope: one-time nonce + SHA-256 over the canonical
+    // string the server recomputes. Crypto failures degrade to an empty signature
+    // (unverifiable) instead of throwing.
+    const envelopeTimestamp = Date.now();
+    const envelopeNonce = generateEnvelopeNonce();
+    const envelopeUserAgent = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+    const envelopePlatform = typeof navigator !== 'undefined' ? navigator.platform || '' : '';
+    const envelopeScreenResolution = browserDevice.screenResolution || '';
+    const envelopeTimezone = browserDevice.timezone || '';
+    const envelopeCanonical = `INTEL_ENVELOPE_V1|${envelopeTimestamp}|${envelopeNonce}|${hardwareSignals.hardwareId}|${envelopeUserAgent}|${envelopePlatform}|${envelopeScreenResolution}|${envelopeTimezone}`;
+    const envelopeSignature = await sha256EnvelopeSignature(envelopeCanonical);
+    const securityEnvelope: SecurityEnvelope = {
+      timestamp: envelopeTimestamp,
+      nonce: envelopeNonce,
+      signature: envelopeSignature,
+      userAgent: envelopeUserAgent,
+      platform: envelopePlatform,
+      screenResolution: envelopeScreenResolution,
+      timezone: envelopeTimezone,
+      protocol: 'INTEL_ENVELOPE_V1',
+    };
+
     const response = await fetch('/api/visitor/identify', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
+        'x-intel-signature': envelopeSignature,
+        'x-intel-nonce': envelopeNonce,
+        'x-intel-timestamp': String(envelopeTimestamp),
       },
       credentials: 'same-origin',
       body: JSON.stringify({
@@ -2481,6 +2677,7 @@ export async function identifyCurrentVisitor(options?: {
         hardwareSignals,
         securitySignals,
         clientGeoHint,
+        securityEnvelope,
         // Top-level mirrors so no server-side spelling path can miss the verdict.
         incognito: incog.isPrivate,
         isIncognito: incog.isPrivate,
