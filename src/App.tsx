@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { identifyCurrentVisitor, detectIncognitoMode } from './lib/collector';
 import type {
+  BotSubtype,
   IntelVisitorResponse,
   NetworkType,
   RiskLevel,
@@ -381,6 +382,13 @@ function buildClientSignalRows(
   const hasTzMismatch = Boolean(signals.timezoneMismatch);
   const isVm = Boolean(signals.isVirtualMachine);
   const isTampered = Boolean(signals.isOsTampered);
+  const isEmulator = Boolean(signals.emulatorDetected);
+  const isRequestTampered = Boolean(signals.tamperedRequest || signals.replayDetected);
+  const isTorExit = Boolean(signals.torExitNode);
+  const isBlocklisted = Boolean(signals.ipBlocklisted);
+  const botSubtype: BotSubtype = signals.botSubtype ?? 'human';
+  const isSpoofedCrawler =
+    botSubtype === 'bad_bot' && /spoof/i.test(`${signals.botCategory || ''} ${signals.botReason || ''}`);
   const isIncognito =
     incognitoConfirmed ||
     Boolean(
@@ -390,10 +398,40 @@ function buildClientSignalRows(
   const ispBrand = signals.brandName?.trim() || '';
 
   const incognitoScore = isIncognito ? 4 : 0;
-  const botScore = isBotDetected ? 9 : isHeadlessDetected ? 7 : 0;
-  const vpnScore =
-    isDatacenterAsn && hasTzMismatch ? 8 : isDatacenterAsn ? 6 : hasTzMismatch ? 5 : 0;
-  const vmScore = isVm && isTampered ? 8 : isVm ? 7 : isTampered ? 6 : 0;
+  const botScore =
+    botSubtype === 'good_bot'
+      ? 2
+      : botSubtype === 'ai_agent'
+      ? 8
+      : botSubtype === 'bad_bot'
+      ? isSpoofedCrawler
+        ? 10
+        : 9
+      : isBotDetected
+      ? 9
+      : isHeadlessDetected
+      ? 7
+      : 0;
+  const vpnScore = isTorExit
+    ? 10
+    : isBlocklisted
+    ? 9
+    : isDatacenterAsn && hasTzMismatch
+    ? 8
+    : isDatacenterAsn
+    ? 6
+    : hasTzMismatch
+    ? 5
+    : 0;
+  const vmScore = isRequestTampered
+    ? 10
+    : isEmulator
+    ? 8
+    : isVm
+    ? 7
+    : isTampered
+    ? 6
+    : 0;
 
   const incognitoDetail = isIncognito
     ? `Ephemeral RAM storage detected (${
@@ -404,25 +442,40 @@ function buildClientSignalRows(
       })`;
   const botDetail =
     signals.botReason ||
-    (isBotDetected
+    (botSubtype === 'good_bot'
+      ? 'Verified crawler operating from its official provider network'
+      : botSubtype === 'ai_agent'
+      ? `${signals.botProvider || 'AI agent'} autonomous crawler signature`
+      : botSubtype === 'bad_bot'
+      ? 'Browser automation / spoofed crawler identity detected'
+      : isBotDetected
       ? 'WebDriver / CDP automation runtime detected'
       : isHeadlessDetected
       ? 'Headless rendering context without an attached physical display'
       : 'No automation, WebDriver, CDP hooks, or headless runtime detected');
-  const vpnDetail =
-    vpnScore > 0
-      ? signals.vpnReasons[0] ||
-        (isDatacenterAsn
-          ? `Datacenter / hosting ASN detected on ${ispBrand || 'this network'}`
-          : `Browser timezone (${signals.browserTimezone}) differs from IP geolocation timezone (${signals.ipTimezone})`)
-      : `${ispBrand || 'Standard ISP'} • ${
-          signals.networkType ?? 'Residential Broadband'
-        } verified against browser timezone ${signals.browserTimezone}`;
-  const vmDetail =
-    signals.vmReason ||
-    (isTampered
-      ? signals.tamperReasons[0] || 'Operating-system / User-Agent tampering detected'
-      : 'Unmasked physical GPU & consistent OS platform verified');
+  const vpnDetail = isTorExit
+    ? 'Confirmed active Tor exit relay (Tor Project DNSEL + bulk exit list)'
+    : isBlocklisted
+    ? (signals.ipBlocklistReasons?.[0] || 'IP flagged on the abuse / tamper blocklist')
+    : vpnScore > 0
+    ? signals.vpnReasons[0] ||
+      (isDatacenterAsn
+        ? `Datacenter / hosting ASN detected on ${ispBrand || 'this network'}`
+        : `Browser timezone (${signals.browserTimezone}) differs from IP geolocation timezone (${signals.ipTimezone})`)
+    : `${ispBrand || 'Standard ISP'} • ${
+        signals.networkType ?? 'Residential Broadband'
+      } verified against browser timezone ${signals.browserTimezone}`;
+  const vmDetail = isRequestTampered
+    ? signals.requestIntegrityReason ||
+      (signals.replayDetected
+        ? 'Duplicate payload nonce (replay attack detected)'
+        : 'Payload integrity hash mismatch')
+    : isEmulator
+    ? signals.emulatorReason || 'Mobile UA backed by a desktop architecture or emulator GPU'
+    : signals.vmReason ||
+      (isTampered
+        ? signals.tamperReasons[0] || 'Operating-system / User-Agent tampering detected'
+        : 'Unmasked physical GPU & consistent OS platform verified');
 
   return [
     createSignalRow({
@@ -439,11 +492,20 @@ function buildClientSignalRows(
       tone: toneForScore(botScore),
       title: 'Bot & Automation Detection',
       caption: botDetail,
-      statusLabel: isBotDetected
-        ? 'Bot / Automated'
-        : isHeadlessDetected
-        ? 'Cloud / Headless'
-        : 'Verified Human',
+      statusLabel:
+        botSubtype === 'good_bot'
+          ? 'Good Bot · Search Crawler'
+          : botSubtype === 'ai_agent'
+          ? 'AI Agent · Cloud Browser'
+          : botSubtype === 'bad_bot'
+          ? isSpoofedCrawler
+            ? 'Spoofed Crawler'
+            : 'Bot / Automated'
+          : isBotDetected
+          ? 'Bot / Automated'
+          : isHeadlessDetected
+          ? 'Cloud / Headless'
+          : 'Verified Human',
       tooltip: signals.botSignals.length > 0 ? signals.botSignals.join(' • ') : botDetail,
       riskScore: botScore,
     }),
@@ -452,7 +514,11 @@ function buildClientSignalRows(
       tone: toneForScore(vpnScore),
       title: 'VPN / Proxy & Network Type',
       caption: vpnDetail,
-      statusLabel: isDatacenterAsn
+      statusLabel: isTorExit
+        ? 'Tor Exit Node'
+        : isBlocklisted
+        ? 'Blocklisted IP'
+        : isDatacenterAsn
         ? 'VPN / Datacenter Proxy'
         : hasTzMismatch
         ? 'VPN / Timezone Relay'
@@ -467,14 +533,15 @@ function buildClientSignalRows(
       tone: toneForScore(vmScore),
       title: 'Virtual Machine & OS Integrity',
       caption: vmDetail,
-      statusLabel:
-        isVm && isTampered
-          ? 'Virtual Machine / Spoofed OS'
-          : isVm
-          ? 'Virtual Machine / Hypervisor'
-          : isTampered
-          ? 'Spoofed OS / Tampered UA'
-          : 'Physical Hardware',
+      statusLabel: isRequestTampered
+        ? 'Tampered / Replayed'
+        : isEmulator
+        ? 'Mobile Emulator'
+        : isVm
+        ? 'Virtual Machine / VM'
+        : isTampered
+        ? 'Spoofed Environment'
+        : 'Physical Hardware',
       tooltip: vmDetail,
       riskScore: vmScore,
     }),
