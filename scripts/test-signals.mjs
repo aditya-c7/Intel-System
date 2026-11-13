@@ -72,6 +72,8 @@ function excerptOf(json) {
     botSubtype: ss.botSubtype,
     botProvider: ss.botProvider,
     torExitNode: ss.torExitNode,
+    vpnSuspected: ss.vpnSuspected,
+    datacenterAsn: ss.datacenterAsn,
     ipBlocklisted: ss.ipBlocklisted,
     ipBlocklistReasons: ss.ipBlocklistReasons,
     replayDetected: ss.replayDetected,
@@ -79,6 +81,8 @@ function excerptOf(json) {
     requestIntegrityReason: ss.requestIntegrityReason,
     emulatorDetected: ss.emulatorDetected,
     suspectScore: ss.suspectScore ?? json?.suspectScore,
+    riskLevel: ss.riskLevel ?? json?.riskLevel,
+    riskFactors: ss.riskFactors,
     location: json?.location,
   };
 }
@@ -343,7 +347,6 @@ async function resolveTorExitIp() {
 
 async function caseA(torExitIp) {
   const id = 'A';
-  caseStatus.set(id, { title: 'Tor exit node', ok: true });
   const { status, json } = await postIdentify({
     ip: torExitIp,
     ua: UA.windowsChrome,
@@ -360,7 +363,6 @@ async function caseA(torExitIp) {
 
 async function caseB() {
   const id = 'B';
-  caseStatus.set(id, { title: 'Spoofed crawler (Googlebot UA, residential IP)', ok: true });
   const { status, json } = await postIdentify({
     ip: '49.36.0.1',
     ua: UA.googlebot,
@@ -380,7 +382,6 @@ async function caseB() {
 
 async function caseC() {
   const id = 'C';
-  caseStatus.set(id, { title: 'Verified crawler (Googlebot UA, official Google IP)', ok: true });
   const { status, json } = await postIdentify({
     ip: '66.249.66.1',
     ua: UA.googlebot,
@@ -399,7 +400,6 @@ async function caseC() {
 
 async function caseD() {
   const id = 'D';
-  caseStatus.set(id, { title: 'AI agent (GPTBot)', ok: true });
   const { status, json } = await postIdentify({
     ip: '49.36.4.1',
     ua: UA.gptbot,
@@ -418,7 +418,6 @@ async function caseD() {
 
 async function caseE() {
   const id = 'E';
-  caseStatus.set(id, { title: 'Headless automation (HeadlessChrome UA)', ok: true });
   const { status, json } = await postIdentify({
     ip: '49.36.6.1',
     ua: UA.headlessChrome,
@@ -448,7 +447,6 @@ async function caseE() {
 
 async function caseH() {
   const id = 'H';
-  caseStatus.set(id, { title: 'Mobile emulator (Android UA, zero touch points, emulator GPU)', ok: true });
   const { status, json } = await postIdentify({
     ip: '49.36.12.1',
     ua: UA.androidChrome,
@@ -488,7 +486,6 @@ async function caseH() {
 
 async function caseI() {
   const id = 'I';
-  caseStatus.set(id, { title: 'Cloud container (datacenter IP, masked GPU)', ok: true });
   const { status, json } = await postIdentify({
     ip: '34.82.0.1',
     ua: UA.windowsChrome,
@@ -526,7 +523,6 @@ async function caseI() {
 
 async function caseJ() {
   const id = 'J';
-  caseStatus.set(id, { title: 'Clean human (Windows Chrome, residential IP)', ok: true });
   const { status, json } = await postIdentify({
     ip: '49.36.2.1',
     ua: UA.windowsChrome,
@@ -548,7 +544,6 @@ async function caseJ() {
 
 async function caseK() {
   const id = 'K';
-  caseStatus.set(id, { title: 'Header / body contradiction (envelope Windows, header Linux)', ok: true });
   const { status, json } = await postIdentify({
     ip: '49.36.14.1',
     // The signed payload claims Windows Chrome...
@@ -588,7 +583,6 @@ async function caseK() {
 
 async function caseF() {
   const id = 'F';
-  caseStatus.set(id, { title: 'Tampered payload (body hardwareId altered after signing)', ok: true });
   const { status, json } = await postIdentify({
     ip: '49.36.8.1',
     ua: UA.windowsChrome,
@@ -618,7 +612,6 @@ async function caseF() {
 
 async function caseG() {
   const id = 'G';
-  caseStatus.set(id, { title: 'Replay (identical signed request sent twice)', ok: true });
   const request = buildIdentifyRequest({
     ip: '49.36.10.1',
     ua: UA.windowsChrome,
@@ -726,8 +719,8 @@ async function main() {
   ];
 
   for (const { id: caseId, title, run } of cases) {
-    const entry = caseStatus.get(caseId);
-    console.log(`\n--- ${caseId}: ${entry?.title ?? title} ---`);
+    caseStatus.set(caseId, { title, ok: true });
+    console.log(`\n--- ${caseId}: ${title} ---`);
     try {
       await run();
     } catch (error) {

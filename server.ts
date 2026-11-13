@@ -1082,6 +1082,19 @@ const AI_AGENT_UA_RULES: Array<{ pattern: RegExp; provider: string; label: strin
 
 const AUTOMATION_UA_PATTERN = /playwright|puppeteer|selenium|cypress|phantomjs/i;
 
+/** `keyid` fragments in Web Bot Auth `Signature-Input` headers → operator display names. */
+const BOT_SIGNATURE_KEYID_PROVIDERS: Array<[string, string]> = [
+  ['openai', 'OpenAI'],
+  ['anthropic', 'Anthropic'],
+  ['perplexity', 'Perplexity'],
+  ['google', 'Google'],
+  ['microsoft', 'Microsoft'],
+  ['apple', 'Apple'],
+  ['amazon', 'Amazon'],
+  ['cloudflare', 'Cloudflare'],
+  ['web-bot-auth', 'Web Bot Auth Directory'],
+];
+
 const DATACENTER_NETWORK_PATTERN =
   /\b(amazon|amazonaws|aws|google cloud|azure|microsoft azure|digitalocean|hetzner|linode|akamai|ovh|vultr|oracle cloud|alibaba|aliyun|tencent|leaseweb|contabo|m247|choopa|datacamp)\b/i;
 
@@ -1153,8 +1166,33 @@ function classifyBotTraffic(
     };
   }
 
-  const datacenterNetwork = DATACENTER_NETWORK_PATTERN.test(networkHaystack);
-  const automationRuntimeDetected = Boolean(client.webdriver || client.cdpDetected);
+  // RFC 9421 HTTP Message Signatures ("Web Bot Auth"): an agent that signs its request with a
+  // `Signature` + `Signature-Input` pair is self-identifying as automated even when its
+  // User-Agent imitates a desktop browser. Browsers never emit these headers. `keyid` names the
+  // operator, so the tile can attribute it instead of printing a generic automation verdict.
+  const signatureInput = readRequestHeader(headers, 'signature-input');
+  const signatureHeader = readRequestHeader(headers, 'signature');
+  if (signatureInput && signatureHeader) {
+    const keyIdMatch = /keyid\s*=\s*"([^"]+)"/i.exec(signatureInput);
+    const keyId = keyIdMatch ? keyIdMatch[1].trim().slice(0, 80) : '';
+    const keyIdLower = keyId.toLowerCase();
+    const namedOperator = BOT_SIGNATURE_KEYID_PROVIDERS.find(([needle]) =>
+      keyIdLower.includes(needle)
+    );
+    return {
+      subtype: 'ai_agent',
+      label: 'Web Bot Auth Agent',
+      provider: namedOperator ? namedOperator[1] : keyId || 'RFC 9421 Signer',
+      category: 'Autonomous Agent',
+      confidence: 0.9,
+      reasons: [
+        'RFC 9421 Signature / Signature-Input headers present (Web Bot Auth)',
+        keyId ? `Agent key identifier: ${keyId}` : 'Agent key identifier not published',
+      ],
+    };
+  }
+
+  const datacenterNetwork = DATACENTER_NETWORK_PATTERN.test(networkHaystack);  const automationRuntimeDetected = Boolean(client.webdriver || client.cdpDetected);
   if (automationRuntimeDetected && datacenterNetwork) {
     return {
       subtype: 'ai_agent',
@@ -1360,17 +1398,22 @@ function pruneTorDnsCache(nowMs: number): void {
  *
  * The native resolver is tried first because it is the cheapest and honours the host's own
  * DNS policy. Some hosts (locked-down resolvers, containers, this build's CI machine) refuse
- * direct A queries, so the same lookup is retried over DNS-over-HTTPS. A definitive negative
- * is only cached when at least one resolver actually produced an answer; transport failures
- * are never cached, so a later request can still classify the relay correctly.
+ * direct A queries, so the same lookup is retried over DNS-over-HTTPS.
+ *
+ * The verdict is deliberately tri-state. `not_exit` requires at least one resolver to have
+ * produced a real answer (a `NOERROR`/`NXDOMAIN` reply); a total transport failure returns
+ * `unknown` so the caller can fall back to other first-party evidence instead of silently
+ * concluding "not Tor". Only definitive verdicts are cached.
  */
-async function isTorExitNode(ip: string): Promise<boolean> {
+type TorExitVerdict = 'exit' | 'not_exit' | 'unknown';
+
+async function resolveTorExitVerdict(ip: string): Promise<TorExitVerdict> {
   const cleanIp = typeof ip === 'string' ? ip.trim() : '';
-  if (!isIpv4Literal(cleanIp)) return false;
+  if (!isIpv4Literal(cleanIp)) return 'unknown';
 
   const nowMs = Date.now();
   const cached = torDnsCache.get(cleanIp);
-  if (cached && cached.expiresAtMs > nowMs) return cached.isTorExit;
+  if (cached && cached.expiresAtMs > nowMs) return cached.isTorExit ? 'exit' : 'not_exit';
 
   const queryName = `${cleanIp.split('.').reverse().join('.')}.dnsel.torproject.org`;
   let resolved = false;
@@ -1420,8 +1463,48 @@ async function isTorExitNode(ip: string): Promise<boolean> {
       isTorExit,
       expiresAtMs: nowMs + TOR_DNS_CACHE_TTL_MS,
     });
+    return isTorExit ? 'exit' : 'not_exit';
   }
-  return isTorExit;
+  return 'unknown';
+}
+
+/** Boolean wrapper used by diagnostics; `unknown` degrades to `false`. */
+async function isTorExitNode(ip: string): Promise<boolean> {
+  return (await resolveTorExitVerdict(ip)) === 'exit';
+}
+
+/**
+ * Operator-name fallback for the `unknown` DNSEL verdict. Every string here belongs to an
+ * organisation that runs public Tor exit relays, so when the DNS query itself cannot be
+ * answered this is the strongest first-party hint left. It is never used to overrule a
+ * definitive DNSEL answer.
+ */
+const TOR_OPERATOR_ORG_PATTERN =
+  /tor exit|torproject|tor project|calyx institute|f3netze|zwiebelfreunde|emerald onion|dfri|foreningen for digitala/i;
+
+function matchesTorOperatorHint(location: { isp?: string; org?: string; asn?: string }): boolean {
+  const haystack = [location.isp, location.org, location.asn]
+    .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+    .join(' ');
+  return haystack.length > 0 && TOR_OPERATOR_ORG_PATTERN.test(haystack);
+}
+
+/**
+ * Resolves the Phase 2 Tor verdict from every first-party layer, in strict order of authority:
+ * bulk exit list → authoritative DNSEL → operator-name fallback (only when DNSEL is unknown).
+ */
+async function resolveTorExitStatus(
+  publicIp: string,
+  location: { isp?: string; org?: string; asn?: string },
+  prefetched?: Promise<TorExitVerdict>
+): Promise<{ isExit: boolean; viaOperatorHint: boolean }> {
+  if (isTorBulkListed(publicIp)) return { isExit: true, viaOperatorHint: false };
+  const verdict = await (prefetched ?? resolveTorExitVerdict(publicIp));
+  if (verdict === 'exit') return { isExit: true, viaOperatorHint: false };
+  if (verdict === 'unknown' && matchesTorOperatorHint(location)) {
+    return { isExit: true, viaOperatorHint: true };
+  }
+  return { isExit: false, viaOperatorHint: false };
 }
 
 /** Minimal DNS-over-HTTPS A-record lookup (JSON API). Returns null on any transport error. */
@@ -2176,7 +2259,7 @@ app.get('/api/health', async (req, res) => {
     typeof req.query.torCheck === 'string' ? normalizeIpCandidate(req.query.torCheck) : null;
   if (torCheckIp && isIpv4Literal(torCheckIp)) {
     const startedAtMs = Date.now();
-    const exitNode = await isTorExitNode(torCheckIp);
+    const verdict = await resolveTorExitVerdict(torCheckIp);
     res.json({
       status: 'ok',
       visitorsCount,
@@ -2185,7 +2268,8 @@ app.get('/api/health', async (req, res) => {
       regionLabel,
       torCheck: {
         ip: torCheckIp,
-        exitNode,
+        exitNode: verdict === 'exit',
+        verdict,
         bulkListed: isTorBulkListed(torCheckIp),
         latencyMs: Date.now() - startedAtMs,
       },
@@ -2379,6 +2463,8 @@ interface RequestIntegrityContext {
   requestIntegrityReason?: string;
   requestNonce?: string;
   torExitNode?: boolean;
+  /** True when the Tor verdict came from the operator-name fallback, not a DNS answer. */
+  torOperatorHint?: boolean;
   ipBlocklisted?: boolean;
   ipBlocklistReasons?: string[];
   botClassification?: BotClassification;
@@ -2606,6 +2692,7 @@ function sanitizeAndReinforceSecuritySignals(
   const requestNonce =
     typeof requestContext.requestNonce === 'string' ? requestContext.requestNonce.slice(0, 128) : '';
   const torExitNode = Boolean(requestContext.torExitNode);
+  const torOperatorHint = Boolean(requestContext.torOperatorHint);
   const ipBlocklisted = Boolean(requestContext.ipBlocklisted);
   const ipBlocklistReasons = Array.isArray(requestContext.ipBlocklistReasons)
     ? requestContext.ipBlocklistReasons
@@ -2747,7 +2834,9 @@ function sanitizeAndReinforceSecuritySignals(
     ? 'VPN / Timezone Relay'
     : 'Standard ISP';
   const vpnDetail = torExitNode
-    ? `Confirmed active Tor exit relay (${location.publicIp} · ${asnOrOrg})`
+    ? torOperatorHint
+      ? `Tor exit relay operator matched on ${location.publicIp} (${asnOrOrg}) — DNSEL unreachable, operator attribution used`
+      : `Confirmed active Tor exit relay (${location.publicIp} · ${asnOrOrg})`
     : ipBlocklisted
     ? 'IP flagged on abuse / tamper blocklist'
     : isDatacenterAsn && hasTzMismatch
@@ -3050,7 +3139,9 @@ app.post('/api/visitor/identify', async (req, res) => {
     // Phase 2 — the authoritative Tor DNSEL query is started here so its network round trip
     // overlaps the geolocation lookups below instead of being serialized after them. A cold
     // cache costs a DNS query; a warm one resolves from the 10-minute per-IP cache.
-    const torLookupPromise: Promise<boolean> = isTorExitNode(extractedIp).catch(() => false);
+    const torLookupPromise: Promise<TorExitVerdict> = resolveTorExitVerdict(extractedIp).catch(
+      () => 'unknown' as TorExitVerdict
+    );
 
     let location = await lookupVerifiedGeolocation(extractedIp, isPublic);
     const vercelGeo = extractVercelEdgeGeo(req);
@@ -3592,11 +3683,12 @@ app.post('/api/visitor/identify', async (req, res) => {
     // Phase 2 — the per-IP DNSEL query started before geolocation is authoritative for the
     // extracted address; if the geo provider reported a different address, that one is checked.
     const torLookupTarget = location.publicIp.trim().toLowerCase();
-    const torExitNode =
-      isTorBulkListed(location.publicIp) ||
-      (torLookupTarget === extractedIp.trim().toLowerCase()
-        ? await torLookupPromise
-        : await isTorExitNode(location.publicIp).catch(() => false));
+    const torStatus = await resolveTorExitStatus(
+      location.publicIp,
+      location,
+      torLookupTarget === extractedIp.trim().toLowerCase() ? torLookupPromise : undefined
+    );
+    const torExitNode = torStatus.isExit;
 
     // Only cryptographic tampering (modified signed payload) and nonce replay poison the IP
     // ledger. A User-Agent header mismatch is deliberately excluded: edge proxies can rewrite
@@ -3641,6 +3733,7 @@ app.post('/api/visitor/identify', async (req, res) => {
         requestIntegrityReason: envelopeVerdict.requestIntegrityReason,
         requestNonce: envelopeVerdict.requestNonce,
         torExitNode,
+        torOperatorHint: torStatus.viaOperatorHint,
         ipBlocklisted: blocklist.blocklisted,
         ipBlocklistReasons: blocklist.reasons,
         botClassification,

@@ -791,6 +791,17 @@ var AI_AGENT_UA_RULES = [
   { pattern: /headlesschrome/i, provider: "Cloud Browser Agent", label: "Headless Chrome" }
 ];
 var AUTOMATION_UA_PATTERN = /playwright|puppeteer|selenium|cypress|phantomjs/i;
+var BOT_SIGNATURE_KEYID_PROVIDERS = [
+  ["openai", "OpenAI"],
+  ["anthropic", "Anthropic"],
+  ["perplexity", "Perplexity"],
+  ["google", "Google"],
+  ["microsoft", "Microsoft"],
+  ["apple", "Apple"],
+  ["amazon", "Amazon"],
+  ["cloudflare", "Cloudflare"],
+  ["web-bot-auth", "Web Bot Auth Directory"]
+];
 var DATACENTER_NETWORK_PATTERN = /\b(amazon|amazonaws|aws|google cloud|azure|microsoft azure|digitalocean|hetzner|linode|akamai|ovh|vultr|oracle cloud|alibaba|aliyun|tencent|leaseweb|contabo|m247|choopa|datacamp)\b/i;
 var KNOWN_AI_CRAWLER_REASON = "LLM crawler user-agent signature";
 function classifyBotTraffic(headers, network, client) {
@@ -839,6 +850,27 @@ function classifyBotTraffic(headers, network, client) {
       reasons: [
         `${rule.label} user-agent matched`,
         networkHaystack ? `Network identity: ${networkHaystack}` : "Network identity unavailable"
+      ]
+    };
+  }
+  const signatureInput = readRequestHeader(headers, "signature-input");
+  const signatureHeader = readRequestHeader(headers, "signature");
+  if (signatureInput && signatureHeader) {
+    const keyIdMatch = /keyid\s*=\s*"([^"]+)"/i.exec(signatureInput);
+    const keyId = keyIdMatch ? keyIdMatch[1].trim().slice(0, 80) : "";
+    const keyIdLower = keyId.toLowerCase();
+    const namedOperator = BOT_SIGNATURE_KEYID_PROVIDERS.find(
+      ([needle]) => keyIdLower.includes(needle)
+    );
+    return {
+      subtype: "ai_agent",
+      label: "Web Bot Auth Agent",
+      provider: namedOperator ? namedOperator[1] : keyId || "RFC 9421 Signer",
+      category: "Autonomous Agent",
+      confidence: 0.9,
+      reasons: [
+        "RFC 9421 Signature / Signature-Input headers present (Web Bot Auth)",
+        keyId ? `Agent key identifier: ${keyId}` : "Agent key identifier not published"
       ]
     };
   }
@@ -984,12 +1016,12 @@ function pruneTorDnsCache(nowMs) {
     torDnsCache.delete(oldestKey);
   }
 }
-async function isTorExitNode(ip) {
+async function resolveTorExitVerdict(ip) {
   const cleanIp = typeof ip === "string" ? ip.trim() : "";
-  if (!isIpv4Literal(cleanIp)) return false;
+  if (!isIpv4Literal(cleanIp)) return "unknown";
   const nowMs = Date.now();
   const cached = torDnsCache.get(cleanIp);
-  if (cached && cached.expiresAtMs > nowMs) return cached.isTorExit;
+  if (cached && cached.expiresAtMs > nowMs) return cached.isTorExit ? "exit" : "not_exit";
   const queryName = `${cleanIp.split(".").reverse().join(".")}.dnsel.torproject.org`;
   let resolved = false;
   let isTorExit = false;
@@ -1031,8 +1063,23 @@ async function isTorExitNode(ip) {
       isTorExit,
       expiresAtMs: nowMs + TOR_DNS_CACHE_TTL_MS
     });
+    return isTorExit ? "exit" : "not_exit";
   }
-  return isTorExit;
+  return "unknown";
+}
+var TOR_OPERATOR_ORG_PATTERN = /tor exit|torproject|tor project|calyx institute|f3netze|zwiebelfreunde|emerald onion|dfri|foreningen for digitala/i;
+function matchesTorOperatorHint(location) {
+  const haystack = [location.isp, location.org, location.asn].filter((part) => typeof part === "string" && part.trim().length > 0).join(" ");
+  return haystack.length > 0 && TOR_OPERATOR_ORG_PATTERN.test(haystack);
+}
+async function resolveTorExitStatus(publicIp, location, prefetched) {
+  if (isTorBulkListed(publicIp)) return { isExit: true, viaOperatorHint: false };
+  const verdict = await (prefetched ?? resolveTorExitVerdict(publicIp));
+  if (verdict === "exit") return { isExit: true, viaOperatorHint: false };
+  if (verdict === "unknown" && matchesTorOperatorHint(location)) {
+    return { isExit: true, viaOperatorHint: true };
+  }
+  return { isExit: false, viaOperatorHint: false };
 }
 async function resolveAOverDoh(endpoint, name) {
   const controller = new AbortController();
@@ -1581,7 +1628,7 @@ app.get("/api/health", async (req, res) => {
   const torCheckIp = typeof req.query.torCheck === "string" ? normalizeIpCandidate(req.query.torCheck) : null;
   if (torCheckIp && isIpv4Literal(torCheckIp)) {
     const startedAtMs = Date.now();
-    const exitNode = await isTorExitNode(torCheckIp);
+    const verdict = await resolveTorExitVerdict(torCheckIp);
     res.json({
       status: "ok",
       visitorsCount,
@@ -1590,7 +1637,8 @@ app.get("/api/health", async (req, res) => {
       regionLabel,
       torCheck: {
         ip: torCheckIp,
-        exitNode,
+        exitNode: verdict === "exit",
+        verdict,
         bulkListed: isTorBulkListed(torCheckIp),
         latencyMs: Date.now() - startedAtMs
       }
@@ -1775,6 +1823,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const requestIntegrityReason = typeof requestContext.requestIntegrityReason === "string" ? requestContext.requestIntegrityReason.trim().slice(0, 240) : "";
   const requestNonce = typeof requestContext.requestNonce === "string" ? requestContext.requestNonce.slice(0, 128) : "";
   const torExitNode = Boolean(requestContext.torExitNode);
+  const torOperatorHint = Boolean(requestContext.torOperatorHint);
   const ipBlocklisted = Boolean(requestContext.ipBlocklisted);
   const ipBlocklistReasons = Array.isArray(requestContext.ipBlocklistReasons) ? requestContext.ipBlocklistReasons.filter((reason) => typeof reason === "string" && reason.trim().length > 0).map((reason) => reason.trim().slice(0, 180)).slice(0, 5) : [];
   let persistenceMode = "First-Party Cookie";
@@ -1819,7 +1868,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const asnOrOrg = `${asnLabel} \xB7 ${location.org !== "Unknown" ? location.org : ispBrand}`;
   const vpnScore = torExitNode ? 10 : ipBlocklisted ? 9 : isDatacenterAsn && hasTzMismatch ? 8 : isDatacenterAsn ? 6 : hasTzMismatch ? 5 : 0;
   const vpnStatus = torExitNode ? "Tor Exit Node" : ipBlocklisted ? "Blocklisted IP" : isDatacenterAsn ? "VPN / Datacenter Proxy" : hasTzMismatch ? "VPN / Timezone Relay" : "Standard ISP";
-  const vpnDetail = torExitNode ? `Confirmed active Tor exit relay (${location.publicIp} \xB7 ${asnOrOrg})` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
+  const vpnDetail = torExitNode ? torOperatorHint ? `Tor exit relay operator matched on ${location.publicIp} (${asnOrOrg}) \u2014 DNSEL unreachable, operator attribution used` : `Confirmed active Tor exit relay (${location.publicIp} \xB7 ${asnOrOrg})` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
   const vpnSignal = {
     id: "vpn",
     title: "VPN / Proxy & Network Type",
@@ -2000,7 +2049,9 @@ app.post("/api/visitor/identify", async (req, res) => {
         isPublic = true;
       }
     }
-    const torLookupPromise = isTorExitNode(extractedIp).catch(() => false);
+    const torLookupPromise = resolveTorExitVerdict(extractedIp).catch(
+      () => "unknown"
+    );
     let location = await lookupVerifiedGeolocation(extractedIp, isPublic);
     const vercelGeo = extractVercelEdgeGeo(req);
     if (isPublic && (!location.isLocationVerified || location.isp === "Unknown" || location.latitude === null) && clientGeoHint && normalizeIpCandidate(clientGeoHint.ip)?.toLowerCase() === extractedIp.toLowerCase()) {
@@ -2352,7 +2403,12 @@ app.post("/api/visitor/identify", async (req, res) => {
       }
     );
     const torLookupTarget = location.publicIp.trim().toLowerCase();
-    const torExitNode = isTorBulkListed(location.publicIp) || (torLookupTarget === extractedIp.trim().toLowerCase() ? await torLookupPromise : await isTorExitNode(location.publicIp).catch(() => false));
+    const torStatus = await resolveTorExitStatus(
+      location.publicIp,
+      location,
+      torLookupTarget === extractedIp.trim().toLowerCase() ? torLookupPromise : void 0
+    );
+    const torExitNode = torStatus.isExit;
     const signedPayloadTampered = /Payload integrity hash mismatch/i.test(
       envelopeVerdict.requestIntegrityReason
     );
@@ -2392,6 +2448,7 @@ app.post("/api/visitor/identify", async (req, res) => {
         requestIntegrityReason: envelopeVerdict.requestIntegrityReason,
         requestNonce: envelopeVerdict.requestNonce,
         torExitNode,
+        torOperatorHint: torStatus.viaOperatorHint,
         ipBlocklisted: blocklist.blocklisted,
         ipBlocklistReasons: blocklist.reasons,
         botClassification
