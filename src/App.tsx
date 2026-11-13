@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react';
-import { identifyCurrentVisitor, detectIncognitoMode } from './lib/collector';
+import { identifyCurrentVisitor, detectIncognitoMode, detectEmulatorEvidence } from './lib/collector';
+import type { EmulatorEvidence } from './lib/collector';
 import type {
   BotSubtype,
   IntelVisitorResponse,
@@ -371,10 +372,13 @@ function SignalRow(row: SignalRowModel & { className?: string }) {
 /**
  * Client-side fallback mirror of the server's 4-signal engine. Only used when the API
  * response predates `smartSignals`; scores, statuses and labels match server.ts exactly.
+ * `clientEmulator` carries the GAP-1 emulator derivation so Tile 4 reaches the same
+ * verdict the server would reach from the same device values.
  */
 function buildClientSignalRows(
   signals: SecuritySignals,
-  incognitoConfirmed = false
+  incognitoConfirmed = false,
+  clientEmulator?: EmulatorEvidence | null
 ): SignalRowModel[] {
   const isBotDetected = Boolean(signals.isBot || signals.webdriver || signals.cdpDetected);
   const isHeadlessDetected = Boolean(signals.isHeadless);
@@ -382,7 +386,7 @@ function buildClientSignalRows(
   const hasTzMismatch = Boolean(signals.timezoneMismatch);
   const isVm = Boolean(signals.isVirtualMachine);
   const isTampered = Boolean(signals.isOsTampered);
-  const isEmulator = Boolean(signals.emulatorDetected);
+  const isEmulator = Boolean(signals.emulatorDetected) || Boolean(clientEmulator?.detected);
   const isRequestTampered = Boolean(signals.tamperedRequest || signals.replayDetected);
   const isTorExit = Boolean(signals.torExitNode);
   const isBlocklisted = Boolean(signals.ipBlocklisted);
@@ -471,7 +475,9 @@ function buildClientSignalRows(
         ? 'Duplicate payload nonce (replay attack detected)'
         : 'Payload integrity hash mismatch')
     : isEmulator
-    ? signals.emulatorReason || 'Mobile UA backed by a desktop architecture or emulator GPU'
+    ? signals.emulatorReason ||
+      clientEmulator?.reason ||
+      'Mobile UA backed by a desktop architecture or emulator GPU'
     : signals.vmReason ||
       (isTampered
         ? signals.tamperReasons[0] || 'Operating-system / User-Agent tampering detected'
@@ -559,7 +565,8 @@ function buildClientSignalRows(
 function buildSignalRows(
   signals: SecuritySignals,
   serverSignals?: SmartSignals | null,
-  incognitoConfirmed = false
+  incognitoConfirmed = false,
+  clientEmulator?: EmulatorEvidence | null
 ): SignalRowModel[] {
   if (serverSignals) {
     const rows = [
@@ -579,7 +586,7 @@ function buildSignalRows(
     }
     return rows;
   }
-  return buildClientSignalRows(signals, incognitoConfirmed);
+  return buildClientSignalRows(signals, incognitoConfirmed, clientEmulator);
 }
 
 export default function App() {
@@ -706,21 +713,21 @@ export default function App() {
     ? `${data.hardwareSignals.gpuVendor} • ${data.hardwareSignals.gpuRenderer}`
     : '';
 
-  // Normalized 0..10 threat score + derived risk tier (legacy scale converted). The server's
-  // top-level mirrors win; older payloads fall back to securitySignals.
-  const normalizedSuspectScore = normalizeLegacyScore(
-    data?.suspectScore ?? data?.securitySignals?.suspectScore
-  );
-  const riskTier: RiskLevel = data?.riskLevel ?? resolveRiskTier(normalizedSuspectScore);
-  const riskBadgeText =
-    data?.riskBadgeText ??
-    data?.securitySignals?.riskBadgeText ??
-    `${riskTier} Risk • ${normalizedSuspectScore}/10`;
-
   // 4-signal core grid model (null-safe: renders only inside the data block). The server's
   // computed grid is preferred; the client mirror covers older responses.
   const activeSignals = data?.securitySignals ?? null;
   const serverSmartSignals = data?.smartSignals ?? data?.securitySignals?.smartSignals ?? null;
+  // GAP 1 — emulator evidence derived on the client from the same values the server sees,
+  // so the Tile 4 fallback can never disagree with the server's own verdict.
+  const clientEmulatorEvidence: EmulatorEvidence | null = data
+    ? detectEmulatorEvidence({
+        platform: data.browserDevice.platform,
+        maxTouchPoints: data.hardwareSignals.maxTouchPoints,
+        gpuVendor: data.hardwareSignals.gpuVendor,
+        gpuRenderer: data.hardwareSignals.gpuRenderer,
+        screenResolution: data.browserDevice.screenResolution,
+      })
+    : null;
   // A private verdict from either side wins — the incognito tile must never fall back to
   // "Standard Window" when the client device object, the client signals, or either server
   // smart-signal copy reports an incognito score.
@@ -737,8 +744,34 @@ export default function App() {
         (data.securitySignals?.smartSignals?.incognito?.scoreOutOf10 ?? 0) > 0)
   );
   const signalRows = activeSignals
-    ? buildSignalRows(activeSignals, serverSmartSignals, incognitoConfirmed)
+    ? buildSignalRows(
+        activeSignals,
+        serverSmartSignals,
+        incognitoConfirmed,
+        clientEmulatorEvidence
+      )
     : [];
+
+  // Normalized 0..10 threat score + derived risk tier (legacy scale converted). The server's
+  // top-level mirrors win; older payloads fall back to securitySignals.
+  const normalizedSuspectScore = normalizeLegacyScore(
+    data?.suspectScore ?? data?.securitySignals?.suspectScore
+  );
+  const serverRiskBadgeText =
+    data?.riskBadgeText ?? data?.securitySignals?.riskBadgeText ?? null;
+  // The header may never advertise a lower tier than the worst card: when the server sent no
+  // badge text and any tile rates >= 7, the displayed composite is raised to the High floor (7).
+  // A server-supplied badge is never overridden.
+  const worstTileScore = signalRows.reduce((max, row) => Math.max(max, row.riskScore), 0);
+  const compositeRaisedByTile =
+    !serverRiskBadgeText && worstTileScore >= 7 && normalizedSuspectScore < worstTileScore;
+  const displayedRiskScore = compositeRaisedByTile
+    ? Math.max(normalizedSuspectScore, 7)
+    : normalizedSuspectScore;
+  const riskTier: RiskLevel = serverRiskBadgeText
+    ? data?.riskLevel ?? resolveRiskTier(normalizedSuspectScore)
+    : resolveRiskTier(displayedRiskScore);
+  const riskBadgeText = serverRiskBadgeText ?? `${riskTier} Risk • ${displayedRiskScore}/10`;
 
   return (
     <div
@@ -1326,7 +1359,7 @@ export default function App() {
                         : 'bg-emerald-500'
                     }`}
                     style={{
-                      width: `${Math.max(8, 100 - normalizedSuspectScore * 10)}%`,
+                      width: `${Math.max(8, 100 - displayedRiskScore * 10)}%`,
                     }}
                   />
                 </div>

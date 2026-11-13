@@ -1174,6 +1174,134 @@ const EMULATOR_GPU_PATTERN =
 const SOFTWARE_RENDERER_PATTERN =
   /android emulator opengl es translator|swiftshader|llvmpipe|virgl|apple software renderer|basic render driver/i;
 
+/** x86 / desktop platform strings that a real Android handset can never report. */
+const NON_ARM_ANDROID_PLATFORM_PATTERN = /Linux x86|x86_64|i686|Win32|Win64|MacIntel/i;
+
+/** Phase 3 — emulator / iOS-simulator GPU renderer signatures (same list the server uses). */
+const EMULATOR_GPU_SIGNATURE_PATTERN =
+  /Android Emulator OpenGL ES Translator|Goldfish|Ranchu|BlueStacks|Nox|LDPlayer|MEmu|Genymotion|VirGL|Apple Software Renderer/i;
+
+/** Any iOS device User-Agent (iPhone / iPad / iPod, including iPadOS 13+ desktop UA). */
+const IOS_DEVICE_UA_PATTERN = /(iPhone|iPad|iPod)/i;
+
+/** Desktop platforms an iOS simulator is hosted on. */
+const IOS_FOREIGN_PLATFORM_PATTERN = /Linux|Win32|Win64/i;
+
+/** Phones that never legitimately pair with a desktop-width screen. */
+const IPHONE_OR_IPOD_UA_PATTERN = /(iPhone|iPod)/i;
+
+/**
+ * Inputs for the client emulator probe. Every field is optional: missing values fall
+ * back to the live `navigator` values, which keeps the helper usable from tests.
+ */
+export interface EmulatorEvidenceInput {
+  userAgent?: string;
+  platform?: string;
+  maxTouchPoints?: number;
+  gpuVendor?: string;
+  gpuRenderer?: string;
+  screenResolution?: string;
+}
+
+/** Verdict + short human evidence for the mobile emulator / simulator probe. */
+export interface EmulatorEvidence {
+  detected: boolean;
+  reason: string;
+}
+
+/**
+ * Mobile emulator / iOS simulator evidence derived from real client values.
+ *
+ * The predicates are the same ones the server applies to the payload, so the client
+ * verdict and the server verdict cannot drift apart:
+ * 1. Android UA on an x86 / desktop platform (a handset never reports one).
+ * 2. Android UA reporting zero touch points.
+ * 3. Emulator / simulator GPU renderer string.
+ * 4. iOS UA on a foreign platform, or on any platform with zero touch points —
+ *    iPadOS 13+ legitimately reports `MacIntel` WITH real touch points and stays clean.
+ * 5. iPhone / iPod UA on a desktop-width (>= 1000 px) screen.
+ *
+ * Never throws and reads hostile `navigator` proxies through `try`/`catch`.
+ */
+export function detectEmulatorEvidence(input: EmulatorEvidenceInput = {}): EmulatorEvidence {
+  let liveUserAgent = '';
+  let liveTouchPoints = 0;
+  try {
+    if (typeof navigator !== 'undefined') {
+      liveUserAgent = navigator.userAgent || '';
+      liveTouchPoints =
+        typeof navigator.maxTouchPoints === 'number' ? Math.max(0, navigator.maxTouchPoints) : 0;
+    }
+  } catch {
+    // Ignore hostile navigator proxies.
+  }
+
+  const ua = typeof input.userAgent === 'string' ? input.userAgent : liveUserAgent;
+  const platform = (input.platform || '').trim();
+  const maxTouchPoints =
+    typeof input.maxTouchPoints === 'number'
+      ? Math.max(0, input.maxTouchPoints)
+      : liveTouchPoints;
+  const vendor = (input.gpuVendor || '').trim();
+  const renderer = (input.gpuRenderer || '').trim();
+  const gpuSignature = `${vendor} ${renderer}`;
+
+  const claimsAndroid = /Android/i.test(ua);
+  const claimsIos = IOS_DEVICE_UA_PATTERN.test(ua);
+
+  // 1 — Android UA backed by an x86 / desktop platform: the emulator CPU profile.
+  if (claimsAndroid && NON_ARM_ANDROID_PLATFORM_PATTERN.test(platform)) {
+    return {
+      detected: true,
+      reason: `Android user-agent on desktop ${platform} (emulator CPU profile)`,
+    };
+  }
+
+  // 2 — Android UA without a single touch point: emulated input layer.
+  if (claimsAndroid && maxTouchPoints === 0) {
+    return {
+      detected: true,
+      reason: 'Android user-agent reporting zero touch points (emulated input layer)',
+    };
+  }
+
+  // 3 — Emulator / simulator renderers expose themselves through WebGL.
+  if (EMULATOR_GPU_SIGNATURE_PATTERN.test(gpuSignature)) {
+    return {
+      detected: true,
+      reason: `Emulator GPU renderer (${renderer || vendor || 'masked renderer'})`,
+    };
+  }
+
+  // 4 — iOS UA on a non-Apple platform, or without touch points. iPadOS 13+ reports
+  // `MacIntel` WITH touch points, so that legitimate combination is never flagged.
+  if (claimsIos) {
+    if (IOS_FOREIGN_PLATFORM_PATTERN.test(platform)) {
+      return {
+        detected: true,
+        reason: `iOS user-agent on ${platform} platform (simulator host)`,
+      };
+    }
+    if (maxTouchPoints === 0) {
+      return {
+        detected: true,
+        reason: `iOS user-agent on ${platform || 'desktop'} with zero touch points (simulator)`,
+      };
+    }
+  }
+
+  // 5 — iPhone / iPod UA on a desktop-width screen (never applied to Android).
+  const screenWidth = parseScreenResolutionWidth(input.screenResolution);
+  if (IPHONE_OR_IPOD_UA_PATTERN.test(ua) && screenWidth >= 1000) {
+    return {
+      detected: true,
+      reason: `iPhone user-agent on a ${screenWidth}px desktop-width screen`,
+    };
+  }
+
+  return { detected: false, reason: '' };
+}
+
 /**
  * Virtual machine / hypervisor + OS identity integrity detection.
  * Matches WebGL vendor/renderer strings against known hypervisor GPUs, then
@@ -2396,6 +2524,22 @@ export async function evaluateSecuritySignals(
   }
   const tamperDetected = vmStatus.isOsTampered || vmStatus.isVirtualMachine;
 
+  // 3b. Mobile emulator / iOS simulator evidence (Phase 3). The client-side derivation
+  // uses the same predicates the server applies, so the `emulatorDetected` verdict is
+  // produced even when the raw navigator probe above stayed silent. The OR keeps the
+  // existing detector authoritative — nothing it flagged can be demoted here.
+  const emulatorEvidence = detectEmulatorEvidence({
+    platform: browserDevice.platform,
+    maxTouchPoints: hardwareSignals.maxTouchPoints,
+    gpuVendor: hardwareSignals.gpuVendor,
+    gpuRenderer: hardwareSignals.gpuRenderer,
+    screenResolution: browserDevice.screenResolution,
+  });
+  const emulatorDetected = vmStatus.emulatorDetected || emulatorEvidence.detected;
+  const emulatorReason = vmStatus.emulatorDetected
+    ? vmStatus.emulatorReason || emulatorEvidence.reason
+    : emulatorEvidence.reason;
+
   // 4. Private Mode / Incognito Inspection (multi-engine physics)
   const incognito = await detectIncognitoMode();
   const privateBrowsing = (await hasPersistedStorageGrant())
@@ -2512,8 +2656,8 @@ export async function evaluateSecuritySignals(
     isOsTampered: vmStatus.isOsTampered,
     vmReason: vmStatus.vmReason,
     /* Phase 3 — mobile emulator / cloud container verdict */
-    emulatorDetected: vmStatus.emulatorDetected,
-    emulatorReason: vmStatus.emulatorReason,
+    emulatorDetected,
+    emulatorReason,
     /* Bot / automation verdict */
     isHeadless: botAssessment.isHeadless,
     botReason: botAssessment.botReason,
