@@ -2312,7 +2312,9 @@ export async function detectPrivateBrowsing(
     };
   }
   return assessPrivateBrowsing(hasStoredIdentity, await detectIncognitoMode());
-}/**
+}
+
+/**
  * Evaluates First-Party Security & Anomaly Signals ("Smart Signals") and computes an
  * explainable Suspect & Risk Score (0-10).
  */
