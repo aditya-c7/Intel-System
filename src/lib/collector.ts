@@ -1293,16 +1293,15 @@ export function detectVmAndIntegrity(
   let emulatorDetected = false;
   let emulatorReason = '';
 
-  if (claimsMobile && (desktopPlatform || maxTouchPoints === 0)) {
+  // A mobile UA is only treated as an emulator with hard evidence: a desktop platform claim,
+  // or zero touch points on a desktop-class viewport. A lone zero-touch report from a quirky
+  // WebView is not enough (real phones occasionally report 0), so normal phones stay clean.
+  const zeroTouchOnWideViewport = maxTouchPoints === 0 && viewportWidth >= 1000;
+  if (claimsMobile && (desktopPlatform || zeroTouchOnWideViewport)) {
     emulatorDetected = true;
     emulatorReason = desktopPlatform
       ? `Mobile User-Agent (${mobileClaim ? mobileClaim[0] : 'mobile'}) with a desktop platform (${platform})`
-      : `Mobile User-Agent (${mobileClaim ? mobileClaim[0] : 'mobile'}) with zero touch points`;
-  }
-
-  if (!emulatorDetected && claimsMobile && maxTouchPoints === 0 && viewportWidth >= 1000) {
-    emulatorDetected = true;
-    emulatorReason = `Mobile User-Agent with a ${viewportWidth}px desktop-class viewport and zero touch points`;
+      : `Mobile User-Agent with a ${viewportWidth}px desktop-class viewport and zero touch points`;
   }
 
   if (claimsMobile && EMULATOR_GPU_PATTERN.test(signature)) {
