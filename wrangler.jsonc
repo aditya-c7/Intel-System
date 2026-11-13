@@ -16,13 +16,13 @@
   },
   "durable_objects": {
     "bindings": [
-      { "name": "VISITOR_STORE", "class_name": "VisitorStore" },
-      { "name": "SPEED_TEST_STORE", "class_name": "SpeedTestStore" }
+      { "name": "VISITOR_STORE", "class_name": "VisitorStore" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["VisitorStore"] },
-    { "tag": "v2", "new_sqlite_classes": ["SpeedTestStore"] }
+    { "tag": "v2", "new_sqlite_classes": ["SpeedTestStore"] },
+    { "tag": "v3", "deleted_classes": ["SpeedTestStore"] }
   ],
   "observability": { "enabled": true }
 }

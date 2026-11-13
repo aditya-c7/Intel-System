@@ -64,10 +64,6 @@ const db: DatabaseAdapter = {
         if (!source.includes('const IS_SERVERLESS_RUNTIME = true;')) {
           throw new Error('Worker standalone-listener guard could not be installed.');
         }
-        source = replaceOnce(source,
-          'const HIGH_ENTROPY_64KB_CHUNK = crypto.randomBytes(65536);',
-          'let workerDownloadChunk: Buffer | undefined;\nfunction getWorkerDownloadChunk(): Buffer { return workerDownloadChunk ??= crypto.randomBytes(65536); }');
-        source = source.replaceAll('HIGH_ENTROPY_64KB_CHUNK', 'getWorkerDownloadChunk()');
         source = source.replaceAll("await import('vite')", "await import(String('vite'))");
         return { contents: source, loader: 'ts', resolveDir: path.dirname(filename) };
       });

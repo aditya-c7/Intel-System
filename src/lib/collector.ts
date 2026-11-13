@@ -2513,9 +2513,8 @@ export async function identifyCurrentVisitor(options?: {
   return inFlightRequest;
 }
 
-// Start the storage-physics probe as soon as the module loads — before App mounts and
-// before NetworkStabilityPanel fires its first download/upload speed test, so the
-// main-thread timing is not skewed by network/speed-test contention.
+// Start the storage-physics probe as soon as the module loads — before App mounts, so the
+// main-thread timing is not skewed by the first paint and initial network activity.
 if (typeof window !== 'undefined' && typeof indexedDB !== 'undefined') {
   void detectIncognitoMode();
 }

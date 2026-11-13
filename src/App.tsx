@@ -561,8 +561,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // Start the module-cached storage-physics probe before any network panel mounts or
-    // fires a speed test, so its main-thread timing is not skewed. Never blocks rendering.
+    // Start the module-cached storage-physics probe before any network panel mounts,
+    // so its main-thread timing is not skewed. Never blocks rendering.
     void detectIncognitoMode();
     loadVisitorData(false);
   }, [loadVisitorData]);
