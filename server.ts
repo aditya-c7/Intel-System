@@ -5,12 +5,15 @@ import net from 'net';
 import os from 'os';
 import path from 'path';
 import fs from 'fs';
+import dns from 'node:dns/promises';
 import { createRequire } from 'module';
 import dotenv from 'dotenv';
 import type {
   BrowserDeviceInfo,
+  BotSubtype,
   HardwareSignals,
   IspNetworkClassification,
+  SecurityEnvelope,
   SecuritySignals,
   RiskLevel,
   PersistenceMode,
@@ -907,6 +910,583 @@ function classifyIspNetwork(isp: string, org: string, asn: string): IspNetworkCl
   };
 }
 
+/* -------------------------------------------------------------------------- */
+/* Phase 1 — bot / AI-agent subtype classification                            */
+/* -------------------------------------------------------------------------- */
+
+type RawHeaderBag = Record<string, string | string[] | undefined>;
+
+interface BotClassification {
+  subtype: BotSubtype;
+  label: string;
+  provider: string;
+  category: string;
+  confidence: number;
+  reasons: string[];
+}
+
+interface BotNetworkIdentity {
+  org?: string;
+  isp?: string;
+  asn?: string;
+}
+
+interface BotClientSignals {
+  isBot?: boolean;
+  isHeadless?: boolean;
+  webdriver?: boolean;
+  cdpDetected?: boolean;
+  botSignals?: string[];
+}
+
+/** Reads a header case-insensitively, collapsing repeated headers into a comma list. */
+function readRequestHeader(headers: RawHeaderBag | null | undefined, name: string): string {
+  if (!headers) return '';
+  const direct = headers[name.toLowerCase()];
+  const raw = Array.isArray(direct) ? direct.join(', ') : direct;
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+const GOOD_BOT_UA_RULES: Array<{
+  pattern: RegExp;
+  provider: string;
+  label: string;
+  category: string;
+  network: RegExp;
+}> = [
+  {
+    pattern: /googlebot/i,
+    provider: 'Google',
+    label: 'Googlebot',
+    category: 'Search Crawler',
+    network: /google/i,
+  },
+  {
+    pattern: /bingbot|bingpreview/i,
+    provider: 'Microsoft',
+    label: 'Bingbot',
+    category: 'Search Crawler',
+    network: /microsoft|\bbing\b/i,
+  },
+  {
+    pattern: /applebot/i,
+    provider: 'Apple',
+    label: 'Applebot',
+    category: 'Search Crawler',
+    network: /\bapple\b/i,
+  },
+  {
+    pattern: /duckduckbot/i,
+    provider: 'DuckDuckGo',
+    label: 'DuckDuckBot',
+    category: 'Search Crawler',
+    network: /duckduckgo/i,
+  },
+  {
+    pattern: /linkedinbot/i,
+    provider: 'LinkedIn',
+    label: 'LinkedInBot',
+    category: 'Link Preview',
+    network: /linkedin/i,
+  },
+  {
+    pattern: /twitterbot/i,
+    provider: 'X (Twitter)',
+    label: 'Twitterbot',
+    category: 'Link Preview',
+    network: /twitter|\bx corp\b/i,
+  },
+  {
+    pattern: /slackbot/i,
+    provider: 'Slack',
+    label: 'Slackbot',
+    category: 'Link Preview',
+    network: /slack/i,
+  },
+  {
+    pattern: /vercelbot/i,
+    provider: 'Vercel',
+    label: 'Vercelbot',
+    category: 'Link Preview',
+    network: /vercel/i,
+  },
+];
+
+const AI_AGENT_UA_RULES: Array<{ pattern: RegExp; provider: string; label: string }> = [
+  { pattern: /gptbot/i, provider: 'OpenAI', label: 'GPTBot' },
+  { pattern: /chatgpt-user/i, provider: 'OpenAI', label: 'ChatGPT-User' },
+  { pattern: /oai-searchbot/i, provider: 'OpenAI', label: 'OAI-SearchBot' },
+  { pattern: /claudebot/i, provider: 'Anthropic', label: 'ClaudeBot' },
+  { pattern: /claude-web/i, provider: 'Anthropic', label: 'Claude-Web' },
+  { pattern: /anthropic-ai/i, provider: 'Anthropic', label: 'Anthropic-AI' },
+  { pattern: /perplexitybot/i, provider: 'Perplexity', label: 'PerplexityBot' },
+  { pattern: /perplexity-user/i, provider: 'Perplexity', label: 'Perplexity-User' },
+  { pattern: /google-extended/i, provider: 'Google', label: 'Google-Extended' },
+  { pattern: /ccbot/i, provider: 'Common Crawl', label: 'CCBot' },
+  { pattern: /bytespider/i, provider: 'ByteDance', label: 'Bytespider' },
+  { pattern: /cohere-ai/i, provider: 'Cohere', label: 'Cohere-AI' },
+  { pattern: /meta-externalagent/i, provider: 'Meta', label: 'Meta-ExternalAgent' },
+  { pattern: /headlesschrome/i, provider: 'Cloud Browser Agent', label: 'Headless Chrome' },
+];
+
+const AUTOMATION_UA_PATTERN = /playwright|puppeteer|selenium|cypress|phantomjs/i;
+
+const DATACENTER_NETWORK_PATTERN =
+  /\b(amazon|amazonaws|aws|google cloud|azure|microsoft azure|digitalocean|hetzner|linode|akamai|ovh|vultr|oracle cloud|alibaba|aliyun|tencent|leaseweb|contabo|m247|choopa|datacamp)\b/i;
+
+const KNOWN_AI_CRAWLER_REASON = 'LLM crawler user-agent signature';
+
+/**
+ * Phase 1 — resolves the request identity into one of `human`, `good_bot`, `ai_agent`
+ * or `bad_bot`. A search-crawler UA is only trusted when the network identity matches the
+ * crawler operator; every other claim of that UA is a spoof. Automation runtimes and
+ * header-incomplete desktop browsers fall through to `bad_bot`. Never throws.
+ */
+function classifyBotTraffic(
+  headers: RawHeaderBag | null | undefined,
+  network: BotNetworkIdentity,
+  client: BotClientSignals
+): BotClassification {
+  const ua = readRequestHeader(headers, 'user-agent');
+  const acceptLanguage = readRequestHeader(headers, 'accept-language');
+  const secFetchSite = readRequestHeader(headers, 'sec-fetch-site');
+  const secFetchMode = readRequestHeader(headers, 'sec-fetch-mode');
+  const secFetchDest = readRequestHeader(headers, 'sec-fetch-dest');
+  const networkHaystack = [network.org, network.isp, network.asn]
+    .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+    .join(' ');
+  const clientSignals = Array.isArray(client.botSignals)
+    ? client.botSignals.filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+    : [];
+
+  for (const rule of GOOD_BOT_UA_RULES) {
+    if (!rule.pattern.test(ua)) continue;
+    if (rule.network.test(networkHaystack)) {
+      return {
+        subtype: 'good_bot',
+        label: rule.label,
+        provider: rule.provider,
+        category: rule.category,
+        confidence: 0.97,
+        reasons: [
+          `${rule.label} user-agent matched`,
+          `Network identity (${networkHaystack || 'unknown'}) matches ${rule.provider}`,
+        ],
+      };
+    }
+    return {
+      subtype: 'bad_bot',
+      label: 'Spoofed Crawler',
+      provider: `Unverified ${rule.provider} claim`,
+      category: 'Spoofed Identity',
+      confidence: 0.99,
+      reasons: [
+        `${rule.label} user-agent presented`,
+        `Network identity (${networkHaystack || 'unknown'}) does not belong to ${rule.provider}`,
+      ],
+    };
+  }
+
+  for (const rule of AI_AGENT_UA_RULES) {
+    if (!rule.pattern.test(ua)) continue;
+    return {
+      subtype: 'ai_agent',
+      label: rule.label,
+      provider: rule.provider,
+      category: rule.provider === 'Cloud Browser Agent' ? 'Autonomous Agent' : 'AI Crawler',
+      confidence: rule.provider === 'Cloud Browser Agent' ? 0.85 : 0.92,
+      reasons: [
+        `${rule.label} user-agent matched`,
+        networkHaystack ? `Network identity: ${networkHaystack}` : 'Network identity unavailable',
+      ],
+    };
+  }
+
+  const datacenterNetwork = DATACENTER_NETWORK_PATTERN.test(networkHaystack);
+  const automationRuntimeDetected = Boolean(client.webdriver || client.cdpDetected);
+  if (automationRuntimeDetected && datacenterNetwork) {
+    return {
+      subtype: 'ai_agent',
+      label: 'Cloud Browser Agent',
+      provider: 'Cloud Browser Agent',
+      category: 'Autonomous Agent',
+      confidence: 0.78,
+      reasons: [
+        client.webdriver ? 'WebDriver runtime binding present' : 'CDP runtime binding present',
+        `Datacenter ASN hosting the agent (${networkHaystack})`,
+      ],
+    };
+  }
+
+  const isDesktopChromeOrSafari =
+    /chrome\/|crios\/|safari\//i.test(ua) && !/mobile|android|iphone|ipad/i.test(ua);
+  const missingFetchMetadata = !secFetchSite && !secFetchMode && !secFetchDest;
+
+  if (
+    client.isBot ||
+    client.webdriver ||
+    client.cdpDetected ||
+    AUTOMATION_UA_PATTERN.test(ua) ||
+    (isDesktopChromeOrSafari && (!acceptLanguage || missingFetchMetadata))
+  ) {
+    const reasons: string[] = [];
+    if (client.isBot) reasons.push('Client reported an automated runtime');
+    if (client.webdriver) reasons.push('WebDriver handshake detected');
+    if (client.cdpDetected) reasons.push('Chrome DevTools Protocol binding detected');
+    if (AUTOMATION_UA_PATTERN.test(ua)) reasons.push('Automation framework signature in user-agent');
+    if (isDesktopChromeOrSafari && !acceptLanguage) {
+      reasons.push('Desktop browser user-agent without accept-language');
+    }
+    if (isDesktopChromeOrSafari && missingFetchMetadata) {
+      reasons.push('Desktop browser user-agent without sec-fetch metadata');
+    }
+    for (const signal of clientSignals.slice(0, 2)) reasons.push(signal);
+    return {
+      subtype: 'bad_bot',
+      label: AUTOMATION_UA_PATTERN.test(ua) ? 'Automation Runtime' : 'Automation / Header Anomaly',
+      provider: 'Unattributed Automation',
+      category: 'Automation',
+      confidence: client.isBot || automationRuntimeDetected ? 0.93 : 0.7,
+      reasons: reasons.length > 0 ? reasons : ['Automated traffic signature detected'],
+    };
+  }
+
+  return {
+    subtype: 'human',
+    label: 'Verified Human',
+    provider: 'None',
+    category: 'Human Interaction',
+    confidence: 0.6,
+    reasons: ['Interactive browser profile without automation signatures'],
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Phase 2 — Tor exit relay resolution and local abuse blocklist               */
+/* -------------------------------------------------------------------------- */
+
+const TOR_DNS_TIMEOUT_MS = 600;
+const TOR_DNS_CACHE_TTL_MS = 10 * 60 * 1000;
+const TOR_DNS_CACHE_MAX_ENTRIES = 5000;
+const TOR_BULK_LIST_URL = 'https://check.torproject.org/torbulkexitlist';
+const TOR_BULK_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+const TOR_BULK_TIMEOUT_MS = 1500;
+const TOR_BULK_LIST_MAX_ENTRIES = 20000;
+
+const torDnsCache = new Map<string, { isTorExit: boolean; expiresAtMs: number }>();
+const torBulkExitList = new Set<string>();
+let torBulkRefreshedAtMs = 0;
+let torBulkRefreshInFlight = false;
+
+const SUSPICIOUS_IP_TTL_MS = 24 * 60 * 60 * 1000;
+const SUSPICIOUS_IP_MAX_ENTRIES = 10000;
+const suspiciousIpLedger = new Map<string, number>();
+const suspiciousIpReasons = new Map<string, string[]>();
+
+function isIpv4Literal(value: string): boolean {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(trimmed)) return false;
+  return trimmed.split('.').every((octet) => {
+    const parsed = Number.parseInt(octet, 10);
+    return Number.isFinite(parsed) && parsed >= 0 && parsed <= 255;
+  });
+}
+
+function pruneTorDnsCache(nowMs: number): void {
+  for (const [ip, entry] of torDnsCache) {
+    if (entry.expiresAtMs <= nowMs) torDnsCache.delete(ip);
+  }
+  while (torDnsCache.size >= TOR_DNS_CACHE_MAX_ENTRIES) {
+    const oldestKey = torDnsCache.keys().next().value;
+    if (typeof oldestKey !== 'string') break;
+    torDnsCache.delete(oldestKey);
+  }
+}
+
+/**
+ * Authoritative per-IP Tor relay check via the Tor Project DNS exit list
+ * (`<reversed-octets>.dnsel.torproject.org`). Only `127.0.0.2` means "exit relay".
+ * Bounded to 600ms, cached for 10 minutes, and it never throws.
+ */
+async function isTorExitNode(ip: string): Promise<boolean> {
+  const cleanIp = typeof ip === 'string' ? ip.trim() : '';
+  if (!isIpv4Literal(cleanIp)) return false;
+
+  const nowMs = Date.now();
+  const cached = torDnsCache.get(cleanIp);
+  if (cached && cached.expiresAtMs > nowMs) return cached.isTorExit;
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const reversedIp = cleanIp.split('.').reverse().join('.');
+    const lookup = dns.resolve4(`${reversedIp}.dnsel.torproject.org`).catch(() => [] as string[]);
+    const timeout = new Promise<string[]>((resolve) => {
+      timeoutHandle = setTimeout(() => resolve([]), TOR_DNS_TIMEOUT_MS);
+    });
+    const records = await Promise.race([lookup, timeout]);
+    const isTorExit = Array.isArray(records) && records.includes('127.0.0.2');
+
+    pruneTorDnsCache(nowMs);
+    torDnsCache.set(cleanIp, {
+      isTorExit,
+      expiresAtMs: nowMs + TOR_DNS_CACHE_TTL_MS,
+    });
+    return isTorExit;
+  } catch {
+    return false;
+  } finally {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+  }
+}
+
+function isTorBulkListed(ip: string): boolean {
+  const cleanIp = typeof ip === 'string' ? ip.trim() : '';
+  return cleanIp.length > 0 && torBulkExitList.has(cleanIp);
+}
+
+/**
+ * Refreshes the bulk Tor exit list (at most once per hour). Fire-and-forget: the caller
+ * uses `void refreshTorBulkList()` so an identify request is never blocked on the fetch.
+ */
+async function refreshTorBulkList(): Promise<void> {
+  const nowMs = Date.now();
+  if (torBulkRefreshInFlight) return;
+  if (nowMs - torBulkRefreshedAtMs < TOR_BULK_REFRESH_INTERVAL_MS) return;
+
+  torBulkRefreshInFlight = true;
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), TOR_BULK_TIMEOUT_MS);
+  try {
+    const response = await fetch(TOR_BULK_LIST_URL, {
+      signal: controller.signal,
+      headers: { accept: 'text/plain' },
+    });
+    if (!response.ok) return;
+    const body = await response.text();
+    let added = 0;
+    for (const line of body.split(/\r?\n/)) {
+      const candidate = line.trim();
+      if (!isIpv4Literal(candidate)) continue;
+      torBulkExitList.add(candidate);
+      added += 1;
+      if (added >= TOR_BULK_LIST_MAX_ENTRIES) break;
+    }
+  } catch {
+    // Network failure keeps the previous list; the next hourly window retries.
+  } finally {
+    clearTimeout(timeoutHandle);
+    torBulkRefreshInFlight = false;
+    torBulkRefreshedAtMs = Date.now();
+  }
+}
+
+function flagSuspiciousIp(ip: string, reason: string): void {
+  const cleanIp = typeof ip === 'string' ? ip.trim() : '';
+  if (!cleanIp || cleanIp === 'Unavailable') return;
+
+  const nowMs = Date.now();
+  for (const [knownIp, expiresAtMs] of suspiciousIpLedger) {
+    if (expiresAtMs <= nowMs) {
+      suspiciousIpLedger.delete(knownIp);
+      suspiciousIpReasons.delete(knownIp);
+    }
+  }
+  while (suspiciousIpLedger.size >= SUSPICIOUS_IP_MAX_ENTRIES) {
+    const oldestKey = suspiciousIpLedger.keys().next().value;
+    if (typeof oldestKey !== 'string') break;
+    suspiciousIpLedger.delete(oldestKey);
+    suspiciousIpReasons.delete(oldestKey);
+  }
+
+  const cleanReason = reason.trim().slice(0, 180);
+  const existingReasons = suspiciousIpReasons.get(cleanIp) ?? [];
+  if (cleanReason && !existingReasons.includes(cleanReason) && existingReasons.length < 5) {
+    existingReasons.push(cleanReason);
+  }
+  suspiciousIpReasons.set(cleanIp, existingReasons);
+  suspiciousIpLedger.set(cleanIp, nowMs + SUSPICIOUS_IP_TTL_MS);
+}
+
+function lookupSuspiciousIp(ip: string): { blocklisted: boolean; reasons: string[] } {
+  const cleanIp = typeof ip === 'string' ? ip.trim() : '';
+  if (!cleanIp) return { blocklisted: false, reasons: [] };
+  const expiresAtMs = suspiciousIpLedger.get(cleanIp);
+  if (expiresAtMs === undefined) return { blocklisted: false, reasons: [] };
+  if (expiresAtMs <= Date.now()) {
+    suspiciousIpLedger.delete(cleanIp);
+    suspiciousIpReasons.delete(cleanIp);
+    return { blocklisted: false, reasons: [] };
+  }
+  return {
+    blocklisted: true,
+    reasons: [...(suspiciousIpReasons.get(cleanIp) ?? [])],
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Phase 4 — sealed request envelope verification                             */
+/* -------------------------------------------------------------------------- */
+
+const ENVELOPE_FRESHNESS_WINDOW_MS = 60 * 1000;
+const NONCE_TTL_MS = 15 * 60 * 1000;
+const NONCE_CACHE_MAX_ENTRIES = 5000;
+const seenEnvelopeNonces = new Map<string, number>();
+
+interface EnvelopeVerdict {
+  tamperedRequest: boolean;
+  replayDetected: boolean;
+  requestIntegrityReason: string;
+  requestNonce: string;
+}
+
+function sha256HexLower(input: string): string {
+  return crypto.createHash('sha256').update(input, 'utf8').digest('hex').toLowerCase();
+}
+
+/** Folds navigator.platform / `sec-ch-ua-platform` spellings onto one comparison key. */
+function normalizePlatformKey(value: string): string {
+  const folded = value.replace(/"/g, '').trim().toLowerCase();
+  if (!folded) return '';
+  if (/windows|win32|win64|winnt/.test(folded)) return 'windows';
+  if (/mac|macintosh|macintel/.test(folded)) return 'macos';
+  if (/android/.test(folded)) return 'android';
+  if (/ipad/.test(folded)) return 'ipados';
+  if (/iphone|ios/.test(folded)) return 'ios';
+  if (/chrome ?os|cros/.test(folded)) return 'chromeos';
+  if (/linux|x11/.test(folded)) return 'linux';
+  return '';
+}
+
+function rememberEnvelopeNonce(nonce: string, nowMs: number): boolean {
+  for (const [knownNonce, expiresAtMs] of seenEnvelopeNonces) {
+    if (expiresAtMs <= nowMs) seenEnvelopeNonces.delete(knownNonce);
+  }
+  const seenAtMs = seenEnvelopeNonces.get(nonce);
+  if (seenAtMs !== undefined && seenAtMs > nowMs) return true;
+
+  while (seenEnvelopeNonces.size >= NONCE_CACHE_MAX_ENTRIES) {
+    const oldestKey = seenEnvelopeNonces.keys().next().value;
+    if (typeof oldestKey !== 'string') break;
+    seenEnvelopeNonces.delete(oldestKey);
+  }
+  seenEnvelopeNonces.set(nonce, nowMs + NONCE_TTL_MS);
+  return false;
+}
+
+/**
+ * Phase 4 — verifies the sealed request envelope. A missing signature is accepted (older
+ * cached bundles), but a present-and-wrong signature, a stale timestamp or a header that
+ * contradicts the JS payload marks the request tampered. A reused nonce is a replay.
+ */
+function verifySecurityEnvelope(args: {
+  envelope: Partial<SecurityEnvelope> | null | undefined;
+  headers: RawHeaderBag | null | undefined;
+  hardwareId: string;
+  nowMs: number;
+}): EnvelopeVerdict {
+  const { envelope, headers, hardwareId, nowMs } = args;
+  const reasons: string[] = [];
+  let tamperedRequest = false;
+
+  const headerSignature = readRequestHeader(headers, 'x-intel-signature');
+  const headerNonce = readRequestHeader(headers, 'x-intel-nonce');
+  const headerTimestamp = readRequestHeader(headers, 'x-intel-timestamp');
+
+  const envNonce = typeof envelope?.nonce === 'string' ? envelope.nonce.trim() : '';
+  const requestNonce = (envNonce || headerNonce).slice(0, 128);
+
+  const envSignature =
+    typeof envelope?.signature === 'string' && envelope.signature.trim()
+      ? envelope.signature.trim()
+      : headerSignature;
+
+  const envTimestamp =
+    typeof envelope?.timestamp === 'number' && Number.isFinite(envelope.timestamp)
+      ? envelope.timestamp
+      : Number.parseFloat(headerTimestamp);
+  const timestamp = Number.isFinite(envTimestamp) && envTimestamp > 0 ? envTimestamp : 0;
+
+  const envelopeUserAgent =
+    typeof envelope?.userAgent === 'string' ? envelope.userAgent.trim() : '';
+  const envelopePlatform = typeof envelope?.platform === 'string' ? envelope.platform.trim() : '';
+  const envelopeScreenResolution =
+    typeof envelope?.screenResolution === 'string' ? envelope.screenResolution.trim() : '';
+  const envelopeTimezone =
+    typeof envelope?.timezone === 'string' ? envelope.timezone.trim() : '';
+
+  // Payload integrity: only a present body signature is verified, and only when the fields the
+  // canonical string needs (timestamp + nonce) are present. A signature carried only in headers
+  // without an envelope object, or without a nonce, is unverifiable rather than tampered.
+  if (envelope && envSignature && timestamp > 0 && requestNonce) {
+    const canonical = [
+      'INTEL_ENVELOPE_V1',
+      String(timestamp),
+      requestNonce,
+      hardwareId,
+      envelopeUserAgent,
+      envelopePlatform,
+      envelopeScreenResolution,
+      envelopeTimezone,
+    ].join('|');
+    if (sha256HexLower(canonical) !== envSignature.toLowerCase()) {
+      tamperedRequest = true;
+      reasons.push('Payload integrity hash mismatch');
+    }
+  }
+
+  // Freshness: a timestamp-less payload is unverifiable, not tampered.
+  if (timestamp > 0 && Math.abs(nowMs - timestamp) > ENVELOPE_FRESHNESS_WINDOW_MS) {
+    tamperedRequest = true;
+    reasons.push('Expired or replayed payload timestamp (>60s)');
+  }
+
+  // Replay: a nonce may be used exactly once inside the 15-minute window.
+  let replayDetected = false;
+  if (requestNonce) {
+    replayDetected = rememberEnvelopeNonce(requestNonce, nowMs);
+    if (replayDetected) reasons.push('Duplicate payload nonce (Replay Attack detected)');
+  }
+
+  // Header cross-check: the raw HTTP headers must agree with the signed JS payload.
+  const headerUserAgent = readRequestHeader(headers, 'user-agent');
+  if (headerUserAgent && envelopeUserAgent && headerUserAgent !== envelopeUserAgent) {
+    tamperedRequest = true;
+    reasons.push('HTTP User-Agent header contradicts JS payload');
+  }
+
+  const clientHintPlatform = readRequestHeader(headers, 'sec-ch-ua-platform');
+  const payloadPlatformKey = normalizePlatformKey(envelopePlatform);
+  const clientHintPlatformKey = normalizePlatformKey(clientHintPlatform);
+  // navigator.platform reports "Linux armv8l" on Android and "Linux x86_64" on Chrome OS while
+  // the client hint reports "Android" / "Chrome OS" — those pairs are the same platform.
+  const androidEquivalent =
+    /android/i.test(headerUserAgent) &&
+    ((payloadPlatformKey === 'linux' && clientHintPlatformKey === 'android') ||
+      (payloadPlatformKey === 'android' && clientHintPlatformKey === 'linux'));
+  const chromeOsEquivalent =
+    /cros/i.test(headerUserAgent) &&
+    ((payloadPlatformKey === 'linux' && clientHintPlatformKey === 'chromeos') ||
+      (payloadPlatformKey === 'chromeos' && clientHintPlatformKey === 'linux'));
+  const platformPairCompatible = androidEquivalent || chromeOsEquivalent;
+  if (
+    payloadPlatformKey &&
+    clientHintPlatformKey &&
+    payloadPlatformKey !== clientHintPlatformKey &&
+    !platformPairCompatible
+  ) {
+    tamperedRequest = true;
+    reasons.push('HTTP User-Agent header contradicts JS payload');
+  }
+
+  return {
+    tamperedRequest,
+    replayDetected,
+    requestIntegrityReason: Array.from(new Set(reasons)).join('; '),
+    requestNonce,
+  };
+}
+
 /**
  * Task 2b — per-visit suspect scores stored before the 0..10 normalization used a 0..100
  * scale. Any stored value above 10 is treated as legacy and rescaled to 0..10
@@ -1528,6 +2108,23 @@ interface IncognitoCrossModeContext {
   crossSessionEphemeral?: boolean;
 }
 
+/**
+ * Phase 1/2/4 request context, resolved by the identify handler before sanitization:
+ * sealed-envelope verdicts, Tor / blocklist lookups and the resolved bot classification.
+ * Everything is optional so older callers keep the previous behaviour.
+ */
+interface RequestIntegrityContext {
+  headers?: RawHeaderBag;
+  tamperedRequest?: boolean;
+  replayDetected?: boolean;
+  requestIntegrityReason?: string;
+  requestNonce?: string;
+  torExitNode?: boolean;
+  ipBlocklisted?: boolean;
+  ipBlocklistReasons?: string[];
+  botClassification?: BotClassification;
+}
+
 function sanitizeAndReinforceSecuritySignals(
   raw: Partial<SecuritySignals> | null | undefined,
   browserDevice: BrowserDeviceInfo,
@@ -1537,7 +2134,8 @@ function sanitizeAndReinforceSecuritySignals(
   recognitionSource: IntelVisitorResponse['recognitionSource'],
   classification: IspNetworkClassification,
   velocity: { visitsLastHour: number; distinctIpsLastHour: number },
-  incognitoContext: IncognitoCrossModeContext = {}
+  incognitoContext: IncognitoCrossModeContext = {},
+  requestContext: RequestIntegrityContext = {}
 ): SecuritySignals {
   const safeStrArray = (arr: unknown): string[] =>
     Array.isArray(arr)
@@ -1547,17 +2145,32 @@ function sanitizeAndReinforceSecuritySignals(
           .slice(0, 10)
       : [];
 
-  // Bot / automation: client flags only. `isBot` is the union of the explicit bot verdict,
-  // the WebDriver handshake and the CDP (Chrome DevTools Protocol) runtime probe.
+  // Bot / automation: client flags plus the server-side identity classification. `isBot` is
+  // the union of the explicit client verdict, the WebDriver handshake, the CDP (Chrome DevTools
+  // Protocol) runtime probe and any non-human subtype the request signature proves.
   const webdriver = Boolean(raw?.webdriver);
   const cdpDetected = Boolean(raw?.cdpDetected);
-  const isBot = Boolean(raw?.isBot || webdriver || cdpDetected);
   const isHeadless = Boolean(raw?.isHeadless);
   const botReason =
     typeof raw?.botReason === 'string' && raw.botReason.trim()
       ? raw.botReason.trim().slice(0, 200)
       : '';
   const botSignals = safeStrArray(raw?.botSignals);
+  const clientAutomationDetected = Boolean(raw?.isBot || webdriver || cdpDetected);
+
+  const botClassification: BotClassification =
+    requestContext.botClassification ??
+    classifyBotTraffic(
+      requestContext.headers,
+      { org: location.org, isp: location.isp, asn: location.asn },
+      { isBot: clientAutomationDetected, isHeadless, webdriver, cdpDetected, botSignals }
+    );
+  const botSubtype: BotSubtype = botClassification.subtype;
+  const spoofedCrawler =
+    botClassification.subtype === 'bad_bot' && botClassification.label === 'Spoofed Crawler';
+  const isBot = Boolean(
+    clientAutomationDetected || botSubtype === 'bad_bot' || botSubtype === 'ai_agent'
+  );
 
   const browserTimezone =
     typeof raw?.browserTimezone === 'string' && raw.browserTimezone.trim()
@@ -1631,8 +2244,16 @@ function sanitizeAndReinforceSecuritySignals(
       clientTzCanonical.toLowerCase() !== ipTzCanonical.toLowerCase()
   );
 
-  const tamperDetected = Boolean(raw?.tamperDetected);
+  const tamperDetected = Boolean(raw?.tamperDetected || requestContext.tamperedRequest);
   const tamperReasons = safeStrArray(raw?.tamperReasons);
+  if (
+    requestContext.tamperedRequest &&
+    requestContext.requestIntegrityReason &&
+    !tamperReasons.includes(requestContext.requestIntegrityReason)
+  ) {
+    tamperReasons.unshift(requestContext.requestIntegrityReason);
+    tamperReasons.splice(10);
+  }
 
   const incognitoLikely = Boolean(raw?.incognitoLikely);
   const storageQuotaMb =
@@ -1689,6 +2310,31 @@ function sanitizeAndReinforceSecuritySignals(
     (raw as (Partial<SecuritySignals> & { cloudOrMaskedGpu?: boolean }) | null | undefined)
       ?.cloudOrMaskedGpu
   );
+
+  // Phase 3 — mobile emulator / simulator verdict from the client probe.
+  const emulatorDetected = Boolean(raw?.emulatorDetected);
+  const emulatorReason =
+    typeof raw?.emulatorReason === 'string' && raw.emulatorReason.trim()
+      ? raw.emulatorReason.trim().slice(0, 200)
+      : '';
+
+  // Phase 2 / 4 — sealed-envelope and network reputation verdicts resolved by the handler.
+  const tamperedRequest = Boolean(requestContext.tamperedRequest);
+  const replayDetected = Boolean(requestContext.replayDetected);
+  const requestIntegrityReason =
+    typeof requestContext.requestIntegrityReason === 'string'
+      ? requestContext.requestIntegrityReason.trim().slice(0, 240)
+      : '';
+  const requestNonce =
+    typeof requestContext.requestNonce === 'string' ? requestContext.requestNonce.slice(0, 128) : '';
+  const torExitNode = Boolean(requestContext.torExitNode);
+  const ipBlocklisted = Boolean(requestContext.ipBlocklisted);
+  const ipBlocklistReasons = Array.isArray(requestContext.ipBlocklistReasons)
+    ? requestContext.ipBlocklistReasons
+        .filter((reason): reason is string => typeof reason === 'string' && reason.trim().length > 0)
+        .map((reason) => reason.trim().slice(0, 180))
+        .slice(0, 5)
+    : [];
 
   // Persistence mode resolution order is fixed: hardware-fingerprint recovery wins, then a
   // private / restricted storage context, else a first-party cookie.
@@ -1747,76 +2393,156 @@ function sanitizeAndReinforceSecuritySignals(
       : `Persistent disk-backed storage verified (${incognitoMethod || 'Standard profile'})`,
   };
 
-  // Tile 2 — Bot & Automation Detection (9 / 7 / 0)
-  const botScore = isBot ? 9 : isHeadless ? 7 : 0;
+  // Tile 2 — Bot & Automation Detection (10 spoofed / 9 bad / 8 AI agent / 2 good bot / 0)
+  const botScore =
+    botSubtype === 'bad_bot'
+      ? spoofedCrawler
+        ? 10
+        : 9
+      : botSubtype === 'ai_agent'
+      ? 8
+      : botSubtype === 'good_bot'
+      ? 2
+      : 0;
+  const botStatus =
+    botSubtype === 'bad_bot'
+      ? spoofedCrawler
+        ? 'Spoofed Crawler'
+        : 'Bot / Automated'
+      : botSubtype === 'ai_agent'
+      ? 'AI Agent · Cloud Browser'
+      : botSubtype === 'good_bot'
+      ? 'Good Bot · Search Crawler'
+      : 'Verified Human';
+  const botDetail =
+    botSubtype === 'human'
+      ? 'Verified human interactive session'
+      : botSubtype === 'ai_agent'
+      ? `${botClassification.provider} ${botClassification.label} — ${
+          botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON
+        }`
+      : botSubtype === 'good_bot'
+      ? `${botClassification.provider} ${botClassification.label} verified against its official network — ${
+          botClassification.reasons[1] || 'ASN / organisation match'
+        }`
+      : botReason ||
+        botClassification.reasons[0] ||
+        (spoofedCrawler
+          ? 'Crawler user-agent claimed from a network that does not belong to the operator'
+          : 'WebDriver / CDP automation runtime detected');
+
   const botSignal: SmartSignal = {
     id: 'bot',
     title: 'Bot & Automation Detection',
-    status: isBot ? 'Bot / Automated' : isHeadless ? 'Cloud / Headless' : 'Verified Human',
+    status: botStatus,
     scoreOutOf10: botScore,
     riskLabel: `${tierFor(botScore)} Risk • ${botScore}/10`,
     level: levelFor(botScore),
-    detail:
-      botReason ||
-      (isBot
-        ? 'WebDriver / CDP automation runtime detected'
-        : isHeadless
-        ? 'Headless rendering context without an attached physical display'
-        : 'No automation, WebDriver, CDP hooks, or headless runtime detected'),
+    detail: botDetail,
   };
 
-  // Tile 3 — VPN / Proxy & Network Type (8 / 6 / 5 / 0)
+  // Tile 3 — VPN / Proxy & Network Type (10 Tor / 9 blocklisted / 8 datacenter + tz / 6 / 5 / 0)
   const isDatacenterAsn = datacenterAsn;
   const ispBrand = classification.brandName || location.isp || 'Unknown ISP';
   const asnSuffix = location.asn !== 'Unknown' ? ` • ${location.asn}` : '';
-  const vpnScore =
-    isDatacenterAsn && hasTzMismatch ? 8 : isDatacenterAsn ? 6 : hasTzMismatch ? 5 : 0;
+  const asnLabel =
+    location.asn && location.asn !== 'Unknown'
+      ? /^AS/i.test(location.asn)
+        ? location.asn.toUpperCase()
+        : `AS${location.asn}`
+      : 'AS unknown';
+  const asnOrOrg = `${asnLabel} · ${location.org !== 'Unknown' ? location.org : ispBrand}`;
+  const vpnScore = torExitNode
+    ? 10
+    : ipBlocklisted
+    ? 9
+    : isDatacenterAsn && hasTzMismatch
+    ? 8
+    : isDatacenterAsn
+    ? 6
+    : hasTzMismatch
+    ? 5
+    : 0;
+  const vpnStatus = torExitNode
+    ? 'Tor Exit Node'
+    : ipBlocklisted
+    ? 'Blocklisted IP'
+    : isDatacenterAsn
+    ? 'VPN / Datacenter Proxy'
+    : hasTzMismatch
+    ? 'VPN / Timezone Relay'
+    : 'Standard ISP';
+  const vpnDetail = torExitNode
+    ? `Confirmed active Tor exit relay (${location.publicIp} · ${asnOrOrg})`
+    : ipBlocklisted
+    ? 'IP flagged on abuse / tamper blocklist'
+    : isDatacenterAsn && hasTzMismatch
+    ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})`
+    : isDatacenterAsn
+    ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}`
+    : hasTzMismatch
+    ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})`
+    : `${ispBrand} • ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
+
   const vpnSignal: SmartSignal = {
     id: 'vpn',
     title: 'VPN / Proxy & Network Type',
-    status: isDatacenterAsn
-      ? 'VPN / Datacenter Proxy'
-      : hasTzMismatch
-      ? 'VPN / Timezone Relay'
-      : ispBrand !== 'Unknown ISP'
-      ? `Standard ISP (${ispBrand})`
-      : 'Standard ISP',
+    status: vpnStatus,
     scoreOutOf10: vpnScore,
     riskLabel: `${tierFor(vpnScore)} Risk • ${vpnScore}/10`,
     level: levelFor(vpnScore),
-    detail:
-      isDatacenterAsn && hasTzMismatch
-        ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})`
-        : isDatacenterAsn
-        ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}`
-        : hasTzMismatch
-        ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})`
-        : `${ispBrand} • ${classification.networkType} verified against browser timezone ${browserTimezone}`,
+    detail: vpnDetail,
   };
 
-  // Tile 4 — Virtual Machine & OS Integrity (8 / 7 / 6 / 0)
+  // Tile 4 — Virtual Machine, Emulator & OS Integrity (10 tampered / 8 emulator or cloud VM
+  // with masked GPU / 7 VM or cloud container / 6 spoofed environment / 0 physical hardware)
   const isVm = isVirtualMachine;
   const isTampered = isOsTampered;
-  const vmScore = isVm && isTampered ? 8 : isVm ? 7 : isTampered ? 6 : 0;
+  const cloudContainerVm = datacenterAsn && (isGpuMaskedOrUnavailable || cloudOrMaskedGpu);
+  const vmLike = isVm || cloudContainerVm;
+  const vmScore = tamperedRequest || replayDetected
+    ? 10
+    : emulatorDetected
+    ? 8
+    : vmLike
+    ? datacenterAsn && isGpuMaskedOrUnavailable
+      ? 8
+      : 7
+    : isTampered
+    ? 6
+    : 0;
+  const vmStatus =
+    tamperedRequest || replayDetected
+      ? 'Tampered / Replayed'
+      : emulatorDetected
+      ? 'Mobile Emulator'
+      : vmLike
+      ? 'Virtual Machine / VM'
+      : isTampered
+      ? 'Spoofed Environment'
+      : 'Physical Hardware';
+  const vmDetail =
+    tamperedRequest || replayDetected
+      ? requestIntegrityReason || 'Sealed request envelope failed verification'
+      : emulatorDetected
+      ? emulatorReason || vmReason || 'Mobile emulator / simulator runtime detected'
+      : vmLike
+      ? vmReason ||
+        (cloudContainerVm
+          ? `Cloud container on ${ispBrand}${asnSuffix} exposed an unavailable / masked GPU`
+          : 'Hypervisor CPUID / virtualised GPU footprint detected')
+      : isTampered
+      ? vmReason || tamperReasons[0] || 'Operating-system / User-Agent tampering detected'
+      : 'Unmasked physical GPU & consistent OS platform verified';
+
   const vmSignal: SmartSignal = {
     id: 'vm',
     title: 'Virtual Machine & OS Integrity',
-    status:
-      isVm && isTampered
-        ? 'Virtual Machine / Spoofed OS'
-        : isVm
-        ? 'Virtual Machine / Hypervisor'
-        : isTampered
-        ? 'Spoofed OS / Tampered UA'
-        : 'Physical Hardware',
+    status: vmStatus,
     scoreOutOf10: vmScore,
     riskLabel: `${tierFor(vmScore)} Risk • ${vmScore}/10`,
     level: levelFor(vmScore),
-    detail:
-      vmReason ||
-      (isTampered
-        ? tamperReasons[0] || 'Operating-system / User-Agent tampering detected'
-        : 'Unmasked physical GPU & consistent OS platform verified'),
+    detail: vmDetail,
   };
 
   const smartSignals: SmartSignals = {
@@ -1826,12 +2552,15 @@ function sanitizeAndReinforceSecuritySignals(
     vm: vmSignal,
   };
 
-  // Composite — bot/headless 5|4, network 3|2, VM/tampered-OS 3, incognito 2 (strictly ≤ 10).
+  // Composite — bot/headless 5|4, network 3|2, VM/tampered-OS 3, incognito 2,
+  // sealed-envelope tamper or replay 2 (strictly ≤ 10).
+  const integrityViolation = Boolean(tamperedRequest || replayDetected);
   const rawCompositePoints =
     (isBot ? 5 : isHeadless ? 4 : 0) +
     (isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0) +
     (vmScore > 0 ? 3 : 0) +
-    (isIncognito ? 2 : 0);
+    (isIncognito ? 2 : 0) +
+    (integrityViolation ? 2 : 0);
   const suspectScore = Math.min(10, rawCompositePoints);
   const riskLevel: SecuritySignals['riskLevel'] = tierFor(suspectScore);
   const riskBadgeText = `${riskLevel} Risk • ${suspectScore}/10`;
@@ -1842,7 +2571,10 @@ function sanitizeAndReinforceSecuritySignals(
   if (isBot) {
     riskFactors.push(
       `Automated browser / bot runtime detected (+5): ${
-        botReason || botSignals[0] || 'WebDriver / CDP automation signatures'
+        botReason ||
+        botClassification.reasons[0] ||
+        botSignals[0] ||
+        'WebDriver / CDP automation signatures'
       }`
     );
   } else if (isHeadless) {
@@ -1864,6 +2596,13 @@ function sanitizeAndReinforceSecuritySignals(
   }
   if (isIncognito) {
     riskFactors.push(`Incognito / ephemeral storage (+2): ${incognitoSignal.detail}`);
+  }
+  if (integrityViolation) {
+    riskFactors.push(
+      `Sealed request envelope failed verification (+2): ${
+        requestIntegrityReason || 'tampered or replayed payload'
+      }`
+    );
   }
 
   const securitySignalsCore: SecuritySignals = {
@@ -1937,6 +2676,23 @@ function sanitizeAndReinforceSecuritySignals(
       cdpDetected,
       smartSignals,
       riskBadgeText,
+      // Phase 1 — bot / AI-agent subtype classification
+      botSubtype,
+      botProvider: botClassification.provider,
+      botCategory: botClassification.category,
+      botIdentityConfidence: botClassification.confidence,
+      // Phase 2 — Tor exit relay + local abuse blocklist
+      torExitNode,
+      ipBlocklisted,
+      ipBlocklistReasons,
+      // Phase 3 — mobile emulator / simulator verdict
+      emulatorDetected,
+      emulatorReason,
+      // Phase 4 — sealed request envelope verdicts
+      tamperedRequest,
+      replayDetected,
+      requestIntegrityReason,
+      requestNonce,
       // Task 3 — visit velocity / IP rotation (display only, never scored)
       distinctIpsLastHour: velocity.distinctIpsLastHour,
       visitsLastHour: velocity.visitsLastHour,
@@ -1955,6 +2711,8 @@ app.post('/api/visitor/identify', async (req, res) => {
       browserDevice?: Partial<BrowserDeviceInfo>;
       hardwareSignals?: Partial<HardwareSignals> | null;
       securitySignals?: Partial<SecuritySignals> | null;
+      /** Phase 4 — sealed request envelope (timestamp / nonce / signature + JS payload identity). */
+      securityEnvelope?: Partial<SecurityEnvelope> | null;
       clientGeoHint?: {
         ip?: string;
         city?: string;
@@ -2503,6 +3261,55 @@ app.post('/api/visitor/identify', async (req, res) => {
           }
         : rawSecuritySignals;
 
+    // Phase 4 — sealed request envelope verification runs BEFORE sanitization so every tile,
+    // the composite score and the blocklist see the same verdict.
+    const rawRequestHeaders = req.headers as RawHeaderBag;
+    const envelopeVerdict = verifySecurityEnvelope({
+      envelope: requestBody.securityEnvelope,
+      headers: rawRequestHeaders,
+      hardwareId,
+      nowMs,
+    });
+
+    // Phase 1 — bot identity is resolved from the raw headers plus the server network identity.
+    const botClassification = classifyBotTraffic(
+      rawRequestHeaders,
+      { org: location.org, isp: location.isp, asn: location.asn },
+      {
+        isBot: Boolean(
+          rawSecuritySignals?.isBot ||
+            rawSecuritySignals?.webdriver ||
+            rawSecuritySignals?.cdpDetected
+        ),
+        isHeadless: Boolean(rawSecuritySignals?.isHeadless),
+        webdriver: Boolean(rawSecuritySignals?.webdriver),
+        cdpDetected: Boolean(rawSecuritySignals?.cdpDetected),
+        botSignals: Array.isArray(rawSecuritySignals?.botSignals)
+          ? rawSecuritySignals.botSignals
+          : [],
+      }
+    );
+
+    // Phase 2 — bulk Tor list is refreshed lazily (never blocks this request); the per-IP DNS
+    // lookup is only paid when the bulk list misses.
+    void refreshTorBulkList();
+    const torExitNode =
+      isTorBulkListed(location.publicIp) || (await isTorExitNode(location.publicIp));
+
+    if (envelopeVerdict.tamperedRequest) {
+      flagSuspiciousIp(
+        location.publicIp,
+        envelopeVerdict.requestIntegrityReason || 'Tampered request payload'
+      );
+    }
+    if (envelopeVerdict.replayDetected) {
+      flagSuspiciousIp(location.publicIp, 'Replayed payload nonce');
+    }
+    if (botClassification.subtype === 'bad_bot' && botClassification.label === 'Spoofed Crawler') {
+      flagSuspiciousIp(location.publicIp, 'Spoofed crawler user-agent');
+    }
+    const blocklist = lookupSuspiciousIp(location.publicIp);
+
     const securitySignals = sanitizeAndReinforceSecuritySignals(
       securitySignalsInput,
       browserDevice,
@@ -2517,6 +3324,17 @@ app.post('/api/visitor/identify', async (req, res) => {
         existingHwidVisitor,
         clientReportedIncognito,
         crossSessionEphemeral,
+      },
+      {
+        headers: rawRequestHeaders,
+        tamperedRequest: envelopeVerdict.tamperedRequest,
+        replayDetected: envelopeVerdict.replayDetected,
+        requestIntegrityReason: envelopeVerdict.requestIntegrityReason,
+        requestNonce: envelopeVerdict.requestNonce,
+        torExitNode,
+        ipBlocklisted: blocklist.blocklisted,
+        ipBlocklistReasons: blocklist.reasons,
+        botClassification,
       }
     );
 
