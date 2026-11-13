@@ -15,3 +15,6 @@ data/*.db-*
 
 # Wrangler local state
 .wrangler/
+
+# AI Studio scratch artifacts (never commit)
+.aistudio/
