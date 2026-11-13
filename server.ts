@@ -1218,6 +1218,8 @@ function classifyBotTraffic(
 /* -------------------------------------------------------------------------- */
 
 const TOR_DNS_TIMEOUT_MS = 600;
+const TOR_DOH_TIMEOUT_MS = 1200;
+const TOR_DOH_ENDPOINTS = ['https://dns.google/resolve', 'https://cloudflare-dns.com/dns-query'];
 const TOR_DNS_CACHE_TTL_MS = 10 * 60 * 1000;
 const TOR_DNS_CACHE_MAX_ENTRIES = 5000;
 const TOR_BULK_LIST_URL = 'https://check.torproject.org/torbulkexitlist';
@@ -1232,8 +1234,13 @@ let torBulkRefreshInFlight = false;
 
 const SUSPICIOUS_IP_TTL_MS = 24 * 60 * 60 * 1000;
 const SUSPICIOUS_IP_MAX_ENTRIES = 10000;
+// A single anomalous request is not enough to brand an IP: residential lines are shared and a
+// single stale tab, clock glitch or one-off probe must never show a visitor as blocklisted.
+// Only repeated, independent evidence promotes an entry into the visible blocklist.
+const SUSPICIOUS_IP_BLOCK_THRESHOLD = 2;
 const suspiciousIpLedger = new Map<string, number>();
 const suspiciousIpReasons = new Map<string, string[]>();
+const suspiciousIpStrikes = new Map<string, number>();
 
 function isIpv4Literal(value: string): boolean {
   if (typeof value !== 'string') return false;
@@ -1259,7 +1266,12 @@ function pruneTorDnsCache(nowMs: number): void {
 /**
  * Authoritative per-IP Tor relay check via the Tor Project DNS exit list
  * (`<reversed-octets>.dnsel.torproject.org`). Only `127.0.0.2` means "exit relay".
- * Bounded to 600ms, cached for 10 minutes, and it never throws.
+ *
+ * The native resolver is tried first because it is the cheapest and honours the host's own
+ * DNS policy. Some hosts (locked-down resolvers, containers, this build's CI machine) refuse
+ * direct A queries, so the same lookup is retried over DNS-over-HTTPS. A definitive negative
+ * is only cached when at least one resolver actually produced an answer; transport failures
+ * are never cached, so a later request can still classify the relay correctly.
  */
 async function isTorExitNode(ip: string): Promise<boolean> {
   const cleanIp = typeof ip === 'string' ? ip.trim() : '';
@@ -1269,26 +1281,84 @@ async function isTorExitNode(ip: string): Promise<boolean> {
   const cached = torDnsCache.get(cleanIp);
   if (cached && cached.expiresAtMs > nowMs) return cached.isTorExit;
 
+  const queryName = `${cleanIp.split('.').reverse().join('.')}.dnsel.torproject.org`;
+  let resolved = false;
+  let isTorExit = false;
+
+  // 1. Native resolver (fast path).
   let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   try {
-    const reversedIp = cleanIp.split('.').reverse().join('.');
-    const lookup = dns.resolve4(`${reversedIp}.dnsel.torproject.org`).catch(() => [] as string[]);
-    const timeout = new Promise<string[]>((resolve) => {
-      timeoutHandle = setTimeout(() => resolve([]), TOR_DNS_TIMEOUT_MS);
+    const lookup = dns.resolve4(queryName).catch((error: NodeJS.ErrnoException) => {
+      // A missing record is a definitive "not an exit relay"; a refused or timed-out query
+      // says nothing about the address and must fall through to DNS-over-HTTPS.
+      const code = typeof error?.code === 'string' ? error.code : '';
+      if (code === 'ENOTFOUND' || code === 'ENODATA' || code === 'ENOTIMP') {
+        return [] as string[];
+      }
+      return null;
+    });
+    const timeout = new Promise<string[] | null>((resolve) => {
+      timeoutHandle = setTimeout(() => resolve(null), TOR_DNS_TIMEOUT_MS);
     });
     const records = await Promise.race([lookup, timeout]);
-    const isTorExit = Array.isArray(records) && records.includes('127.0.0.2');
+    if (Array.isArray(records)) {
+      resolved = true;
+      isTorExit = records.includes('127.0.0.2');
+    }
+  } catch {
+    resolved = false;
+  } finally {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+  }
 
+  // 2. DNS-over-HTTPS fallback for hosts whose resolver refuses direct queries.
+  if (!resolved) {
+    for (const endpoint of TOR_DOH_ENDPOINTS) {
+      const answers = await resolveAOverDoh(endpoint, queryName);
+      if (answers) {
+        resolved = true;
+        isTorExit = answers.includes('127.0.0.2');
+        break;
+      }
+    }
+  }
+
+  if (resolved) {
     pruneTorDnsCache(nowMs);
     torDnsCache.set(cleanIp, {
       isTorExit,
       expiresAtMs: nowMs + TOR_DNS_CACHE_TTL_MS,
     });
-    return isTorExit;
+  }
+  return isTorExit;
+}
+
+/** Minimal DNS-over-HTTPS A-record lookup (JSON API). Returns null on any transport error. */
+async function resolveAOverDoh(endpoint: string, name: string): Promise<string[] | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TOR_DOH_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${endpoint}?name=${encodeURIComponent(name)}&type=A`, {
+      headers: { accept: 'application/dns-json' },
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+    const payload = (await response.json()) as {
+      Status?: number;
+      Answer?: Array<{ type?: number; data?: string }>;
+    };
+    // Status 3 (NXDOMAIN) and an empty answer section are definitive negatives: the address is
+    // not on the exit list. Servfail / refused are transport-quality problems and stay unknown.
+    if (payload.Status === 3) return [];
+    if (payload.Status !== 0) return null;
+    const answers = Array.isArray(payload.Answer) ? payload.Answer : [];
+    return answers
+      .filter((entry) => entry.type === 1 && typeof entry.data === 'string')
+      .map((entry) => String(entry.data).trim());
   } catch {
-    return false;
+    return null;
   } finally {
-    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    clearTimeout(timer);
   }
 }
 
@@ -1298,8 +1368,9 @@ function isTorBulkListed(ip: string): boolean {
 }
 
 /**
- * Refreshes the bulk Tor exit list (at most once per hour). Fire-and-forget: the caller
- * uses `void refreshTorBulkList()` so an identify request is never blocked on the fetch.
+ * Refreshes the bulk Tor exit list at most once per hour. The identify route starts it at the
+ * top of the handler and awaits it next to the geolocation work, so the fetch overlaps other
+ * I/O; a failure is silent because the DNSEL lookup is the authoritative fallback.
  */
 async function refreshTorBulkList(): Promise<void> {
   const nowMs = Date.now();
@@ -1342,6 +1413,7 @@ function flagSuspiciousIp(ip: string, reason: string): void {
     if (expiresAtMs <= nowMs) {
       suspiciousIpLedger.delete(knownIp);
       suspiciousIpReasons.delete(knownIp);
+      suspiciousIpStrikes.delete(knownIp);
     }
   }
   while (suspiciousIpLedger.size >= SUSPICIOUS_IP_MAX_ENTRIES) {
@@ -1349,6 +1421,7 @@ function flagSuspiciousIp(ip: string, reason: string): void {
     if (typeof oldestKey !== 'string') break;
     suspiciousIpLedger.delete(oldestKey);
     suspiciousIpReasons.delete(oldestKey);
+    suspiciousIpStrikes.delete(oldestKey);
   }
 
   const cleanReason = reason.trim().slice(0, 180);
@@ -1357,6 +1430,10 @@ function flagSuspiciousIp(ip: string, reason: string): void {
     existingReasons.push(cleanReason);
   }
   suspiciousIpReasons.set(cleanIp, existingReasons);
+  // Strikes count distinct reasons; the same reason repeated (for example a cached page that
+  // keeps resending one stale envelope) never escalates on its own.
+  const strikes = existingReasons.length;
+  suspiciousIpStrikes.set(cleanIp, strikes);
   suspiciousIpLedger.set(cleanIp, nowMs + SUSPICIOUS_IP_TTL_MS);
 }
 
@@ -1368,6 +1445,11 @@ function lookupSuspiciousIp(ip: string): { blocklisted: boolean; reasons: string
   if (expiresAtMs <= Date.now()) {
     suspiciousIpLedger.delete(cleanIp);
     suspiciousIpReasons.delete(cleanIp);
+    suspiciousIpStrikes.delete(cleanIp);
+    return { blocklisted: false, reasons: [] };
+  }
+  const strikes = suspiciousIpStrikes.get(cleanIp) ?? 0;
+  if (strikes < SUSPICIOUS_IP_BLOCK_THRESHOLD) {
     return { blocklisted: false, reasons: [] };
   }
   return {
@@ -1988,7 +2070,7 @@ app.get('/api/network/ping', handleNetworkPing);
 
 app.use(express.json({ limit: '512kb' }));
 
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
   const visitorsCount = (
     db.prepare('SELECT COUNT(*) AS count FROM visitors').get() as { count: number }
   ).count;
@@ -1996,6 +2078,30 @@ app.get('/api/health', (req, res) => {
     db.prepare('SELECT COUNT(*) AS count FROM visits').get() as { count: number }
   ).count;
   const { regionCode, regionLabel } = detectServerRegion(req);
+
+  // Diagnostics: `?torCheck=<ipv4>` reports whether the Tor Project exit list resolves this
+  // address from the server's network, so the relay reputation path can be verified directly.
+  const torCheckIp =
+    typeof req.query.torCheck === 'string' ? normalizeIpCandidate(req.query.torCheck) : null;
+  if (torCheckIp && isIpv4Literal(torCheckIp)) {
+    const startedAtMs = Date.now();
+    const exitNode = await isTorExitNode(torCheckIp);
+    res.json({
+      status: 'ok',
+      visitorsCount,
+      visitsCount,
+      regionCode,
+      regionLabel,
+      torCheck: {
+        ip: torCheckIp,
+        exitNode,
+        bulkListed: isTorBulkListed(torCheckIp),
+        latencyMs: Date.now() - startedAtMs,
+      },
+    });
+    return;
+  }
+
   res.json({ status: 'ok', visitorsCount, visitsCount, regionCode, regionLabel });
 });
 
@@ -2758,6 +2864,10 @@ function sanitizeAndReinforceSecuritySignals(
 
 app.post('/api/visitor/identify', async (req, res) => {
   try {
+    // Start the hourly bulk Tor exit-list refresh immediately so it overlaps the geolocation
+    // work below. It is deliberately not awaited: the per-IP DNSEL query is authoritative and
+    // fast, and a page load must never wait on a list download.
+    void refreshTorBulkList();
     const requestBody = (req.body || {}) as {
       pageLoadId?: string;
       storedVisitorId?: string | null;
@@ -3362,9 +3472,8 @@ app.post('/api/visitor/identify', async (req, res) => {
       }
     );
 
-    // Phase 2 — bulk Tor list is refreshed lazily (never blocks this request); the per-IP DNS
-    // lookup is only paid when the bulk list misses.
-    void refreshTorBulkList();
+    // Phase 2 — the bulk list was started at the top of this handler; the per-IP DNSEL query
+    // below is authoritative and only pays a network round trip on a cache miss.
     const torExitNode =
       isTorBulkListed(location.publicIp) || (await isTorExitNode(location.publicIp));
 

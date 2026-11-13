@@ -889,6 +889,8 @@ function classifyBotTraffic(headers, network, client) {
   };
 }
 var TOR_DNS_TIMEOUT_MS = 600;
+var TOR_DOH_TIMEOUT_MS = 1200;
+var TOR_DOH_ENDPOINTS = ["https://dns.google/resolve", "https://cloudflare-dns.com/dns-query"];
 var TOR_DNS_CACHE_TTL_MS = 10 * 60 * 1e3;
 var TOR_DNS_CACHE_MAX_ENTRIES = 5e3;
 var TOR_BULK_LIST_URL = "https://check.torproject.org/torbulkexitlist";
@@ -901,8 +903,10 @@ var torBulkRefreshedAtMs = 0;
 var torBulkRefreshInFlight = false;
 var SUSPICIOUS_IP_TTL_MS = 24 * 60 * 60 * 1e3;
 var SUSPICIOUS_IP_MAX_ENTRIES = 1e4;
+var SUSPICIOUS_IP_BLOCK_THRESHOLD = 2;
 var suspiciousIpLedger = /* @__PURE__ */ new Map();
 var suspiciousIpReasons = /* @__PURE__ */ new Map();
+var suspiciousIpStrikes = /* @__PURE__ */ new Map();
 function isIpv4Literal(value) {
   if (typeof value !== "string") return false;
   const trimmed = value.trim();
@@ -928,25 +932,68 @@ async function isTorExitNode(ip) {
   const nowMs = Date.now();
   const cached = torDnsCache.get(cleanIp);
   if (cached && cached.expiresAtMs > nowMs) return cached.isTorExit;
+  const queryName = `${cleanIp.split(".").reverse().join(".")}.dnsel.torproject.org`;
+  let resolved = false;
+  let isTorExit = false;
   let timeoutHandle;
   try {
-    const reversedIp = cleanIp.split(".").reverse().join(".");
-    const lookup = dns.resolve4(`${reversedIp}.dnsel.torproject.org`).catch(() => []);
+    const lookup = dns.resolve4(queryName).catch((error) => {
+      const code = typeof error?.code === "string" ? error.code : "";
+      if (code === "ENOTFOUND" || code === "ENODATA" || code === "ENOTIMP") {
+        return [];
+      }
+      return null;
+    });
     const timeout = new Promise((resolve) => {
-      timeoutHandle = setTimeout(() => resolve([]), TOR_DNS_TIMEOUT_MS);
+      timeoutHandle = setTimeout(() => resolve(null), TOR_DNS_TIMEOUT_MS);
     });
     const records = await Promise.race([lookup, timeout]);
-    const isTorExit = Array.isArray(records) && records.includes("127.0.0.2");
+    if (Array.isArray(records)) {
+      resolved = true;
+      isTorExit = records.includes("127.0.0.2");
+    }
+  } catch {
+    resolved = false;
+  } finally {
+    if (timeoutHandle !== void 0) clearTimeout(timeoutHandle);
+  }
+  if (!resolved) {
+    for (const endpoint of TOR_DOH_ENDPOINTS) {
+      const answers = await resolveAOverDoh(endpoint, queryName);
+      if (answers) {
+        resolved = true;
+        isTorExit = answers.includes("127.0.0.2");
+        break;
+      }
+    }
+  }
+  if (resolved) {
     pruneTorDnsCache(nowMs);
     torDnsCache.set(cleanIp, {
       isTorExit,
       expiresAtMs: nowMs + TOR_DNS_CACHE_TTL_MS
     });
-    return isTorExit;
+  }
+  return isTorExit;
+}
+async function resolveAOverDoh(endpoint, name) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TOR_DOH_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${endpoint}?name=${encodeURIComponent(name)}&type=A`, {
+      headers: { accept: "application/dns-json" },
+      signal: controller.signal
+    });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    if (payload.Status === 3) return [];
+    if (payload.Status !== 0) return null;
+    const answers = Array.isArray(payload.Answer) ? payload.Answer : [];
+    return answers.filter((entry) => entry.type === 1 && typeof entry.data === "string").map((entry) => String(entry.data).trim());
   } catch {
-    return false;
+    return null;
   } finally {
-    if (timeoutHandle !== void 0) clearTimeout(timeoutHandle);
+    clearTimeout(timer);
   }
 }
 function isTorBulkListed(ip) {
@@ -990,6 +1037,7 @@ function flagSuspiciousIp(ip, reason) {
     if (expiresAtMs <= nowMs) {
       suspiciousIpLedger.delete(knownIp);
       suspiciousIpReasons.delete(knownIp);
+      suspiciousIpStrikes.delete(knownIp);
     }
   }
   while (suspiciousIpLedger.size >= SUSPICIOUS_IP_MAX_ENTRIES) {
@@ -997,6 +1045,7 @@ function flagSuspiciousIp(ip, reason) {
     if (typeof oldestKey !== "string") break;
     suspiciousIpLedger.delete(oldestKey);
     suspiciousIpReasons.delete(oldestKey);
+    suspiciousIpStrikes.delete(oldestKey);
   }
   const cleanReason = reason.trim().slice(0, 180);
   const existingReasons = suspiciousIpReasons.get(cleanIp) ?? [];
@@ -1004,6 +1053,8 @@ function flagSuspiciousIp(ip, reason) {
     existingReasons.push(cleanReason);
   }
   suspiciousIpReasons.set(cleanIp, existingReasons);
+  const strikes = existingReasons.length;
+  suspiciousIpStrikes.set(cleanIp, strikes);
   suspiciousIpLedger.set(cleanIp, nowMs + SUSPICIOUS_IP_TTL_MS);
 }
 function lookupSuspiciousIp(ip) {
@@ -1014,6 +1065,11 @@ function lookupSuspiciousIp(ip) {
   if (expiresAtMs <= Date.now()) {
     suspiciousIpLedger.delete(cleanIp);
     suspiciousIpReasons.delete(cleanIp);
+    suspiciousIpStrikes.delete(cleanIp);
+    return { blocklisted: false, reasons: [] };
+  }
+  const strikes = suspiciousIpStrikes.get(cleanIp) ?? 0;
+  if (strikes < SUSPICIOUS_IP_BLOCK_THRESHOLD) {
     return { blocklisted: false, reasons: [] };
   }
   return {
@@ -1460,10 +1516,29 @@ var handleNetworkPing = (_req, res) => {
 app.head("/api/network/ping", handleNetworkHeadPing);
 app.get("/api/network/ping", handleNetworkPing);
 app.use(express.json({ limit: "512kb" }));
-app.get("/api/health", (req, res) => {
+app.get("/api/health", async (req, res) => {
   const visitorsCount = db.prepare("SELECT COUNT(*) AS count FROM visitors").get().count;
   const visitsCount = db.prepare("SELECT COUNT(*) AS count FROM visits").get().count;
   const { regionCode, regionLabel } = detectServerRegion(req);
+  const torCheckIp = typeof req.query.torCheck === "string" ? normalizeIpCandidate(req.query.torCheck) : null;
+  if (torCheckIp && isIpv4Literal(torCheckIp)) {
+    const startedAtMs = Date.now();
+    const exitNode = await isTorExitNode(torCheckIp);
+    res.json({
+      status: "ok",
+      visitorsCount,
+      visitsCount,
+      regionCode,
+      regionLabel,
+      torCheck: {
+        ip: torCheckIp,
+        exitNode,
+        bulkListed: isTorBulkListed(torCheckIp),
+        latencyMs: Date.now() - startedAtMs
+      }
+    });
+    return;
+  }
   res.json({ status: "ok", visitorsCount, visitsCount, regionCode, regionLabel });
 });
 function extractVercelEdgeGeo(req) {
@@ -1832,6 +1907,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
 }
 app.post("/api/visitor/identify", async (req, res) => {
   try {
+    void refreshTorBulkList();
     const requestBody = req.body || {};
     const {
       pageLoadId,
@@ -2206,7 +2282,6 @@ app.post("/api/visitor/identify", async (req, res) => {
         botSignals: Array.isArray(rawSecuritySignals?.botSignals) ? rawSecuritySignals.botSignals : []
       }
     );
-    void refreshTorBulkList();
     const torExitNode = isTorBulkListed(location.publicIp) || await isTorExitNode(location.publicIp);
     const signedPayloadTampered = /Payload integrity hash mismatch/i.test(
       envelopeVerdict.requestIntegrityReason
