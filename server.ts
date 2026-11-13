@@ -1214,6 +1214,97 @@ function classifyBotTraffic(
 }
 
 /* -------------------------------------------------------------------------- */
+/* Phase 3 — server-side emulator / simulator re-verification                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The client probe in `src/lib/collector.ts` reports `emulatorDetected` inside the payload, but a
+ * client is free to omit or forge that flag. These are the same predicates re-applied on the
+ * server to the sanitized payload (the signed User-Agent, `navigator.platform`, touch capability
+ * and the WebGL renderer string), so an emulated runtime cannot hide by lying about the verdict.
+ */
+const EMULATOR_GPU_SIGNATURE_PATTERN =
+  /android emulator opengl es translator|goldfish|ranchu|bluestacks|nox|ldplayer|memu|genymotion|virgl|apple software renderer/i;
+/** x86 / desktop platform strings a real Android handset can never report. */
+const NON_ARM_ANDROID_PLATFORM_PATTERN = /linux x86|x86_64|i[3-6]86|win32|win64|macintel/i;
+const IOS_DEVICE_UA_PATTERN = /(iphone|ipad|ipod)/i;
+const IOS_FOREIGN_PLATFORM_PATTERN = /linux|win32|win64/i;
+const IPHONE_OR_IPOD_UA_PATTERN = /(iphone|ipod)/i;
+
+/** `1920x1080` / `1920 × 1080` → viewport width in CSS pixels (0 when unparsable). */
+function parseScreenResolutionWidth(resolution: string): number {
+  const match = /(\d+)\s*[x×]\s*(\d+)/i.exec(resolution || '');
+  if (match) {
+    const width = Number.parseInt(match[1], 10);
+    return Number.isFinite(width) && width > 0 ? width : 0;
+  }
+  const single = Number.parseInt(resolution || '', 10);
+  return Number.isFinite(single) && single > 0 ? single : 0;
+}
+
+/**
+ * Server-side mirror of `detectEmulatorEvidence()`: Android UA on an x86/desktop platform or with
+ * zero touch points, an emulator/simulator GPU renderer, an iOS UA on a foreign platform or with
+ * no touch points (iPadOS 13+ reports `MacIntel` WITH touch points and stays clean), and an
+ * iPhone/iPod UA on a desktop-width screen.
+ */
+function classifyEmulatorFromSignals(input: {
+  userAgent: string;
+  platform: string;
+  maxTouchPoints: number;
+  gpuVendor: string;
+  gpuRenderer: string;
+  screenResolution: string;
+}): { detected: boolean; reason: string } {
+  const ua = typeof input.userAgent === 'string' ? input.userAgent : '';
+  const platform = (input.platform || '').trim();
+  const maxTouchPoints =
+    typeof input.maxTouchPoints === 'number' ? Math.max(0, input.maxTouchPoints) : 0;
+  const vendor = (input.gpuVendor || '').trim();
+  const renderer = (input.gpuRenderer || '').trim();
+  const gpuSignature = `${vendor} ${renderer}`;
+
+  const claimsAndroid = /android/i.test(ua);
+  const claimsIos = IOS_DEVICE_UA_PATTERN.test(ua);
+
+  if (claimsAndroid && NON_ARM_ANDROID_PLATFORM_PATTERN.test(platform)) {
+    return {
+      detected: true,
+      reason: `Android user-agent on desktop ${platform} (emulator CPU profile)`,
+    };
+  }
+  if (claimsAndroid && maxTouchPoints === 0) {
+    return {
+      detected: true,
+      reason: 'Android user-agent reporting zero touch points (emulated input layer)',
+    };
+  }
+  if (EMULATOR_GPU_SIGNATURE_PATTERN.test(gpuSignature)) {
+    return {
+      detected: true,
+      reason: `Emulator GPU renderer (${renderer || vendor || 'masked renderer'})`,
+    };
+  }
+  if (claimsIos) {
+    if (IOS_FOREIGN_PLATFORM_PATTERN.test(platform)) {
+      return { detected: true, reason: `iOS user-agent on ${platform} platform (simulator host)` };
+    }
+    if (maxTouchPoints === 0) {
+      return {
+        detected: true,
+        reason: `iOS user-agent on ${platform || 'desktop'} with zero touch points (simulator)`,
+      };
+    }
+  }
+  const screenWidth = parseScreenResolutionWidth(input.screenResolution);
+  if (IPHONE_OR_IPOD_UA_PATTERN.test(ua) && screenWidth >= 1000) {
+    return { detected: true, reason: `iPhone user-agent on a ${screenWidth}px desktop-width screen` };
+  }
+
+  return { detected: false, reason: '' };
+}
+
+/* -------------------------------------------------------------------------- */
 /* Phase 2 — Tor exit relay resolution and local abuse blocklist               */
 /* -------------------------------------------------------------------------- */
 
@@ -2281,6 +2372,8 @@ interface IncognitoCrossModeContext {
  */
 interface RequestIntegrityContext {
   headers?: RawHeaderBag;
+  /** The signed / full User-Agent used for Phase 1 + Phase 3 identity checks. */
+  requestUserAgent?: string;
   tamperedRequest?: boolean;
   replayDetected?: boolean;
   requestIntegrityReason?: string;
@@ -2477,12 +2570,31 @@ function sanitizeAndReinforceSecuritySignals(
       ?.cloudOrMaskedGpu
   );
 
-  // Phase 3 — mobile emulator / simulator verdict from the client probe.
-  const emulatorDetected = Boolean(raw?.emulatorDetected);
-  const emulatorReason =
+  // Phase 3 — mobile emulator / simulator verdict. The client probe is authoritative when it
+  // fires, but it is re-derived here from the signed payload so a client that omits or forges
+  // `emulatorDetected` still gets the same verdict.
+  const serverEmulator = classifyEmulatorFromSignals({
+    userAgent:
+      requestContext.requestUserAgent ||
+      readRequestHeader(requestContext.headers, 'user-agent') ||
+      '',
+    platform: browserDevice.platform,
+    maxTouchPoints: hardwareSignals.maxTouchPoints,
+    gpuVendor: hardwareSignals.gpuVendor,
+    gpuRenderer: hardwareSignals.gpuRenderer,
+    screenResolution: browserDevice.screenResolution,
+  });
+  const clientEmulatorReported = Boolean(raw?.emulatorDetected);
+  const emulatorDetected = clientEmulatorReported || serverEmulator.detected;
+  const clientEmulatorReason =
     typeof raw?.emulatorReason === 'string' && raw.emulatorReason.trim()
       ? raw.emulatorReason.trim().slice(0, 200)
       : '';
+  const emulatorReason = emulatorDetected
+    ? serverEmulator.detected
+      ? serverEmulator.reason
+      : clientEmulatorReason
+    : '';
 
   // Phase 2 / 4 — sealed-envelope and network reputation verdicts resolved by the handler.
   const tamperedRequest = Boolean(requestContext.tamperedRequest);
@@ -3514,6 +3626,7 @@ app.post('/api/visitor/identify', async (req, res) => {
       },
       {
         headers: rawRequestHeaders,
+        requestUserAgent: fullRequestUserAgent,
         tamperedRequest: envelopeVerdict.tamperedRequest,
         replayDetected: envelopeVerdict.replayDetected,
         requestIntegrityReason: envelopeVerdict.requestIntegrityReason,

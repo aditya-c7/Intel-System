@@ -888,6 +888,64 @@ function classifyBotTraffic(headers, network, client) {
     reasons: ["Interactive browser profile without automation signatures"]
   };
 }
+var EMULATOR_GPU_SIGNATURE_PATTERN = /android emulator opengl es translator|goldfish|ranchu|bluestacks|nox|ldplayer|memu|genymotion|virgl|apple software renderer/i;
+var NON_ARM_ANDROID_PLATFORM_PATTERN = /linux x86|x86_64|i[3-6]86|win32|win64|macintel/i;
+var IOS_DEVICE_UA_PATTERN = /(iphone|ipad|ipod)/i;
+var IOS_FOREIGN_PLATFORM_PATTERN = /linux|win32|win64/i;
+var IPHONE_OR_IPOD_UA_PATTERN = /(iphone|ipod)/i;
+function parseScreenResolutionWidth(resolution) {
+  const match = /(\d+)\s*[x×]\s*(\d+)/i.exec(resolution || "");
+  if (match) {
+    const width = Number.parseInt(match[1], 10);
+    return Number.isFinite(width) && width > 0 ? width : 0;
+  }
+  const single = Number.parseInt(resolution || "", 10);
+  return Number.isFinite(single) && single > 0 ? single : 0;
+}
+function classifyEmulatorFromSignals(input) {
+  const ua = typeof input.userAgent === "string" ? input.userAgent : "";
+  const platform = (input.platform || "").trim();
+  const maxTouchPoints = typeof input.maxTouchPoints === "number" ? Math.max(0, input.maxTouchPoints) : 0;
+  const vendor = (input.gpuVendor || "").trim();
+  const renderer = (input.gpuRenderer || "").trim();
+  const gpuSignature = `${vendor} ${renderer}`;
+  const claimsAndroid = /android/i.test(ua);
+  const claimsIos = IOS_DEVICE_UA_PATTERN.test(ua);
+  if (claimsAndroid && NON_ARM_ANDROID_PLATFORM_PATTERN.test(platform)) {
+    return {
+      detected: true,
+      reason: `Android user-agent on desktop ${platform} (emulator CPU profile)`
+    };
+  }
+  if (claimsAndroid && maxTouchPoints === 0) {
+    return {
+      detected: true,
+      reason: "Android user-agent reporting zero touch points (emulated input layer)"
+    };
+  }
+  if (EMULATOR_GPU_SIGNATURE_PATTERN.test(gpuSignature)) {
+    return {
+      detected: true,
+      reason: `Emulator GPU renderer (${renderer || vendor || "masked renderer"})`
+    };
+  }
+  if (claimsIos) {
+    if (IOS_FOREIGN_PLATFORM_PATTERN.test(platform)) {
+      return { detected: true, reason: `iOS user-agent on ${platform} platform (simulator host)` };
+    }
+    if (maxTouchPoints === 0) {
+      return {
+        detected: true,
+        reason: `iOS user-agent on ${platform || "desktop"} with zero touch points (simulator)`
+      };
+    }
+  }
+  const screenWidth = parseScreenResolutionWidth(input.screenResolution);
+  if (IPHONE_OR_IPOD_UA_PATTERN.test(ua) && screenWidth >= 1e3) {
+    return { detected: true, reason: `iPhone user-agent on a ${screenWidth}px desktop-width screen` };
+  }
+  return { detected: false, reason: "" };
+}
 var TOR_DNS_TIMEOUT_MS = 600;
 var TOR_DOH_TIMEOUT_MS = 1200;
 var TOR_DOH_ENDPOINTS = ["https://dns.google/resolve", "https://cloudflare-dns.com/dns-query"];
@@ -1700,8 +1758,18 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const cloudOrMaskedGpu = Boolean(
     raw?.cloudOrMaskedGpu
   );
-  const emulatorDetected = Boolean(raw?.emulatorDetected);
-  const emulatorReason = typeof raw?.emulatorReason === "string" && raw.emulatorReason.trim() ? raw.emulatorReason.trim().slice(0, 200) : "";
+  const serverEmulator = classifyEmulatorFromSignals({
+    userAgent: requestContext.requestUserAgent || readRequestHeader(requestContext.headers, "user-agent") || "",
+    platform: browserDevice.platform,
+    maxTouchPoints: hardwareSignals.maxTouchPoints,
+    gpuVendor: hardwareSignals.gpuVendor,
+    gpuRenderer: hardwareSignals.gpuRenderer,
+    screenResolution: browserDevice.screenResolution
+  });
+  const clientEmulatorReported = Boolean(raw?.emulatorDetected);
+  const emulatorDetected = clientEmulatorReported || serverEmulator.detected;
+  const clientEmulatorReason = typeof raw?.emulatorReason === "string" && raw.emulatorReason.trim() ? raw.emulatorReason.trim().slice(0, 200) : "";
+  const emulatorReason = emulatorDetected ? serverEmulator.detected ? serverEmulator.reason : clientEmulatorReason : "";
   const tamperedRequest = Boolean(requestContext.tamperedRequest);
   const replayDetected = Boolean(requestContext.replayDetected);
   const requestIntegrityReason = typeof requestContext.requestIntegrityReason === "string" ? requestContext.requestIntegrityReason.trim().slice(0, 240) : "";
@@ -2316,6 +2384,7 @@ app.post("/api/visitor/identify", async (req, res) => {
       },
       {
         headers: rawRequestHeaders,
+        requestUserAgent: fullRequestUserAgent,
         tamperedRequest: envelopeVerdict.tamperedRequest,
         replayDetected: envelopeVerdict.replayDetected,
         requestIntegrityReason: envelopeVerdict.requestIntegrityReason,
