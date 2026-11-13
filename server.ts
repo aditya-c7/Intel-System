@@ -2576,7 +2576,17 @@ function sanitizeAndReinforceSecuritySignals(
   ) {
     vpnReasons.push('Cloud / Masked GPU environment');
   }
-  const vpnSuspected = Boolean(raw?.vpnSuspected) || timezoneMismatch || datacenterAsn;
+  // Phase 2 verdicts are consumed by the network boolean below, so they are resolved first.
+  const torExitNode = Boolean(requestContext.torExitNode);
+  const torOperatorHint = Boolean(requestContext.torOperatorHint);
+
+  // A confirmed Tor exit relay is a network-reputation verdict in its own right; it must reach
+  // `vpnSuspected` even when the relay sits on a residential ASN.
+  const vpnSuspected =
+    Boolean(raw?.vpnSuspected) ||
+    timezoneMismatch ||
+    torExitNode ||
+    (datacenterAsn && botSubtype !== 'good_bot');
 
   // Smart-signal timezone comparison: both sides are canonicalized through normalizeTimezone so
   // a legacy alias (Asia/Calcutta vs Asia/Kolkata, US/Pacific vs America/Los_Angeles) is never
@@ -2691,8 +2701,6 @@ function sanitizeAndReinforceSecuritySignals(
       : '';
   const requestNonce =
     typeof requestContext.requestNonce === 'string' ? requestContext.requestNonce.slice(0, 128) : '';
-  const torExitNode = Boolean(requestContext.torExitNode);
-  const torOperatorHint = Boolean(requestContext.torOperatorHint);
   const ipBlocklisted = Boolean(requestContext.ipBlocklisted);
   const ipBlocklistReasons = Array.isArray(requestContext.ipBlocklistReasons)
     ? requestContext.ipBlocklistReasons
@@ -2804,6 +2812,10 @@ function sanitizeAndReinforceSecuritySignals(
 
   // Tile 3 — VPN / Proxy & Network Type (10 Tor / 9 blocklisted / 8 datacenter + tz / 6 / 5 / 0)
   const isDatacenterAsn = datacenterAsn;
+  // A verified search crawler legitimately runs on its operator's own datacenter ASN. Scoring
+  // that as a consumer-facing "VPN / datacenter proxy" is a false positive produced by two
+  // engines disagreeing about the same network, so the tile drops to a low-risk crawler state.
+  const verifiedCrawlerNetwork = botSubtype === 'good_bot' && isDatacenterAsn;
   const ispBrand = classification.brandName || location.isp || 'Unknown ISP';
   const asnSuffix = location.asn !== 'Unknown' ? ` • ${location.asn}` : '';
   const asnLabel =
@@ -2817,6 +2829,8 @@ function sanitizeAndReinforceSecuritySignals(
     ? 10
     : ipBlocklisted
     ? 9
+    : verifiedCrawlerNetwork
+    ? 2
     : isDatacenterAsn && hasTzMismatch
     ? 8
     : isDatacenterAsn
@@ -2828,6 +2842,8 @@ function sanitizeAndReinforceSecuritySignals(
     ? 'Tor Exit Node'
     : ipBlocklisted
     ? 'Blocklisted IP'
+    : verifiedCrawlerNetwork
+    ? 'Verified Crawler Network'
     : isDatacenterAsn
     ? 'VPN / Datacenter Proxy'
     : hasTzMismatch
@@ -2839,6 +2855,8 @@ function sanitizeAndReinforceSecuritySignals(
       : `Confirmed active Tor exit relay (${location.publicIp} · ${asnOrOrg})`
     : ipBlocklisted
     ? 'IP flagged on abuse / tamper blocklist'
+    : verifiedCrawlerNetwork
+    ? `${botClassification.provider} crawler operating from its own ${ispBrand}${asnSuffix} — crawler infrastructure, not a consumer proxy`
     : isDatacenterAsn && hasTzMismatch
     ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})`
     : isDatacenterAsn
@@ -2918,9 +2936,20 @@ function sanitizeAndReinforceSecuritySignals(
   // Composite — bot/headless 5|4, network 3|2, VM/tampered-OS 3, incognito 2,
   // sealed-envelope tamper or replay 2 (strictly ≤ 10).
   const integrityViolation = Boolean(tamperedRequest || replayDetected);
+  // Network weight: a confirmed exit relay (5) outranks generic hosting (3); a verified
+  // crawler's own network costs nothing; a plain timezone relay is worth 2.
+  const networkPoints = torExitNode
+    ? 5
+    : verifiedCrawlerNetwork
+    ? 0
+    : isDatacenterAsn
+    ? 3
+    : hasTzMismatch
+    ? 2
+    : 0;
   const rawCompositePoints =
     (isBot ? 5 : isHeadless ? 4 : 0) +
-    (isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0) +
+    networkPoints +
     (vmScore > 0 ? 3 : 0) +
     (isIncognito ? 2 : 0) +
     (integrityViolation ? 2 : 0);
@@ -2945,7 +2974,15 @@ function sanitizeAndReinforceSecuritySignals(
       `Headless browser environment (+4): ${botReason || 'no physical display attached'}`
     );
   }
-  if (isDatacenterAsn) {
+  if (torExitNode) {
+    riskFactors.push(
+      `Confirmed Tor exit relay (+5): ${
+        torOperatorHint ? 'exit-operator attribution' : 'Tor Project DNSEL / bulk exit list'
+      } ${location.publicIp}`
+    );
+  } else if (verifiedCrawlerNetwork) {
+    // Verified crawler infrastructure is intentional and unweighted.
+  } else if (isDatacenterAsn) {
     riskFactors.push(
       `Datacenter / hosting network detected (+3): ${vpnReasons[0] || ispBrand}`
     );
@@ -2955,7 +2992,13 @@ function sanitizeAndReinforceSecuritySignals(
     );
   }
   if (vmScore > 0) {
-    riskFactors.push(`Virtual machine / tampered OS (+3): ${vmSignal.detail}`);
+    // When the VM tile was maxed by the sealed-envelope verdict, the integrity factor below
+    // already reports the same evidence — never list one finding twice.
+    const duplicatesIntegrityReason =
+      integrityViolation && vmSignal.detail === (requestIntegrityReason || 'tampered or replayed payload');
+    if (!duplicatesIntegrityReason) {
+      riskFactors.push(`Virtual machine / tampered OS (+3): ${vmSignal.detail}`);
+    }
   }
   if (isIncognito) {
     riskFactors.push(`Incognito / ephemeral storage (+2): ${incognitoSignal.detail}`);

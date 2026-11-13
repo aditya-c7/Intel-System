@@ -1777,7 +1777,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   if (datacenterAsn && isGpuMaskedOrUnavailable && !vpnReasons.some((r) => /Cloud \/ Masked GPU/i.test(r))) {
     vpnReasons.push("Cloud / Masked GPU environment");
   }
-  const vpnSuspected = Boolean(raw?.vpnSuspected) || timezoneMismatch || datacenterAsn;
+  const torExitNode = Boolean(requestContext.torExitNode);
+  const torOperatorHint = Boolean(requestContext.torOperatorHint);
+  const vpnSuspected = Boolean(raw?.vpnSuspected) || timezoneMismatch || torExitNode || datacenterAsn && botSubtype !== "good_bot";
   const clientTzCanonical = normalizeTimezone(browserTimezone);
   const ipTzCanonical = normalizeTimezone(ipTimezone === "Unavailable" ? "" : ipTimezone);
   const hasTzMismatch = Boolean(
@@ -1822,8 +1824,6 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const replayDetected = Boolean(requestContext.replayDetected);
   const requestIntegrityReason = typeof requestContext.requestIntegrityReason === "string" ? requestContext.requestIntegrityReason.trim().slice(0, 240) : "";
   const requestNonce = typeof requestContext.requestNonce === "string" ? requestContext.requestNonce.slice(0, 128) : "";
-  const torExitNode = Boolean(requestContext.torExitNode);
-  const torOperatorHint = Boolean(requestContext.torOperatorHint);
   const ipBlocklisted = Boolean(requestContext.ipBlocklisted);
   const ipBlocklistReasons = Array.isArray(requestContext.ipBlocklistReasons) ? requestContext.ipBlocklistReasons.filter((reason) => typeof reason === "string" && reason.trim().length > 0).map((reason) => reason.trim().slice(0, 180)).slice(0, 5) : [];
   let persistenceMode = "First-Party Cookie";
@@ -1862,13 +1862,14 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     detail: botDetail
   };
   const isDatacenterAsn = datacenterAsn;
+  const verifiedCrawlerNetwork = botSubtype === "good_bot" && isDatacenterAsn;
   const ispBrand = classification.brandName || location.isp || "Unknown ISP";
   const asnSuffix = location.asn !== "Unknown" ? ` \u2022 ${location.asn}` : "";
   const asnLabel = location.asn && location.asn !== "Unknown" ? /^AS/i.test(location.asn) ? location.asn.toUpperCase() : `AS${location.asn}` : "AS unknown";
   const asnOrOrg = `${asnLabel} \xB7 ${location.org !== "Unknown" ? location.org : ispBrand}`;
-  const vpnScore = torExitNode ? 10 : ipBlocklisted ? 9 : isDatacenterAsn && hasTzMismatch ? 8 : isDatacenterAsn ? 6 : hasTzMismatch ? 5 : 0;
-  const vpnStatus = torExitNode ? "Tor Exit Node" : ipBlocklisted ? "Blocklisted IP" : isDatacenterAsn ? "VPN / Datacenter Proxy" : hasTzMismatch ? "VPN / Timezone Relay" : "Standard ISP";
-  const vpnDetail = torExitNode ? torOperatorHint ? `Tor exit relay operator matched on ${location.publicIp} (${asnOrOrg}) \u2014 DNSEL unreachable, operator attribution used` : `Confirmed active Tor exit relay (${location.publicIp} \xB7 ${asnOrOrg})` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
+  const vpnScore = torExitNode ? 10 : ipBlocklisted ? 9 : verifiedCrawlerNetwork ? 2 : isDatacenterAsn && hasTzMismatch ? 8 : isDatacenterAsn ? 6 : hasTzMismatch ? 5 : 0;
+  const vpnStatus = torExitNode ? "Tor Exit Node" : ipBlocklisted ? "Blocklisted IP" : verifiedCrawlerNetwork ? "Verified Crawler Network" : isDatacenterAsn ? "VPN / Datacenter Proxy" : hasTzMismatch ? "VPN / Timezone Relay" : "Standard ISP";
+  const vpnDetail = torExitNode ? torOperatorHint ? `Tor exit relay operator matched on ${location.publicIp} (${asnOrOrg}) \u2014 DNSEL unreachable, operator attribution used` : `Confirmed active Tor exit relay (${location.publicIp} \xB7 ${asnOrOrg})` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : verifiedCrawlerNetwork ? `${botClassification.provider} crawler operating from its own ${ispBrand}${asnSuffix} \u2014 crawler infrastructure, not a consumer proxy` : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
   const vpnSignal = {
     id: "vpn",
     title: "VPN / Proxy & Network Type",
@@ -1901,7 +1902,8 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     vm: vmSignal
   };
   const integrityViolation = Boolean(tamperedRequest || replayDetected);
-  const rawCompositePoints = (isBot ? 5 : isHeadless ? 4 : 0) + (isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0) + (vmScore > 0 ? 3 : 0) + (isIncognito ? 2 : 0) + (integrityViolation ? 2 : 0);
+  const networkPoints = torExitNode ? 5 : verifiedCrawlerNetwork ? 0 : isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0;
+  const rawCompositePoints = (isBot ? 5 : isHeadless ? 4 : 0) + networkPoints + (vmScore > 0 ? 3 : 0) + (isIncognito ? 2 : 0) + (integrityViolation ? 2 : 0);
   const suspectScore = Math.min(10, rawCompositePoints);
   const riskLevel = tierFor(suspectScore);
   const riskBadgeText = `${riskLevel} Risk \u2022 ${suspectScore}/10`;
@@ -1915,7 +1917,12 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       `Headless browser environment (+4): ${botReason || "no physical display attached"}`
     );
   }
-  if (isDatacenterAsn) {
+  if (torExitNode) {
+    riskFactors.push(
+      `Confirmed Tor exit relay (+5): ${torOperatorHint ? "exit-operator attribution" : "Tor Project DNSEL / bulk exit list"} ${location.publicIp}`
+    );
+  } else if (verifiedCrawlerNetwork) {
+  } else if (isDatacenterAsn) {
     riskFactors.push(
       `Datacenter / hosting network detected (+3): ${vpnReasons[0] || ispBrand}`
     );
@@ -1925,7 +1932,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     );
   }
   if (vmScore > 0) {
-    riskFactors.push(`Virtual machine / tampered OS (+3): ${vmSignal.detail}`);
+    const duplicatesIntegrityReason = integrityViolation && vmSignal.detail === (requestIntegrityReason || "tampered or replayed payload");
+    if (!duplicatesIntegrityReason) {
+      riskFactors.push(`Virtual machine / tampered OS (+3): ${vmSignal.detail}`);
+    }
   }
   if (isIncognito) {
     riskFactors.push(`Incognito / ephemeral storage (+2): ${incognitoSignal.detail}`);
