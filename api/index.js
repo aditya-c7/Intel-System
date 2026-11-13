@@ -1426,7 +1426,15 @@ app.get("/api/health", (req, res) => {
   const visitorsCount = db.prepare("SELECT COUNT(*) AS count FROM visitors").get().count;
   const visitsCount = db.prepare("SELECT COUNT(*) AS count FROM visits").get().count;
   const { regionCode, regionLabel } = detectServerRegion(req);
-  res.json({ status: "ok", visitorsCount, visitsCount, regionCode, regionLabel });
+  const uaDebug = req.headers["x-intel-debug-ua"] === "1";
+  res.json({
+    status: "ok",
+    visitorsCount,
+    visitsCount,
+    regionCode,
+    regionLabel,
+    ...uaDebug ? { receivedUserAgent: String(req.headers["user-agent"] || "") } : {}
+  });
 });
 function extractVercelEdgeGeo(req) {
   const decodeHeader = (val) => {
