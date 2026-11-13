@@ -3047,6 +3047,11 @@ app.post('/api/visitor/identify', async (req, res) => {
       }
     }
 
+    // Phase 2 — the authoritative Tor DNSEL query is started here so its network round trip
+    // overlaps the geolocation lookups below instead of being serialized after them. A cold
+    // cache costs a DNS query; a warm one resolves from the 10-minute per-IP cache.
+    const torLookupPromise: Promise<boolean> = isTorExitNode(extractedIp).catch(() => false);
+
     let location = await lookupVerifiedGeolocation(extractedIp, isPublic);
     const vercelGeo = extractVercelEdgeGeo(req);
 
@@ -3584,10 +3589,14 @@ app.post('/api/visitor/identify', async (req, res) => {
       }
     );
 
-    // Phase 2 — the bulk list was started at the top of this handler; the per-IP DNSEL query
-    // below is authoritative and only pays a network round trip on a cache miss.
+    // Phase 2 — the per-IP DNSEL query started before geolocation is authoritative for the
+    // extracted address; if the geo provider reported a different address, that one is checked.
+    const torLookupTarget = location.publicIp.trim().toLowerCase();
     const torExitNode =
-      isTorBulkListed(location.publicIp) || (await isTorExitNode(location.publicIp));
+      isTorBulkListed(location.publicIp) ||
+      (torLookupTarget === extractedIp.trim().toLowerCase()
+        ? await torLookupPromise
+        : await isTorExitNode(location.publicIp).catch(() => false));
 
     // Only cryptographic tampering (modified signed payload) and nonce replay poison the IP
     // ledger. A User-Agent header mismatch is deliberately excluded: edge proxies can rewrite

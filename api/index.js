@@ -2000,6 +2000,7 @@ app.post("/api/visitor/identify", async (req, res) => {
         isPublic = true;
       }
     }
+    const torLookupPromise = isTorExitNode(extractedIp).catch(() => false);
     let location = await lookupVerifiedGeolocation(extractedIp, isPublic);
     const vercelGeo = extractVercelEdgeGeo(req);
     if (isPublic && (!location.isLocationVerified || location.isp === "Unknown" || location.latitude === null) && clientGeoHint && normalizeIpCandidate(clientGeoHint.ip)?.toLowerCase() === extractedIp.toLowerCase()) {
@@ -2350,7 +2351,8 @@ app.post("/api/visitor/identify", async (req, res) => {
         botSignals: Array.isArray(rawSecuritySignals?.botSignals) ? rawSecuritySignals.botSignals : []
       }
     );
-    const torExitNode = isTorBulkListed(location.publicIp) || await isTorExitNode(location.publicIp);
+    const torLookupTarget = location.publicIp.trim().toLowerCase();
+    const torExitNode = isTorBulkListed(location.publicIp) || (torLookupTarget === extractedIp.trim().toLowerCase() ? await torLookupPromise : await isTorExitNode(location.publicIp).catch(() => false));
     const signedPayloadTampered = /Payload integrity hash mismatch/i.test(
       envelopeVerdict.requestIntegrityReason
     );
