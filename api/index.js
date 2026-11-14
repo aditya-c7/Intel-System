@@ -2528,6 +2528,182 @@ function normalizeLegacySuspectScore(rawSuspectScore) {
   if (rawSuspectScore <= 10) return Math.max(0, rawSuspectScore);
   return Math.max(0, Math.min(10, Math.round(rawSuspectScore / 10)));
 }
+var VELOCITY_WINDOW_MS = {
+  "5_minutes": 5 * 60 * 1e3,
+  "1_hour": 60 * 60 * 1e3,
+  "24_hours": 24 * 60 * 60 * 1e3
+};
+var EMPTY_WINDOW = { "5_minutes": 0, "1_hour": 0, "24_hours": 0 };
+var EMPTY_VELOCITY = {
+  distinct_ip: { ...EMPTY_WINDOW },
+  distinct_linked_id: { ...EMPTY_WINDOW },
+  distinct_country: { ...EMPTY_WINDOW },
+  events: { ...EMPTY_WINDOW },
+  ip_events: { ...EMPTY_WINDOW },
+  distinct_ip_by_linked_id: { ...EMPTY_WINDOW },
+  distinct_visitor_id_by_linked_id: { ...EMPTY_WINDOW }
+};
+function computeVelocitySignals(db2, visitorId, publicIp, sessionId) {
+  const now = Date.now();
+  const iso = (ms) => new Date(now - ms).toISOString();
+  const fiveMinuteCutoff = iso(VELOCITY_WINDOW_MS["5_minutes"]);
+  const oneHourCutoff = iso(VELOCITY_WINDOW_MS["1_hour"]);
+  const dayCutoff = iso(VELOCITY_WINDOW_MS["24_hours"]);
+  try {
+    const row = db2.prepare(
+      `SELECT
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN public_ip END) AS ip_5m,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN public_ip END) AS ip_1h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN public_ip END) AS ip_24h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN session_id END) AS linked_5m,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN session_id END) AS linked_1h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN session_id END) AS linked_24h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN country END) AS country_5m,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN country END) AS country_1h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN country END) AS country_24h,
+          SUM(CASE WHEN visited_at_utc >= ? THEN 1 ELSE 0 END) AS events_5m,
+          SUM(CASE WHEN visited_at_utc >= ? THEN 1 ELSE 0 END) AS events_1h,
+          SUM(CASE WHEN visited_at_utc >= ? THEN 1 ELSE 0 END) AS events_24h
+         FROM visits
+         WHERE visitor_id = ?`
+    ).get(
+      fiveMinuteCutoff,
+      oneHourCutoff,
+      dayCutoff,
+      fiveMinuteCutoff,
+      oneHourCutoff,
+      dayCutoff,
+      fiveMinuteCutoff,
+      oneHourCutoff,
+      dayCutoff,
+      fiveMinuteCutoff,
+      oneHourCutoff,
+      dayCutoff,
+      visitorId
+    );
+    const num = (value) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+    const ipEventsRow = db2.prepare(
+      `SELECT
+          SUM(CASE WHEN visited_at_utc >= ? THEN 1 ELSE 0 END) AS ip_events_5m,
+          SUM(CASE WHEN visited_at_utc >= ? THEN 1 ELSE 0 END) AS ip_events_1h,
+          SUM(CASE WHEN visited_at_utc >= ? THEN 1 ELSE 0 END) AS ip_events_24h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN visitor_id END) AS ip_visitors_24h
+         FROM visits
+         WHERE public_ip = ?`
+    ).get(fiveMinuteCutoff, oneHourCutoff, dayCutoff, dayCutoff, publicIp);
+    const linkedIpRow = db2.prepare(
+      `SELECT
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN public_ip END) AS linked_ips_5m,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN public_ip END) AS linked_ips_1h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN public_ip END) AS linked_ips_24h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN visitor_id END) AS linked_visitors_5m,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN visitor_id END) AS linked_visitors_1h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN visitor_id END) AS linked_visitors_24h
+         FROM visits
+         WHERE session_id = ?`
+    ).get(
+      fiveMinuteCutoff,
+      oneHourCutoff,
+      dayCutoff,
+      fiveMinuteCutoff,
+      oneHourCutoff,
+      dayCutoff,
+      sessionId
+    );
+    const velocity = row ? {
+      distinct_ip: {
+        "5_minutes": num(row.ip_5m),
+        "1_hour": num(row.ip_1h),
+        "24_hours": num(row.ip_24h)
+      },
+      distinct_linked_id: {
+        "5_minutes": num(row.linked_5m),
+        "1_hour": num(row.linked_1h),
+        "24_hours": num(row.linked_24h)
+      },
+      distinct_country: {
+        "5_minutes": num(row.country_5m),
+        "1_hour": num(row.country_1h),
+        "24_hours": num(row.country_24h)
+      },
+      events: {
+        "5_minutes": num(row.events_5m),
+        "1_hour": num(row.events_1h),
+        "24_hours": num(row.events_24h)
+      },
+      ip_events: {
+        "5_minutes": num(ipEventsRow?.ip_events_5m),
+        "1_hour": num(ipEventsRow?.ip_events_1h),
+        "24_hours": num(ipEventsRow?.ip_events_24h)
+      },
+      distinct_ip_by_linked_id: {
+        "5_minutes": num(linkedIpRow?.linked_ips_5m),
+        "1_hour": num(linkedIpRow?.linked_ips_1h),
+        "24_hours": num(linkedIpRow?.linked_ips_24h)
+      },
+      distinct_visitor_id_by_linked_id: {
+        "5_minutes": num(linkedIpRow?.linked_visitors_5m),
+        "1_hour": num(linkedIpRow?.linked_visitors_1h),
+        "24_hours": num(linkedIpRow?.linked_visitors_24h)
+      }
+    } : { ...EMPTY_VELOCITY };
+    return {
+      velocity,
+      events24h: velocity.events["24_hours"],
+      distinctIps24h: velocity.distinct_ip["24_hours"]
+    };
+  } catch {
+    return { velocity: { ...EMPTY_VELOCITY }, events24h: 0, distinctIps24h: 0 };
+  }
+}
+function computeDeviceRarity(db2, browserDevice) {
+  try {
+    const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1e3).toISOString();
+    const row = db2.prepare(
+      `SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN screen_resolution = ? AND browser = ? AND os = ? THEN 1 ELSE 0 END) AS matching
+         FROM visits
+         WHERE visited_at_utc >= ?`
+    ).get(
+      browserDevice.screenResolution,
+      browserDevice.browser,
+      browserDevice.os,
+      cutoff
+    );
+    const total = Number(row?.total) || 0;
+    const matching = Number(row?.matching) || 0;
+    if (total < 20) {
+      return { rareDevice: false, bucket: "<p95", share: 1, sampleSize: total };
+    }
+    const share = matching / total;
+    const bucket = share <= 0.01 ? ">p99" : share <= 0.05 ? "p95-p99" : "<p95";
+    return { rareDevice: bucket !== "<p95", bucket, share, sampleSize: total };
+  } catch {
+    return { rareDevice: false, bucket: "<p95", share: 1, sampleSize: 0 };
+  }
+}
+function computeSuspectScore100(input) {
+  let score = 0;
+  if (input.bot) score += 45;
+  if (input.replayed) score += 35;
+  if (input.tampering) score += 25;
+  if (input.vpn) score += 10 + (input.vpnMethodCount > 1 ? 4 : 0);
+  if (input.blocklisted) score += 12;
+  if (input.virtualMachine) score += 12;
+  if (input.proxy) score += 10;
+  if (input.simulator) score += 10;
+  if (input.activeCall) score += 10;
+  if (input.privacySettings) score += 8;
+  if (input.incognito) score += 6;
+  if (input.highActivityDevice) score += 6;
+  if (input.developerTools) score += 5;
+  if (input.rareDevice) score += 4;
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
 async function lookupVerifiedGeolocation(visitorIp, isPublic) {
   if (!isPublic || !visitorIp || visitorIp === "Unavailable") {
     return {
@@ -3798,6 +3974,53 @@ app.post("/api/visitor/identify", async (req, res) => {
         botClassification: effectiveBotClassification
       }
     );
+    const velocityReport = computeVelocitySignals(
+      db,
+      visitorId,
+      location.publicIp,
+      currentSessionId
+    );
+    const rarityReport = computeDeviceRarity(db, browserDevice);
+    const highActivityDevice = velocityReport.events24h >= 20 || velocityReport.distinctIps24h >= 3 || velocityReport.velocity.ip_events["24_hours"] >= 20;
+    const clientTampering = rawSecuritySignals?.tampering ?? null;
+    const tamperingAssessment = clientTampering === null ? null : {
+      tampering: Boolean(clientTampering),
+      confidence: rawSecuritySignals?.tamperingConfidence || "high",
+      mlScore: typeof rawSecuritySignals?.tamperingMlScore === "number" ? rawSecuritySignals.tamperingMlScore : 24e-4,
+      details: rawSecuritySignals?.tamperingDetails ?? {
+        anomaly_score: 0,
+        anti_detect_browser: false,
+        devtools_device_emulation: false,
+        reasons: []
+      }
+    };
+    const activeCallSupported = Boolean(rawSecuritySignals?.activeCallSupported);
+    const activeCall = activeCallSupported && Boolean(rawSecuritySignals?.activeCall);
+    const privacySettings = Boolean(
+      rawSecuritySignals?.privacySettings || rawSecuritySignals?.isTorBrowserClient || securitySignals.privacyProtected
+    );
+    const developerTools = Boolean(rawSecuritySignals?.developerTools);
+    const suspectScore100 = computeSuspectScore100({
+      bot: Boolean(securitySignals.isBot),
+      replayed: Boolean(securitySignals.replayDetected),
+      tampering: Boolean(tamperingAssessment?.tampering),
+      vpn: Boolean(securitySignals.vpnSuspected),
+      vpnMethodCount: Array.isArray(securitySignals.vpnReasons) ? securitySignals.vpnReasons.length : 0,
+      blocklisted: Boolean(securitySignals.torExitNode || securitySignals.ipBlocklisted),
+      virtualMachine: Boolean(
+        securitySignals.isVirtualMachine || securitySignals.cloudOrMaskedGpu || securitySignals.emulatorDetected
+      ),
+      proxy: Boolean(
+        securitySignals.proxyDetected
+      ),
+      simulator: Boolean(securitySignals.emulatorDetected),
+      activeCall,
+      privacySettings,
+      incognito: Boolean(securitySignals.isIncognito),
+      highActivityDevice,
+      developerTools,
+      rareDevice: rarityReport.rareDevice
+    });
     const visitHistory = rawVisits.map((r) => {
       const storedSuspectScore = typeof r.suspect_score === "number" && Number.isFinite(r.suspect_score) ? normalizeLegacySuspectScore(r.suspect_score) : null;
       const isCurrentVisitRow = String(r.page_load_id || "") === safePageLoadId;
@@ -3861,7 +4084,19 @@ app.post("/api/visitor/identify", async (req, res) => {
       suspectScore: securitySignals.suspectScore,
       riskLevel: securitySignals.riskLevel,
       riskBadgeText: securitySignals.riskBadgeText,
-      smartSignals: securitySignals.smartSignals
+      smartSignals: securitySignals.smartSignals,
+      // API v4 mirrors: 0-100 calibrated composite, velocity windows and device rarity.
+      suspectScore100,
+      velocity: velocityReport.velocity,
+      highActivityDevice,
+      rareDevice: rarityReport.rareDevice,
+      rareDevicePercentileBucket: rarityReport.bucket,
+      tampering: tamperingAssessment?.tampering ?? false,
+      tamperingConfidence: tamperingAssessment?.confidence ?? "high",
+      tamperingDetails: tamperingAssessment?.details,
+      activeCall,
+      activeCallSupported,
+      rawDeviceAttributes: rawSecuritySignals?.rawDeviceAttributes ?? null
     };
     res.json(payload);
   } catch (err) {

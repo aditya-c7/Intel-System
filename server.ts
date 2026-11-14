@@ -26,6 +26,8 @@ import type {
   SmartSignal,
   SmartSignals,
   SmartSignalLevel,
+  VelocitySignals,
+  VelocityWindowCounts,
 } from './src/types/visitor';
 
 dotenv.config();
@@ -3499,8 +3501,261 @@ function normalizeLegacySuspectScore(rawSuspectScore: number): number {
   return Math.max(0, Math.min(10, Math.round(rawSuspectScore / 10)));
 }
 
-async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): Promise<LocationInfo> {
-  if (!isPublic || !visitorIp || visitorIp === 'Unavailable') {
+const VELOCITY_WINDOW_MS = {
+  '5_minutes': 5 * 60 * 1000,
+  '1_hour': 60 * 60 * 1000,
+  '24_hours': 24 * 60 * 60 * 1000,
+} as const;
+
+interface VelocityReport {
+  velocity: VelocitySignals;
+  events24h: number;
+  distinctIps24h: number;
+}
+
+const EMPTY_WINDOW: VelocityWindowCounts = { '5_minutes': 0, '1_hour': 0, '24_hours': 0 };
+
+const EMPTY_VELOCITY: VelocitySignals = {
+  distinct_ip: { ...EMPTY_WINDOW },
+  distinct_linked_id: { ...EMPTY_WINDOW },
+  distinct_country: { ...EMPTY_WINDOW },
+  events: { ...EMPTY_WINDOW },
+  ip_events: { ...EMPTY_WINDOW },
+  distinct_ip_by_linked_id: { ...EMPTY_WINDOW },
+  distinct_visitor_id_by_linked_id: { ...EMPTY_WINDOW },
+};
+
+/**
+ * Multi-window SQLite velocity aggregation backing the `velocity` object and the
+ * High-Activity Device signal. Cutoffs are ISO-8601 UTC instants so they compare directly
+ * against the stored `visited_at_utc` text. A matcher-less in-memory adapter or a query
+ * failure degrades to the zero-filled report rather than failing the identify request.
+ */
+function computeVelocitySignals(
+  db: DatabaseAdapter,
+  visitorId: string,
+  publicIp: string,
+  sessionId: string
+): VelocityReport {
+  const now = Date.now();
+  const iso = (ms: number) => new Date(now - ms).toISOString();
+  const fiveMinuteCutoff = iso(VELOCITY_WINDOW_MS['5_minutes']);
+  const oneHourCutoff = iso(VELOCITY_WINDOW_MS['1_hour']);
+  const dayCutoff = iso(VELOCITY_WINDOW_MS['24_hours']);
+
+  try {
+    const row = db
+      .prepare(
+        `SELECT
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN public_ip END) AS ip_5m,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN public_ip END) AS ip_1h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN public_ip END) AS ip_24h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN session_id END) AS linked_5m,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN session_id END) AS linked_1h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN session_id END) AS linked_24h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN country END) AS country_5m,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN country END) AS country_1h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN country END) AS country_24h,
+          SUM(CASE WHEN visited_at_utc >= ? THEN 1 ELSE 0 END) AS events_5m,
+          SUM(CASE WHEN visited_at_utc >= ? THEN 1 ELSE 0 END) AS events_1h,
+          SUM(CASE WHEN visited_at_utc >= ? THEN 1 ELSE 0 END) AS events_24h
+         FROM visits
+         WHERE visitor_id = ?`
+      )
+      .get(
+        fiveMinuteCutoff,
+        oneHourCutoff,
+        dayCutoff,
+        fiveMinuteCutoff,
+        oneHourCutoff,
+        dayCutoff,
+        fiveMinuteCutoff,
+        oneHourCutoff,
+        dayCutoff,
+        fiveMinuteCutoff,
+        oneHourCutoff,
+        dayCutoff,
+        visitorId
+      ) as Record<string, unknown> | undefined;
+
+    const num = (value: unknown): number => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+
+    const ipEventsRow = db
+      .prepare(
+        `SELECT
+          SUM(CASE WHEN visited_at_utc >= ? THEN 1 ELSE 0 END) AS ip_events_5m,
+          SUM(CASE WHEN visited_at_utc >= ? THEN 1 ELSE 0 END) AS ip_events_1h,
+          SUM(CASE WHEN visited_at_utc >= ? THEN 1 ELSE 0 END) AS ip_events_24h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN visitor_id END) AS ip_visitors_24h
+         FROM visits
+         WHERE public_ip = ?`
+      )
+      .get(fiveMinuteCutoff, oneHourCutoff, dayCutoff, dayCutoff, publicIp) as
+      | Record<string, unknown>
+      | undefined;
+
+    const linkedIpRow = db
+      .prepare(
+        `SELECT
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN public_ip END) AS linked_ips_5m,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN public_ip END) AS linked_ips_1h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN public_ip END) AS linked_ips_24h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN visitor_id END) AS linked_visitors_5m,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN visitor_id END) AS linked_visitors_1h,
+          COUNT(DISTINCT CASE WHEN visited_at_utc >= ? THEN visitor_id END) AS linked_visitors_24h
+         FROM visits
+         WHERE session_id = ?`
+      )
+      .get(
+        fiveMinuteCutoff,
+        oneHourCutoff,
+        dayCutoff,
+        fiveMinuteCutoff,
+        oneHourCutoff,
+        dayCutoff,
+        sessionId
+      ) as Record<string, unknown> | undefined;
+
+    const velocity: VelocitySignals = row
+      ? {
+          distinct_ip: {
+            '5_minutes': num(row.ip_5m),
+            '1_hour': num(row.ip_1h),
+            '24_hours': num(row.ip_24h),
+          },
+          distinct_linked_id: {
+            '5_minutes': num(row.linked_5m),
+            '1_hour': num(row.linked_1h),
+            '24_hours': num(row.linked_24h),
+          },
+          distinct_country: {
+            '5_minutes': num(row.country_5m),
+            '1_hour': num(row.country_1h),
+            '24_hours': num(row.country_24h),
+          },
+          events: {
+            '5_minutes': num(row.events_5m),
+            '1_hour': num(row.events_1h),
+            '24_hours': num(row.events_24h),
+          },
+          ip_events: {
+            '5_minutes': num(ipEventsRow?.ip_events_5m),
+            '1_hour': num(ipEventsRow?.ip_events_1h),
+            '24_hours': num(ipEventsRow?.ip_events_24h),
+          },
+          distinct_ip_by_linked_id: {
+            '5_minutes': num(linkedIpRow?.linked_ips_5m),
+            '1_hour': num(linkedIpRow?.linked_ips_1h),
+            '24_hours': num(linkedIpRow?.linked_ips_24h),
+          },
+          distinct_visitor_id_by_linked_id: {
+            '5_minutes': num(linkedIpRow?.linked_visitors_5m),
+            '1_hour': num(linkedIpRow?.linked_visitors_1h),
+            '24_hours': num(linkedIpRow?.linked_visitors_24h),
+          },
+        }
+      : { ...EMPTY_VELOCITY };
+
+    return {
+      velocity,
+      events24h: velocity.events['24_hours'],
+      distinctIps24h: velocity.distinct_ip['24_hours'],
+    };
+  } catch {
+    return { velocity: { ...EMPTY_VELOCITY }, events24h: 0, distinctIps24h: 0 };
+  }
+}
+
+interface DeviceRarityReport {
+  rareDevice: boolean;
+  bucket: '<p95' | 'p95-p99' | '>p99';
+  share: number;
+  sampleSize: number;
+}
+
+/**
+ * Statistical rarity of this device configuration (screen resolution + browser + OS) over the
+ * last 30 days of visits. `p95-p99` and `>p99` both mark the device as rare; the sample must
+ * contain at least 20 visits before rarity is asserted.
+ */
+function computeDeviceRarity(
+  db: DatabaseAdapter,
+  browserDevice: BrowserDeviceInfo
+): DeviceRarityReport {
+  try {
+    const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const row = db
+      .prepare(
+        `SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN screen_resolution = ? AND browser = ? AND os = ? THEN 1 ELSE 0 END) AS matching
+         FROM visits
+         WHERE visited_at_utc >= ?`
+      )
+      .get(
+        browserDevice.screenResolution,
+        browserDevice.browser,
+        browserDevice.os,
+        cutoff
+      ) as Record<string, unknown> | undefined;
+    const total = Number(row?.total) || 0;
+    const matching = Number(row?.matching) || 0;
+    if (total < 20) {
+      return { rareDevice: false, bucket: '<p95', share: 1, sampleSize: total };
+    }
+    const share = matching / total;
+    const bucket: DeviceRarityReport['bucket'] =
+      share <= 0.01 ? '>p99' : share <= 0.05 ? 'p95-p99' : '<p95';
+    return { rareDevice: bucket !== '<p95', bucket, share, sampleSize: total };
+  } catch {
+    return { rareDevice: false, bucket: '<p95', share: 1, sampleSize: 0 };
+  }
+}
+
+/**
+ * Calibrated additive Suspect Score (0–100). Weights reproduce the reference payload:
+ * incognito 6 + vpn 14 + vm 12 + privacy 8 + Tor blocklist 12 = 52, plus
+ * high_activity_device 6 = 58. The score is clamped to [0, 100].
+ */
+function computeSuspectScore100(input: {
+  bot: boolean;
+  replayed: boolean;
+  tampering: boolean;
+  vpn: boolean;
+  vpnMethodCount: number;
+  blocklisted: boolean;
+  virtualMachine: boolean;
+  proxy: boolean;
+  simulator: boolean;
+  activeCall: boolean;
+  privacySettings: boolean;
+  incognito: boolean;
+  highActivityDevice: boolean;
+  developerTools: boolean;
+  rareDevice: boolean;
+}): number {
+  let score = 0;
+  if (input.bot) score += 45;
+  if (input.replayed) score += 35;
+  if (input.tampering) score += 25;
+  if (input.vpn) score += 10 + (input.vpnMethodCount > 1 ? 4 : 0);
+  if (input.blocklisted) score += 12;
+  if (input.virtualMachine) score += 12;
+  if (input.proxy) score += 10;
+  if (input.simulator) score += 10;
+  if (input.activeCall) score += 10;
+  if (input.privacySettings) score += 8;
+  if (input.incognito) score += 6;
+  if (input.highActivityDevice) score += 6;
+  if (input.developerTools) score += 5;
+  if (input.rareDevice) score += 4;
+  return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): Promise<LocationInfo> {  if (!isPublic || !visitorIp || visitorIp === 'Unavailable') {
     return {
       publicIp: 'Unavailable',
       city: 'Unavailable',
@@ -5632,6 +5887,75 @@ app.post('/api/visitor/identify', async (req, res) => {
       }
     );
 
+    // Phase 2 — SQLite velocity windows, device rarity and the calibrated 0–100 Suspect Score.
+    // These are additive to the 0–10 per-tile grid: the tiles keep their own calibrated scale
+    // while the Risk Meter consumes the 0–100 composite.
+    const velocityReport = computeVelocitySignals(
+      db,
+      visitorId,
+      location.publicIp,
+      currentSessionId
+    );
+    const rarityReport = computeDeviceRarity(db, browserDevice);
+    const highActivityDevice =
+      velocityReport.events24h >= 20 ||
+      velocityReport.distinctIps24h >= 3 ||
+      velocityReport.velocity.ip_events['24_hours'] >= 20;
+    const clientTampering = rawSecuritySignals?.tampering ?? null;
+    const tamperingAssessment =
+      clientTampering === null
+        ? null
+        : {
+            tampering: Boolean(clientTampering),
+            confidence: (rawSecuritySignals?.tamperingConfidence || 'high') as
+              | 'low'
+              | 'medium'
+              | 'high',
+            mlScore:
+              typeof rawSecuritySignals?.tamperingMlScore === 'number'
+                ? rawSecuritySignals.tamperingMlScore
+                : 0.0024,
+            details: rawSecuritySignals?.tamperingDetails ?? {
+              anomaly_score: 0,
+              anti_detect_browser: false,
+              devtools_device_emulation: false,
+              reasons: [],
+            },
+          };
+    const activeCallSupported = Boolean(rawSecuritySignals?.activeCallSupported);
+    const activeCall = activeCallSupported && Boolean(rawSecuritySignals?.activeCall);
+    const privacySettings = Boolean(
+      rawSecuritySignals?.privacySettings ||
+        rawSecuritySignals?.isTorBrowserClient ||
+        securitySignals.privacyProtected
+    );
+    const developerTools = Boolean(rawSecuritySignals?.developerTools);
+    const suspectScore100 = computeSuspectScore100({
+      bot: Boolean(securitySignals.isBot),
+      replayed: Boolean(securitySignals.replayDetected),
+      tampering: Boolean(tamperingAssessment?.tampering),
+      vpn: Boolean(securitySignals.vpnSuspected),
+      vpnMethodCount: Array.isArray(securitySignals.vpnReasons)
+        ? securitySignals.vpnReasons.length
+        : 0,
+      blocklisted: Boolean(securitySignals.torExitNode || securitySignals.ipBlocklisted),
+      virtualMachine: Boolean(
+        securitySignals.isVirtualMachine ||
+          securitySignals.cloudOrMaskedGpu ||
+          securitySignals.emulatorDetected
+      ),
+      proxy: Boolean(
+        (securitySignals as SecuritySignals & { proxyDetected?: boolean }).proxyDetected
+      ),
+      simulator: Boolean(securitySignals.emulatorDetected),
+      activeCall,
+      privacySettings,
+      incognito: Boolean(securitySignals.isIncognito),
+      highActivityDevice,
+      developerTools,
+      rareDevice: rarityReport.rareDevice,
+    });
+
     // Every history row always carries suspectScore / riskLevel / recognitionSource so the UI
     // never renders `undefined`. Stored per-visit risk data is used when present; the current
     // visit falls back to the just-computed security signals; legacy rows use safe defaults.
@@ -5715,6 +6039,18 @@ app.post('/api/visitor/identify', async (req, res) => {
       riskLevel: securitySignals.riskLevel,
       riskBadgeText: securitySignals.riskBadgeText,
       smartSignals: securitySignals.smartSignals,
+      // API v4 mirrors: 0-100 calibrated composite, velocity windows and device rarity.
+      suspectScore100,
+      velocity: velocityReport.velocity,
+      highActivityDevice,
+      rareDevice: rarityReport.rareDevice,
+      rareDevicePercentileBucket: rarityReport.bucket,
+      tampering: tamperingAssessment?.tampering ?? false,
+      tamperingConfidence: tamperingAssessment?.confidence ?? 'high',
+      tamperingDetails: tamperingAssessment?.details,
+      activeCall,
+      activeCallSupported,
+      rawDeviceAttributes: rawSecuritySignals?.rawDeviceAttributes ?? null,
     };
 
     res.json(payload);
