@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useMemo, useState, useCallback } from 'react';
 import { identifyCurrentVisitor, detectIncognitoMode, detectEmulatorEvidence } from './lib/collector';
 import type { EmulatorEvidence } from './lib/collector';
 import type {
@@ -13,6 +13,11 @@ import type {
 import { LocationMap } from './components/LocationMap';
 import { NetworkStabilityPanel } from './components/NetworkStabilityPanel';
 import { CpuActivityPanel } from './components/CpuActivityPanel';
+import { SmartSignalsGrid } from './components/SmartSignalsGrid';
+import {
+  CursorAttributionOverlay,
+  resolveCursorIdentity,
+} from './components/CursorAttributionOverlay';
 import {
   Copy,
   Check,
@@ -37,25 +42,8 @@ import {
   CircuitBoard,
   HardDrive,
   Palette,
-  Moon,
-  Sun,
   Bot,
 } from 'lucide-react';
-
-type ThemeMode = 'light' | 'dark';
-
-const THEME_STORAGE_KEY = 'intel_theme';
-
-function resolveInitialTheme(): ThemeMode {
-  if (typeof window === 'undefined') return 'light';
-  try {
-    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
-    if (stored === 'dark' || stored === 'light') return stored;
-  } catch {
-    // localStorage unavailable
-  }
-  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-}
 
 /**
  * Formats a stored UTC ISO-8601 timestamp into the visitor's local timezone.
@@ -603,21 +591,18 @@ export default function App() {
   const [copiedId, setCopiedId] = useState<boolean>(false);
   const [copiedHwId, setCopiedHwId] = useState<boolean>(false);
   const [selectedVisitIndex, setSelectedVisitIndex] = useState<number>(0);
-  const [theme, setTheme] = useState<ThemeMode>(resolveInitialTheme);
+  const [visibleVisitsCount, setVisibleVisitsCount] = useState<number>(5);
+  const [copiedJson, setCopiedJson] = useState<boolean>(false);
 
+  // Swiss light mode is the only theme: strip any legacy class left by a previous session.
   useEffect(() => {
-    const isDark = theme === 'dark';
-    document.documentElement.classList.toggle('dark', isDark);
-    document.body?.classList.toggle('dark', isDark);
+    document.documentElement.classList.remove('dark');
+    document.body?.classList.remove('dark');
     try {
-      window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+      window.localStorage.removeItem('intel_theme');
     } catch {
       // localStorage unavailable
     }
-  }, [theme]);
-
-  const toggleTheme = useCallback(() => {
-    setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'));
   }, []);
 
   const loadVisitorData = useCallback(async (manualRefresh = false) => {
@@ -780,6 +765,144 @@ export default function App() {
     : resolveRiskTier(displayedRiskScore);
   const riskBadgeText = serverRiskBadgeText ?? `${riskTier} Risk • ${displayedRiskScore}/10`;
 
+  // Calibrated 0-100 composite for the top-centered Risk Meter. Older payloads fall back to
+  // the 0-10 card-floor score scaled by ten so the meter always has a value.
+  const suspectScore100 = data
+    ? Math.max(
+        0,
+        Math.min(
+          100,
+          Math.round(
+            Number(data.suspectScore100 ?? data.securitySignals?.suspectScore100 ?? displayedRiskScore * 10) || 0
+          )
+        )
+      )
+    : 0;
+
+  // Cursor attribution pill: resolved from the first-party bot / agent verdicts.
+  const cursorIdentity = resolveCursorIdentity({
+    botSubtype: data?.securitySignals.botSubtype ?? null,
+    isBot: Boolean(data?.securitySignals.isBot),
+    agentId: data?.securitySignals.aiAgent?.agentId ?? null,
+    agentName: data?.securitySignals.aiAgent?.agentName ?? null,
+    isBrave: Boolean(
+      typeof navigator !== 'undefined' &&
+        (navigator as unknown as { brave?: { isBrave?: () => boolean } }).brave?.isBrave
+    ),
+  });
+
+  // API v4 event payload rendered by the bottom inspector. Built exclusively from live
+  // first-party values: no invented signals, no third-party fraud labels.
+  const eventJson = useMemo(() => {
+    if (!data) return null;
+    const s = data.securitySignals;
+    const firstVisitMs = Date.parse(data.visitHistory[0]?.visitedAtUtc || '') || Date.now();
+    const deviceType = data.browserDevice.deviceType;
+    const osName = data.browserDevice.os;
+    const rawAttributes =
+      data.rawDeviceAttributes ?? (s as { rawDeviceAttributes?: unknown }).rawDeviceAttributes ?? null;
+    return {
+      event_id: `${firstVisitMs}.${data.visitorId.slice(-6)}`,
+      timestamp: firstVisitMs,
+      source: 'device',
+      linked_id: data.statistics.currentSessionId,
+      environment_id: 'intel_adityahq_first_party',
+      sdk: {
+        platform: 'js',
+        version: '2.1.0',
+        integrations: [
+          { name: 'intel-system-express-vercel', version: '2.1.0' },
+          { name: 'intel-system-react', version: '19.0.0' },
+        ],
+      },
+      replayed: Boolean(s.replayDetected),
+      identification: {
+        visitor_id: data.visitorId,
+        hardware_id: data.hardwareId,
+        confidence: { score: 1, version: 'v2.1' },
+        visitor_found: data.isReturning,
+        recognition_mode: data.recognitionSource,
+        first_seen_at: Date.parse(data.statistics.firstVisitUtc) || null,
+        last_seen_at: Date.parse(data.statistics.lastVisitUtc) || null,
+      },
+      url: typeof window !== 'undefined' ? window.location.href : '',
+      ip_address: data.location.publicIp,
+      user_agent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+      device: deviceType,
+      os: osName,
+      os_version: data.browserDevice.platform,
+      browser_details: {
+        browser_name: data.browserDevice.browser,
+        browser_major_version: String(data.browserDevice.browser || '').replace(/\D.*$/, ''),
+        browser_full_version: data.browserDevice.browser,
+        os: osName,
+        os_version: data.browserDevice.platform,
+        device: deviceType,
+      },
+      active_call: Boolean(data.activeCall ?? s.activeCall),
+      bot: s.botSubtype === 'bad_bot' || s.botSubtype === 'ai_agent' ? 'bad' : 'not_detected',
+      developer_tools: Boolean(s.developerTools),
+      ip_blocklist: {
+        email_spam: false,
+        attack_source: Boolean(s.ipBlocklisted),
+        tor_node: Boolean(s.torExitNode),
+      },
+      ip_info: {
+        v4: {
+          address: data.location.publicIp,
+          geolocation: {
+            accuracy_radius: data.location.isLocationVerified ? 100 : null,
+            latitude: data.location.latitude,
+            longitude: data.location.longitude,
+            timezone: data.browserDevice.timezone,
+            city_name: data.location.city,
+            country_code: data.location.countryCode,
+            country_name: data.location.country,
+            subdivisions: data.location.region ? [{ name: data.location.region }] : [],
+          },
+          asn: data.location.asn,
+          asn_name: data.location.org,
+          asn_type: s.isDatacenterOrHosting ? 'hosting' : 'isp',
+          datacenter_result: Boolean(s.isDatacenterOrHosting),
+        },
+      },
+      proxy: Boolean((s as unknown as { proxyDetected?: boolean }).proxyDetected),
+      proxy_confidence: 'high',
+      incognito: Boolean(s.isIncognito ?? s.incognito ?? s.privateMode),
+      privacy_settings: Boolean(
+        (s as { privacySettings?: boolean }).privacySettings || s.isTorBrowserClient
+      ),
+      simulator: Boolean(s.emulatorDetected),
+      suspect_score: suspectScore100,
+      tampering: Boolean(data.tampering ?? s.tampering),
+      tampering_confidence: data.tamperingConfidence ?? 'high',
+      tampering_ml_score: s.tamperingMlScore ?? 0.0024,
+      tampering_details: data.tamperingDetails ?? {
+        anomaly_score: 0,
+        anti_detect_browser: false,
+        devtools_device_emulation: false,
+        reasons: [],
+      },
+      velocity: data.velocity ?? null,
+      virtual_machine: Boolean(s.isVirtualMachine || s.emulatorDetected),
+      vpn: Boolean(s.vpnSuspected),
+      vpn_confidence: s.vpnSuspected ? 'high' : 'low',
+      vpn_methods: {
+        timezone_mismatch: Boolean(s.timezoneMismatch),
+        public_vpn: Boolean(s.datacenterAsn),
+        auxiliary_mobile: false,
+        os_mismatch: Boolean(s.isOsTampered),
+        relay: Boolean(s.torExitNode),
+        ml_prediction: Boolean(s.vpnSuspected),
+      },
+      high_activity_device: Boolean(data.highActivityDevice ?? s.highActivityDevice),
+      rare_device: Boolean(data.rareDevice ?? s.rareDevice),
+      rare_device_percentile_bucket:
+        data.rareDevicePercentileBucket ?? s.rareDevicePercentileBucket ?? '<p95',
+      raw_device_attributes: rawAttributes,
+    };
+  }, [data, suspectScore100]);
+
   // Tor / AI attribution surface — rendered above the Smart Signals grid whenever any
   // first-party anonymity or agent identity was resolved for this visit.
   const activeAiAgent = data?.securitySignals?.aiAgent ?? null;
@@ -791,11 +914,7 @@ export default function App() {
   );
 
   return (
-    <div
-      className={`${
-        theme === 'dark' ? 'dark bg-[#0b1220] text-[#f1f5f9]' : 'bg-[#F4F5F7] text-[#111827]'
-      } min-h-screen flex flex-col transition-colors duration-150`}
-    >
+    <div className="bg-[#F4F5F7] text-[#111827] min-h-screen flex flex-col">
       {/* Responsive Top Navigation Bar */}
       <header className="bg-white border-b border-[#E5E7EB] px-4 sm:px-6 py-3.5">
         <div className="max-w-7xl mx-auto flex items-center justify-between gap-4 sm:gap-8">
@@ -824,16 +943,6 @@ export default function App() {
           <div className="flex items-center gap-2 shrink-0">
             <button
               type="button"
-              onClick={toggleTheme}
-              aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-              aria-pressed={theme === 'dark'}
-              title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-              className="inline-flex items-center justify-center w-8 h-8 text-slate-700 bg-white hover:bg-slate-50 border border-slate-300 rounded-md shrink-0 cursor-pointer"
-            >
-              {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
-            </button>
-            <button
-              type="button"
               onClick={() => loadVisitorData(true)}
               disabled={loading || refreshing}
               className="inline-flex items-center gap-1.5 px-3 sm:px-3.5 py-1.5 text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-300 rounded-md disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
@@ -846,6 +955,64 @@ export default function App() {
       </header>
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-6 py-4 sm:py-7 space-y-6">
+        {/* Top-centered Risk Meter: calibrated 0-100 Suspect Score */}
+        <section className="w-full max-w-2xl mx-auto flex flex-col items-center justify-center text-center pt-4 pb-2 px-4">
+          <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-slate-500">
+            Device Intelligence
+          </span>
+          <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
+            <span
+              className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold ${
+                suspectScore100 === 0
+                  ? 'bg-[#E6F4EA] border-[#81C995] text-[#137333]'
+                  : riskTier === 'High'
+                  ? 'bg-[#FCE8E6] border-[#D93025]/40 text-[#D93025]'
+                  : riskTier === 'Medium'
+                  ? 'bg-[#FEF7E0] border-[#F9AB00]/50 text-[#B06000]'
+                  : 'bg-[#E6F4EA] border-[#81C995] text-[#137333]'
+              }`}
+            >
+              {riskTier === 'High' ? (
+                <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
+              ) : (
+                <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+              )}
+              {suspectScore100 === 0 ? 'Not detected' : `Suspect Score \u2022 ${suspectScore100}`}
+            </span>
+            {suspectScore100 > 0 && (
+              <span className="text-[11px] font-mono text-slate-500">{riskTier} Risk</span>
+            )}
+          </div>
+          <div className="w-full max-w-md h-2.5 bg-slate-200 rounded-full overflow-hidden mt-3">
+            <div
+              className={`h-full transition-all duration-300 ${
+                riskTier === 'High'
+                  ? 'bg-[#D93025]'
+                  : riskTier === 'Medium'
+                  ? 'bg-[#F9AB00]'
+                  : 'bg-[#81C995]'
+              }`}
+              style={{ width: `${Math.max(2, suspectScore100)}%` }}
+            />
+          </div>
+          <div className="mt-3 flex items-center justify-center gap-3">
+            <button
+              type="button"
+              onClick={() => loadVisitorData(true)}
+              disabled={loading || refreshing}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-md disabled:opacity-50 cursor-pointer"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+              <span>{refreshing ? 'Analyzing...' : 'Analyze my browser'}</span>
+            </button>
+            <a
+              href="#raw-json"
+              className="text-xs font-medium text-slate-600 hover:text-slate-900 underline underline-offset-2"
+            >
+              View Event JSON
+            </a>
+          </div>
+        </section>
         {error && (
           <div className="bg-white border border-red-300 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div className="flex items-center gap-2.5 text-xs text-red-700">
@@ -1408,6 +1575,22 @@ export default function App() {
                     );
                   })}
                 </div>
+
+                {/* Granular Smart Signals grid: one deterministic row per signal */}
+                <div className="mt-5 pt-4 border-t border-[#E5E7EB]">
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <div className="flex items-center gap-2">
+                      <Layers className="w-4 h-4 text-[#2563EB] shrink-0" />
+                      <h3 className="text-xs sm:text-sm font-semibold text-slate-900">
+                        Smart Signals
+                      </h3>
+                    </div>
+                    <span className="text-[11px] font-mono text-slate-500">
+                      {data.visitHistory.length} {data.visitHistory.length === 1 ? 'record' : 'records'} persisted
+                    </span>
+                  </div>
+                  <SmartSignalsGrid data={data} />
+                </div>
               </div>
 
               {/* Clean Visual Trust Meter Footer Bar */}
@@ -1431,7 +1614,7 @@ export default function App() {
                         : 'bg-emerald-500'
                     }`}
                     style={{
-                      width: `${Math.max(6, displayedRiskScore * 10)}%`,
+                      width: `${Math.max(2, suspectScore100)}%`,
                     }}
                   />
                 </div>
@@ -1609,7 +1792,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {data.visitHistory.map((visit, index) => {
+                  {data.visitHistory.slice(0, visibleVisitsCount).map((visit, index) => {
                     const rowIsp = formatValidNetworkField(visit.isp);
                     const rowOrg = formatValidNetworkField(visit.org);
                     const rowAsn = formatValidNetworkField(visit.asn);
@@ -1684,9 +1867,85 @@ export default function App() {
                 </tbody>
               </table>
             </div>
+
+            {data.visitHistory.length > 5 && (
+              <div className="mt-3 pt-3 border-t border-[#E5E7EB] flex flex-wrap items-center justify-between gap-3">
+                <span className="text-[11px] font-mono text-slate-500">
+                  Showing {Math.min(visibleVisitsCount, data.visitHistory.length)} of{' '}
+                  {data.visitHistory.length} visits
+                </span>
+                <div className="flex items-center gap-2">
+                  {visibleVisitsCount < data.visitHistory.length && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setVisibleVisitsCount((prev) =>
+                          Math.min(prev + 5, data.visitHistory.length)
+                        )
+                      }
+                      className="px-3 py-1.5 text-xs font-medium text-slate-800 bg-white border border-slate-300 rounded-md hover:bg-slate-50 cursor-pointer"
+                    >
+                      Show next 5 visits (+
+                      {Math.min(5, data.visitHistory.length - visibleVisitsCount)})
+                    </button>
+                  )}
+                  {visibleVisitsCount > 5 && (
+                    <button
+                      type="button"
+                      onClick={() => setVisibleVisitsCount(5)}
+                      className="px-3 py-1.5 text-xs font-medium text-slate-600 bg-white border border-slate-300 rounded-md hover:bg-slate-50 cursor-pointer"
+                    >
+                      Collapse to latest 5
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
           </section>
         )}
+
+        {/* Bottom event inspector: complete API v4 payload built from live signals */}
+        <section id="raw-json" className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3.5 border-b border-[#E5E7EB]">
+            <div className="flex items-center gap-2">
+              <KeyRound className="w-4 h-4 text-slate-700 shrink-0" />
+              <h2 className="text-sm sm:text-base font-semibold text-slate-900">
+                Event JSON
+              </h2>
+              <span className="text-[11px] font-mono text-slate-500">API v4</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={async () => {
+                  if (!eventJson) return;
+                  try {
+                    await navigator.clipboard.writeText(JSON.stringify(eventJson, null, 2));
+                    setCopiedJson(true);
+                    setTimeout(() => setCopiedJson(false), 1500);
+                  } catch {
+                    // Clipboard unavailable
+                  }
+                }}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-800 bg-white border border-slate-300 rounded-md hover:bg-slate-50 cursor-pointer"
+              >
+                {copiedJson ? (
+                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                ) : (
+                  <Copy className="w-3.5 h-3.5" />
+                )}
+                {copiedJson ? 'Copied' : 'Copy Event JSON'}
+              </button>
+            </div>
+          </div>
+          <pre className="mt-3 max-h-[420px] overflow-auto rounded-xl bg-[#F8FAFC] border border-[#E5E7EB] p-3 text-[11px] leading-relaxed font-mono text-slate-700">
+{eventJson ? JSON.stringify(eventJson, null, 2) : 'Collecting event payload...'}
+          </pre>
+        </section>
       </main>
+
+      {/* Cursor attribution: human pointer or remote browser agent pill */}
+      <CursorAttributionOverlay identity={cursorIdentity} />
     </div>
   );
 }
