@@ -7,62 +7,58 @@
 *Know the visitor. Understand the device. Inspect the network.*
 
 [![Live Demo](https://img.shields.io/badge/Live_Demo-Explore-22C55E?logo=cloudflare&logoColor=white)](https://intel.adityahq.me)
-[![Visitor Identity](https://img.shields.io/badge/Visitor_Identity-First--Party-2563EB)](#visitor-intelligence)
-[![Threat Signals](https://img.shields.io/badge/Threat_Signals-Multi--Signal-DC2626)](#threat-analysis)
-[![Network](https://img.shields.io/badge/Network-Real--Time-0891B2)](#network--device-intelligence)
-[![Visit History](https://img.shields.io/badge/Visit_History-Persistent-059669)](#visit-history)
+[![Visitor Identity](https://img.shields.io/badge/Visitor_Identity-First--Party-2563EB)](#what-it-does)
+[![Threat Signals](https://img.shields.io/badge/Threat_Signals-Multi--Signal-DC2626)](#what-it-detects)
+[![Network](https://img.shields.io/badge/Network-Real--Time-0891B2)](#dashboard)
+[![Visit History](https://img.shields.io/badge/Visit_History-Persistent-059669)](#dashboard)
 [![Deployment](https://img.shields.io/badge/Deployment-Cloudflare_Workers-F38020?logo=cloudflare&logoColor=white)](https://developers.cloudflare.com/workers/)
 
 </div>
 
-Intel System is a first-party visitor intelligence dashboard that brings browser identity, hardware fingerprinting, network telemetry, and threat signals into one interface.
+## What it does
 
-## Features
+Intel System turns a browser visit into an explainable intelligence profile. It combines first-party identity signals, hardware and rendering fingerprints, network telemetry, privacy indicators, and behavioural context to assess whether a visitor is human, automated, private, proxied, or emulated.
 
-### Visitor intelligence
-- Persistent Visitor ID (`vid_`) and Hardware ID (`hwid_`).
-- Returning visitor and session recognition.
-- Visit totals, observed IPs and geolocation history.
-- Hardware-based identity recovery when cookies are cleared.
+Every analysis is performed through a signed first-party API request, scored across granular signals, stored as visit history, and rendered in a real-time dashboard.
 
-### Threat analysis
+## Why it’s different
 
-Four core cards and a granular grid rate every visit from `0/10` to `10/10`. The server computes both, and the dashboard mirrors the same rules client-side, so the tiles and the meter never disagree.
+- **First-party and transparent** — visitor signals are collected and processed through your own API, with no third-party tracking dependency.
+- **Multi-layer analysis** — combines browser identity, hardware fingerprints, network intelligence, privacy settings, and behavioural signals.
+- **Explainable scoring** — each signal has a visible status and score, while the server also produces a calibrated overall risk score.
+- **Persistent visitor history** — recognizes returning visitors and preserves session, IP, location, and device context across visits.
+- **Serverless-ready** — designed for Cloudflare Workers with SQLite-backed Durable Objects, while remaining deployable with Express.
 
-| Signal | Evidence used | Score |
-|---|---|---|
-| Incognito / Private Browsing | IndexedDB strict-commit durability, OPFS flush timing, quota headroom | `0/10` or `4/10` |
-| Bot & Automation Detection | User-Agent, operator ASN, rDNS, Web Bot Auth, WebDriver, CDP, headless rendering | `0`, `2`, `8`, `9` or `10/10` |
-| VPN / Proxy & Network Type | Tor DNSEL, cached exit list, datacenter ASN, timezone mismatch, proxy headers | `0` to `10/10` |
-| Virtual Machine & OS Integrity | GPU vendor and renderer, platform, touch points, screen width, emulator markers | `0` to `10/10` |
+## What it detects
 
-- **Sealed request envelope**: every payload carries a SHA-256 signature, a `±60 s` timestamp window and a one-time nonce. Stale, modified or replayed requests report `Tampered / Replayed 10/10`.
-- **Browser tampering**: DevTools device emulation and anti-detect browsers are caught by cross-checking a mobile User-Agent against `navigator.platform`, the JavaScript engine, `navigator.maxTouchPoints`, `outerWidth` versus `screen.width`, the unmasked WebGL renderer, `matchMedia` versus `screen.width`, replaced `Navigator.prototype` getters, and the JS versus HTTP User-Agent. A genuine iPadOS `MacIntel` device with real touch points stays clean.
-- **Docked DevTools**: a `200 px` outer/inner viewport delta reports `Developer Tools: Yes`.
-- **Proxy detection**: `Proxy-Authorization`, `Proxy-Connection`, a non-CDN `Via` header, an upstream `Forwarded` address, or a three-hop public `X-Forwarded-For` chain reports `Proxy Detection: Yes` with the proving header.
-- **Active call detection**: a connected WebRTC audio track, `navigator.audioSession` or a voice-routed `AudioContext` detects an in-progress call. The row is pruned where call state cannot be observed.
-- **Privacy settings**: Tor Browser RFP, letterboxed viewports, Brave Shields and canvas anti-fingerprinting noise.
-- **Velocity and rarity**: SQLite windows over `5 minutes`, `1 hour` and `24 hours` count distinct IPs, linked sessions, countries and events. `High-Activity Device` trips at 20+ events in 24 hours, and `Rare Device` compares the configuration against a 30-day baseline.
-- **Remote browser agents**: Firecrawl, Browser Use, Skyvern, MultiOn, Hyperbrowser, Steel, Airtop, Notte, Lightpanda and Browserless are attributed by name, while signed cloud browsers are verified through Web Bot Auth.
+| Area | What Intel System checks |
+|---|---|
+| Visitor identity | Persistent Visitor ID, Hardware ID, returning visitors, sessions, visit totals, observed IPs, and geolocation history |
+| Incognito / private browsing | IndexedDB durability, OPFS flush timing, and storage quota behaviour |
+| Bots and automation | User-Agent consistency, operator ASN, rDNS, Web Bot Auth, WebDriver, CDP, and headless-rendering signals |
+| VPN, proxy, and Tor | Tor DNSEL and exit lists, datacenter ASN, timezone mismatch, proxy headers, and forwarded-IP chains |
+| Virtual machines and emulators | GPU vendor/renderer, platform, touch points, screen dimensions, and emulator markers |
+| Browser tampering | DevTools emulation, anti-detect browsers, replaced Navigator getters, and JavaScript-versus-HTTP User-Agent mismatches |
+| Developer tools | Docked DevTools through outer/inner viewport differences |
+| Active calls | WebRTC audio tracks, `navigator.audioSession`, and voice-routed AudioContext state |
+| Privacy settings | Tor Browser RFP, letterboxed viewports, Brave Shields, and canvas anti-fingerprinting noise |
+| Behaviour and rarity | IP, session, country, and event velocity across 5-minute, 1-hour, and 24-hour windows; rare-device comparison against a 30-day baseline |
+| Remote browser agents | Named attribution for Firecrawl, Browser Use, Skyvern, MultiOn, Hyperbrowser, Steel, Airtop, Notte, Lightpanda, and Browserless; Web Bot Auth verification for signed cloud browsers |
 
-### Smart Signals grid and risk score
-- One deterministic row per signal, with plain statuses such as `Not detected`, `You are incognito`, `You are using a VPN` and `Your IP is a Tor exit node`.
-- Every visible score is `0/10`. The server also publishes the calibrated additive `0/100` score in the event payload. Weights are clamped: bot 45, replay 35, tampering 25, VPN 14 plus 4 for multiple methods, blocklist 12, virtual machine 12, proxy 10, simulator 10, active call 10, privacy settings 8, incognito 6, high activity 6, developer tools 5, rare device 4.
-- The dashboard stacks the identity overview, then Hardware & Rendering Entropy, then Smart Signals & Threat Analysis, then Network Stability and CPU Activity side by side, then Visit History and the Event JSON inspector.
-- `Analyze my browser` re-runs collection without a page reload, so a DevTools device preset is reflected immediately.
-- The Event JSON inspector at `#raw-json` renders and copies the live API v4 payload, including raw device attributes (fonts, emoji metrics, canvas stability, WebGL hashes, math vector).
-- The cursor overlay appears for non-human visitors only. A human keeps the native cursor with no pill and no listeners. Remote browser agents get a branded pill, and agents that click or focus without moving a pointer are attributed at the interacted element.
+The four core cards and granular signal grid rate visits from `0/10` to `10/10`. The server computes both views, and the dashboard mirrors the same rules client-side so the displayed scores remain consistent.
 
-### Network & device intelligence
-- Public IP, ISP, ASN and verified geolocation on an interactive Leaflet map.
-- Browser, OS, CPU, GPU, memory and display details.
-- Live RTT, jitter and failed-HTTP-probe monitoring on a fixed `0-1000 ms` axis, paused when the tab is hidden or offline.
-- CPU pressure through the W3C Compute Pressure API, with a 1 Hz heartbeat so a steady load never freezes the timeline. The panel is pruned on mobile and unsupported browsers.
+<details>
+<summary><strong>Sealed request and tamper protection</strong></summary>
 
-### Visit history
-- Persistent first-party visit records with session, timestamp, IP, location and device details.
-- Latest five visits by default, with `Show next 5 visits (+5)` and `Collapse to latest 5`.
-- Server-signed history backup for serverless continuity.
+Every payload includes a SHA-256 signature, a `±60 s` timestamp window, and a one-time nonce. Stale, modified, or replayed requests are reported as `Tampered / Replayed 10/10`.
+
+Browser-tampering checks cross-reference the mobile User-Agent with `navigator.platform`, the JavaScript engine, `navigator.maxTouchPoints`, `outerWidth` versus `screen.width`, the unmasked WebGL renderer, `matchMedia` versus `screen.width`, replaced `Navigator.prototype` getters, and the JavaScript-versus-HTTP User-Agent. A genuine iPadOS `MacIntel` device with real touch points remains clean.
+
+Proxy signals include `Proxy-Authorization`, `Proxy-Connection`, a non-CDN `Via` header, an upstream `Forwarded` address, and a three-hop public `X-Forwarded-For` chain. The dashboard identifies the proving header when proxy detection triggers.
+
+</details>
+
+## How it works
 
 ```mermaid
 flowchart TD
@@ -125,12 +121,45 @@ flowchart TD
   History --> Backup["Server-signed history backup"]
 ```
 
-One signed payload goes in. The server verifies it, resolves the network, classifies the visitor, scores every signal, stores the visit and returns the same evidence the dashboard renders.
+One signed payload goes in. The server verifies it, resolves the network, classifies the visitor, scores every signal, stores the visit, and returns the same evidence the dashboard renders.
 
-> Browser fingerprinting and threat detection rely on heuristic signals. Results can vary with browser privacy settings, proxies, extensions and platform capabilities.
+## Try it
 
-Deployment, storage and cost details are documented in [CLOUDFLARE.md](./CLOUDFLARE.md).
+Open the [live demo](https://intel.adityahq.me) and select **Analyze my browser**.
 
-## Tech
+| Test | What to observe |
+|---|---|
+| Normal browsing | Identity, device, network, and signal panels populate with a low-risk profile |
+| Incognito or private window | Privacy and storage-related signals change |
+| VPN or proxy | Network type, ASN, timezone, and proxy signals are reassessed |
+| DevTools device emulation | Tampering and device-consistency signals respond immediately |
+| Repeated visits | Visitor recognition, visit totals, and history update |
 
-React 19 · TypeScript · Tailwind CSS v4 · Vite · Express · Cloudflare Workers · SQLite-backed Durable Objects · Leaflet
+## Dashboard
+
+- **Identity overview** — visitor and hardware identity, returning-visitor state, visit totals, and observed locations.
+- **Hardware & rendering entropy** — browser, OS, CPU, GPU, memory, display, fonts, emoji metrics, canvas stability, WebGL hashes, and math-vector attributes.
+- **Smart Signals & threat analysis** — deterministic signal rows, four core risk cards, and a granular signal grid.
+- **Network stability & CPU activity** — public IP, ISP, ASN, interactive Leaflet geolocation map, live RTT, jitter, failed HTTP probes, and Compute Pressure-based CPU activity.
+- **Visit history** — persistent session, timestamp, IP, location, and device records; latest five visits by default with expand/collapse controls.
+- **Event JSON inspector** — renders and copies the live API v4 payload, including raw device attributes.
+- **Cursor overlay** — appears only for non-human visitors; humans retain the native cursor, while remote browser agents receive a branded attribution pill.
+
+## Privacy & limitations
+
+Intel System is designed around first-party visitor intelligence. Browser fingerprinting and threat detection rely on heuristic signals, so results can vary with browser privacy settings, proxies, extensions, and platform capabilities.
+
+## Tech stack
+
+![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
+![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-v4-06B6D4?logo=tailwindcss&logoColor=white)
+![Vite](https://img.shields.io/badge/Vite-Build-646CFF?logo=vite&logoColor=white)
+![Express](https://img.shields.io/badge/Express-API-000000?logo=express&logoColor=white)
+![Cloudflare Workers](https://img.shields.io/badge/Cloudflare_Workers-Edge-F38020?logo=cloudflare&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-Durable_Objects-003B57?logo=sqlite&logoColor=white)
+![Leaflet](https://img.shields.io/badge/Leaflet-Maps-199900?logo=leaflet&logoColor=white)
+
+## Deployment
+
+Deployment, storage, and cost details are documented in [CLOUDFLARE.md](./CLOUDFLARE.md).
