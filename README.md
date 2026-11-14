@@ -1,4 +1,3 @@
-
 <div align="center">
 
 # Intel System
@@ -99,6 +98,19 @@ Four core cards and a granular grid rate every visit from `0/10` to `10/10`. The
 - Persistent first-party visit records with session, timestamp, IP, location and device details.
 - Latest five visits by default, with `Show next 5 visits (+5)` and `Collapse to latest 5`.
 - Server-signed history backup for serverless continuity.
+
+```mermaid
+flowchart LR
+  A(["New visit detected"]) --> B{"Returning visitor?"}
+  B -- "Yes" --> C["Match Visitor ID + Hardware ID"]
+  B -- "No" --> D["Create Visitor ID + Hardware ID"]
+  C --> E["Update visit streak"]
+  D --> E
+  E --> F["Capture IP · location · device"]
+  F --> G["Append signed history record"]
+  G --> H["Render latest 5 visits"]
+  H --> I["Expand older history on demand"]
+```
 
 > Browser fingerprinting and threat detection rely on heuristic signals. Results can vary with browser privacy settings, proxies, extensions and platform capabilities.
 
