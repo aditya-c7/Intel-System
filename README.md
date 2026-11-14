@@ -45,8 +45,8 @@ Four Smart Signals cards rate each visit from `0/10` to `10/10`, and the granula
 - **Velocity and rarity** — SQLite aggregations over `5 minutes`, `1 hour` and `24 hours` windows count distinct IPs, linked sessions, countries, events and per-IP events. `High-Activity Device` trips at 20+ events or 3+ IPs in 24 hours; `Rare Device` compares the device configuration against a 30-day baseline with `p95-p99` and `>p99` buckets.
 
 ### Smart Signals grid and risk score
-- A granular grid renders one row per signal with deterministic statuses: `Not detected`, `You are incognito 🕶`, `You are a bot`, `You are using a VPN 🌐`, `Your IP is a Tor exit node 🧅`.
-- The top-centered Risk Meter shows the calibrated `0–100` Suspect Score. Weights are additive and clamped: bot 45, replay 35, tampering 25, VPN 14 (plus 4 for multiple methods), blocklist 12, virtual machine 12, proxy 10, simulator 10, active call 10, privacy settings 8, incognito 6, high activity 6, developer tools 5, rare device 4.
+- A granular grid renders one row per signal with deterministic statuses: `Not detected`, `You are incognito`, `You are a bot`, `You are using a VPN`, `Your IP is a Tor exit node`.
+- The top-centered Risk Meter shows the Suspect Score on a `0–10` scale, matching every tile. The server also publishes the calibrated additive `0–100` score in the event payload. Weights are additive and clamped: bot 45, replay 35, tampering 25, VPN 14 (plus 4 for multiple methods), blocklist 12, virtual machine 12, proxy 10, simulator 10, active call 10, privacy settings 8, incognito 6, high activity 6, developer tools 5, rare device 4.
 - `Analyze my browser` re-runs collection without a page reload, so a DevTools device preset is reflected immediately.
 - The Event JSON inspector at `#raw-json` renders and copies the live API v4 payload, including the raw device attributes (fonts, emoji metrics, canvas stability, WebGL hashes, math vector).
 
