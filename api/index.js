@@ -1376,7 +1376,7 @@ async function resolveAiAgentIdentity(input) {
         ].filter(Boolean)
       });
     }
-    if (googleRangesLoaded || googleDnsNames.length > 0) {
+    if (googleRangesLoaded) {
       return aiAgentResult({
         agentId: "impostor-spoof",
         agentName: "Spoofed Google Bot Impostor (Unverified IP)",
@@ -1406,7 +1406,7 @@ async function resolveAiAgentIdentity(input) {
     const googleDns = hostMatchesSuffix(googleDnsNames, GOOGLE_VERIFICATION_SUFFIXES);
     const googleRangesLoaded = (aiBotPrefixTable.get("google-common")?.length ?? 0) > 0;
     const verified = webBotAuth.operator === "google" || googleCidr || googleDns;
-    if (geminiUa && !verified && (googleRangesLoaded || googleDnsNames.length > 0)) {
+    if (geminiUa && !verified && googleRangesLoaded) {
       return aiAgentResult({
         agentId: "impostor-spoof",
         agentName: "Spoofed Google Gemini Agent (Unverified IP)",
@@ -1460,20 +1460,6 @@ async function resolveAiAgentIdentity(input) {
     const xaiDns = hostMatchesSuffix(xaiDnsNames, XAI_VERIFICATION_SUFFIXES);
     const xaiAsn = asnIn(input.network.asn, XAI_ASNS);
     const verified = webBotAuth.operator === "xai" || xaiDns || xaiAsn;
-    if (grokUa && !verified && !grokReferer && xaiDnsNames.length > 0) {
-      return aiAgentResult({
-        agentId: "impostor-spoof",
-        agentName: "Spoofed xAI Grok Bot (Unverified IP)",
-        operator: "Unverified xAI claim",
-        executionMode: "Spoofed Impostor",
-        verified: false,
-        confidence: "Verified",
-        evidence: [
-          `Grok user-agent presented: ${ua.slice(0, 120)}`,
-          `Source IP ${input.publicIp} is not on xAI infrastructure`
-        ]
-      });
-    }
     return aiAgentResult({
       agentId: "grok",
       agentName: directoryHint?.clientName || "xAI Grok Bot",
@@ -1498,20 +1484,6 @@ async function resolveAiAgentIdentity(input) {
     const metaDns = hostMatchesSuffix(metaDnsNames, META_VERIFICATION_SUFFIXES);
     const metaAsn = asnIn(input.network.asn, META_ASNS);
     const verified = webBotAuth.operator === "meta" || metaDns || metaAsn;
-    if (museUa && !verified && metaDnsNames.length > 0) {
-      return aiAgentResult({
-        agentId: "impostor-spoof",
-        agentName: "Spoofed Meta Muse Agent (Unverified IP)",
-        operator: "Unverified Meta claim",
-        executionMode: "Spoofed Impostor",
-        verified: false,
-        confidence: "Verified",
-        evidence: [
-          `Meta agent user-agent presented: ${ua.slice(0, 120)}`,
-          `Source IP ${input.publicIp} is not on Meta infrastructure`
-        ]
-      });
-    }
     return aiAgentResult({
       agentId: "muse",
       agentName: directoryHint?.clientName || "Meta Muse",
@@ -1552,20 +1524,6 @@ async function resolveAiAgentIdentity(input) {
     );
     const perplexityAsn = asnIn(input.network.asn, PERPLEXITY_ASNS);
     const verified = webBotAuth.operator === "perplexity" || perplexityDns || perplexityAsn;
-    if (perplexityUa && !verified && perplexityDnsNames.length > 0) {
-      return aiAgentResult({
-        agentId: "impostor-spoof",
-        agentName: "Spoofed Perplexity Agent (Unverified IP)",
-        operator: "Unverified Perplexity claim",
-        executionMode: "Spoofed Impostor",
-        verified: false,
-        confidence: "Verified",
-        evidence: [
-          `Perplexity user-agent presented: ${ua.slice(0, 120)}`,
-          `Source IP ${input.publicIp} is not on Perplexity infrastructure`
-        ]
-      });
-    }
     return aiAgentResult({
       agentId: "perplexity",
       agentName: directoryHint?.clientName || "Perplexity AI Agent",
@@ -1605,7 +1563,7 @@ async function resolveAiAgentIdentity(input) {
     const openAiCidr = matchesAiPrefixTable(input.publicIp, ["chatgpt-user", "gptbot", "searchbot"]);
     const openAiRangesLoaded = (aiBotPrefixTable.get("chatgpt-user")?.length ?? 0) > 0 || (aiBotPrefixTable.get("gptbot")?.length ?? 0) > 0;
     const verified = webBotAuth.operator === "openai" || openAiDns || openAiCidr;
-    if (openAiUa && !verified && (openAiRangesLoaded || openAiDnsNames.length > 0)) {
+    if (openAiUa && !verified && openAiRangesLoaded) {
       return aiAgentResult({
         agentId: "impostor-spoof",
         agentName: "Spoofed OpenAI Agent (Unverified IP)",
@@ -1656,7 +1614,7 @@ async function resolveAiAgentIdentity(input) {
     const anthropicDnsNames = await confirmedNames();
     const anthropicDns = hostMatchesSuffix(anthropicDnsNames, ANTHROPIC_VERIFICATION_SUFFIXES);
     const verified = webBotAuth.operator === "anthropic" || anthropicDns;
-    if (claudeUa && !verified && anthropicDnsNames.length > 0) {
+    if (claudeUa && !verified && anthropicDns) {
       return aiAgentResult({
         agentId: "impostor-spoof",
         agentName: "Spoofed Anthropic Claude Agent (Unverified IP)",
