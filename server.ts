@@ -1106,6 +1106,63 @@ function readRequestHeader(headers: RawHeaderBag | null | undefined, name: strin
   return typeof raw === 'string' ? raw.trim() : '';
 }
 
+/**
+ * First-party proxy detection from request headers. A browser never talks to an origin through
+ * an explicit proxy without one of these markers, so their presence is direct evidence that the
+ * connection was relayed. Edge/CDN hops added by the hosting platform are excluded by name.
+ */
+function detectProxyHeaders(
+  headers: RawHeaderBag | null | undefined,
+  resolvedIp: string
+): { detected: boolean; reasons: string[] } {
+  const reasons: string[] = [];
+  if (!headers) return { detected: false, reasons };
+
+  if (readRequestHeader(headers, 'proxy-authorization')) {
+    reasons.push('Proxy-Authorization header');
+  }
+  if (readRequestHeader(headers, 'proxy-connection')) {
+    reasons.push('Proxy-Connection header');
+  }
+
+  // `Via` is added by forward and reverse proxies alike. The hosting edge uses its own product
+  // names, which are removed here so a platform hop is never reported as a user proxy.
+  const via = readRequestHeader(headers, 'via').toLowerCase();
+  if (via && !/varnish|vegur|cloudflare|akamai|fastly|vercel|netlify/.test(via)) {
+    reasons.push(`Via header (${via.slice(0, 80)})`);
+  }
+
+  // RFC 7239: a public `for=` address that is not the resolved client is an upstream relay.
+  const forwarded = readRequestHeader(headers, 'forwarded');
+  if (forwarded) {
+    for (const segment of forwarded.split(/[,;]/)) {
+      const match = /for="?\[?([0-9a-f:.]+)\]?"?/i.exec(segment.trim());
+      const hop = match?.[1]?.replace(/^::ffff:/, '');
+      if (hop && hop !== resolvedIp && isPublicRoutableIp(hop)) {
+        reasons.push(`Forwarded header names upstream relay ${hop}`);
+        break;
+      }
+    }
+  }
+
+  // A three-hop public chain cannot be produced by a single edge hop. Two public addresses are
+  // the normal client + edge pair, so only longer chains are reported.
+  const xff = readRequestHeader(headers, 'x-forwarded-for');
+  if (xff) {
+    const hops = new Set(
+      xff
+        .split(',')
+        .map((hop) => normalizeIpCandidate(hop))
+        .filter((hop): hop is string => Boolean(hop) && isPublicRoutableIp(hop))
+    );
+    if (hops.size >= 3) {
+      reasons.push(`X-Forwarded-For chain with ${hops.size} public hops`);
+    }
+  }
+
+  return { detected: reasons.length > 0, reasons };
+}
+
 /** Coarse browser / tool family used to compare a signed UA with the HTTP header. */
 function detectUaFamily(userAgent: string): string {
   const ua = userAgent.toLowerCase();
@@ -4997,6 +5054,8 @@ function sanitizeAndReinforceSecuritySignals(
     );
   }
 
+  const proxyAssessment = detectProxyHeaders(requestContext.headers, location.publicIp);
+
   const securitySignalsCore: SecuritySignals = {
     isBot,
     botSignals,
@@ -5084,6 +5143,9 @@ function sanitizeAndReinforceSecuritySignals(
       aiAgent: requestContext.aiAgent ?? null,
       ipBlocklisted,
       ipBlocklistReasons,
+      // Phase 5 — explicit proxy relay markers (Via / Forwarded / Proxy-Authorization chains)
+      proxyDetected: proxyAssessment.detected,
+      proxyReasons: proxyAssessment.reasons,
       // Phase 3 — mobile emulator / simulator verdict
       emulatorDetected,
       emulatorReason,

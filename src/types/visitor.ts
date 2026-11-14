@@ -232,6 +232,9 @@ export interface SecuritySignals {
   torExitNode?: boolean;
   ipBlocklisted?: boolean;
   ipBlocklistReasons?: string[];
+  /** Explicit proxy relay markers observed on the request (Via / Forwarded / proxy auth). */
+  proxyDetected?: boolean;
+  proxyReasons?: string[];
   /** Client-side Tor Browser fingerprint (Gecko RFP + letterboxing). */
   isTorBrowserClient?: boolean;
   /** Tri-state server verdict: an anonymous relay known to be an exit node or a relay. */

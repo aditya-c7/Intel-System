@@ -902,7 +902,6 @@ export default function App() {
   const activeAiAgent = data?.securitySignals?.aiAgent ?? null;
   const torExitDetected = Boolean(data?.securitySignals?.torExitNode);
   const torBrowserClient = Boolean(data?.securitySignals?.isTorBrowserClient);
-  const torOperatorLabel = data?.securitySignals?.torOperator || '';
   const showAttributionBanner = Boolean(
     data && (torExitDetected || torBrowserClient || activeAiAgent?.detected)
   );
@@ -1478,12 +1477,8 @@ export default function App() {
                           </span>
                           <span className="block text-[11px] leading-relaxed text-rose-700/80 font-mono break-words">
                             {[
-                              torExitDetected
-                                ? `Exit relay ${data.location.publicIp}`
-                                : `Client fingerprint on ${data.location.publicIp}`,
-                              torOperatorLabel ? `Operator ${torOperatorLabel}` : '',
-                              torExitDetected ? 'Server exit-list match' : '',
-                              torBrowserClient ? 'Tor Browser RFP + letterboxing' : '',
+                              torExitDetected ? 'Your IP is a Tor exit node' : '',
+                              torBrowserClient ? 'Tor Browser fingerprint detected' : '',
                             ]
                               .filter(Boolean)
                               .join(' · ')}

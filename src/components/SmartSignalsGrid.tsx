@@ -175,7 +175,7 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     label: 'Proxy Detection',
     status: proxy ? 'Yes' : 'Not detected',
     triggered: proxy,
-    detail: proxy ? signals.networkType : undefined,
+    detail: proxy ? signals.proxyReasons?.[0] || signals.networkType : undefined,
   });
 
   const highActivity = Boolean(data.highActivityDevice ?? signals.highActivityDevice);

@@ -780,6 +780,41 @@ function readRequestHeader(headers, name) {
   const raw = Array.isArray(direct) ? direct.join(", ") : direct;
   return typeof raw === "string" ? raw.trim() : "";
 }
+function detectProxyHeaders(headers, resolvedIp) {
+  const reasons = [];
+  if (!headers) return { detected: false, reasons };
+  if (readRequestHeader(headers, "proxy-authorization")) {
+    reasons.push("Proxy-Authorization header");
+  }
+  if (readRequestHeader(headers, "proxy-connection")) {
+    reasons.push("Proxy-Connection header");
+  }
+  const via = readRequestHeader(headers, "via").toLowerCase();
+  if (via && !/varnish|vegur|cloudflare|akamai|fastly|vercel|netlify/.test(via)) {
+    reasons.push(`Via header (${via.slice(0, 80)})`);
+  }
+  const forwarded = readRequestHeader(headers, "forwarded");
+  if (forwarded) {
+    for (const segment of forwarded.split(/[,;]/)) {
+      const match = /for="?\[?([0-9a-f:.]+)\]?"?/i.exec(segment.trim());
+      const hop = match?.[1]?.replace(/^::ffff:/, "");
+      if (hop && hop !== resolvedIp && isPublicRoutableIp(hop)) {
+        reasons.push(`Forwarded header names upstream relay ${hop}`);
+        break;
+      }
+    }
+  }
+  const xff = readRequestHeader(headers, "x-forwarded-for");
+  if (xff) {
+    const hops = new Set(
+      xff.split(",").map((hop) => normalizeIpCandidate(hop)).filter((hop) => Boolean(hop) && isPublicRoutableIp(hop))
+    );
+    if (hops.size >= 3) {
+      reasons.push(`X-Forwarded-For chain with ${hops.size} public hops`);
+    }
+  }
+  return { detected: reasons.length > 0, reasons };
+}
 function detectUaFamily(userAgent) {
   const ua = userAgent.toLowerCase();
   if (!ua) return "";
@@ -3355,6 +3390,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       `Sealed request envelope failed verification (+2): ${requestIntegrityReason || "tampered or replayed payload"}`
     );
   }
+  const proxyAssessment = detectProxyHeaders(requestContext.headers, location.publicIp);
   const securitySignalsCore = {
     isBot,
     botSignals,
@@ -3432,6 +3468,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       aiAgent: requestContext.aiAgent ?? null,
       ipBlocklisted,
       ipBlocklistReasons,
+      // Phase 5 — explicit proxy relay markers (Via / Forwarded / Proxy-Authorization chains)
+      proxyDetected: proxyAssessment.detected,
+      proxyReasons: proxyAssessment.reasons,
       // Phase 3 — mobile emulator / simulator verdict
       emulatorDetected,
       emulatorReason,
