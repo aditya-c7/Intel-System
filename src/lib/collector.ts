@@ -1586,6 +1586,91 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
 }
 
 /**
+ * Client-side Tor Browser fingerprint.
+ *
+ * Tor Browser ships the Resist Fingerprinting (RFP) patch set, and several of those patches are
+ * directly observable from page JavaScript: a fixed UTC timezone, a clamped
+ * `navigator.hardwareConcurrency`, forced letterboxing viewports (multiples of 200 x 100), a
+ * Gecko-only engine and an OPFS write rejection. A single signal proves nothing (a Firefox user
+ * in UTC is not a Tor user), so the verdict requires the Gecko engine *and* at least two
+ * independent RFP signals. Never throws.
+ */
+export function detectTorBrowserClient(
+  browserDevice: Pick<BrowserDeviceInfo, 'browser' | 'platform' | 'timezone' | 'screenResolution' | 'pixelRatio'>,
+  hardwareSignals: Pick<HardwareSignals, 'cpuCores' | 'deviceMemoryGb' | 'gpuVendor' | 'gpuRenderer'>,
+  incognitoMethod: string
+): { detected: boolean; signals: string[]; reasons: string[] } {
+  const signals: string[] = [];
+  const reasons: string[] = [];
+
+  const browserLabel = `${browserDevice.browser || ''} ${browserDevice.platform || ''}`;
+  const geckoEngine = /firefox|gecko|spidermonkey/i.test(browserLabel);
+  if (!geckoEngine) return { detected: false, signals, reasons };
+
+  signals.push('gecko-engine');
+
+  const timezone = (browserDevice.timezone || '').trim();
+  if (/^(utc|etc\/utc|gmt)$/i.test(timezone)) {
+    signals.push('tor-browser-rfp-timezone-utc');
+    reasons.push('RFP forces the browser timezone to UTC');
+  }
+
+  let viewportWidth = 0;
+  let viewportHeight = 0;
+  let screenWidth = 0;
+  let screenHeight = 0;
+  try {
+    if (typeof window !== 'undefined') {
+      viewportWidth = window.innerWidth || 0;
+      viewportHeight = window.innerHeight || 0;
+      screenWidth = window.screen?.width ?? 0;
+      screenHeight = window.screen?.height ?? 0;
+    }
+  } catch {
+    // Hostile window proxy: letterboxing cannot be measured.
+  }
+  const letterboxed =
+    viewportWidth >= 200 &&
+    viewportHeight >= 100 &&
+    viewportWidth % 200 === 0 &&
+    viewportHeight % 100 === 0;
+  if (letterboxed) {
+    signals.push('tor-letterboxing-viewport');
+    reasons.push(`Letterboxed viewport ${viewportWidth}x${viewportHeight} (200 x 100 steps)`);
+  }
+  if (
+    screenWidth > 0 &&
+    screenHeight > 0 &&
+    screenWidth === viewportWidth &&
+    screenHeight === viewportHeight
+  ) {
+    signals.push('tor-letterboxing-viewport');
+    reasons.push('Viewport is pinned to the reported screen size (letterboxing)');
+  }
+
+  const cpuCores = hardwareSignals.cpuCores;
+  if (cpuCores !== null && cpuCores !== undefined && cpuCores === 2) {
+    const pixelRatio = Number.parseFloat(browserDevice.pixelRatio || '');
+    const dprDetail =
+      Number.isFinite(pixelRatio) && pixelRatio >= 1 && pixelRatio <= 2
+        ? `, DPR ${pixelRatio}`
+        : '';
+    signals.push('tor-browser-rfp-hardware-clamp');
+    reasons.push(`RFP clamps navigator.hardwareConcurrency to ${cpuCores}${dprDetail}`);
+  }
+
+  if (incognitoMethod === 'firefox-opfs-rejected') {
+    signals.push('tor-browser-rfp-opfs-rejected');
+    reasons.push('OPFS write rejected by the Gecko private context');
+  }
+
+  const uniqueSignals = Array.from(new Set(signals));
+  const rfpSignals = uniqueSignals.filter((signal) => signal !== 'gecko-engine');
+  const detected = geckoEngine && rfpSignals.length >= 2;
+  return { detected, signals: uniqueSignals, reasons };
+}
+
+/**
  * Private / Incognito browsing assessment.
  *
  * Modern Chromium no longer differs in raw quota: both a normal and an
@@ -2571,49 +2656,98 @@ export async function evaluateSecuritySignals(
   // false here by design.
   const incognitoOrCleared = false;
 
+  // Tor Browser client fingerprint (Gecko + RFP + letterboxing). Runs independently of the
+  // server's exit-relay verdict: a Tor Browser user on a non-exit network still exposes RFP.
+  const torBrowserClient = detectTorBrowserClient(
+    browserDevice,
+    hardwareSignals,
+    incognito.method
+  );
+
   const persistenceMode: PersistenceMode = !localStorageAvailable || incognitoLikely
     ? 'Private / Restricted Storage'
     : hasStoredIdentity
     ? 'First-Party Cookie'
     : 'First-Party Cookie';
 
-  // 5. Composite Suspect & Risk Score (0-10) — four core Smart Signals only
-  let rawScore = 0;
+  // 5. Composite Suspect & Risk Score (0-10) — four core Smart Signals only.
+  // Card table (mirrored on the server): Tor exit / browser 9 (10 if server exit too),
+  // spoofed impostor 10, AI agent 8, cloud VM / masked WebGL 7, VPN / tz relay 5,
+  // incognito 4. The headline score is monotonic in the cards: it can never fall below the
+  // highest card, and two elevated cards add +1 synergy (three or more add +2).
   const riskFactors: string[] = [];
 
-  if (botAssessment.isBot) {
-    rawScore += 3;
-    riskFactors.push(
-      `Automation / headless signal (+3): ${botSignals[0] || 'automation runtime detected'}`
-    );
-  }
-  if (vpnSuspected) {
-    rawScore += 2;
-    const vpnDetail = vpnReasons[0] || 'proxy network signal';
-    riskFactors.push(`VPN / proxy network (+2): ${vpnDetail}`);
-  }
-  if (vmStatus.isVirtualMachine || cloudOrMaskedGpu) {
-    rawScore += 2;
-    const virtualDetail =
-      vmStatus.isVirtualMachine && cloudOrMaskedGpu
-        ? `${vmStatus.vmReason}; Cloud / Masked GPU environment`
-        : vmStatus.isVirtualMachine
-        ? vmStatus.vmReason
-        : 'Cloud / Masked GPU environment';
-    riskFactors.push(`Virtualization / cloud GPU signal (+2): ${virtualDetail}`);
-  }
-  if (incognitoLikely) {
-    rawScore += 1;
+  const incognitoScore = incognito.isPrivate ? 4 : 0;
+  if (incognitoScore > 0) {
     const storageDetail =
       storageQuotaMb !== null
         ? `${storageQuotaMb} MB storage quota`
         : !localStorageAvailable
         ? 'first-party storage write blocked'
         : 'restricted storage';
-    riskFactors.push(`Private / ephemeral storage (+1): ${storageDetail}`);
+    riskFactors.push(`Private / ephemeral storage (+4 card): ${storageDetail}`);
   }
 
-  const suspectScore = Math.min(10, rawScore);
+  const botScore = botAssessment.isBot ? 9 : 0;
+  if (botScore > 0) {
+    riskFactors.push(
+      `Automation / headless runtime (+9 card): ${
+        botSignals[0] || 'automation runtime detected'
+      }`
+    );
+  }
+
+  const vpnScore = torBrowserClient.detected
+    ? 9
+    : datacenterAsn && timezoneMismatch
+    ? 8
+    : datacenterAsn
+    ? 6
+    : timezoneMismatch
+    ? 5
+    : 0;
+  if (vpnScore > 0) {
+    riskFactors.push(
+      torBrowserClient.detected
+        ? `Tor Browser fingerprint (+9 card): ${torBrowserClient.reasons[0] || 'RFP detected'}`
+        : `VPN / proxy network (+${vpnScore} card): ${
+            vpnReasons[0] || 'proxy network signal'
+          }`
+    );
+  }
+
+  const vmLike = vmStatus.isVirtualMachine || cloudOrMaskedGpu;
+  const vmScore = emulatorDetected ? 8 : vmLike ? 7 : vmStatus.isOsTampered ? 6 : 0;
+  if (vmScore > 0) {
+    const virtualDetail = emulatorDetected
+      ? emulatorReason || 'mobile emulator / simulator'
+      : vmStatus.isVirtualMachine && cloudOrMaskedGpu
+      ? `${vmStatus.vmReason}; Cloud / Masked GPU environment`
+      : vmStatus.isVirtualMachine
+      ? vmStatus.vmReason
+      : cloudOrMaskedGpu
+      ? 'Cloud / Masked GPU environment'
+      : vmStatus.vmReason;
+    riskFactors.push(`Virtualization / cloud GPU signal (+${vmScore} card): ${virtualDetail}`);
+  }
+
+  // Weighted composite (unchanged physics): automation 3, network 2, VM 2, incognito 1.
+  const weightedCompositeScore = Math.min(
+    10,
+    (botAssessment.isBot ? 3 : 0) +
+      (vpnSuspected ? 2 : 0) +
+      (vmStatus.isVirtualMachine || cloudOrMaskedGpu ? 2 : 0) +
+      (incognitoLikely ? 1 : 0)
+  );
+
+  const cardScores = [incognitoScore, botScore, vpnScore, vmScore];
+  const maxCardScore = Math.max(0, ...cardScores);
+  const elevatedCardCount = cardScores.filter((score) => score >= 4).length;
+  const synergyBonus = elevatedCardCount >= 3 ? 2 : elevatedCardCount === 2 ? 1 : 0;
+  const suspectScore = Math.min(
+    10,
+    Math.max(weightedCompositeScore, maxCardScore + synergyBonus)
+  );
   const riskLevel: RiskLevel =
     suspectScore >= 7 ? 'High' : suspectScore >= 3 ? 'Medium' : 'Low';
 
@@ -2663,6 +2797,8 @@ export async function evaluateSecuritySignals(
     botReason: botAssessment.botReason,
     webdriver: botAssessment.webdriver,
     cdpDetected: botAssessment.cdpDetected,
+    /* Phase 2 — client-side Tor Browser fingerprint (Gecko RFP + letterboxing) */
+    isTorBrowserClient: torBrowserClient.detected,
     /* Removed probes are neutralised so downstream consumers see explicit falses. */
     devToolsOpen: false,
     adBlockerDetected: false,

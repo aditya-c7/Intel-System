@@ -1024,6 +1024,721 @@ function classifyBotTraffic(headers, network, client) {
     reasons: ["Interactive browser profile without automation signatures"]
   };
 }
+var AI_BOT_CIDR_SOURCES = [
+  { id: "chatgpt-user", url: "https://openai.com/chatgpt-user.json" },
+  { id: "gptbot", url: "https://openai.com/gptbot.json" },
+  { id: "searchbot", url: "https://openai.com/searchbot.json" },
+  {
+    id: "google-common",
+    url: "https://developers.google.com/static/crawling/ipranges/common-crawlers.json"
+  },
+  {
+    id: "google-user-triggered",
+    url: "https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers.json"
+  },
+  {
+    id: "google-user-triggered-google",
+    url: "https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers-google.json"
+  }
+];
+var AI_BOT_CIDR_SYNC_INTERVAL_MS = 6 * 60 * 60 * 1e3;
+var AI_BOT_CIDR_TIMEOUT_MS = 1e4;
+var AI_AUTH_DIRECTORY_TIMEOUT_MS = 1500;
+var AI_AUTH_DIRECTORY_TTL_MS = 60 * 60 * 1e3;
+var AI_FORWARD_DNS_TIMEOUT_MS = 1200;
+var AI_FORWARD_DNS_TTL_MS = 60 * 60 * 1e3;
+var AI_VERDICT_TABLE_MAX_ENTRIES = 1e4;
+var aiBotPrefixTable = /* @__PURE__ */ new Map();
+var aiBotCidrLastSyncMs = 0;
+var aiBotCidrSyncInFlight = null;
+var aiBotCidrTimer = null;
+var aiAuthDirectoryCache = /* @__PURE__ */ new Map();
+var aiForwardConfirmedDnsCache = /* @__PURE__ */ new Map();
+function extractAiPrefixes(payload) {
+  const prefixes = [];
+  const visit = (value, depth) => {
+    if (depth > 4 || value === null || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+      return;
+    }
+    const record = value;
+    for (const key of ["ipv4Prefix", "ipv6Prefix", "prefix"]) {
+      const raw = record[key];
+      if (typeof raw === "string" && raw.includes("/")) prefixes.push(raw.trim());
+    }
+    for (const nested of Object.values(record)) {
+      if (nested && typeof nested === "object") visit(nested, depth + 1);
+    }
+  };
+  visit(payload, 0);
+  return Array.from(new Set(prefixes));
+}
+async function syncAiBotCidrs() {
+  const next = /* @__PURE__ */ new Map();
+  await Promise.all(
+    AI_BOT_CIDR_SOURCES.map(async (source) => {
+      const body = await fetchTextWithTimeout(
+        source.url,
+        AI_BOT_CIDR_TIMEOUT_MS,
+        "application/json"
+      );
+      if (!body) return;
+      try {
+        const prefixes = extractAiPrefixes(JSON.parse(body));
+        if (prefixes.length > 0) next.set(source.id, prefixes);
+      } catch {
+      }
+    })
+  );
+  if (next.size === 0) return;
+  const merged = new Map(aiBotPrefixTable);
+  for (const [id, prefixes] of next) merged.set(id, prefixes);
+  aiBotPrefixTable = merged;
+  aiBotCidrLastSyncMs = Date.now();
+}
+function runAiBotCidrSync() {
+  if (aiBotCidrSyncInFlight) return aiBotCidrSyncInFlight;
+  aiBotCidrSyncInFlight = syncAiBotCidrs().catch(() => void 0).finally(() => {
+    aiBotCidrSyncInFlight = null;
+  });
+  return aiBotCidrSyncInFlight;
+}
+function ensureAiBotCidrSync() {
+  if (aiBotCidrTimer === null) {
+    void runAiBotCidrSync();
+    aiBotCidrTimer = setInterval(() => {
+      void runAiBotCidrSync();
+    }, AI_BOT_CIDR_SYNC_INTERVAL_MS);
+    const handle = aiBotCidrTimer;
+    if (typeof handle.unref === "function") handle.unref();
+    return;
+  }
+  if (Date.now() - aiBotCidrLastSyncMs >= AI_BOT_CIDR_SYNC_INTERVAL_MS) {
+    void runAiBotCidrSync();
+  }
+}
+try {
+  ensureAiBotCidrSync();
+} catch {
+}
+function matchesAiPrefixTable(ip, ids) {
+  return ids.some((id) => ipMatchesCidrList(ip, aiBotPrefixTable.get(id) ?? []));
+}
+function firstHttpsUrl(text) {
+  const match = /https?:\/\/[^\s",;)]+/i.exec(text);
+  return match ? match[0].replace(/[.;]+$/, "") : null;
+}
+function resolveSignatureAgentOperator(host, label) {
+  const lowerHost = host.toLowerCase();
+  const lowerLabel = label.toLowerCase();
+  if (lowerHost === "agent.bot.goog" || lowerHost.endsWith(".bot.goog") || lowerHost.endsWith("bot.goog") || lowerLabel === "g") {
+    return "google";
+  }
+  if (lowerHost.endsWith("openai.com") || lowerHost.endsWith("chatgpt.com")) return "openai";
+  if (lowerHost.endsWith("perplexity.ai")) return "perplexity";
+  if (lowerHost.endsWith("anthropic.com") || lowerHost.endsWith("claude.ai")) return "anthropic";
+  if (lowerHost.endsWith("browserbase.com")) return "browserbase";
+  if (lowerHost.endsWith("anchorbrowser.io")) return "anchorbrowser";
+  if (lowerHost.endsWith("x.ai") || lowerHost.endsWith("grok.com")) return "xai";
+  if (lowerHost.endsWith("meta.com") || lowerHost.endsWith("facebook.com")) return "meta";
+  return null;
+}
+function parseWebBotAuthHeaders(headers) {
+  const signatureInput = readRequestHeader(headers, "signature-input");
+  const signature = readRequestHeader(headers, "signature");
+  const signatureAgent = readRequestHeader(headers, "signature-agent");
+  const labelMatch = /^\s*([A-Za-z0-9_-]+)\s*=/.exec(signatureInput);
+  const keyIdMatch = /keyid\s*=\s*"([^"]+)"/i.exec(signatureInput);
+  const tagMatch = /tag\s*=\s*"([^"]+)"/i.exec(signatureInput);
+  const agentUrl = signatureAgent ? firstHttpsUrl(signatureAgent) : null;
+  let agentHost = "";
+  if (agentUrl) {
+    try {
+      agentHost = new URL(agentUrl).hostname.toLowerCase();
+    } catch {
+      agentHost = "";
+    }
+  }
+  const label = labelMatch ? labelMatch[1] : "";
+  return {
+    present: Boolean(signatureInput && signature),
+    label,
+    keyId: keyIdMatch ? keyIdMatch[1].trim().slice(0, 160) : "",
+    tag: tagMatch ? tagMatch[1].trim().slice(0, 80) : "",
+    agentUrl,
+    agentHost,
+    operator: resolveSignatureAgentOperator(agentHost, label)
+  };
+}
+async function fetchWebBotAuthDirectory(agentUrl) {
+  let origin = "";
+  try {
+    origin = new URL(agentUrl).origin;
+  } catch {
+    return null;
+  }
+  const nowMs = Date.now();
+  const cached = aiAuthDirectoryCache.get(origin);
+  if (cached && cached.expiresAtMs > nowMs) {
+    return { clientName: cached.clientName, trigger: cached.trigger };
+  }
+  const body = await fetchTextWithTimeout(
+    `${origin}/.well-known/http-message-signatures-directory`,
+    AI_AUTH_DIRECTORY_TIMEOUT_MS,
+    "application/json"
+  );
+  if (!body) return null;
+  let clientName = "";
+  let trigger = null;
+  const visit = (value, depth) => {
+    if (depth > 4 || value === null || typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+      return;
+    }
+    const record = value;
+    if (!clientName) {
+      const name = record.client_name ?? record.clientName;
+      if (typeof name === "string" && name.trim()) clientName = name.trim().slice(0, 120);
+    }
+    if (trigger === null) {
+      const rawTrigger = record.trigger;
+      if (typeof rawTrigger === "string" && /fetcher|crawler/i.test(rawTrigger)) {
+        trigger = /fetcher/i.test(rawTrigger) ? "fetcher" : "crawler";
+      }
+    }
+    for (const nested of Object.values(record)) {
+      if (nested && typeof nested === "object") visit(nested, depth + 1);
+    }
+  };
+  try {
+    visit(JSON.parse(body), 0);
+  } catch {
+    return null;
+  }
+  if (!clientName && trigger === null) return null;
+  if (aiAuthDirectoryCache.size > 500) aiAuthDirectoryCache.clear();
+  aiAuthDirectoryCache.set(origin, {
+    clientName,
+    trigger,
+    expiresAtMs: nowMs + AI_AUTH_DIRECTORY_TTL_MS
+  });
+  return { clientName, trigger };
+}
+async function resolveForwardConfirmedReverseDns(ip) {
+  const normalized = normalizeIpAddress(ip);
+  if (!normalized) return [];
+  const nowMs = Date.now();
+  const cached = aiForwardConfirmedDnsCache.get(normalized);
+  if (cached && cached.expiresAtMs > nowMs) return cached.names;
+  const reverseNames = await resolveTorReverseDns(normalized);
+  const isV4 = isIpv4Literal(normalized);
+  const confirmed = [];
+  const forwardLookup = async (name) => {
+    if (!/^[a-z0-9.-]+$/i.test(name)) return [];
+    let timeoutHandle;
+    try {
+      const lookup = (isV4 ? dns.resolve4(name) : dns.resolve6(name)).catch(
+        () => []
+      );
+      const timeout = new Promise((resolve) => {
+        timeoutHandle = setTimeout(() => resolve([]), AI_FORWARD_DNS_TIMEOUT_MS);
+      });
+      const addresses = await Promise.race([lookup, timeout]);
+      return Array.isArray(addresses) ? addresses : [];
+    } catch {
+      return [];
+    } finally {
+      if (timeoutHandle !== void 0) clearTimeout(timeoutHandle);
+    }
+  };
+  for (const name of reverseNames.slice(0, 3)) {
+    const addresses = await forwardLookup(name);
+    if (addresses.some((address) => normalizeIpAddress(address) === normalized)) {
+      confirmed.push(name);
+    }
+  }
+  if (aiForwardConfirmedDnsCache.size > AI_VERDICT_TABLE_MAX_ENTRIES) {
+    aiForwardConfirmedDnsCache.clear();
+  }
+  aiForwardConfirmedDnsCache.set(normalized, {
+    names: confirmed,
+    expiresAtMs: nowMs + AI_FORWARD_DNS_TTL_MS
+  });
+  return confirmed;
+}
+function hostMatchesSuffix(names, suffixes) {
+  return names.some((name) => {
+    const lower = name.toLowerCase().replace(/\.$/, "");
+    return suffixes.some((suffix) => lower === suffix || lower.endsWith(`.${suffix}`));
+  });
+}
+function asnDigits(asn) {
+  if (typeof asn !== "string") return "";
+  const match = /(\d{1,10})/.exec(asn);
+  return match ? match[1] : "";
+}
+function asnIn(asn, digits) {
+  const value = asnDigits(asn);
+  return value.length > 0 && digits.includes(value);
+}
+var GOOGLE_VERIFICATION_SUFFIXES = ["googlebot.com", "google.com"];
+var OPENAI_VERIFICATION_SUFFIXES = ["openai.com", "chatgpt.com"];
+var PERPLEXITY_VERIFICATION_SUFFIXES = ["perplexity.ai"];
+var ANTHROPIC_VERIFICATION_SUFFIXES = ["anthropic.com", "claude.ai"];
+var XAI_VERIFICATION_SUFFIXES = ["x.ai", "grok.com"];
+var META_VERIFICATION_SUFFIXES = ["facebook.com", "meta.com", "fb.com"];
+var GCP_ASNS = ["15169", "396982"];
+var XAI_ASNS = ["400562", "13414"];
+var META_ASNS = ["32934", "63293"];
+var AWS_ASNS = ["16509", "14618"];
+var AZURE_ASNS = ["8075"];
+var PERPLEXITY_ASNS = ["209242"];
+var NO_AI_AGENT = {
+  detected: false,
+  agentId: null,
+  agentName: "",
+  operator: "",
+  executionMode: null,
+  verified: false,
+  confidence: "Medium",
+  riskScore: 0,
+  evidence: []
+};
+function aiAgentResult(partial) {
+  return {
+    detected: true,
+    riskScore: partial.riskScore ?? (partial.agentId === "impostor-spoof" ? 10 : 8),
+    ...partial
+  };
+}
+async function resolveAiAgentIdentity(input) {
+  const ua = input.userAgent || readRequestHeader(input.headers, "user-agent");
+  if (!ua) return NO_AI_AGENT;
+  const webBotAuth = parseWebBotAuthHeaders(input.headers);
+  const referer = `${readRequestHeader(input.headers, "referer")} ${readRequestHeader(
+    input.headers,
+    "origin"
+  )}`;
+  const networkHaystack = [input.network.org, input.network.isp, input.network.asn].filter((part) => typeof part === "string" && part.trim().length > 0).join(" \xB7 ");
+  let confirmedNamesPromise = null;
+  const confirmedNames = () => {
+    if (confirmedNamesPromise === null) {
+      confirmedNamesPromise = resolveForwardConfirmedReverseDns(input.publicIp);
+    }
+    return confirmedNamesPromise;
+  };
+  const gpuRenderer = (input.client.gpuRenderer || "").toLowerCase();
+  const maskedGpu = !gpuRenderer || gpuRenderer === "unavailable" || /swiftshader|llvmpipe|mesa|software|generic|^standard/.test(gpuRenderer);
+  const idbRatio = typeof input.client.idbDurabilityRatio === "number" ? input.client.idbDurabilityRatio : null;
+  const clientAutomation = Boolean(
+    input.client.isBot || input.client.webdriver || input.client.cdpDetected || input.client.isHeadless
+  );
+  const desktopChrome = /chrome\//i.test(ua) && !/mobile|android|iphone|ipad/i.test(ua);
+  const screen = (input.client.screenResolution || "").toLowerCase();
+  const claudeComputerUseViewport = screen.includes("1024x768") || screen.includes("1280x800") || screen.includes("1280\xD7800");
+  const silentCloudTelemetry = Boolean(
+    input.client.isVirtualMachine || idbRatio !== null && idbRatio > 0.95 && maskedGpu || desktopChrome && clientAutomation && maskedGpu
+  );
+  const signatureEvidence = webBotAuth.present ? [
+    "RFC 9421 Signature / Signature-Input headers present (Web Bot Auth)",
+    webBotAuth.label ? `Signature label: ${webBotAuth.label}` : "",
+    webBotAuth.agentUrl ? `Signature-Agent: ${webBotAuth.agentUrl}` : "",
+    webBotAuth.keyId ? `keyid: ${webBotAuth.keyId}` : ""
+  ].filter(Boolean) : [];
+  const directoryHint = webBotAuth.agentUrl ? await fetchWebBotAuthDirectory(webBotAuth.agentUrl) : null;
+  const directoryEvidence = directoryHint ? [
+    directoryHint.clientName ? `Agent directory client_name: ${directoryHint.clientName}` : "",
+    directoryHint.trigger ? `Agent trigger: ${directoryHint.trigger}` : ""
+  ].filter(Boolean) : [];
+  if (/\bgooglebot\b/i.test(ua)) {
+    const googleCidr = matchesAiPrefixTable(input.publicIp, [
+      "google-common",
+      "google-user-triggered",
+      "google-user-triggered-google"
+    ]);
+    const googleDnsNames = await confirmedNames();
+    const googleDns = hostMatchesSuffix(googleDnsNames, GOOGLE_VERIFICATION_SUFFIXES);
+    const googleRangesLoaded = (aiBotPrefixTable.get("google-common")?.length ?? 0) > 0;
+    if (googleCidr || googleDns) {
+      return aiAgentResult({
+        agentId: "gemini",
+        agentName: "Googlebot (Verified Google Crawler)",
+        operator: "Google LLC",
+        executionMode: "Autonomous Crawler",
+        verified: true,
+        confidence: "Verified",
+        evidence: [
+          `Googlebot user-agent: ${ua.slice(0, 120)}`,
+          googleCidr ? "Source IP matched a Google official crawler CIDR range" : "",
+          googleDns ? "FCrDNS matched *.googlebot.com / *.google.com" : ""
+        ].filter(Boolean)
+      });
+    }
+    if (googleRangesLoaded || googleDnsNames.length > 0) {
+      return aiAgentResult({
+        agentId: "impostor-spoof",
+        agentName: "Spoofed Google Bot Impostor (Unverified IP)",
+        operator: "Unverified Google claim",
+        executionMode: "Spoofed Impostor",
+        verified: false,
+        confidence: "Verified",
+        evidence: [
+          `Googlebot user-agent presented: ${ua.slice(0, 120)}`,
+          `Source IP ${input.publicIp} is not inside Google's official crawler ranges`,
+          "Forward-confirmed reverse DNS does not resolve to googlebot.com / google.com"
+        ]
+      });
+    }
+    return NO_AI_AGENT;
+  }
+  const geminiUa = /Gemini-Deep-Research|GoogleAgent-Mariner|Google-NotebookLM|Google-CloudVertexBot|Google-Extended|GoogleOther(-Image|-Video)?|Google-InspectionTool/i.test(
+    ua
+  );
+  if (webBotAuth.operator === "google" || geminiUa) {
+    const googleCidr = matchesAiPrefixTable(input.publicIp, [
+      "google-common",
+      "google-user-triggered",
+      "google-user-triggered-google"
+    ]);
+    const googleDnsNames = await confirmedNames();
+    const googleDns = hostMatchesSuffix(googleDnsNames, GOOGLE_VERIFICATION_SUFFIXES);
+    const googleRangesLoaded = (aiBotPrefixTable.get("google-common")?.length ?? 0) > 0;
+    const verified = webBotAuth.operator === "google" || googleCidr || googleDns;
+    if (geminiUa && !verified && (googleRangesLoaded || googleDnsNames.length > 0)) {
+      return aiAgentResult({
+        agentId: "impostor-spoof",
+        agentName: "Spoofed Google Gemini Agent (Unverified IP)",
+        operator: "Unverified Google claim",
+        executionMode: "Spoofed Impostor",
+        verified: false,
+        confidence: "Verified",
+        evidence: [
+          `Gemini / Google agent user-agent presented: ${ua.slice(0, 120)}`,
+          `Source IP ${input.publicIp} is not inside Google's official crawler ranges`,
+          "Forward-confirmed reverse DNS does not resolve to googlebot.com / google.com"
+        ]
+      });
+    }
+    return aiAgentResult({
+      agentId: "gemini",
+      agentName: directoryHint?.clientName || (verified ? "Google Gemini (Mariner / Deep Research)" : "Google Gemini / Cloud Agent (GCP VM)"),
+      operator: "Google LLC",
+      executionMode: webBotAuth.operator === "google" ? "RFC 9421 Signed Agent" : geminiUa && !clientAutomation ? "User-Triggered Fetcher" : "Autonomous Crawler",
+      verified,
+      confidence: verified ? "Verified" : googleRangesLoaded || googleDnsNames.length > 0 ? "High" : "Medium",
+      evidence: [
+        ...webBotAuth.operator === "google" ? signatureEvidence : [],
+        ...geminiUa ? [`Google AI agent user-agent: ${ua.slice(0, 120)}`] : [],
+        ...googleCidr ? ["Source IP matched a Google official crawler CIDR range"] : [],
+        ...googleDns ? ["FCrDNS matched *.googlebot.com / *.google.com"] : [],
+        ...!verified ? ["Verification sources unavailable \u2014 identity inferred from headers"] : [],
+        ...directoryEvidence
+      ]
+    });
+  }
+  if ((asnIn(input.network.asn, GCP_ASNS) || hostMatchesSuffix(await confirmedNames(), ["googleusercontent.com"])) && (webBotAuth.present || silentCloudTelemetry)) {
+    return aiAgentResult({
+      agentId: "gemini",
+      agentName: "Google Gemini / Cloud Agent (GCP VM)",
+      operator: "Google LLC",
+      executionMode: webBotAuth.present ? "RFC 9421 Signed Agent" : "Silent Cloud VM Browser",
+      verified: webBotAuth.present,
+      confidence: webBotAuth.present ? "Verified" : "High",
+      evidence: [
+        ...signatureEvidence,
+        ...asnIn(input.network.asn, GCP_ASNS) ? [`Google Cloud ASN (${input.network.asn}) hosting the browser`] : ["Reverse DNS matched *.googleusercontent.com"],
+        ...silentCloudTelemetry ? ["Cloud-VM browser telemetry (masked WebGL / ephemeral storage)"] : []
+      ]
+    });
+  }
+  const grokUa = /GrokBot|xAI-GrokBot|Grok-Search|xAI-Bot|\bGrok\b/i.test(ua);
+  const grokReferer = /grok\.com|x\.ai/i.test(referer);
+  if (webBotAuth.operator === "xai" || grokUa || grokReferer) {
+    const xaiDnsNames = await confirmedNames();
+    const xaiDns = hostMatchesSuffix(xaiDnsNames, XAI_VERIFICATION_SUFFIXES);
+    const xaiAsn = asnIn(input.network.asn, XAI_ASNS);
+    const verified = webBotAuth.operator === "xai" || xaiDns || xaiAsn;
+    if (grokUa && !verified && !grokReferer && xaiDnsNames.length > 0) {
+      return aiAgentResult({
+        agentId: "impostor-spoof",
+        agentName: "Spoofed xAI Grok Bot (Unverified IP)",
+        operator: "Unverified xAI claim",
+        executionMode: "Spoofed Impostor",
+        verified: false,
+        confidence: "Verified",
+        evidence: [
+          `Grok user-agent presented: ${ua.slice(0, 120)}`,
+          `Source IP ${input.publicIp} is not on xAI infrastructure`
+        ]
+      });
+    }
+    return aiAgentResult({
+      agentId: "grok",
+      agentName: directoryHint?.clientName || "xAI Grok Bot",
+      operator: "xAI",
+      executionMode: webBotAuth.operator === "xai" ? "RFC 9421 Signed Agent" : grokReferer && !grokUa ? "Silent Cloud VM Browser" : "Autonomous Crawler",
+      verified,
+      confidence: verified ? "Verified" : xaiDnsNames.length > 0 ? "High" : "Medium",
+      evidence: [
+        ...webBotAuth.operator === "xai" ? signatureEvidence : [],
+        ...grokUa ? [`Grok user-agent: ${ua.slice(0, 120)}`] : [],
+        ...grokReferer ? [`Referer / Origin points at grok.com or x.ai`] : [],
+        ...xaiAsn ? [`xAI / X Corp ASN ${input.network.asn}`] : [],
+        ...xaiDns ? ["FCrDNS matched *.x.ai / *.grok.com"] : [],
+        ...!verified ? ["Verification sources unavailable \u2014 identity inferred from headers"] : [],
+        ...directoryEvidence
+      ]
+    });
+  }
+  const museUa = /\bMuseBot\b|\bMuse\b|Meta-ExternalAgent|Meta-ExternalFetcher|FacebookBot/i.test(ua);
+  if (webBotAuth.operator === "meta" || museUa) {
+    const metaDnsNames = await confirmedNames();
+    const metaDns = hostMatchesSuffix(metaDnsNames, META_VERIFICATION_SUFFIXES);
+    const metaAsn = asnIn(input.network.asn, META_ASNS);
+    const verified = webBotAuth.operator === "meta" || metaDns || metaAsn;
+    if (museUa && !verified && metaDnsNames.length > 0) {
+      return aiAgentResult({
+        agentId: "impostor-spoof",
+        agentName: "Spoofed Meta Muse Agent (Unverified IP)",
+        operator: "Unverified Meta claim",
+        executionMode: "Spoofed Impostor",
+        verified: false,
+        confidence: "Verified",
+        evidence: [
+          `Meta agent user-agent presented: ${ua.slice(0, 120)}`,
+          `Source IP ${input.publicIp} is not on Meta infrastructure`
+        ]
+      });
+    }
+    return aiAgentResult({
+      agentId: "muse",
+      agentName: directoryHint?.clientName || "Meta Muse",
+      operator: "Meta Platforms",
+      executionMode: webBotAuth.operator === "meta" ? "RFC 9421 Signed Agent" : "Autonomous Crawler",
+      verified,
+      confidence: verified ? "Verified" : metaDnsNames.length > 0 ? "High" : "Medium",
+      evidence: [
+        ...webBotAuth.operator === "meta" ? signatureEvidence : [],
+        ...museUa ? [`Meta / Muse user-agent: ${ua.slice(0, 120)}`] : [],
+        ...metaAsn ? [`Meta Platforms ASN ${input.network.asn}`] : [],
+        ...metaDns ? ["FCrDNS matched *.facebook.com / *.meta.com"] : [],
+        ...!verified ? ["Verification sources unavailable \u2014 identity inferred from headers"] : [],
+        ...directoryEvidence
+      ]
+    });
+  }
+  if (asnIn(input.network.asn, META_ASNS) && desktopChrome && silentCloudTelemetry) {
+    return aiAgentResult({
+      agentId: "muse",
+      agentName: "Meta Muse (Cloud VM Browser Agent)",
+      operator: "Meta Platforms",
+      executionMode: "Silent Cloud VM Browser",
+      verified: false,
+      confidence: "High",
+      evidence: [
+        `Meta Platforms ASN (${input.network.asn}) hosting a desktop Chrome session`,
+        "Virtual machine / cloud browser telemetry (masked WebGL, Linux platform or ephemeral storage)"
+      ]
+    });
+  }
+  const perplexityUa = /PerplexityBot|Perplexity-User/i.test(ua);
+  if (webBotAuth.operator === "perplexity" || perplexityUa) {
+    const perplexityDnsNames = await confirmedNames();
+    const perplexityDns = hostMatchesSuffix(
+      perplexityDnsNames,
+      PERPLEXITY_VERIFICATION_SUFFIXES
+    );
+    const perplexityAsn = asnIn(input.network.asn, PERPLEXITY_ASNS);
+    const verified = webBotAuth.operator === "perplexity" || perplexityDns || perplexityAsn;
+    if (perplexityUa && !verified && perplexityDnsNames.length > 0) {
+      return aiAgentResult({
+        agentId: "impostor-spoof",
+        agentName: "Spoofed Perplexity Agent (Unverified IP)",
+        operator: "Unverified Perplexity claim",
+        executionMode: "Spoofed Impostor",
+        verified: false,
+        confidence: "Verified",
+        evidence: [
+          `Perplexity user-agent presented: ${ua.slice(0, 120)}`,
+          `Source IP ${input.publicIp} is not on Perplexity infrastructure`
+        ]
+      });
+    }
+    return aiAgentResult({
+      agentId: "perplexity",
+      agentName: directoryHint?.clientName || "Perplexity AI Agent",
+      operator: "Perplexity AI",
+      executionMode: webBotAuth.operator === "perplexity" ? "RFC 9421 Signed Agent" : "Autonomous Crawler",
+      verified,
+      confidence: verified ? "Verified" : perplexityDnsNames.length > 0 ? "High" : "Medium",
+      evidence: [
+        ...webBotAuth.operator === "perplexity" ? signatureEvidence : [],
+        ...perplexityUa ? [`Perplexity user-agent: ${ua.slice(0, 120)}`] : [],
+        ...perplexityAsn ? [`Perplexity ASN ${input.network.asn}`] : [],
+        ...perplexityDns ? ["FCrDNS matched *.perplexity.ai"] : [],
+        ...!verified ? ["Verification sources unavailable \u2014 identity inferred from headers"] : [],
+        ...directoryEvidence
+      ]
+    });
+  }
+  if (asnIn(input.network.asn, AWS_ASNS) && clientAutomation && (webBotAuth.present || hostMatchesSuffix(await confirmedNames(), PERPLEXITY_VERIFICATION_SUFFIXES))) {
+    return aiAgentResult({
+      agentId: "perplexity",
+      agentName: "Perplexity AI (PerplexityBot / Stealth Agent)",
+      operator: "Perplexity AI",
+      executionMode: webBotAuth.present ? "RFC 9421 Signed Agent" : "Silent Cloud VM Browser",
+      verified: webBotAuth.present,
+      confidence: webBotAuth.present ? "Verified" : "Medium",
+      evidence: [
+        ...signatureEvidence,
+        `AWS ASN (${input.network.asn}) hosting a headless Chromium session`,
+        "RFC 9421 headers or Perplexity network attribution"
+      ]
+    });
+  }
+  const openAiUa = /ChatGPT-User|OAI-SearchBot|GPTBot/i.test(ua);
+  if (webBotAuth.operator === "openai" || openAiUa) {
+    const openAiDnsNames = await confirmedNames();
+    const openAiDns = hostMatchesSuffix(openAiDnsNames, OPENAI_VERIFICATION_SUFFIXES);
+    const openAiCidr = matchesAiPrefixTable(input.publicIp, ["chatgpt-user", "gptbot", "searchbot"]);
+    const openAiRangesLoaded = (aiBotPrefixTable.get("chatgpt-user")?.length ?? 0) > 0 || (aiBotPrefixTable.get("gptbot")?.length ?? 0) > 0;
+    const verified = webBotAuth.operator === "openai" || openAiDns || openAiCidr;
+    if (openAiUa && !verified && (openAiRangesLoaded || openAiDnsNames.length > 0)) {
+      return aiAgentResult({
+        agentId: "impostor-spoof",
+        agentName: "Spoofed OpenAI Agent (Unverified IP)",
+        operator: "Unverified OpenAI claim",
+        executionMode: "Spoofed Impostor",
+        verified: false,
+        confidence: "Verified",
+        evidence: [
+          `OpenAI user-agent presented: ${ua.slice(0, 120)}`,
+          `Source IP ${input.publicIp} is not inside chatgpt-user.json / gptbot.json / searchbot.json`,
+          "Forward-confirmed reverse DNS does not resolve to openai.com / chatgpt.com"
+        ]
+      });
+    }
+    return aiAgentResult({
+      agentId: "openai",
+      agentName: directoryHint?.clientName || "OpenAI ChatGPT Agent / Operator",
+      operator: "OpenAI",
+      executionMode: webBotAuth.operator === "openai" ? "RFC 9421 Signed Agent" : /chatgpt-user/i.test(ua) ? "User-Triggered Fetcher" : "Autonomous Crawler",
+      verified,
+      confidence: verified ? "Verified" : openAiRangesLoaded || openAiDnsNames.length > 0 ? "High" : "Medium",
+      evidence: [
+        ...webBotAuth.operator === "openai" ? signatureEvidence : [],
+        ...openAiUa ? [`OpenAI user-agent: ${ua.slice(0, 120)}`] : [],
+        ...openAiCidr ? ["Source IP matched an official OpenAI JSON prefix list"] : [],
+        ...openAiDns ? ["FCrDNS matched *.openai.com / *.chatgpt.com"] : [],
+        ...!verified ? ["Verification sources unavailable \u2014 identity inferred from headers"] : [],
+        ...directoryEvidence
+      ]
+    });
+  }
+  if (asnIn(input.network.asn, AZURE_ASNS) && webBotAuth.present) {
+    return aiAgentResult({
+      agentId: "openai",
+      agentName: "OpenAI ChatGPT Agent / Operator",
+      operator: "OpenAI",
+      executionMode: "RFC 9421 Signed Agent",
+      verified: true,
+      confidence: "Verified",
+      evidence: [
+        ...signatureEvidence,
+        `Microsoft Azure ASN (${input.network.asn}) hosting the signed agent`
+      ]
+    });
+  }
+  const claudeUa = /Claude-User|Claude-SearchBot|ClaudeBot|anthropic-ai/i.test(ua);
+  if (webBotAuth.operator === "anthropic" || claudeUa) {
+    const anthropicDnsNames = await confirmedNames();
+    const anthropicDns = hostMatchesSuffix(anthropicDnsNames, ANTHROPIC_VERIFICATION_SUFFIXES);
+    const verified = webBotAuth.operator === "anthropic" || anthropicDns;
+    if (claudeUa && !verified && anthropicDnsNames.length > 0) {
+      return aiAgentResult({
+        agentId: "impostor-spoof",
+        agentName: "Spoofed Anthropic Claude Agent (Unverified IP)",
+        operator: "Unverified Anthropic claim",
+        executionMode: "Spoofed Impostor",
+        verified: false,
+        confidence: "Verified",
+        evidence: [
+          `Claude user-agent presented: ${ua.slice(0, 120)}`,
+          `Source IP ${input.publicIp} is not on Anthropic infrastructure`
+        ]
+      });
+    }
+    return aiAgentResult({
+      agentId: "claude",
+      agentName: directoryHint?.clientName || "Anthropic Claude (Claude-User / Computer Use)",
+      operator: "Anthropic",
+      executionMode: webBotAuth.operator === "anthropic" ? "RFC 9421 Signed Agent" : /claude-user/i.test(ua) ? "User-Triggered Fetcher" : "Autonomous Crawler",
+      verified,
+      confidence: verified ? "Verified" : anthropicDnsNames.length > 0 ? "High" : "Medium",
+      evidence: [
+        ...webBotAuth.operator === "anthropic" ? signatureEvidence : [],
+        ...claudeUa ? [`Claude user-agent: ${ua.slice(0, 120)}`] : [],
+        ...anthropicDns ? ["FCrDNS matched *.anthropic.com / *.claude.ai"] : [],
+        ...!verified ? ["Verification sources unavailable \u2014 identity inferred from headers"] : [],
+        ...directoryEvidence
+      ]
+    });
+  }
+  if ((asnIn(input.network.asn, AWS_ASNS) || asnIn(input.network.asn, GCP_ASNS)) && claudeComputerUseViewport && /llvmpipe|mesa|swiftshader|software/i.test(gpuRenderer) && clientAutomation) {
+    return aiAgentResult({
+      agentId: "claude",
+      agentName: "Anthropic Claude (Claude-User / Computer Use)",
+      operator: "Anthropic",
+      executionMode: "Silent Cloud VM Browser",
+      verified: false,
+      confidence: "Medium",
+      evidence: [
+        `Cloud ASN (${input.network.asn}) hosting a Linux X11 / Xvfb framebuffer`,
+        `Viewport ${input.client.screenResolution} matches a Claude computer-use desktop`,
+        "Software WebGL renderer (llvmpipe / Mesa) with an automated session"
+      ]
+    });
+  }
+  const cloudBrowserOperator = webBotAuth.operator === "browserbase" ? { name: "Browserbase Cloud Agent", operator: "Browserbase" } : webBotAuth.operator === "anchorbrowser" ? { name: "Anchor Browser AI Agent", operator: "Anchor Browser" } : null;
+  if (webBotAuth.present || cloudBrowserOperator) {
+    const handle = webBotAuth.agentHost || webBotAuth.keyId || "unattributed signer";
+    return aiAgentResult({
+      agentId: "cloud-browser",
+      agentName: directoryHint?.clientName || cloudBrowserOperator?.name || "AI Agent \xB7 Cloud Browser (RFC 9421 Signed)",
+      operator: cloudBrowserOperator?.operator || "Unattributed Cloud Browser",
+      executionMode: "RFC 9421 Signed Agent",
+      verified: webBotAuth.present,
+      confidence: webBotAuth.present ? "Verified" : "High",
+      evidence: [
+        ...signatureEvidence,
+        ...cloudBrowserOperator ? [`Signature-Agent operator: ${handle}`] : [],
+        ...!cloudBrowserOperator ? [`Signed agent handle: ${handle}`] : [],
+        ...networkHaystack ? [`Network identity: ${networkHaystack}`] : [],
+        ...directoryEvidence
+      ]
+    });
+  }
+  const officialBotClaim = /googlebot|googleother|gemini-deep-research|gptbot|chatgpt-user|perplexitybot|perplexity-user|claudebot|claude-user|grokbot|meta-externalagent|muse/i.test(
+    ua
+  );
+  if (officialBotClaim) {
+    return aiAgentResult({
+      agentId: "impostor-spoof",
+      agentName: "Spoofed AI Bot Impostor (Unverified IP)",
+      operator: "Unverified AI crawler claim",
+      executionMode: "Spoofed Impostor",
+      verified: false,
+      confidence: "Verified",
+      evidence: [
+        `Official AI crawler user-agent claim: ${ua.slice(0, 120)}`,
+        `Source IP ${input.publicIp} could not be verified via CIDR or FCrDNS`
+      ]
+    });
+  }
+  return NO_AI_AGENT;
+}
 var EMULATOR_GPU_SIGNATURE_PATTERN = /android emulator opengl es translator|goldfish|ranchu|bluestacks|nox|ldplayer|memu|genymotion|virgl|apple software renderer/i;
 var NON_ARM_ANDROID_PLATFORM_PATTERN = /linux x86|x86_64|i[3-6]86|win32|win64|macintel/i;
 var IOS_DEVICE_UA_PATTERN = /(iphone|ipad|ipod)/i;
@@ -2398,9 +3113,12 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     // own storage-commit probe method, a normal tile quotes the verified disk-backed path.
     detail: isIncognito ? `Ephemeral RAM storage detected (${incognitoMethod || "In-memory LevelDB / 10 GiB decoy quota"})` : `Persistent disk-backed storage verified (${incognitoMethod || "Standard profile"})`
   };
-  const botScore = botSubtype === "bad_bot" ? spoofedCrawler ? 10 : 9 : botSubtype === "ai_agent" ? 8 : botSubtype === "good_bot" ? 2 : 0;
-  const botStatus = botSubtype === "bad_bot" ? spoofedCrawler ? "Spoofed Crawler" : "Bot / Automated" : botSubtype === "ai_agent" ? "AI Agent \xB7 Cloud Browser" : botSubtype === "good_bot" ? "Good Bot \xB7 Search Crawler" : "Verified Human";
-  const botDetail = botSubtype === "human" ? "Verified human interactive session" : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected");
+  const aiAgent = requestContext.aiAgent ?? null;
+  const spoofedImpostor = aiAgent?.agentId === "impostor-spoof" || botSubtype === "bad_bot" && spoofedCrawler;
+  const botScore = spoofedImpostor ? 10 : botSubtype === "bad_bot" ? 9 : botSubtype === "ai_agent" ? 8 : botSubtype === "good_bot" ? 2 : 0;
+  const botStatus = spoofedImpostor ? "Spoofed AI Impostor" : botSubtype === "bad_bot" ? "Bot / Automated" : aiAgent?.detected && aiAgent.agentName ? aiAgent.agentName : botSubtype === "ai_agent" ? "AI Agent \xB7 Cloud Browser" : botSubtype === "good_bot" ? "Good Bot \xB7 Search Crawler" : "Verified Human";
+  const aiAgentDetail = aiAgent?.detected && aiAgent.agentName ? `${aiAgent.agentName} \u2014 ${aiAgent.operator}${aiAgent.executionMode ? ` \xB7 ${aiAgent.executionMode}` : ""} \xB7 ${aiAgent.confidence}${aiAgent.verified ? " (verified)" : ""}: ${aiAgent.evidence[0] || "agent identity attributed from request headers"}` : "";
+  const botDetail = botSubtype === "human" && !aiAgent?.detected ? "Verified human interactive session" : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected");
   const botSignal = {
     id: "bot",
     title: "Bot & Automation Detection",
@@ -2416,9 +3134,13 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const asnSuffix = location.asn !== "Unknown" ? ` \u2022 ${location.asn}` : "";
   const asnLabel = location.asn && location.asn !== "Unknown" ? /^AS/i.test(location.asn) ? location.asn.toUpperCase() : `AS${location.asn}` : "AS unknown";
   const asnOrOrg = `${asnLabel} \xB7 ${location.org !== "Unknown" ? location.org : ispBrand}`;
-  const vpnScore = torExitNode ? 10 : ipBlocklisted ? 9 : verifiedCrawlerNetwork ? 2 : isDatacenterAsn && hasTzMismatch ? 8 : isDatacenterAsn ? 6 : hasTzMismatch ? 5 : 0;
-  const vpnStatus = torExitNode ? "Tor Exit Node" : ipBlocklisted ? "Blocklisted IP" : verifiedCrawlerNetwork ? "Verified Crawler Network" : isDatacenterAsn ? "VPN / Datacenter Proxy" : hasTzMismatch ? "VPN / Timezone Relay" : "Standard ISP";
-  const vpnDetail = torExitNode ? torOperatorHint ? `Tor exit relay operator matched on ${location.publicIp} (${asnOrOrg}) \u2014 DNSEL unreachable, operator attribution used` : `Confirmed active Tor exit relay (${location.publicIp} \xB7 ${asnOrOrg})` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : verifiedCrawlerNetwork ? `${botClassification.provider} crawler operating from its own ${ispBrand}${asnSuffix} \u2014 crawler infrastructure, not a consumer proxy` : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
+  const torBrowserClient = clientTorBrowser;
+  const torRelayNetwork = requestContext.torVerdict === "relay" || requestContext.torRelay === true;
+  const torAnonymity = torExitNode || torBrowserClient;
+  const torOperatorLabel = requestContext.torOperator ?? describeTorRelay(location.publicIp) ?? null;
+  const vpnScore = torAnonymity ? torExitNode && torBrowserClient ? 10 : 9 : ipBlocklisted ? 9 : verifiedCrawlerNetwork ? 2 : torRelayNetwork ? 6 : aiAgent?.detected ? 8 : isDatacenterAsn && hasTzMismatch ? 8 : isDatacenterAsn ? 6 : hasTzMismatch ? 5 : 0;
+  const vpnStatus = torAnonymity ? torExitNode && torBrowserClient ? "Tor Exit Node & Tor Browser" : torExitNode ? "Tor Exit Node" : "Tor Browser (Onion Routing / RFP)" : ipBlocklisted ? "Blocklisted IP" : verifiedCrawlerNetwork ? "Verified Crawler Network" : torRelayNetwork ? "Tor Relay (Non-Exit)" : aiAgent?.detected ? "AI Agent Cloud Network" : isDatacenterAsn ? "VPN / Datacenter Proxy" : hasTzMismatch ? "VPN / Timezone Relay" : "Standard ISP";
+  const vpnDetail = torAnonymity ? `${torExitNode ? "Confirmed active Tor exit relay" : "Tor Browser fingerprint (Gecko RFP + letterboxing)"} (${location.publicIp} \xB7 ${torOperatorLabel || asnOrOrg})${torOperatorHint ? " \u2014 DNSEL unreachable, operator attribution used" : ""}${torExitNode && torBrowserClient ? " \xB7 server exit IP and client RFP both matched (10/10)" : ""}` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : verifiedCrawlerNetwork ? `${botClassification.provider} crawler operating from its own ${ispBrand}${asnSuffix} \u2014 crawler infrastructure, not a consumer proxy` : torRelayNetwork ? `Tor relay network (${torOperatorLabel || asnOrOrg}) \u2014 part of the Tor network but not an exit egress` : aiAgent?.detected ? `${aiAgent.agentName} (${aiAgent.operator}) \u2014 ${aiAgent.executionMode || "AI agent"} traffic from ${ispBrand}${asnSuffix}` : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
   const vpnSignal = {
     id: "vpn",
     title: "VPN / Proxy & Network Type",
@@ -2432,7 +3154,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const isTampered = isOsTampered;
   const cloudContainerVm = datacenterAsn && (isGpuMaskedOrUnavailable || cloudOrMaskedGpu);
   const vmLike = isVm || cloudContainerVm;
-  const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : vmLike ? datacenterAsn && isGpuMaskedOrUnavailable ? 8 : 7 : isTampered ? 6 : 0;
+  const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : vmLike ? 7 : isTampered ? 6 : 0;
   const vmStatus = tamperedRequest || replayDetected ? "Tampered / Replayed" : emulatorDetected ? "Mobile Emulator" : vmLike ? "Virtual Machine / VM" : isTampered ? "Spoofed Environment" : "Physical Hardware";
   const vmDetail = tamperedRequest || replayDetected ? requestIntegrityReason || "Sealed request envelope failed verification" : emulatorDetected ? emulatorReason || vmReason || "Mobile emulator / simulator runtime detected" : vmLike ? vmReason || (cloudContainerVm ? `Cloud container on ${ispBrand}${asnSuffix} exposed an unavailable / masked GPU` : "Hypervisor CPUID / virtualised GPU footprint detected") : isTampered ? vmReason || tamperReasons[0] || "Operating-system / User-Agent tampering detected" : "Unmasked physical GPU & consistent OS platform verified";
   const vmSignal = {
@@ -2453,7 +3175,15 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const integrityViolation = Boolean(tamperedRequest || replayDetected);
   const networkPoints = torExitNode ? 5 : verifiedCrawlerNetwork ? 0 : isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0;
   const rawCompositePoints = (isBot ? 5 : isHeadless ? 4 : 0) + networkPoints + (vmScore > 0 ? 3 : 0) + (isIncognito ? 2 : 0) + (integrityViolation ? 2 : 0);
-  const suspectScore = Math.min(10, rawCompositePoints);
+  const weightedCompositeScore = Math.min(10, rawCompositePoints);
+  const cardScores = [incognitoScore, botScore, vpnScore, vmScore];
+  const maxCardScore = Math.max(0, ...cardScores);
+  const elevatedCardCount = cardScores.filter((score) => score >= 4).length;
+  const synergyBonus = elevatedCardCount >= 3 ? 2 : elevatedCardCount === 2 ? 1 : 0;
+  const suspectScore = Math.min(
+    10,
+    Math.max(weightedCompositeScore, maxCardScore + synergyBonus)
+  );
   const riskLevel = tierFor(suspectScore);
   const riskBadgeText = `${riskLevel} Risk \u2022 ${suspectScore}/10`;
   const riskFactors = [];
@@ -2466,9 +3196,13 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       `Headless browser environment (+4): ${botReason || "no physical display attached"}`
     );
   }
-  if (torExitNode) {
+  if (torAnonymity) {
     riskFactors.push(
-      `Confirmed Tor exit relay (+5): ${torOperatorHint ? "exit-operator attribution" : "Tor Project DNSEL / bulk exit list"} ${location.publicIp}`
+      `${torExitNode ? "Confirmed Tor exit relay" : "Tor Browser fingerprint"} (+${torExitNode && torBrowserClient ? 10 : 9} card): ${torExitNode ? torOperatorHint ? "exit-operator attribution" : "Tor Project DNSEL / consensus exit list" : "Gecko RFP + letterboxing detected on the client"} ${location.publicIp}`
+    );
+  } else if (torRelayNetwork) {
+    riskFactors.push(
+      `Tor relay network (+6 card): ${torOperatorLabel || asnOrOrg} \u2014 relay, not an exit egress`
     );
   } else if (verifiedCrawlerNetwork) {
   } else if (isDatacenterAsn) {
@@ -2478,6 +3212,11 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   } else if (hasTzMismatch) {
     riskFactors.push(
       `Browser timezone differs from IP geolocation (+2): ${clientTzCanonical} vs ${ipTzCanonical}`
+    );
+  }
+  if (aiAgent?.detected) {
+    riskFactors.push(
+      `${aiAgent.agentId === "impostor-spoof" ? "Spoofed AI bot impostor (10/10)" : "AI agent attributed (8/10)"}: ${aiAgent.agentName} \xB7 ${aiAgent.operator} \xB7 ${aiAgent.confidence}`
     );
   }
   if (vmScore > 0) {
@@ -2972,6 +3711,41 @@ app.post("/api/visitor/identify", async (req, res) => {
       torLookupTarget === extractedIp.trim().toLowerCase() ? torLookupPromise : void 0
     );
     const torExitNode = torStatus.isExit;
+    const aiAgent = await resolveAiAgentIdentity({
+      headers: rawRequestHeaders,
+      userAgent: fullRequestUserAgent,
+      network: { isp: location.isp, org: location.org, asn: location.asn },
+      publicIp: location.publicIp,
+      client: {
+        isBot: Boolean(rawSecuritySignals?.isBot),
+        isHeadless: Boolean(rawSecuritySignals?.isHeadless),
+        webdriver: Boolean(rawSecuritySignals?.webdriver),
+        cdpDetected: Boolean(rawSecuritySignals?.cdpDetected),
+        isVirtualMachine: Boolean(rawSecuritySignals?.isVirtualMachine),
+        gpuVendor: hardwareSignals.gpuVendor,
+        gpuRenderer: hardwareSignals.gpuRenderer,
+        idbDurabilityRatio: rawSecuritySignals?.idbDurabilityRatio ?? null,
+        screenResolution: browserDevice.screenResolution,
+        platform: browserDevice.platform,
+        botSignals: Array.isArray(rawSecuritySignals?.botSignals) ? rawSecuritySignals.botSignals : []
+      }
+    });
+    const attributedBotClassification = aiAgent.detected && aiAgent.agentId === "impostor-spoof" ? {
+      subtype: "bad_bot",
+      label: "Spoofed AI Bot",
+      provider: aiAgent.operator,
+      category: "Spoofed Identity",
+      confidence: 0.99,
+      reasons: aiAgent.evidence.slice(0, 3)
+    } : aiAgent.detected && aiAgent.agentId !== null ? {
+      subtype: "ai_agent",
+      label: aiAgent.agentName,
+      provider: aiAgent.operator,
+      category: "AI Agent",
+      confidence: aiAgent.verified ? 0.99 : 0.85,
+      reasons: aiAgent.evidence.slice(0, 3)
+    } : null;
+    const effectiveBotClassification = attributedBotClassification ?? botClassification;
     const signedPayloadTampered = /Payload integrity hash mismatch/i.test(
       envelopeVerdict.requestIntegrityReason
     );
@@ -2984,8 +3758,10 @@ app.post("/api/visitor/identify", async (req, res) => {
     if (envelopeVerdict.replayDetected) {
       flagSuspiciousIp(location.publicIp, "Replayed payload nonce");
     }
-    if (botClassification.subtype === "bad_bot" && botClassification.label === "Spoofed Crawler") {
+    if (effectiveBotClassification.subtype === "bad_bot" && effectiveBotClassification.label === "Spoofed Crawler") {
       flagSuspiciousIp(location.publicIp, "Spoofed crawler user-agent");
+    } else if (aiAgent.agentId === "impostor-spoof") {
+      flagSuspiciousIp(location.publicIp, "Spoofed AI bot user-agent");
     }
     const blocklist = lookupSuspiciousIp(location.publicIp);
     const securitySignals = sanitizeAndReinforceSecuritySignals(
@@ -3016,10 +3792,10 @@ app.post("/api/visitor/identify", async (req, res) => {
         torOperator: torStatus.operator,
         torOperatorHint: torStatus.viaOperatorHint,
         clientTorBrowser: Boolean(rawSecuritySignals?.isTorBrowserClient),
-        aiAgent: null,
+        aiAgent,
         ipBlocklisted: blocklist.blocklisted,
         ipBlocklistReasons: blocklist.reasons,
-        botClassification
+        botClassification: effectiveBotClassification
       }
     );
     const visitHistory = rawVisits.map((r) => {
