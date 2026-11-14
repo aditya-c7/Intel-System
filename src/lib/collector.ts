@@ -10,6 +10,7 @@ import type {
   SecurityEnvelope,
   SignedHistoryBackup,
 } from '../types/visitor';
+import { detectBrowserTampering } from './tamperingDetector';
 
 const STORAGE_KEYS = {
   VISITOR_ID: 'intel_fp_vid',
@@ -2664,6 +2665,16 @@ export async function evaluateSecuritySignals(
     incognito.method
   );
 
+  // Browser tampering — DevTools Device Mode emulation and anti-detect browsers. Compares
+  // engine, platform, touch, viewport and GPU invariants rather than trusting one getter.
+  const tampering = detectBrowserTampering({
+    webglVendor: hardwareSignals.gpuVendor,
+    webglRenderer: hardwareSignals.gpuRenderer,
+  });
+
+  // Active call — WebRTC audio transceivers, navigator.audioSession, voice-routed AudioContext.
+  const activeCall = detectActiveCall();
+
   const persistenceMode: PersistenceMode = !localStorageAvailable || incognitoLikely
     ? 'Private / Restricted Storage'
     : hasStoredIdentity
@@ -2799,6 +2810,20 @@ export async function evaluateSecuritySignals(
     cdpDetected: botAssessment.cdpDetected,
     /* Phase 2 — client-side Tor Browser fingerprint (Gecko RFP + letterboxing) */
     isTorBrowserClient: torBrowserClient.detected,
+    /* Phase 5 — browser tampering (DevTools device emulation / anti-detect browsers) */
+    tampering: tampering.tampering,
+    tamperingConfidence: tampering.tampering_confidence,
+    tamperingMlScore: tampering.tampering_ml_score,
+    tamperingDetails: tampering.tampering_details,
+    developerTools: false,
+    /* Phase 5 — active call detection (pruned when unsupported) */
+    activeCall: activeCall.active,
+    activeCallSupported: activeCall.supported,
+    activeCallReasons: activeCall.reasons,
+    /* Phase 6 — raw device attributes for the event JSON inspector */
+    rawDeviceAttributes: collectRawDeviceAttributes(),
+    /* Privacy settings: Tor Browser RFP / anti-fingerprinting evidence */
+    privacySettings: torBrowserClient.detected,
     /* Removed probes are neutralised so downstream consumers see explicit falses. */
     devToolsOpen: false,
     adBlockerDetected: false,
@@ -2806,6 +2831,651 @@ export async function evaluateSecuritySignals(
     webrtcCandidateIp: null,
     distinctIpsLastHour: undefined,
     visitsLastHour: undefined,
+  };
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Active Call Detection & capability pruning
+ *
+ * A phone in an active cellular / VoIP call locks the OS audio layer into voice-communication
+ * mode (Android `MODE_IN_COMMUNICATION`, iOS `AVAudioSessionModeVoiceChat`). The browser cannot
+ * read telephony state, but the lock leaks through three Web APIs: the WebRTC transceiver list,
+ * `navigator.audioSession`, and the AudioContext sample rate / lifecycle. Each probe is
+ * best-effort and must never throw.
+ * ---------------------------------------------------------------------------------------------- */
+
+export interface ActiveCallAssessment {
+  /** Whether this runtime can observe call state at all (drives UI pruning). */
+  supported: boolean;
+  active: boolean;
+  reasons: string[];
+}
+
+interface TrackedPeerConnection {
+  connection: RTCPeerConnection;
+  audio: boolean;
+}
+
+const trackedPeerConnections = new Set<TrackedPeerConnection>();
+let webrtcProbeInstalled = false;
+
+/**
+ * Instruments `RTCPeerConnection` once, at module load, so peer connections created by any
+ * third-party call widget are counted too. Connections are pruned on state transitions.
+ */
+export function installWebRtcCallProbe(): void {
+  if (webrtcProbeInstalled || typeof window === 'undefined') return;
+  const scope = window as unknown as {
+    RTCPeerConnection?: typeof RTCPeerConnection;
+    webkitRTCPeerConnection?: typeof RTCPeerConnection;
+  };
+  const Ctor = scope.RTCPeerConnection || scope.webkitRTCPeerConnection;
+  if (typeof Ctor !== 'function') return;
+  webrtcProbeInstalled = true;
+  try {
+    const Original = Ctor;
+    const Wrapped = function PatchedPeerConnection(
+      this: RTCPeerConnection,
+      ...args: ConstructorParameters<typeof RTCPeerConnection>
+    ) {
+      const pc = new Original(...args);
+      const entry: TrackedPeerConnection = { connection: pc, audio: false };
+      trackedPeerConnections.add(entry);
+      const refresh = () => {
+        try {
+          const senders = pc.getSenders?.() ?? [];
+          const receivers = pc.getReceivers?.() ?? [];
+          entry.audio = [...senders, ...receivers].some(
+            (rtp) => rtp?.track?.kind === 'audio' && rtp.track.readyState === 'live'
+          );
+        } catch {
+          entry.audio = false;
+        }
+        const state = pc.connectionState;
+        if (state === 'closed' || state === 'failed' || state === 'disconnected') {
+          trackedPeerConnections.delete(entry);
+        }
+      };
+      try {
+        pc.addEventListener('track', refresh);
+        pc.addEventListener('connectionstatechange', refresh);
+        pc.addEventListener('iceconnectionstatechange', refresh);
+      } catch {
+        // Hostile event target: the audio flag simply stays false.
+      }
+      refresh();
+      return pc;
+    } as unknown as typeof RTCPeerConnection;
+    Wrapped.prototype = Original.prototype;
+    scope.RTCPeerConnection = Wrapped;
+  } catch {
+    // Frozen global: WebRTC transceiver polling below still runs on existing connections.
+  }
+}
+
+// Install eagerly so call widgets that load after first paint are still observed.
+installWebRtcCallProbe();
+
+/**
+ * Detects an in-progress call from WebRTC transceivers, `navigator.audioSession`, and the
+ * AudioContext voice-routing profile. `supported` is true on any mobile claim or when the
+ * runtime exposes call telemetry, which is what the Smart Signals grid uses to prune the row.
+ */
+export function detectActiveCall(): ActiveCallAssessment {
+  const reasons: string[] = [];
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+  const maxTouchPoints = typeof navigator !== 'undefined' ? navigator.maxTouchPoints ?? 0 : 0;
+  const claimsMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+  const hasRtc =
+    typeof window !== 'undefined' &&
+    typeof (window as unknown as { RTCPeerConnection?: unknown }).RTCPeerConnection === 'function';
+  const audioSessionType = (() => {
+    try {
+      const session = (navigator as unknown as { audioSession?: { type?: string } }).audioSession;
+      return typeof session?.type === 'string' ? session.type : '';
+    } catch {
+      return '';
+    }
+  })();
+  const supported = claimsMobile || hasRtc || Boolean(audioSessionType) || maxTouchPoints > 0;
+
+  // 1. A connected peer connection carrying a live audio track.
+  let connectedAudioCall = false;
+  for (const entry of Array.from(trackedPeerConnections)) {
+    try {
+      const { connection } = entry;
+      const connected =
+        connection.connectionState === 'connected' ||
+        connection.iceConnectionState === 'connected' ||
+        connection.iceConnectionState === 'completed';
+      const hasAudio =
+        entry.audio ||
+        (connection.getSenders?.() ?? []).some(
+          (sender) => sender?.track?.kind === 'audio' && sender.track.readyState === 'live'
+        );
+      if (connected && hasAudio) {
+        connectedAudioCall = true;
+        break;
+      }
+    } catch {
+      // Ignore a connection that threw while being inspected.
+    }
+  }
+  if (connectedAudioCall) {
+    reasons.push('Connected WebRTC peer connection with a live audio track');
+  }
+  if (audioSessionType === 'play-and-record') {
+    reasons.push('navigator.audioSession reports play-and-record');
+  }
+
+  // 2. Voice-routed audio hardware: narrowband/wideband voice sample rates, or an iOS
+  //    `interrupted` context that only occurs while the audio session is held by a call.
+  let voiceRoutedAudio = false;
+  if (typeof window !== 'undefined') {
+    const AudioContextCtor =
+      (window as unknown as { AudioContext?: typeof AudioContext }).AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (typeof AudioContextCtor === 'function') {
+      try {
+        const ctx = new AudioContextCtor();
+        const state = String(ctx.state || '');
+        const sampleRate = ctx.sampleRate || 0;
+        if (sampleRate > 0 && sampleRate <= 16000) {
+          voiceRoutedAudio = true;
+          reasons.push(`Audio hardware clamped to ${sampleRate} Hz voice profile`);
+        }
+        if (state === 'interrupted') {
+          voiceRoutedAudio = true;
+          reasons.push('AudioContext state is "interrupted" (audio session owned by a call)');
+        }
+        const closer = (ctx as AudioContext & { close?: () => Promise<void> }).close;
+        if (typeof closer === 'function') {
+          void closer.call(ctx).catch(() => undefined);
+        }
+      } catch {
+        // Autoplay policy or a sandboxed context: no evidence either way.
+      }
+    }
+  }
+
+  return {
+    supported,
+    active: connectedAudioCall || voiceRoutedAudio || audioSessionType === 'play-and-record',
+    reasons,
+  };
+}
+
+/* ------------------------------------------------------------------------------------------------
+ * Raw device attributes — the `raw_device_attributes` block of the event payload.
+ * Everything is measured with native Web APIs; nothing is fetched or cached remotely.
+ * ---------------------------------------------------------------------------------------------- */
+
+export interface RawDeviceAttributes {
+  font_preferences: Record<string, number>;
+  emoji: {
+    font: string;
+    width: number;
+    height: number;
+    top: number;
+    bottom: number;
+    left: number;
+    right: number;
+    x: number;
+    y: number;
+  } | null;
+  fonts: string[];
+  timezone: string;
+  canvas: {
+    winding: boolean | null;
+    geometry: string;
+    text: string;
+  };
+  languages: string[][];
+  webgl_extensions: {
+    context_attributes: string;
+    parameters: string;
+    shader_precisions: string;
+    extensions: string;
+    extension_parameters: string;
+    unsupported_extensions: string[];
+  };
+  webgl_basics: {
+    version: string;
+    vendor: string;
+    renderer: string;
+    shading_language_version: string;
+  };
+  screen_resolution: [number, number];
+  touch_support: {
+    touch_event: boolean;
+    touch_start: boolean;
+    max_touch_points: number;
+  };
+  oscpu: string;
+  architecture: number;
+  cookies_enabled: boolean;
+  hardware_concurrency: number | null;
+  date_time_locale: string;
+  vendor: string;
+  color_depth: number;
+  platform: string;
+  session_storage: boolean;
+  local_storage: boolean;
+  audio: number | null;
+  plugins: Array<{ name: string; description: string; mimeTypes: Array<{ type: string; suffixes: string }> }>;
+  indexed_db: boolean;
+  math: string;
+  font_hash: string;
+  timezone_offset: string;
+}
+
+/** 32-character hex digest (four seeded FNV-1a passes over the same input). */
+function hash128(input: string): string {
+  const seeds = [0x811c9dc5, 0x01000193, 0x7f4a7c15, 0x9e3779b9];
+  return seeds
+    .map((seed) => {
+      let hash = seed >>> 0;
+      for (let i = 0; i < input.length; i += 1) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+      }
+      return hash.toString(16).padStart(8, '0');
+    })
+    .join('');
+}
+
+const FONT_PROFILES: Record<string, string> = {
+  default: '',
+  serif: 'serif',
+  sans: 'sans-serif',
+  mono: 'monospace',
+  apple: '-apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial',
+  min: 'Minion Pro, "Times New Roman", Times, serif',
+  system: 'system-ui, -apple-system, "Segoe UI", Roboto, Arial',
+};
+
+const PROBE_FONT_FAMILIES = [
+  'Arial',
+  'Courier New',
+  'Georgia',
+  'Helvetica Neue',
+  'Menlo',
+  'Monaco',
+  'Roboto',
+  'Segoe UI',
+  'Tahoma',
+  'Times New Roman',
+  'Trebuchet MS',
+  'Verdana',
+];
+
+/**
+ * Measures font metrics, emoji bounding boxes, canvas stability, WebGL hashes and the math
+ * vector with native APIs. Returns `null` only when the DOM is unavailable.
+ */
+export function collectRawDeviceAttributes(): RawDeviceAttributes | null {
+  if (typeof document === 'undefined' || typeof window === 'undefined') return null;
+
+  const makeSpan = (text: string, style: string): HTMLSpanElement | null => {
+    try {
+      const span = document.createElement('span');
+      span.textContent = text;
+      span.style.position = 'absolute';
+      span.style.left = '-9999px';
+      span.style.top = '0';
+      span.style.visibility = 'hidden';
+      span.style.whiteSpace = 'nowrap';
+      span.style.fontSize = '72px';
+      if (style) span.style.fontFamily = style;
+      document.body.appendChild(span);
+      return span;
+    } catch {
+      return null;
+    }
+  };
+
+  const measure = (span: HTMLSpanElement | null): number => {
+    if (!span) return 0;
+    try {
+      const width = span.getBoundingClientRect().width;
+      return Number.isFinite(width) ? Number(width.toFixed(6)) : 0;
+    } catch {
+      return 0;
+    }
+  };
+
+  const fontPreferences: Record<string, number> = {};
+  for (const [key, family] of Object.entries(FONT_PROFILES)) {
+    const span = makeSpan('mmmmmmmmmmlli', family);
+    fontPreferences[key] = measure(span);
+    span?.remove();
+  }
+
+  const detectedFonts: string[] = [];
+  for (const family of PROBE_FONT_FAMILIES) {
+    const withFamily = makeSpan('mmmmmmmmmmlli', `"${family}", monospace`);
+    const without = makeSpan('mmmmmmmmmmlli', 'monospace');
+    const diff = Math.abs(measure(withFamily) - measure(without));
+    withFamily?.remove();
+    without?.remove();
+    if (diff > 0.1) detectedFonts.push(family);
+  }
+
+  let emoji: RawDeviceAttributes['emoji'] = null;
+  const emojiSpan = makeSpan('😀', 'serif');
+  if (emojiSpan) {
+    try {
+      const rect = emojiSpan.getBoundingClientRect();
+      emoji = {
+        font: 'serif',
+        width: Number(rect.width.toFixed(6)),
+        height: Number(rect.height.toFixed(6)),
+        top: Number(rect.top.toFixed(6)),
+        bottom: Number(rect.bottom.toFixed(6)),
+        left: Number(rect.left.toFixed(6)),
+        right: Number(rect.right.toFixed(6)),
+        x: Number(rect.x.toFixed(6)),
+        y: Number(rect.y.toFixed(6)),
+      };
+    } catch {
+      emoji = null;
+    }
+    emojiSpan.remove();
+  }
+
+  // Canvas: winding + double-encoded geometry/text stability (anti-fingerprinting noise).
+  let winding: boolean | null = null;
+  let geometry = 'unavailable';
+  let textHash = 'unavailable';
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = 240;
+    canvas.height = 60;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      const path = new Path2D('M 10 10 L 100 10 L 100 50 Z');
+      try {
+        winding = ctx.isPointInPath(path, 50, 20, 'evenodd');
+      } catch {
+        winding = null;
+      }
+      const paint = () => {
+        ctx.fillStyle = '#f60';
+        ctx.fillRect(0, 0, 120, 30);
+        ctx.fillStyle = '#069';
+        ctx.font = '14px "Arial"';
+        ctx.fillText('Intel🔒System', 2, 45);
+        ctx.strokeStyle = 'rgba(102, 204, 0, 0.7)';
+        ctx.beginPath();
+        ctx.arc(60, 30, 20, 0, Math.PI * 2);
+        ctx.stroke();
+      };
+      const read = () => canvas.toDataURL();
+      paint();
+      const first = read();
+      paint();
+      const second = read();
+      geometry = first === second ? hash128(first) : 'unstable';
+      textHash = first === second ? hash128(`${first}|text`) : 'unstable';
+    }
+  } catch {
+    // Canvas blocked: report the hash as unavailable rather than throwing.
+  }
+
+  let webglExtensions: RawDeviceAttributes['webgl_extensions'] = {
+    context_attributes: 'unavailable',
+    parameters: 'unavailable',
+    shader_precisions: 'unavailable',
+    extensions: 'unavailable',
+    extension_parameters: 'unavailable',
+    unsupported_extensions: [],
+  };
+  let webglBasics: RawDeviceAttributes['webgl_basics'] = {
+    version: 'unavailable',
+    vendor: 'unavailable',
+    renderer: 'unavailable',
+    shading_language_version: 'unavailable',
+  };
+  try {
+    const canvas = document.createElement('canvas');
+    const gl = (canvas.getContext('webgl') ||
+      canvas.getContext('experimental-webgl')) as WebGLRenderingContext | null;
+    if (gl) {
+      const attributeKeys = [
+        'alpha',
+        'antialias',
+        'depth',
+        'failIfMajorPerformanceCaveat',
+        'premultipliedAlpha',
+        'preserveDrawingBuffer',
+        'stencil',
+      ];
+      const attributes = attributeKeys.map((key) => `${key}:${String(gl.getContextAttributes()?.[key as keyof WebGLContextAttributes])}`).join('|');
+      const parameterNames: Array<keyof WebGLRenderingContext> = [
+        'MAX_TEXTURE_SIZE',
+        'MAX_VIEWPORT_DIMS',
+        'MAX_RENDERBUFFER_SIZE',
+        'MAX_VERTEX_ATTRIBS',
+        'MAX_VARYING_VECTORS',
+        'MAX_COMBINED_TEXTURE_IMAGE_UNITS',
+        'MAX_VERTEX_TEXTURE_IMAGE_UNITS',
+        'MAX_TEXTURE_IMAGE_UNITS',
+        'MAX_FRAGMENT_UNIFORM_VECTORS',
+        'MAX_VERTEX_UNIFORM_VECTORS',
+        'MAX_CUBE_MAP_TEXTURE_SIZE',
+        'ALIASED_LINE_WIDTH_RANGE',
+        'ALIASED_POINT_SIZE_RANGE',
+        'RED_BITS',
+        'GREEN_BITS',
+        'BLUE_BITS',
+        'ALPHA_BITS',
+        'DEPTH_BITS',
+        'STENCIL_BITS',
+        'SUBPIXEL_BITS',
+      ];
+      const parameters = parameterNames
+        .map((name) => {
+          const enumValue = gl[name] as unknown as number;
+          let value: unknown = 'n/a';
+          try {
+            value = enumValue ? gl.getParameter(enumValue) : 'n/a';
+          } catch {
+            value = 'err';
+          }
+          return `${String(name)}:${String(value)}`;
+        })
+        .join('|');
+      const shaderPrecisions = ['VERTEX_SHADER', 'FRAGMENT_SHADER']
+        .map((shader) => {
+          const enumValue = gl[shader as unknown as keyof WebGLRenderingContext] as unknown as number;
+          try {
+            return String(gl.getShaderPrecisionFormat(enumValue, gl.HIGH_FLOAT)?.precision ?? 'n/a');
+          } catch {
+            return 'err';
+          }
+        })
+        .join('|');
+      const supported = (gl.getSupportedExtensions?.() ?? []).slice().sort();
+      const extensionParameters = supported
+        .map((name) => {
+          try {
+            const extension = gl.getExtension(name);
+            if (!extension) return `${name}:null`;
+            return `${name}:${hash128(Object.keys(extension).sort().join(','))}`;
+          } catch {
+            return `${name}:err`;
+          }
+        })
+        .join('|');
+      webglExtensions = {
+        context_attributes: hash128(attributes),
+        parameters: hash128(parameters),
+        shader_precisions: hash128(shaderPrecisions),
+        extensions: hash128(supported.join(',')),
+        extension_parameters: hash128(extensionParameters),
+        unsupported_extensions: [],
+      };
+      webglBasics = {
+        version: gl.getParameter(gl.VERSION) || 'unavailable',
+        vendor: gl.getParameter(gl.VENDOR) || 'unavailable',
+        renderer: gl.getParameter(gl.RENDERER) || 'unavailable',
+        shading_language_version:
+          gl.getParameter(gl.SHADING_LANGUAGE_VERSION) || 'unavailable',
+      };
+    }
+  } catch {
+    // WebGL blocked: keep the unavailable placeholders.
+  }
+
+  // Math vector — 14 transcendental operations, hashed.
+  const mathVector = [
+    Math.acos(0.123124234234234242),
+    Math.acosh(1e308),
+    Math.asin(0.123124234234234242),
+    Math.asinh(1),
+    Math.atan(0.123124234234234242),
+    Math.atanh(0.5),
+    Math.cbrt(100000),
+    Math.cos(Math.PI / 3),
+    Math.cosh(1),
+    Math.expm1(1),
+    Math.log1p(0.5),
+    Math.sin(Math.PI / 3),
+    Math.sinh(1),
+    Math.tanh(1),
+    Math.pow(Math.PI, -100),
+  ];
+  const math = hash128(mathVector.map((value) => String(value)).join(','));
+
+  const tzOffsetMinutes = new Date().getTimezoneOffset();
+  const tzSign = tzOffsetMinutes <= 0 ? '+' : '-';
+  const tzAbs = Math.abs(tzOffsetMinutes);
+  const timezoneOffset = `${tzSign}${String(Math.floor(tzAbs / 60)).padStart(2, '0')}:${String(
+    tzAbs % 60
+  ).padStart(2, '0')}`;
+
+  const languages: string[][] = [];
+  try {
+    if (Array.isArray(navigator.languages)) {
+      languages.push(navigator.languages.slice());
+      languages.push(navigator.languages.slice(0, 2));
+    } else {
+      languages.push([navigator.language]);
+    }
+  } catch {
+    // navigator unavailable.
+  }
+
+  const plugins: RawDeviceAttributes['plugins'] = [];
+  try {
+    for (const plugin of Array.from(navigator.plugins ?? [])) {
+      plugins.push({
+        name: plugin.name,
+        description: plugin.description,
+        mimeTypes: Array.from(plugin).map((mime) => ({
+          type: mime.type,
+          suffixes: mime.suffixes,
+        })),
+      });
+    }
+  } catch {
+    // Plugin array blocked by the browser.
+  }
+
+  const audio = (() => {
+    if (typeof window === 'undefined') return null;
+    const OfflineCtor =
+      (window as unknown as { OfflineAudioContext?: typeof OfflineAudioContext })
+        .OfflineAudioContext ||
+      (window as unknown as { webkitOfflineAudioContext?: typeof OfflineAudioContext })
+        .webkitOfflineAudioContext;
+    if (typeof OfflineCtor !== 'function') return null;
+    try {
+      const context = new OfflineCtor(1, 5000, 44100);
+      const oscillator = context.createOscillator();
+      oscillator.type = 'triangle';
+      oscillator.frequency.value = 10000;
+      const compressor = context.createDynamicsCompressor();
+      compressor.threshold.value = -50;
+      compressor.knee.value = 40;
+      compressor.ratio.value = 12;
+      compressor.attack.value = 0;
+      compressor.release.value = 0.25;
+      oscillator.connect(compressor);
+      compressor.connect(context.destination);
+      oscillator.start(0);
+      void context.startRendering();
+      return Number(context.sampleRate.toFixed(6));
+    } catch {
+      return null;
+    }
+  })();
+
+  const fontHash = hash128(
+    `${Object.values(fontPreferences).join(',')}|${detectedFonts.join(',')}|${
+      emoji ? `${emoji.width}x${emoji.height}` : ''
+    }`
+  );
+
+  return {
+    font_preferences: fontPreferences,
+    emoji,
+    fonts: detectedFonts,
+    timezone: (() => {
+      try {
+        return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Unknown';
+      } catch {
+        return 'Unknown';
+      }
+    })(),
+    canvas: { winding, geometry, text: textHash },
+    languages,
+    webgl_extensions: webglExtensions,
+    webgl_basics: webglBasics,
+    screen_resolution: [window.screen?.width ?? 0, window.screen?.height ?? 0],
+    touch_support: {
+      touch_event: 'ontouchstart' in window,
+      touch_start: typeof (window as unknown as { TouchEvent?: unknown }).TouchEvent === 'function',
+      max_touch_points: navigator.maxTouchPoints ?? 0,
+    },
+    oscpu: (navigator as unknown as { oscpu?: string }).oscpu || '',
+    architecture: Number((navigator as unknown as { architecture?: number }).architecture ?? 255),
+    cookies_enabled: navigator.cookieEnabled,
+    hardware_concurrency: navigator.hardwareConcurrency ?? null,
+    date_time_locale: (() => {
+      try {
+        return Intl.DateTimeFormat().resolvedOptions().locale || 'Unknown';
+      } catch {
+        return 'Unknown';
+      }
+    })(),
+    vendor: navigator.vendor || '',
+    color_depth: window.screen?.colorDepth ?? 0,
+    platform: navigator.platform || '',
+    session_storage: (() => {
+      try {
+        sessionStorage.setItem('__intel_probe__', '1');
+        sessionStorage.removeItem('__intel_probe__');
+        return true;
+      } catch {
+        return false;
+      }
+    })(),
+    local_storage: (() => {
+      try {
+        localStorage.setItem('__intel_probe__', '1');
+        localStorage.removeItem('__intel_probe__');
+        return true;
+      } catch {
+        return false;
+      }
+    })(),
+    audio,
+    plugins,
+    indexed_db: typeof indexedDB !== 'undefined',
+    math,
+    font_hash: fontHash,
+    timezone_offset: timezoneOffset,
   };
 }
 

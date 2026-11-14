@@ -34,6 +34,23 @@ export interface HardwareSignals {
 
 export type RiskLevel = 'Low' | 'Medium' | 'High';
 
+/** Multi-window SQLite aggregations backing the Velocity Signals row. */
+export interface VelocityWindowCounts {
+  '5_minutes': number;
+  '1_hour': number;
+  '24_hours': number;
+}
+
+export interface VelocitySignals {
+  distinct_ip: VelocityWindowCounts;
+  distinct_linked_id: VelocityWindowCounts;
+  distinct_country: VelocityWindowCounts;
+  events: VelocityWindowCounts;
+  ip_events: VelocityWindowCounts;
+  distinct_ip_by_linked_id: VelocityWindowCounts;
+  distinct_visitor_id_by_linked_id: VelocityWindowCounts;
+}
+
 export type PersistenceMode =
   | 'First-Party Cookie'
   | 'Hardware ID Recovered'
@@ -237,6 +254,36 @@ export interface SecuritySignals {
   smartSignals?: SmartSignals;
   /** Composite badge text, e.g. `Medium Risk • 4/10`. */
   riskBadgeText?: string;
+
+  /* Phase 5 — browser tampering (DevTools Device Mode / anti-detect browsers) */
+  tampering?: boolean;
+  tamperingConfidence?: 'low' | 'medium' | 'high';
+  tamperingMlScore?: number;
+  tamperingDetails?: {
+    anomaly_score: number;
+    anti_detect_browser: boolean;
+    devtools_device_emulation: boolean;
+    reasons: string[];
+  };
+  developerTools?: boolean;
+
+  /* Phase 5 — active call detection (supported ⇒ the row is rendered) */
+  activeCall?: boolean;
+  activeCallSupported?: boolean;
+  activeCallReasons?: string[];
+
+  /* Phase 5 — privacy settings (Tor Browser RFP / Brave Shields / canvas noise) */
+  privacySettings?: boolean;
+
+  /* Phase 6 — raw device attributes (font, emoji, canvas, WebGL, math entropy) */
+  rawDeviceAttributes?: unknown;
+
+  /* Phase 2 — SQLite velocity windows and 0–100 calibrated score (server-computed) */
+  velocity?: VelocitySignals;
+  suspectScore100?: number;
+  highActivityDevice?: boolean;
+  rareDevice?: boolean;
+  rareDevicePercentileBucket?: string;
 }
 
 export interface LocationInfo {
@@ -328,4 +375,21 @@ export interface IntelVisitorResponse {
   riskLevel?: RiskLevel;
   riskBadgeText?: string;
   smartSignals?: SmartSignals;
+  /* API v4 mirrors */
+  suspectScore100?: number;
+  velocity?: VelocitySignals;
+  highActivityDevice?: boolean;
+  rareDevice?: boolean;
+  rareDevicePercentileBucket?: string;
+  tampering?: boolean;
+  tamperingConfidence?: 'low' | 'medium' | 'high';
+  tamperingDetails?: {
+    anomaly_score: number;
+    anti_detect_browser: boolean;
+    devtools_device_emulation: boolean;
+    reasons: string[];
+  };
+  activeCall?: boolean;
+  activeCallSupported?: boolean;
+  rawDeviceAttributes?: unknown;
 }
