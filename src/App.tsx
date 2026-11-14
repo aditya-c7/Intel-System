@@ -767,17 +767,11 @@ export default function App() {
 
   // Calibrated 0-100 composite for the top-centered Risk Meter. Older payloads fall back to
   // the 0-10 card-floor score scaled by ten so the meter always has a value.
-  const suspectScore100 = data
-    ? Math.max(
-        0,
-        Math.min(
-          100,
-          Math.round(
-            Number(data.suspectScore100 ?? data.securitySignals?.suspectScore100 ?? displayedRiskScore * 10) || 0
-          )
-        )
-      )
-    : 0;
+  // The dashboard reads every score on the 0-10 scale.
+  const displayedSuspectScore = Math.max(
+    0,
+    Math.min(10, Math.round(displayedRiskScore * 10) / 10)
+  );
 
   // Cursor attribution pill: resolved from the first-party bot / agent verdicts.
   const cursorIdentity = resolveCursorIdentity({
@@ -873,7 +867,7 @@ export default function App() {
         (s as { privacySettings?: boolean }).privacySettings || s.isTorBrowserClient
       ),
       simulator: Boolean(s.emulatorDetected),
-      suspect_score: suspectScore100,
+      suspect_score: displayedSuspectScore,
       tampering: Boolean(data.tampering ?? s.tampering),
       tampering_confidence: data.tamperingConfidence ?? 'high',
       tampering_ml_score: s.tamperingMlScore ?? 0.0024,
@@ -901,7 +895,7 @@ export default function App() {
         data.rareDevicePercentileBucket ?? s.rareDevicePercentileBucket ?? '<p95',
       raw_device_attributes: rawAttributes,
     };
-  }, [data, suspectScore100]);
+  }, [data, displayedSuspectScore]);
 
   // Tor / AI attribution surface — rendered above the Smart Signals grid whenever any
   // first-party anonymity or agent identity was resolved for this visit.
@@ -963,7 +957,7 @@ export default function App() {
           <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
             <span
               className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold ${
-                suspectScore100 === 0
+                displayedSuspectScore === 0
                   ? 'bg-[#E6F4EA] border-[#81C995] text-[#137333]'
                   : riskTier === 'High'
                   ? 'bg-[#FCE8E6] border-[#D93025]/40 text-[#D93025]'
@@ -977,9 +971,9 @@ export default function App() {
               ) : (
                 <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
               )}
-              {suspectScore100 === 0 ? 'Not detected' : `Suspect Score \u2022 ${suspectScore100}`}
+              {displayedSuspectScore === 0 ? 'Not detected' : `Suspect Score \u2022 ${displayedSuspectScore}/10`}
             </span>
-            {suspectScore100 > 0 && (
+            {displayedSuspectScore > 0 && (
               <span className="text-[11px] font-mono text-slate-500">{riskTier} Risk</span>
             )}
           </div>
@@ -992,7 +986,7 @@ export default function App() {
                   ? 'bg-[#F9AB00]'
                   : 'bg-[#81C995]'
               }`}
-              style={{ width: `${Math.max(2, suspectScore100)}%` }}
+              style={{ width: `${Math.max(2, displayedSuspectScore * 10)}%` }}
             />
           </div>
           <div className="mt-3 flex items-center justify-center gap-3">
@@ -1550,7 +1544,7 @@ export default function App() {
                     ) : (
                       <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
                     )}
-                    <span>{`${riskTier} Risk \u2022 ${suspectScore100}/100`}</span>
+                    <span>{`${riskTier} Risk \u2022 ${displayedSuspectScore}/10`}</span>
                   </span>
                 </div>
 
@@ -1600,7 +1594,7 @@ export default function App() {
                     Risk Meter
                   </span>
                   <span className="text-xs font-mono tabular-nums text-slate-500 truncate">
-                    • {`${riskTier} Risk \u2022 ${suspectScore100}/100`}
+                    • {`${riskTier} Risk \u2022 ${displayedSuspectScore}/10`}
                   </span>
                 </div>
 
@@ -1614,7 +1608,7 @@ export default function App() {
                         : 'bg-emerald-500'
                     }`}
                     style={{
-                      width: `${Math.max(2, suspectScore100)}%`,
+                      width: `${Math.max(2, displayedSuspectScore * 10)}%`,
                     }}
                   />
                 </div>

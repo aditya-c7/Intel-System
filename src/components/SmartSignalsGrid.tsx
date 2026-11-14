@@ -85,7 +85,7 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   rows.push({
     key: 'incognito',
     label: 'Incognito Mode',
-    status: incognito ? 'You are incognito \u{1F576}' : 'Not detected',
+    status: incognito ? 'You are incognito' : 'Not detected',
     triggered: incognito,
     detail: signals.incognitoMethod,
   });
@@ -104,7 +104,7 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   rows.push({
     key: 'vpn',
     label: 'VPN',
-    status: vpn ? 'You are using a VPN \u{1F310}' : 'Not detected',
+    status: vpn ? 'You are using a VPN' : 'Not detected',
     triggered: vpn,
     detail: vpnMethodCount > 1 ? `${vpnMethodCount} matching network methods` : signals.vpnReasons?.[0],
   });
@@ -136,7 +136,7 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   rows.push({
     key: 'virtualMachine',
     label: 'Virtual Machine',
-    status: virtualMachine ? 'Yes \u2601\uFE0F\u{1F4BB}' : 'Not detected',
+    status: virtualMachine ? 'Yes' : 'Not detected',
     triggered: virtualMachine,
     detail: signals.emulatorReason || signals.vmReason,
   });
@@ -147,7 +147,7 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   rows.push({
     key: 'privacySettings',
     label: 'Privacy Settings',
-    status: privacySettings ? 'Yes \u{1F648}\u{1F4BB}' : 'Not detected',
+    status: privacySettings ? 'Yes' : 'Not detected',
     triggered: privacySettings,
     detail: signals.privacyDetail || (signals.isTorBrowserClient ? 'Tor Browser RFP' : undefined),
   });
@@ -158,7 +158,7 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     key: 'ipBlocklist',
     label: 'IP Blocklist',
     status: torNode
-      ? 'Your IP is a Tor exit node \u{1F9C5}'
+      ? 'Your IP is a Tor exit node'
       : blocklisted
       ? 'Your IP is blocklisted'
       : 'Not detected',
@@ -229,13 +229,16 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     tone: 'clean',
   });
 
-  const suspectScore = Number(data.suspectScore100 ?? 0);
+  const suspectScore = Math.max(
+    0,
+    Math.min(10, Number(data.suspectScore ?? data.securitySignals?.suspectScore ?? 0) || 0)
+  );
   rows.push({
     key: 'suspectScore',
     label: 'Suspect Score',
-    status: String(suspectScore),
-    triggered: suspectScore >= 50,
-    tone: suspectScore >= 50 ? 'trigger' : suspectScore > 0 ? 'neutral' : 'clean',
+    status: `${suspectScore}/10`,
+    triggered: suspectScore >= 5,
+    tone: suspectScore >= 5 ? 'trigger' : suspectScore > 0 ? 'neutral' : 'clean',
   });
 
   const proximityStatus = data.location.isLocationVerified
