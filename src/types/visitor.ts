@@ -43,7 +43,12 @@ export type NetworkType =
   | 'Residential Broadband'
   | 'Cellular / 5G'
   | 'Satellite'
-  | 'Cloud / Datacenter';
+  | 'Cloud / Datacenter'
+  | 'Tor Exit / Anonymity Network'
+  | 'AI Agent Cloud Network'
+  | 'VPN / Proxy Relay'
+  | 'Mobile Carrier'
+  | 'Unknown Network';
 
 export interface IspNetworkClassification {
   brandName: string;
@@ -51,6 +56,37 @@ export interface IspNetworkClassification {
   isConsumerBroadband: boolean;
   isDatacenterOrHosting: boolean;
   matchedReason: string | null;
+}
+
+/**
+ * Granular attribution for autonomous agents. Produced by the server from RFC 9421 Web Bot
+ * Auth headers, official CIDR ranges, forward-confirmed reverse DNS and cloud-VM telemetry.
+ */
+export interface AiAgentAttribution {
+  detected: boolean;
+  agentId:
+    | 'gemini'
+    | 'grok'
+    | 'muse'
+    | 'perplexity'
+    | 'openai'
+    | 'claude'
+    | 'cloud-browser'
+    | 'impostor-spoof'
+    | null;
+  agentName: string;
+  operator: string;
+  executionMode:
+    | 'RFC 9421 Signed Agent'
+    | 'User-Triggered Fetcher'
+    | 'Silent Cloud VM Browser'
+    | 'Autonomous Crawler'
+    | 'Spoofed Impostor'
+    | null;
+  verified: boolean;
+  confidence: 'Verified' | 'High' | 'Medium';
+  riskScore: number;
+  evidence: string[];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -179,6 +215,14 @@ export interface SecuritySignals {
   torExitNode?: boolean;
   ipBlocklisted?: boolean;
   ipBlocklistReasons?: string[];
+  /** Client-side Tor Browser fingerprint (Gecko RFP + letterboxing). */
+  isTorBrowserClient?: boolean;
+  /** Tri-state server verdict: an anonymous relay known to be an exit node or a relay. */
+  torVerdict?: 'exit' | 'relay' | 'no' | 'unknown';
+  /** Relay operator / ASN attribution for the Tor exit. */
+  torOperator?: string;
+  /** Granular AI-agent attribution (Gemini, Grok, Muse, Perplexity, OpenAI, Claude, cloud). */
+  aiAgent?: AiAgentAttribution | null;
 
   /* Phase 3 — mobile emulator / simulator and cloud-container detection */
   emulatorDetected?: boolean;

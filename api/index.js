@@ -617,6 +617,35 @@ var CLOUD_PROVIDER_ASN_NUMBERS = /* @__PURE__ */ new Set([
   8075,
   20473
 ]);
+var TOR_OPERATOR_ASN_SET = /* @__PURE__ */ new Set([
+  "AS215125",
+  // Church of Cyberology / Nothing to Hide
+  "AS60729",
+  // Zwiebelfreunde e.V. / Torservers.net
+  "AS208323",
+  // Foundation for Applied Privacy
+  "AS396507",
+  // Emerald Onion
+  "AS200052",
+  // Artikel10 e.V.
+  "AS206848",
+  // CCC Stuttgart / Chaos Computer Club
+  "AS205100",
+  // F3 Netze e.V.
+  "AS199695"
+  // Nos Oignons
+]);
+var TOR_OPERATOR_ORG_PATTERN = /\b(church of cyberology|cyberology|nothing to hide|nothingtohide|hart voor internetvrijheid|zwiebelfreunde|torservers|emerald onion|emeraldonion|applied privacy|applied-privacy|nos oignons|nos-oignons|artikel10|f3\s?netze|ccc stuttgart|r0cket|tor\s?exit|tor\s?relay)\b/i;
+var TOR_OPERATOR_IPV4_CIDRS = ["192.42.116.0/24"];
+var TOR_OPERATOR_IPV6_PREFIXES = ["2001:67c:e60::/48", "2a02:898:256::/48"];
+var TOR_OPERATOR_REVERSE_DNS_PATTERN = /\b(tor-?exit|tor-?relay|exit-?node|nothingtohide\.nl|hartvoorinternetvrijheid\.nl|cyberology\.(nl|church)|torservers\.net|emeraldonion\.org|applied-privacy\.net|artikel10\.org|nos-oignons\.net|tor\.r0cket\.net)\b/i;
+var VPN_PROXY_PATTERN = /\b(vpn|nordvpn|expressvpn|surfshark|cyberghost|private internet access|proton\s?vpn|mullvad|windscribe|ipvanish|hide\.?me|hola vpn|psiphon|packet hub|packethub|tor ?guard|proxy|socks5|smart dns)\b/i;
+var MOBILE_CARRIER_PATTERN = /\b(mobile|cellular|wireless|5g|4g|lte|t-mobile|tmobile|verizon wireless|cellco|vodafone|orange s\.?a|telefonica|movistar|claro|tim s\.?p\.?a|mtn)\b/i;
+function matchesTorOperatorAsn(asn) {
+  const clean = typeof asn === "string" ? asn.trim().toUpperCase() : "";
+  if (!clean) return false;
+  return TOR_OPERATOR_ASN_SET.has(clean.startsWith("AS") ? clean : `AS${clean}`);
+}
 function classifyIspNetwork(isp, org, asn) {
   const cleanIsp = typeof isp === "string" ? isp.trim() : "";
   const cleanOrg = typeof org === "string" ? org.trim() : "";
@@ -641,18 +670,27 @@ function classifyIspNetwork(isp, org, asn) {
       matchedReason: asnHit !== void 0 ? `ASN AS${asnHit}` : `ISP metadata keyword ${String(keywords)}`
     };
   };
-  const consumerMatch = (
+  const mobileHomeMatch = () => matchConsumerRule("Verizon 5G Home", "Cellular / 5G", [6167, 22394], /cellco|verizon wireless/i) || matchConsumerRule("T-Mobile 5G Home", "Cellular / 5G", [21928], /t-mobile|tmobile/i);
+  const satelliteMatch = () => matchConsumerRule("Starlink (SpaceX)", "Satellite", [14593], /starlink|spacex/i);
+  const residentialMatch = () => (
     // US consumer broadband (Residential Broadband)
-    matchConsumerRule("Xfinity (Comcast)", "Residential Broadband", [7922, 7015, 7016], /comcast|xfinity/i) || matchConsumerRule("Spectrum (Charter)", "Residential Broadband", [20115, 11426, 10796], /charter|spectrum/i) || matchConsumerRule("AT&T Fiber", "Residential Broadband", [7018, 20057], /at&t|att services|sbcglobal/i) || matchConsumerRule("Verizon Fios", "Residential Broadband", [701, 19262], /fios|mci communications|verizon online/i) || matchConsumerRule("Optimum", "Residential Broadband", [6128, 19108], /optimum|cablevision|altice|suddenlink/i) || matchConsumerRule("Cox", "Residential Broadband", [22773], /\bcox\b/i) || matchConsumerRule("Frontier / CenturyLink", "Residential Broadband", [5650, 209], null) || matchConsumerRule("Google Fiber", "Residential Broadband", [16591], /google fiber|gfiber/i) || // US 5G home internet (Cellular / 5G)
-    matchConsumerRule("Verizon 5G Home", "Cellular / 5G", [6167, 22394], /cellco|verizon wireless/i) || matchConsumerRule("T-Mobile 5G Home", "Cellular / 5G", [21928], /t-mobile|tmobile/i) || // Satellite
-    matchConsumerRule("Starlink (SpaceX)", "Satellite", [14593], /starlink|spacex/i) || // India consumer broadband (Residential Broadband)
+    matchConsumerRule("Xfinity (Comcast)", "Residential Broadband", [7922, 7015, 7016], /comcast|xfinity/i) || matchConsumerRule("Spectrum (Charter)", "Residential Broadband", [20115, 11426, 10796], /charter|spectrum/i) || matchConsumerRule("AT&T Fiber", "Residential Broadband", [7018, 20057], /at&t|att services|sbcglobal/i) || matchConsumerRule("Verizon Fios", "Residential Broadband", [701, 19262], /fios|mci communications|verizon online/i) || matchConsumerRule("Optimum", "Residential Broadband", [6128, 19108], /optimum|cablevision|altice|suddenlink/i) || matchConsumerRule("Cox", "Residential Broadband", [22773], /\bcox\b/i) || matchConsumerRule("Frontier / CenturyLink", "Residential Broadband", [5650, 209], null) || matchConsumerRule("Google Fiber", "Residential Broadband", [16591], /google fiber|gfiber/i) || // India consumer broadband (Residential Broadband)
     matchConsumerRule("Jio (Reliance Jio)", "Residential Broadband", [55836], /reliance jio|\bjio\b/i) || matchConsumerRule("Airtel Xstream", "Residential Broadband", [24560, 45609, 9498], /bharti airtel|\bairtel\b/i) || matchConsumerRule("ACT Fibernet", "Residential Broadband", [24309], /act fibernet|atria convergence/i) || matchConsumerRule("BSNL Broadband", "Residential Broadband", [9829], /\bbsnl\b|bharat sanchar/i) || matchConsumerRule("Tata Play / Hathway", "Residential Broadband", [], /tata play|tata sky broadband|hathway|excitel/i)
   );
-  if (consumerMatch) {
-    return consumerMatch;
+  const asnTokenHits = Array.from(asnNumbers).map((n) => `AS${n}`);
+  const torAsnHit = asnTokenHits.find((token) => matchesTorOperatorAsn(token));
+  const torOrgHit = TOR_OPERATOR_ORG_PATTERN.test(keywordHaystack);
+  if (torAsnHit !== void 0 || torOrgHit) {
+    return {
+      brandName: cleanIsp && !/^unknown( isp)?$/i.test(cleanIsp) ? cleanIsp : cleanOrg && !/^unknown( isp)?$/i.test(cleanOrg) ? cleanOrg : "Tor Relay Operator",
+      networkType: "Tor Exit / Anonymity Network",
+      isConsumerBroadband: false,
+      isDatacenterOrHosting: true,
+      matchedReason: torAsnHit !== void 0 ? `Tor operator ASN ${torAsnHit}` : "Tor operator organisation"
+    };
   }
   const cloudAsnHit = Array.from(asnNumbers).find((n) => CLOUD_PROVIDER_ASN_NUMBERS.has(n));
-  const cloudKeywords = /google llc|google cloud|amazonaws|cloudflare|digitalocean|hetzner|m247|datacamp|linode|ovh|choopa|vultr|leaseweb|hostinger|contabo|akamai/i;
+  const cloudKeywords = /google llc|google cloud|amazonaws|cloudflare|digitalocean|hetzner|m247|datacamp|linode|ovh|choopa|vultr|leaseweb|hostinger|contabo|akamai|oracle cloud|alibaba|aliyun|tencent cloud/i;
   if (cloudAsnHit !== void 0 || cloudKeywords.test(keywordHaystack)) {
     return {
       brandName: "Cloud Provider / Datacenter",
@@ -662,13 +700,79 @@ function classifyIspNetwork(isp, org, asn) {
       matchedReason: cloudAsnHit !== void 0 ? `ASN AS${cloudAsnHit}` : `ISP metadata keyword ${String(cloudKeywords)}`
     };
   }
+  if (VPN_PROXY_PATTERN.test(keywordHaystack)) {
+    return {
+      brandName: cleanIsp || cleanOrg || "VPN / Proxy Provider",
+      networkType: "VPN / Proxy Relay",
+      isConsumerBroadband: false,
+      isDatacenterOrHosting: false,
+      matchedReason: "VPN / proxy provider keyword"
+    };
+  }
+  const mobileHome = mobileHomeMatch();
+  if (mobileHome) return mobileHome;
+  if (MOBILE_CARRIER_PATTERN.test(keywordHaystack)) {
+    return {
+      brandName: cleanIsp || cleanOrg || "Mobile Carrier",
+      networkType: "Mobile Carrier",
+      isConsumerBroadband: false,
+      isDatacenterOrHosting: false,
+      matchedReason: "Cellular carrier keyword"
+    };
+  }
+  const satellite = satelliteMatch();
+  if (satellite) return satellite;
+  const residential = residentialMatch();
+  if (residential) return residential;
   return {
-    brandName: cleanIsp && !/^unknown$|^unknown isp$/i.test(cleanIsp) ? cleanIsp : cleanOrg && !/^unknown$|^unknown isp$/i.test(cleanOrg) ? cleanOrg : "Unknown ISP",
-    networkType: "Residential Broadband",
+    brandName: cleanIsp && !/^(unknown|unknown isp|n\/a)$/i.test(cleanIsp) ? cleanIsp : cleanOrg && !/^(unknown|unknown isp|n\/a)$/i.test(cleanOrg) ? cleanOrg : "Unknown ISP",
+    networkType: "Unknown Network",
     isConsumerBroadband: false,
     isDatacenterOrHosting: false,
     matchedReason: null
   };
+}
+function applyNetworkOverrides(base, context) {
+  const torNetwork = context.torExit || context.torOperatorHint || context.isTorBrowserClient || base.networkType === "Tor Exit / Anonymity Network";
+  if (torNetwork) {
+    return {
+      ...base,
+      networkType: "Tor Exit / Anonymity Network",
+      isConsumerBroadband: false,
+      isDatacenterOrHosting: true,
+      matchedReason: base.matchedReason || "Tor anonymity network"
+    };
+  }
+  if (context.aiAgentDetected && base.networkType === "Cloud / Datacenter") {
+    return {
+      ...base,
+      networkType: "AI Agent Cloud Network",
+      isConsumerBroadband: false,
+      isDatacenterOrHosting: true,
+      matchedReason: base.matchedReason || "AI agent cloud infrastructure"
+    };
+  }
+  if (context.datacenterVm && base.networkType !== "Cloud / Datacenter") {
+    return {
+      ...base,
+      networkType: "Cloud / Datacenter",
+      isConsumerBroadband: false,
+      isDatacenterOrHosting: true,
+      matchedReason: base.matchedReason || "Cloud VM / masked GPU footprint"
+    };
+  }
+  if (context.vpnSuspected && base.networkType === "Residential Broadband") {
+    return {
+      ...base,
+      networkType: "VPN / Proxy Relay",
+      isConsumerBroadband: false,
+      matchedReason: base.matchedReason || "VPN indicator on a residential line"
+    };
+  }
+  if (base.networkType === "Residential Broadband" && !base.isConsumerBroadband) {
+    return { ...base, networkType: "Unknown Network" };
+  }
+  return base;
 }
 function readRequestHeader(headers, name) {
   if (!headers) return "";
@@ -981,16 +1085,321 @@ function classifyEmulatorFromSignals(input) {
 var TOR_DNS_TIMEOUT_MS = 600;
 var TOR_DOH_TIMEOUT_MS = 1200;
 var TOR_DOH_ENDPOINTS = ["https://dns.google/resolve", "https://cloudflare-dns.com/dns-query"];
-var TOR_DNS_CACHE_TTL_MS = 10 * 60 * 1e3;
-var TOR_DNS_CACHE_MAX_ENTRIES = 5e3;
 var TOR_BULK_LIST_URL = "https://check.torproject.org/torbulkexitlist";
-var TOR_BULK_REFRESH_INTERVAL_MS = 60 * 60 * 1e3;
-var TOR_BULK_TIMEOUT_MS = 1500;
+var TOR_EXIT_ADDRESSES_URL = "https://check.torproject.org/exit-addresses";
+var TOR_ONIONOO_DETAILS_URL = "https://onionoo.torproject.org/details";
 var TOR_BULK_LIST_MAX_ENTRIES = 2e4;
-var torDnsCache = /* @__PURE__ */ new Map();
-var torBulkExitList = /* @__PURE__ */ new Set();
-var torBulkRefreshedAtMs = 0;
-var torBulkRefreshInFlight = false;
+var TOR_INTELLIGENCE_SYNC_INTERVAL_MS = 30 * 60 * 1e3;
+var TOR_INTELLIGENCE_SYNC_TIMEOUT_MS = 1e4;
+var TOR_LIVE_LOOKUP_TIMEOUT_MS = 1800;
+var TOR_REVERSE_DNS_TIMEOUT_MS = 1200;
+var TOR_VERDICT_CACHE_TTL_MS = 30 * 60 * 1e3;
+var TOR_VERDICT_CACHE_MAX_ENTRIES = 5e3;
+var TOR_OPERATOR_PREFIX_CACHE_TTL_MS = 6 * 60 * 60 * 1e3;
+var torIpv4ExitSet = /* @__PURE__ */ new Set();
+var torIpv6ExitSet = /* @__PURE__ */ new Set();
+var torIpv6Prefix64Set = /* @__PURE__ */ new Set();
+var torIpv6Prefix48Set = /* @__PURE__ */ new Set();
+var torRelayMetadataMap = /* @__PURE__ */ new Map();
+var torIntelligenceLastSyncMs = 0;
+var torIntelligenceSyncInFlight = null;
+var torIntelligenceTimer = null;
+var torVerdictCache = /* @__PURE__ */ new Map();
+var torReverseDnsCache = /* @__PURE__ */ new Map();
+function normalizeIpAddress(rawIp) {
+  if (typeof rawIp !== "string") return "";
+  let value = rawIp.trim();
+  if (!value) return "";
+  if (value.startsWith("[") && value.endsWith("]")) value = value.slice(1, -1);
+  const zoneIndex = value.indexOf("%");
+  if (zoneIndex >= 0) value = value.slice(0, zoneIndex);
+  const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(value);
+  if (mapped) value = mapped[1];
+  return value.toLowerCase();
+}
+function isIpv6Hextet(value) {
+  return /^[0-9a-f]{1,4}$/.test(value);
+}
+function expandIpv6Address(ip) {
+  let value = normalizeIpAddress(ip);
+  if (!value || !value.includes(":")) return null;
+  if (value.includes(".")) {
+    const lastColon = value.lastIndexOf(":");
+    if (lastColon < 0) return null;
+    const tail2 = value.slice(lastColon + 1);
+    if (!isIpv4Literal(tail2)) return null;
+    const [a, b, c, d] = tail2.split(".").map((octet) => Number.parseInt(octet, 10));
+    value = `${value.slice(0, lastColon + 1)}${(a << 8 | b).toString(16)}:${(c << 8 | d).toString(16)}`;
+  }
+  const halves = value.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  if (halves.length === 2) {
+    if (head.length + tail.length > 7) return null;
+    const zeros = new Array(8 - head.length - tail.length).fill("0");
+    const hextets = [...head, ...zeros, ...tail];
+    if (!hextets.every(isIpv6Hextet)) return null;
+    return hextets.map((hextet) => hextet.replace(/^0+(?=.)/, "")).join(":");
+  }
+  if (head.length !== 8 || !head.every(isIpv6Hextet)) return null;
+  return head.map((hextet) => hextet.replace(/^0+(?=.)/, "")).join(":");
+}
+function ipv4ToInt(ip) {
+  if (!isIpv4Literal(ip)) return null;
+  const octets = ip.split(".").map((octet) => Number.parseInt(octet, 10));
+  return octets[0] * 16777216 + octets[1] * 65536 + octets[2] * 256 + octets[3] >>> 0 >>> 0;
+}
+function ipv4MatchesCidr(ip, cidr) {
+  const slash = cidr.indexOf("/");
+  const base = (slash >= 0 ? cidr.slice(0, slash) : cidr).trim();
+  const bits = slash >= 0 ? Number.parseInt(cidr.slice(slash + 1), 10) : 32;
+  if (!Number.isInteger(bits) || bits < 0 || bits > 32) return false;
+  const ipInt = ipv4ToInt(ip);
+  const baseInt = ipv4ToInt(base);
+  if (ipInt === null || baseInt === null) return false;
+  if (bits === 0) return true;
+  const mask = 4294967295 << 32 - bits >>> 0;
+  return (ipInt & mask) >>> 0 === (baseInt & mask) >>> 0;
+}
+function ipv6MatchesCidr(ip, cidr) {
+  const slash = cidr.lastIndexOf("/");
+  const base = (slash >= 0 ? cidr.slice(0, slash) : cidr).trim();
+  const bits = slash >= 0 ? Number.parseInt(cidr.slice(slash + 1), 10) : 128;
+  if (!Number.isInteger(bits) || bits < 0 || bits > 128) return false;
+  const ipExpanded = expandIpv6Address(ip);
+  const baseExpanded = expandIpv6Address(base);
+  if (!ipExpanded || !baseExpanded) return false;
+  const ipHextets = ipExpanded.split(":");
+  const baseHextets = baseExpanded.split(":");
+  const fullHextets = Math.floor(bits / 16);
+  for (let index = 0; index < fullHextets; index += 1) {
+    if (ipHextets[index] !== baseHextets[index]) return false;
+  }
+  const remainingBits = bits % 16;
+  if (remainingBits === 0) return true;
+  const mask = 65535 << 16 - remainingBits & 65535;
+  const ipValue = Number.parseInt(ipHextets[fullHextets], 16);
+  const baseValue = Number.parseInt(baseHextets[fullHextets], 16);
+  return (ipValue & mask) === (baseValue & mask);
+}
+function ipMatchesCidrList(ip, cidrList) {
+  const normalized = normalizeIpAddress(ip);
+  if (!normalized) return false;
+  const isV4 = isIpv4Literal(normalized);
+  for (const cidr of cidrList) {
+    if (typeof cidr !== "string") continue;
+    const candidate = cidr.trim();
+    if (!candidate) continue;
+    if (isV4) {
+      if (ipv4MatchesCidr(normalized, candidate)) return true;
+    } else if (ipv6MatchesCidr(normalized, candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+function extractEmbeddedIpv4FromIpv6(ip) {
+  const expanded = expandIpv6Address(ip);
+  if (!expanded) return null;
+  const tail = expanded.split(":").slice(4);
+  if (tail.length !== 4 || !tail.every((hextet) => /^\d{1,3}$/.test(hextet))) return null;
+  const octets = tail.map((hextet) => Number.parseInt(hextet, 10));
+  if (octets.some((octet) => octet > 255)) return null;
+  return octets.join(".");
+}
+function isTorOperatorPrefix(ip) {
+  const normalized = normalizeIpAddress(ip);
+  if (!normalized) return false;
+  if (isIpv4Literal(normalized)) return ipMatchesCidrList(normalized, TOR_OPERATOR_IPV4_CIDRS);
+  return ipMatchesCidrList(normalized, TOR_OPERATOR_IPV6_PREFIXES);
+}
+function splitTorAddressPort(entry) {
+  const trimmed = entry.trim();
+  if (!trimmed) return "";
+  if (trimmed.startsWith("[")) {
+    const close = trimmed.indexOf("]");
+    if (close > 0) return trimmed.slice(1, close);
+  }
+  const firstColon = trimmed.indexOf(":");
+  const lastColon = trimmed.lastIndexOf(":");
+  if (firstColon > 0 && firstColon === lastColon) return trimmed.slice(0, lastColon);
+  return trimmed;
+}
+async function fetchTextWithTimeout(url, timeoutMs, accept) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { accept }
+    });
+    if (!response.ok) return null;
+    return await response.text();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+function torRelayMetadataFromOnionoo(relay) {
+  return {
+    nickname: typeof relay.nickname === "string" ? relay.nickname : "",
+    fingerprint: typeof relay.fingerprint === "string" ? relay.fingerprint : "",
+    as: typeof relay.as === "string" ? relay.as : void 0,
+    asName: typeof relay.as_name === "string" ? relay.as_name : void 0,
+    country: typeof relay.country === "string" ? relay.country : void 0,
+    flags: Array.isArray(relay.flags) ? relay.flags.filter((flag) => typeof flag === "string") : []
+  };
+}
+async function syncTorIntelligence() {
+  const nextIpv4 = /* @__PURE__ */ new Set();
+  const nextIpv6 = /* @__PURE__ */ new Set();
+  const nextPrefix64 = /* @__PURE__ */ new Set();
+  const nextPrefix48 = /* @__PURE__ */ new Set();
+  const nextMetadata = /* @__PURE__ */ new Map();
+  const remember = (key, metadata) => {
+    if (!nextMetadata.has(key)) nextMetadata.set(key, metadata);
+  };
+  const addIpv4 = (rawIp, metadata) => {
+    if (typeof rawIp !== "string") return;
+    const ip = normalizeIpAddress(rawIp);
+    if (!isIpv4Literal(ip)) return;
+    nextIpv4.add(ip);
+    if (metadata) remember(ip, metadata);
+  };
+  const addIpv6 = (rawIp, metadata) => {
+    if (typeof rawIp !== "string") return;
+    const ip = normalizeIpAddress(rawIp);
+    const expanded = expandIpv6Address(ip);
+    if (!expanded) return;
+    nextIpv6.add(ip);
+    nextIpv6.add(expanded);
+    const hextets = expanded.split(":");
+    nextPrefix64.add(hextets.slice(0, 4).join(":"));
+    nextPrefix48.add(hextets.slice(0, 3).join(":"));
+    if (metadata) {
+      remember(ip, metadata);
+      remember(expanded, metadata);
+    }
+  };
+  const [bulkList, exitAddresses, onionoo] = await Promise.all([
+    fetchTextWithTimeout(TOR_BULK_LIST_URL, TOR_INTELLIGENCE_SYNC_TIMEOUT_MS, "text/plain"),
+    fetchTextWithTimeout(TOR_EXIT_ADDRESSES_URL, TOR_INTELLIGENCE_SYNC_TIMEOUT_MS, "text/plain"),
+    fetchTextWithTimeout(
+      `${TOR_ONIONOO_DETAILS_URL}?search=running:true&fields=nickname,fingerprint,or_addresses,exit_addresses,flags,as,as_name,country`,
+      TOR_INTELLIGENCE_SYNC_TIMEOUT_MS,
+      "application/json"
+    )
+  ]);
+  if (bulkList) {
+    for (const line of bulkList.split(/\r?\n/)) {
+      const candidate = line.trim();
+      if (!candidate || candidate.startsWith("#")) continue;
+      addIpv4(candidate, null);
+      if (nextIpv4.size >= TOR_BULK_LIST_MAX_ENTRIES) break;
+    }
+  }
+  if (exitAddresses) {
+    let fingerprint = "";
+    for (const line of exitAddresses.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (trimmed.startsWith("ExitNode ")) {
+        fingerprint = trimmed.slice("ExitNode ".length).trim();
+        continue;
+      }
+      if (!trimmed.startsWith("ExitAddress ")) continue;
+      const address = trimmed.split(/\s+/)[1] ?? "";
+      addIpv4(address, {
+        nickname: fingerprint ? `exit-${fingerprint.slice(0, 8)}` : "",
+        fingerprint,
+        flags: ["Exit"]
+      });
+    }
+  }
+  if (onionoo) {
+    try {
+      const parsed = JSON.parse(onionoo);
+      const relays = Array.isArray(parsed.relays) ? parsed.relays : [];
+      for (const relay of relays) {
+        const flags = Array.isArray(relay.flags) ? relay.flags.filter((flag) => typeof flag === "string") : [];
+        if (!flags.includes("Exit")) continue;
+        const metadata = torRelayMetadataFromOnionoo(relay);
+        const exitAddressesForRelay = Array.isArray(relay.exit_addresses) ? relay.exit_addresses : [];
+        for (const address of exitAddressesForRelay) addIpv4(address, metadata);
+        const orAddresses = Array.isArray(relay.or_addresses) ? relay.or_addresses : [];
+        for (const entry of orAddresses) {
+          if (typeof entry !== "string") continue;
+          const host = splitTorAddressPort(entry);
+          if (!host) continue;
+          if (isIpv4Literal(host)) addIpv4(host, metadata);
+          else addIpv6(host, metadata);
+        }
+      }
+    } catch {
+    }
+  }
+  if (nextIpv4.size === 0 && nextIpv6.size === 0) return;
+  torIpv4ExitSet = nextIpv4;
+  torIpv6ExitSet = nextIpv6;
+  torIpv6Prefix64Set = nextPrefix64;
+  torIpv6Prefix48Set = nextPrefix48;
+  torRelayMetadataMap = nextMetadata;
+  torIntelligenceLastSyncMs = Date.now();
+}
+function runTorIntelligenceSync() {
+  if (torIntelligenceSyncInFlight) return torIntelligenceSyncInFlight;
+  torIntelligenceSyncInFlight = syncTorIntelligence().catch(() => void 0).finally(() => {
+    torIntelligenceSyncInFlight = null;
+  });
+  return torIntelligenceSyncInFlight;
+}
+function ensureTorIntelligenceSync() {
+  if (torIntelligenceTimer === null) {
+    void runTorIntelligenceSync();
+    torIntelligenceTimer = setInterval(() => {
+      void runTorIntelligenceSync();
+    }, TOR_INTELLIGENCE_SYNC_INTERVAL_MS);
+    const handle = torIntelligenceTimer;
+    if (typeof handle.unref === "function") handle.unref();
+    return;
+  }
+  if (Date.now() - torIntelligenceLastSyncMs >= TOR_INTELLIGENCE_SYNC_INTERVAL_MS) {
+    void runTorIntelligenceSync();
+  }
+}
+try {
+  ensureTorIntelligenceSync();
+} catch {
+}
+function lookupTorRelayMetadata(ip) {
+  const normalized = normalizeIpAddress(ip);
+  if (!normalized) return null;
+  const direct = torRelayMetadataMap.get(normalized);
+  if (direct) return direct;
+  const expanded = expandIpv6Address(normalized);
+  if (!expanded) return null;
+  return torRelayMetadataMap.get(expanded) ?? null;
+}
+function describeTorRelay(ip) {
+  const metadata = lookupTorRelayMetadata(ip);
+  if (!metadata) return null;
+  const organization = metadata.asName || metadata.nickname;
+  const asn = metadata.as ? metadata.as.startsWith("AS") ? metadata.as : `AS${metadata.as}` : "";
+  if (organization && asn) return `${organization} \xB7 ${asn}`;
+  return organization || asn || null;
+}
+function pruneTorVerdictCache(nowMs) {
+  for (const [ip, entry] of torVerdictCache) {
+    if (entry.expiresAtMs <= nowMs) torVerdictCache.delete(ip);
+  }
+  while (torVerdictCache.size >= TOR_VERDICT_CACHE_MAX_ENTRIES) {
+    const oldestKey = torVerdictCache.keys().next().value;
+    if (typeof oldestKey !== "string") break;
+    torVerdictCache.delete(oldestKey);
+  }
+}
 var SUSPICIOUS_IP_TTL_MS = 24 * 60 * 60 * 1e3;
 var SUSPICIOUS_IP_MAX_ENTRIES = 1e4;
 var SUSPICIOUS_IP_BLOCK_THRESHOLD = 2;
@@ -1006,23 +1415,8 @@ function isIpv4Literal(value) {
     return Number.isFinite(parsed) && parsed >= 0 && parsed <= 255;
   });
 }
-function pruneTorDnsCache(nowMs) {
-  for (const [ip, entry] of torDnsCache) {
-    if (entry.expiresAtMs <= nowMs) torDnsCache.delete(ip);
-  }
-  while (torDnsCache.size >= TOR_DNS_CACHE_MAX_ENTRIES) {
-    const oldestKey = torDnsCache.keys().next().value;
-    if (typeof oldestKey !== "string") break;
-    torDnsCache.delete(oldestKey);
-  }
-}
-async function resolveTorExitVerdict(ip) {
-  const cleanIp = typeof ip === "string" ? ip.trim() : "";
-  if (!isIpv4Literal(cleanIp)) return "unknown";
-  const nowMs = Date.now();
-  const cached = torDnsCache.get(cleanIp);
-  if (cached && cached.expiresAtMs > nowMs) return cached.isTorExit ? "exit" : "not_exit";
-  const queryName = `${cleanIp.split(".").reverse().join(".")}.dnsel.torproject.org`;
+async function resolveTorDnsel(ipv4) {
+  const queryName = `${ipv4.split(".").reverse().join(".")}.dnsel.torproject.org`;
   let resolved = false;
   let isTorExit = false;
   let timeoutHandle;
@@ -1057,29 +1451,184 @@ async function resolveTorExitVerdict(ip) {
       }
     }
   }
-  if (resolved) {
-    pruneTorDnsCache(nowMs);
-    torDnsCache.set(cleanIp, {
-      isTorExit,
-      expiresAtMs: nowMs + TOR_DNS_CACHE_TTL_MS
-    });
-    return isTorExit ? "exit" : "not_exit";
-  }
-  return "unknown";
+  return resolved ? isTorExit : null;
 }
-var TOR_OPERATOR_ORG_PATTERN = /tor exit|torproject|tor project|calyx institute|f3netze|zwiebelfreunde|emerald onion|dfri|foreningen for digitala/i;
+async function resolveTorReverseDns(ip) {
+  const nowMs = Date.now();
+  const cached = torReverseDnsCache.get(ip);
+  if (cached && cached.expiresAtMs > nowMs) return cached.names;
+  let names = [];
+  let timeoutHandle;
+  try {
+    const lookup = dns.reverse(ip).catch(() => []);
+    const timeout = new Promise((resolve) => {
+      timeoutHandle = setTimeout(() => resolve([]), TOR_REVERSE_DNS_TIMEOUT_MS);
+    });
+    const records = await Promise.race([lookup, timeout]);
+    if (Array.isArray(records)) {
+      names = records.filter((name) => typeof name === "string");
+    }
+  } catch {
+    names = [];
+  } finally {
+    if (timeoutHandle !== void 0) clearTimeout(timeoutHandle);
+  }
+  if (torReverseDnsCache.size > TOR_VERDICT_CACHE_MAX_ENTRIES) torReverseDnsCache.clear();
+  torReverseDnsCache.set(ip, {
+    names,
+    expiresAtMs: nowMs + TOR_OPERATOR_PREFIX_CACHE_TTL_MS
+  });
+  return names;
+}
+async function lookupOnionooRelay(target) {
+  const url = `${TOR_ONIONOO_DETAILS_URL}?search=${encodeURIComponent(
+    target
+  )}&fields=nickname,fingerprint,or_addresses,exit_addresses,flags,as`;
+  const body = await fetchTextWithTimeout(url, TOR_LIVE_LOOKUP_TIMEOUT_MS, "application/json");
+  if (!body) return null;
+  let relays = [];
+  try {
+    const parsed = JSON.parse(body);
+    relays = Array.isArray(parsed.relays) ? parsed.relays : [];
+  } catch {
+    return null;
+  }
+  const targetExpanded = expandIpv6Address(target);
+  const targetPrefix64 = targetExpanded ? targetExpanded.split(":").slice(0, 4).join(":") : null;
+  let matched = false;
+  let isExit = false;
+  for (const relay of relays) {
+    const addresses = [];
+    if (Array.isArray(relay.exit_addresses)) {
+      for (const address of relay.exit_addresses) {
+        if (typeof address === "string") addresses.push(address);
+      }
+    }
+    if (Array.isArray(relay.or_addresses)) {
+      for (const entry of relay.or_addresses) {
+        if (typeof entry !== "string") continue;
+        const host = splitTorAddressPort(entry);
+        if (host) addresses.push(host);
+      }
+    }
+    const hasMatch = addresses.some((address) => {
+      const normalized = normalizeIpAddress(address);
+      if (!normalized) return false;
+      if (normalized === target) return true;
+      const expanded = expandIpv6Address(normalized);
+      if (!expanded) return false;
+      if (targetExpanded && expanded === targetExpanded) return true;
+      return targetPrefix64 !== null && expanded.split(":").slice(0, 4).join(":") === targetPrefix64;
+    });
+    if (!hasMatch) continue;
+    matched = true;
+    const flags = Array.isArray(relay.flags) ? relay.flags.filter((flag) => typeof flag === "string") : [];
+    if (flags.includes("Exit")) {
+      isExit = true;
+      break;
+    }
+  }
+  return { matched, isExit };
+}
+async function resolveTorExitVerdict(ip) {
+  const cleanIp = normalizeIpAddress(ip);
+  if (!cleanIp) return "unknown";
+  const isV4 = isIpv4Literal(cleanIp);
+  const expanded = isV4 ? null : expandIpv6Address(cleanIp);
+  if (!isV4 && expanded === null) return "unknown";
+  if (isV4 && torIpv4ExitSet.has(cleanIp)) return "exit";
+  if (expanded !== null && (torIpv6ExitSet.has(cleanIp) || torIpv6ExitSet.has(expanded))) {
+    return "exit";
+  }
+  if (!isV4) {
+    const embeddedIpv4 = extractEmbeddedIpv4FromIpv6(cleanIp);
+    if (embeddedIpv4 !== null) {
+      if (torIpv4ExitSet.has(embeddedIpv4)) return "exit";
+      if (ipMatchesCidrList(embeddedIpv4, TOR_OPERATOR_IPV4_CIDRS)) return "exit";
+    }
+  }
+  if (isTorOperatorPrefix(cleanIp)) return "relay";
+  const reverseNames = await resolveTorReverseDns(cleanIp);
+  if (reverseNames.some((name) => TOR_OPERATOR_REVERSE_DNS_PATTERN.test(name))) return "relay";
+  const nowMs = Date.now();
+  const cached = torVerdictCache.get(cleanIp);
+  if (cached && cached.expiresAtMs > nowMs) {
+    return cached.verdict === "exit" ? "exit" : cached.verdict === "relay" ? "relay" : "not_exit";
+  }
+  let liveVerdict = "unknown";
+  if (isV4) {
+    const [dnsel, onionoo] = await Promise.all([
+      resolveTorDnsel(cleanIp),
+      lookupOnionooRelay(cleanIp)
+    ]);
+    if (dnsel === true) {
+      liveVerdict = "exit";
+    } else if (onionoo && onionoo.matched) {
+      liveVerdict = onionoo.isExit ? "exit" : "relay";
+    } else if (dnsel === false || onionoo && !onionoo.matched) {
+      liveVerdict = "no";
+    }
+  } else {
+    const onionoo = await lookupOnionooRelay(expanded ?? cleanIp);
+    if (onionoo && onionoo.matched) liveVerdict = onionoo.isExit ? "exit" : "relay";
+    else if (onionoo && !onionoo.matched) liveVerdict = "no";
+  }
+  if (liveVerdict !== "unknown") {
+    pruneTorVerdictCache(nowMs);
+    torVerdictCache.set(cleanIp, {
+      verdict: liveVerdict,
+      expiresAtMs: nowMs + TOR_VERDICT_CACHE_TTL_MS
+    });
+  }
+  return liveVerdict === "exit" ? "exit" : liveVerdict === "relay" ? "relay" : liveVerdict === "no" ? "not_exit" : "unknown";
+}
 function matchesTorOperatorHint(location) {
   const haystack = [location.isp, location.org, location.asn].filter((part) => typeof part === "string" && part.trim().length > 0).join(" ");
-  return haystack.length > 0 && TOR_OPERATOR_ORG_PATTERN.test(haystack);
+  if (haystack.length > 0 && TOR_OPERATOR_ORG_PATTERN.test(haystack)) return true;
+  if (matchesTorOperatorAsn(location.asn || "")) return true;
+  const ip = typeof location.publicIp === "string" ? normalizeIpAddress(location.publicIp) : "";
+  return ip.length > 0 && isTorOperatorPrefix(ip);
+}
+function relayOperatorLabel(location) {
+  const rawAsn = typeof location.asn === "string" ? location.asn.trim().toUpperCase() : "";
+  const asn = rawAsn ? rawAsn.startsWith("AS") ? rawAsn : `AS${rawAsn}` : "";
+  const name = [location.isp, location.org].find(
+    (value) => typeof value === "string" && value.trim().length > 0 && !/^unknown/i.test(value.trim())
+  ) ?? "";
+  if (name && asn) return `${name} \xB7 ${asn}`;
+  return name || asn || null;
 }
 async function resolveTorExitStatus(publicIp, location, prefetched) {
-  if (isTorBulkListed(publicIp)) return { isExit: true, viaOperatorHint: false };
-  const verdict = await (prefetched ?? resolveTorExitVerdict(publicIp));
-  if (verdict === "exit") return { isExit: true, viaOperatorHint: false };
-  if (verdict === "unknown" && matchesTorOperatorHint(location)) {
-    return { isExit: true, viaOperatorHint: true };
+  const relay = lookupTorRelayMetadata(publicIp);
+  const operator = describeTorRelay(publicIp) ?? relayOperatorLabel(location);
+  if (isTorBulkListed(publicIp)) {
+    return {
+      isExit: true,
+      isRelay: true,
+      verdict: "exit",
+      viaOperatorHint: false,
+      operator,
+      relay
+    };
   }
-  return { isExit: false, viaOperatorHint: false };
+  const verdict = await (prefetched ?? resolveTorExitVerdict(publicIp));
+  if (verdict === "exit") {
+    return { isExit: true, isRelay: true, verdict, viaOperatorHint: false, operator, relay };
+  }
+  if (verdict === "relay") {
+    return { isExit: false, isRelay: true, verdict, viaOperatorHint: false, operator, relay };
+  }
+  if (verdict === "unknown" && matchesTorOperatorHint({ ...location, publicIp })) {
+    return {
+      isExit: true,
+      isRelay: true,
+      verdict: "relay",
+      viaOperatorHint: true,
+      operator: operator ?? relayOperatorLabel(location),
+      relay
+    };
+  }
+  return { isExit: false, isRelay: false, verdict, viaOperatorHint: false, operator: null, relay: null };
 }
 async function resolveAOverDoh(endpoint, name) {
   const controller = new AbortController();
@@ -1102,37 +1651,18 @@ async function resolveAOverDoh(endpoint, name) {
   }
 }
 function isTorBulkListed(ip) {
-  const cleanIp = typeof ip === "string" ? ip.trim() : "";
-  return cleanIp.length > 0 && torBulkExitList.has(cleanIp);
+  const cleanIp = normalizeIpAddress(ip);
+  if (!cleanIp) return false;
+  if (isIpv4Literal(cleanIp)) return torIpv4ExitSet.has(cleanIp);
+  const expanded = expandIpv6Address(cleanIp);
+  if (!expanded) return false;
+  return torIpv6ExitSet.has(cleanIp) || torIpv6ExitSet.has(expanded);
 }
 async function refreshTorBulkList() {
-  const nowMs = Date.now();
-  if (torBulkRefreshInFlight) return;
-  if (nowMs - torBulkRefreshedAtMs < TOR_BULK_REFRESH_INTERVAL_MS) return;
-  torBulkRefreshInFlight = true;
-  const controller = new AbortController();
-  const timeoutHandle = setTimeout(() => controller.abort(), TOR_BULK_TIMEOUT_MS);
-  try {
-    const response = await fetch(TOR_BULK_LIST_URL, {
-      signal: controller.signal,
-      headers: { accept: "text/plain" }
-    });
-    if (!response.ok) return;
-    const body = await response.text();
-    let added = 0;
-    for (const line of body.split(/\r?\n/)) {
-      const candidate = line.trim();
-      if (!isIpv4Literal(candidate)) continue;
-      torBulkExitList.add(candidate);
-      added += 1;
-      if (added >= TOR_BULK_LIST_MAX_ENTRIES) break;
-    }
-  } catch {
-  } finally {
-    clearTimeout(timeoutHandle);
-    torBulkRefreshInFlight = false;
-    torBulkRefreshedAtMs = Date.now();
-  }
+  ensureTorIntelligenceSync();
+  if (torIntelligenceSyncInFlight) return;
+  if (Date.now() - torIntelligenceLastSyncMs < TOR_INTELLIGENCE_SYNC_INTERVAL_MS) return;
+  await runTorIntelligenceSync();
 }
 function flagSuspiciousIp(ip, reason) {
   const cleanIp = typeof ip === "string" ? ip.trim() : "";
@@ -1626,9 +2156,11 @@ app.get("/api/health", async (req, res) => {
   const visitsCount = db.prepare("SELECT COUNT(*) AS count FROM visits").get().count;
   const { regionCode, regionLabel } = detectServerRegion(req);
   const torCheckIp = typeof req.query.torCheck === "string" ? normalizeIpCandidate(req.query.torCheck) : null;
-  if (torCheckIp && isIpv4Literal(torCheckIp)) {
+  if (torCheckIp && (isIpv4Literal(torCheckIp) || expandIpv6Address(torCheckIp) !== null)) {
     const startedAtMs = Date.now();
+    ensureTorIntelligenceSync();
     const verdict = await resolveTorExitVerdict(torCheckIp);
+    const relay = lookupTorRelayMetadata(torCheckIp);
     res.json({
       status: "ok",
       visitorsCount,
@@ -1640,6 +2172,14 @@ app.get("/api/health", async (req, res) => {
         exitNode: verdict === "exit",
         verdict,
         bulkListed: isTorBulkListed(torCheckIp),
+        operatorPrefix: isTorOperatorPrefix(torCheckIp),
+        embeddedIpv4: extractEmbeddedIpv4FromIpv6(torCheckIp),
+        operator: describeTorRelay(torCheckIp),
+        relayOperatorAsn: relay?.as ?? null,
+        relayOperatorName: relay?.asName ?? null,
+        consensusIpv4Exits: torIpv4ExitSet.size,
+        consensusIpv6Exits: torIpv6ExitSet.size,
+        consensusSyncedAtMs: torIntelligenceLastSyncMs || null,
         latencyMs: Date.now() - startedAtMs
       }
     });
@@ -1736,7 +2276,7 @@ function sanitizeHardwareSignals(raw, browserDevice) {
     architecture: safeStr(raw?.architecture, browserDevice.os, 80)
   };
 }
-function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals, location, ipTimezoneHint, recognitionSource, classification, velocity, incognitoContext = {}, requestContext = {}) {
+function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals, location, ipTimezoneHint, recognitionSource, baseClassification, velocity, incognitoContext = {}, requestContext = {}) {
   const safeStrArray = (arr) => Array.isArray(arr) ? arr.filter((item) => typeof item === "string" && item.trim().length > 0).map((s) => s.trim().slice(0, 180)).slice(0, 10) : [];
   const webdriver = Boolean(raw?.webdriver);
   const cdpDetected = Boolean(raw?.cdpDetected);
@@ -1760,8 +2300,17 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const normIpTz = normalizeServerTimezoneId(ipTimezone);
   const serverTzMismatch = Boolean(normBrowserTz && normIpTz && normBrowserTz !== normIpTz);
   const timezoneMismatch = Boolean(raw?.timezoneMismatch) || serverTzMismatch;
-  const isCloudOrDatacenterNetwork = classification.isDatacenterOrHosting || Boolean(location.isVpnOrHosting);
   const isGpuMaskedOrUnavailable = !hardwareSignals.gpuVendor || hardwareSignals.gpuVendor === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuVendor) || !hardwareSignals.gpuRenderer || hardwareSignals.gpuRenderer === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuRenderer);
+  const clientTorBrowser = Boolean(requestContext.clientTorBrowser ?? raw?.isTorBrowserClient);
+  const classification = applyNetworkOverrides(baseClassification, {
+    torExit: Boolean(requestContext.torExitNode || requestContext.torRelay),
+    torOperatorHint: Boolean(requestContext.torOperatorHint),
+    isTorBrowserClient: clientTorBrowser,
+    aiAgentDetected: Boolean(requestContext.aiAgent?.detected),
+    datacenterVm: Boolean(raw?.isVirtualMachine) && (baseClassification.isDatacenterOrHosting || isGpuMaskedOrUnavailable),
+    vpnSuspected: Boolean(raw?.vpnSuspected) || timezoneMismatch
+  });
+  const isCloudOrDatacenterNetwork = classification.isDatacenterOrHosting || Boolean(location.isVpnOrHosting);
   const datacenterAsn = classification.isConsumerBroadband ? false : isCloudOrDatacenterNetwork;
   const vpnReasons = safeStrArray(raw?.vpnReasons);
   if (timezoneMismatch && !vpnReasons.some((r) => r.toLowerCase().includes("timezone"))) {
@@ -2016,6 +2565,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       botIdentityConfidence: botClassification.confidence,
       // Phase 2 — Tor exit relay + local abuse blocklist
       torExitNode,
+      isTorBrowserClient: clientTorBrowser,
+      torVerdict: requestContext.torVerdict ?? (torExitNode ? "exit" : "unknown"),
+      torOperator: requestContext.torOperator ?? describeTorRelay(location.publicIp) ?? (torExitNode ? relayOperatorLabel(location) : null),
+      aiAgent: requestContext.aiAgent ?? null,
       ipBlocklisted,
       ipBlocklistReasons,
       // Phase 3 — mobile emulator / simulator verdict
@@ -2458,7 +3011,12 @@ app.post("/api/visitor/identify", async (req, res) => {
         requestIntegrityReason: envelopeVerdict.requestIntegrityReason,
         requestNonce: envelopeVerdict.requestNonce,
         torExitNode,
+        torRelay: torStatus.isRelay,
+        torVerdict: torStatus.verdict,
+        torOperator: torStatus.operator,
         torOperatorHint: torStatus.viaOperatorHint,
+        clientTorBrowser: Boolean(rawSecuritySignals?.isTorBrowserClient),
+        aiAgent: null,
         ipBlocklisted: blocklist.blocklisted,
         ipBlocklistReasons: blocklist.reasons,
         botClassification

@@ -259,8 +259,13 @@ function resolveRiskTier(score: number): RiskLevel {
 const NETWORK_TYPE_BADGE_CLASS: Record<NetworkType, string> = {
   'Residential Broadband': 'bg-emerald-50 text-emerald-700 border border-emerald-100',
   'Cellular / 5G': 'bg-blue-50 text-blue-700 border border-blue-100',
+  'Mobile Carrier': 'bg-blue-50 text-blue-700 border border-blue-100',
   Satellite: 'bg-violet-50 text-violet-700 border border-violet-100',
   'Cloud / Datacenter': 'bg-slate-100 text-slate-600 border border-slate-200',
+  'AI Agent Cloud Network': 'bg-indigo-50 text-indigo-700 border border-indigo-100',
+  'VPN / Proxy Relay': 'bg-amber-50 text-amber-700 border border-amber-100',
+  'Tor Exit / Anonymity Network': 'bg-rose-50 text-rose-700 border border-rose-100',
+  'Unknown Network': 'bg-slate-100 text-slate-600 border border-slate-200',
 };
 
 type SignalTone = 'ok' | 'warn' | 'bad';
