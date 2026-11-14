@@ -2815,7 +2815,7 @@ export async function evaluateSecuritySignals(
     tamperingConfidence: tampering.tampering_confidence,
     tamperingMlScore: tampering.tampering_ml_score,
     tamperingDetails: tampering.tampering_details,
-    developerTools: false,
+    developerTools: tampering.developerTools,
     /* Phase 5 — active call detection (pruned when unsupported) */
     activeCall: activeCall.active,
     activeCallSupported: activeCall.supported,

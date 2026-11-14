@@ -31,6 +31,8 @@ export interface TamperingDetails {
 
 export interface TamperingAssessment {
   tampering: boolean;
+  /** Docked DevTools window detected from the outer/inner viewport delta. */
+  developerTools: boolean;
   tampering_confidence: TamperingConfidence;
   tampering_ml_score: number;
   tampering_details: TamperingDetails;
@@ -195,7 +197,17 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     reasons.push('Navigator.prototype getter replaced by a non-native function');
   }
 
-  // 7. The JS user-agent must equal the HTTP User-Agent header the server observed.
+  // 7. A docked DevTools window reserves a large slice of the outer viewport. Chrome and
+  //    Firefox chrome (tab strip, address bar, bookmarks) stays well under 160 px, so the
+  //    threshold only trips on a docked panel.
+  const outerHeight = typeof window !== 'undefined' ? Number(window.outerHeight) || 0 : 0;
+  const innerWidth = typeof window !== 'undefined' ? Number(window.innerWidth) || 0 : 0;
+  const innerHeight = typeof window !== 'undefined' ? Number(window.innerHeight) || 0 : 0;
+  const developerTools =
+    (outerWidth > 0 && innerWidth > 0 && outerWidth - innerWidth > 160) ||
+    (outerHeight > 0 && innerHeight > 0 && outerHeight - innerHeight > 160);
+
+  // 8. The JS user-agent must equal the HTTP User-Agent header the server observed.
   const headerUA = (input.serverHeaderUA || '').trim();
   if (headerUA && ua && headerUA !== ua) {
     antiDetect = true;
@@ -208,10 +220,11 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
 
   return {
     tampering: isTampered,
+    developerTools,
     tampering_confidence: isTampered ? (anomalyPoints >= 70 ? 'high' : 'medium') : 'high',
     tampering_ml_score: isTampered ? Math.max(0.842, clampedScore) : 0.0024,
     tampering_details: {
-      anomaly_score: Number((anomalyPoints / 100).toFixed(2)),
+      anomaly_score: Number((Math.min(100, anomalyPoints) / 100).toFixed(2)),
       anti_detect_browser: antiDetect,
       devtools_device_emulation: devtoolsEmulation,
       reasons,
