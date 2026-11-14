@@ -77,6 +77,9 @@ export function NetworkStabilityPanel() {
   const [chartWidth, setChartWidth] = useState<number>(560);
   const [monitorAutoPaused, setMonitorAutoPaused] = useState<boolean>(false);
   const [isMonitorLeader, setIsMonitorLeader] = useState<boolean>(true);
+  // Consecutive failed probes drives the derived connection status. The probe loop always
+  // attempts recovery, so this is display state only — it never stops monitoring.
+  const [consecutiveFailures, setConsecutiveFailures] = useState<number>(0);
   const tabIdRef = useRef<string>(
     `tab_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`
   );
@@ -179,7 +182,7 @@ export function NetworkStabilityPanel() {
         const url = `/api/network/ping?t=${Date.now()}`;
         const startTime = performance.now();
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000);
+        const timeoutId = setTimeout(() => controller.abort(), 3000);
 
         try {
           const res = await fetch(url, {
@@ -271,6 +274,7 @@ export function NetworkStabilityPanel() {
       lastProbeFailedRef.current = false;
       isOnlineRef.current = true;
       setIsOnline(true);
+      setConsecutiveFailures(0);
       setWindowEndMs(recordedAtMs);
       setSamples((prev) => {
         const cutoff = recordedAtMs - FIVE_MINUTES_MS - 15000;
@@ -287,6 +291,7 @@ export function NetworkStabilityPanel() {
     } catch {
       const recordedAtMs = Date.now();
       lastProbeFailedRef.current = true;
+      setConsecutiveFailures((prev) => prev + 1);
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         isOnlineRef.current = false;
         setIsOnline(false);
@@ -308,6 +313,12 @@ export function NetworkStabilityPanel() {
       pingInFlightRef.current = false;
     }
   }, []);
+
+  // Immediate first probe on mount so the header never sits on a placeholder while the
+  // 5-second monitor loop is still scheduling its first sample.
+  useEffect(() => {
+    void executePingProbe();
+  }, [executePingProbe]);
 
   const toggleMonitor = useCallback(() => {
     setIsRunning((prev) => {
@@ -470,6 +481,21 @@ export function NetworkStabilityPanel() {
   const failureRatePercent =
     totalCount > 0 ? Number(((failedCount / totalCount) * 100).toFixed(1)) : 0;
 
+  // Derived connection status. `Offline` is only reported on hard evidence: the browser says
+  // it has no network, or at least two consecutive measured probes failed. A brand-new panel
+  // therefore reads `Probing...` instead of a false `Offline / 100% packet loss`, and a single
+  // transient failure stays `Online`. High loss or a slow current RTT degrades the label.
+  const totalProbes = samples.length;
+  const navigatorOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+  const connectionStatus: 'Offline' | 'Probing...' | 'Degraded' | 'Online' =
+    navigatorOffline || (totalProbes > 0 && consecutiveFailures >= 2)
+      ? 'Offline'
+      : totalProbes === 0
+      ? 'Probing...'
+      : failureRatePercent > 20 || (currentLatencyMs !== null && currentLatencyMs > 400)
+      ? 'Degraded'
+      : 'Online';
+
   // Responsive 1:1 SVG Chart Geometry (never shrinks or squeezes on mobile screens)
   const isCompactMobile = chartWidth < 420;
   const svgWidth = chartWidth;
@@ -599,9 +625,29 @@ export function NetworkStabilityPanel() {
 
           <div className="flex items-center gap-3">
             <span className="inline-flex items-center gap-1.5 text-xs font-mono tabular-nums text-slate-600">
-              <Wifi className={`w-3.5 h-3.5 ${isOnline ? 'text-emerald-600' : 'text-red-600'}`} />
-              <strong className={isOnline ? 'text-emerald-700' : 'text-red-600'}>
-                {isOnline ? 'Online' : 'Offline'}
+              <Wifi
+                className={`w-3.5 h-3.5 ${
+                  connectionStatus === 'Online'
+                    ? 'text-emerald-600'
+                    : connectionStatus === 'Degraded'
+                    ? 'text-amber-600'
+                    : connectionStatus === 'Offline'
+                    ? 'text-red-600'
+                    : 'text-slate-400'
+                }`}
+              />
+              <strong
+                className={
+                  connectionStatus === 'Online'
+                    ? 'text-emerald-700'
+                    : connectionStatus === 'Degraded'
+                    ? 'text-amber-700'
+                    : connectionStatus === 'Offline'
+                    ? 'text-red-600'
+                    : 'text-slate-500'
+                }
+              >
+                {connectionStatus}
               </strong>
             </span>
 

@@ -39,6 +39,7 @@ import {
   Palette,
   Moon,
   Sun,
+  Bot,
 } from 'lucide-react';
 
 type ThemeMode = 'light' | 'dark';
@@ -764,19 +765,30 @@ export default function App() {
   );
   const serverRiskBadgeText =
     data?.riskBadgeText ?? data?.securitySignals?.riskBadgeText ?? null;
-  // The header may never advertise a lower tier than the worst card: when the server sent no
-  // badge text and any tile rates >= 7, the displayed composite is raised to the High floor (7).
-  // A server-supplied badge is never overridden.
+  // The header may never advertise a lower tier than the worst card: without a server badge,
+  // the displayed composite applies the same monotonic card-floor invariant as the server
+  // (max card + 1 for two elevated cards, +2 for three or more).
   const worstTileScore = signalRows.reduce((max, row) => Math.max(max, row.riskScore), 0);
-  const compositeRaisedByTile =
-    !serverRiskBadgeText && worstTileScore >= 7 && normalizedSuspectScore < worstTileScore;
-  const displayedRiskScore = compositeRaisedByTile
-    ? Math.max(normalizedSuspectScore, 7)
-    : normalizedSuspectScore;
+  const elevatedTileCount = signalRows.filter((row) => row.riskScore >= 4).length;
+  const tileSynergyBonus = elevatedTileCount >= 3 ? 2 : elevatedTileCount === 2 ? 1 : 0;
+  const tileFloorScore = Math.min(10, worstTileScore + tileSynergyBonus);
+  const displayedRiskScore = serverRiskBadgeText
+    ? normalizedSuspectScore
+    : Math.max(normalizedSuspectScore, tileFloorScore);
   const riskTier: RiskLevel = serverRiskBadgeText
     ? data?.riskLevel ?? resolveRiskTier(normalizedSuspectScore)
     : resolveRiskTier(displayedRiskScore);
   const riskBadgeText = serverRiskBadgeText ?? `${riskTier} Risk • ${displayedRiskScore}/10`;
+
+  // Tor / AI attribution surface — rendered above the Smart Signals grid whenever any
+  // first-party anonymity or agent identity was resolved for this visit.
+  const activeAiAgent = data?.securitySignals?.aiAgent ?? null;
+  const torExitDetected = Boolean(data?.securitySignals?.torExitNode);
+  const torBrowserClient = Boolean(data?.securitySignals?.isTorBrowserClient);
+  const torOperatorLabel = data?.securitySignals?.torOperator || '';
+  const showAttributionBanner = Boolean(
+    data && (torExitDetected || torBrowserClient || activeAiAgent?.detected)
+  );
 
   return (
     <div
@@ -1294,6 +1306,61 @@ export default function App() {
             {/* LEFT CARD: Smart Signals & Threat Analysis (4-signal core grid) */}
             <div className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6 flex flex-col justify-between">
               <div>
+                {showAttributionBanner && (
+                  <div className="mb-3.5 flex flex-col gap-2">
+                    {(torExitDetected || torBrowserClient) && (
+                      <div className="flex items-start gap-2.5 rounded-xl border border-rose-200 bg-rose-50/70 px-3 py-2.5">
+                        <ShieldAlert className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                        <div className="min-w-0 flex-1">
+                          <span className="block text-xs font-semibold text-rose-700">
+                            Tor Anonymity Network
+                          </span>
+                          <span className="block text-[11px] leading-relaxed text-rose-700/80 font-mono break-words">
+                            {[
+                              torExitDetected
+                                ? `Exit relay ${data.location.publicIp}`
+                                : `Client fingerprint on ${data.location.publicIp}`,
+                              torOperatorLabel ? `Operator ${torOperatorLabel}` : '',
+                              torExitDetected ? 'Server exit-list match' : '',
+                              torBrowserClient ? 'Tor Browser RFP + letterboxing' : '',
+                            ]
+                              .filter(Boolean)
+                              .join(' · ')}
+                          </span>
+                        </div>
+                      </div>
+                    )}
+                    {activeAiAgent?.detected && (
+                      <div className="flex items-start gap-2.5 rounded-xl border border-indigo-200 bg-indigo-50/70 px-3 py-2.5">
+                        <Bot className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
+                        <div className="min-w-0 flex-1">
+                          <span className="block text-xs font-semibold text-indigo-700">
+                            {activeAiAgent.agentId === 'impostor-spoof'
+                              ? 'Spoofed AI Agent (Unverified)'
+                              : 'AI Agent Attribution'}
+                          </span>
+                          <span className="block text-[11px] leading-relaxed text-indigo-700/80 break-words">
+                            {[
+                              activeAiAgent.agentName,
+                              activeAiAgent.operator,
+                              activeAiAgent.executionMode,
+                              `${activeAiAgent.confidence}${
+                                activeAiAgent.verified ? ' (verified)' : ''
+                              }`,
+                            ]
+                              .filter(Boolean)
+                              .join(' · ')}
+                          </span>
+                          {activeAiAgent.evidence[0] && (
+                            <span className="block text-[11px] leading-relaxed text-indigo-700/70 font-mono break-words">
+                              {activeAiAgent.evidence[0]}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div className="flex items-center justify-between gap-3 pb-3.5 border-b border-[#E5E7EB] flex-wrap">
                   <div className="flex items-center gap-2">
                     <ShieldCheck className="w-4 h-4 text-[#2563EB] shrink-0" />
@@ -1347,7 +1414,7 @@ export default function App() {
               <div className="mt-4 pt-3.5 border-t border-[#E5E7EB] flex items-center justify-between gap-4">
                 <div className="flex items-center gap-2 min-w-0">
                   <span className="text-xs font-medium text-slate-600 whitespace-nowrap">
-                    Trust Meter
+                    Risk Meter
                   </span>
                   <span className="text-xs font-mono tabular-nums text-slate-500 truncate">
                     • {riskBadgeText}
@@ -1364,7 +1431,7 @@ export default function App() {
                         : 'bg-emerald-500'
                     }`}
                     style={{
-                      width: `${Math.max(8, 100 - displayedRiskScore * 10)}%`,
+                      width: `${Math.max(6, displayedRiskScore * 10)}%`,
                     }}
                   />
                 </div>
