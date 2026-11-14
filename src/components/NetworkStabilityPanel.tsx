@@ -8,8 +8,8 @@ interface PingSample {
   failed: boolean;
 }
 
-const Y_LEVELS = [0, 150, 300, 450, 600] as const;
-const MAX_Y_MS = 600;
+const Y_LEVELS = [0, 250, 500, 750, 1000] as const;
+const MAX_Y_MS = 1000;
 const FIVE_MINUTES_MS = 5 * 60 * 1000; // 300,000 ms rolling five-minute timeline
 const SAMPLE_INTERVAL_MS = 5000; // 5s visible RTT measurement interval (serialized, configurable)
 const MAX_MONITOR_DURATION_MS = 15 * 60 * 1000; // auto-pause live monitoring after 15 minutes
@@ -267,7 +267,8 @@ export function NetworkStabilityPanel() {
       }
       recentRttsRef.current = nextHist;
 
-      const clampedRtt = Math.max(1, Math.min(MAX_Y_MS, stabilizedRttMs));
+      // Keep the raw measurement; only the plotted vertex is clamped by getYForLatency.
+      const clampedRtt = Math.max(1, stabilizedRttMs);
       latestRttMsRef.current = Math.round(latestRttMsRef.current * 0.6 + clampedRtt * 0.4);
 
       const recordedAtMs = Date.now();
@@ -754,10 +755,10 @@ export function NetworkStabilityPanel() {
                 </clipPath>
               </defs>
 
-              {/* Horizontal Gridlines at 0, 150, 300 (dashed reference), 450, 600 ms */}
+              {/* Horizontal Gridlines at 0, 250, 500 (dashed reference), 750, 1000 ms */}
               {Y_LEVELS.map((level) => {
                 const y = getYForLatency(level);
-                const isReference300 = level === 300;
+                const isReference500 = level === 500;
                 return (
                   <g key={level}>
                     <line
@@ -765,9 +766,9 @@ export function NetworkStabilityPanel() {
                       y1={y}
                       x2={svgWidth - padRight}
                       y2={y}
-                      stroke={isReference300 ? '#94A3B8' : '#E2E8F0'}
+                      stroke={isReference500 ? '#94A3B8' : '#E2E8F0'}
                       strokeWidth="1"
-                      strokeDasharray={isReference300 ? '4 4' : undefined}
+                      strokeDasharray={isReference500 ? '4 4' : undefined}
                     />
                     <text
                       x={padLeft - 6}

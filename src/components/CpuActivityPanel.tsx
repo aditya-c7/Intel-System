@@ -52,6 +52,20 @@ const PRESSURE_MAP: Record<RawPressureState, DisplayPressureLevel> = {
 
 const DISPLAY_LEVELS: DisplayPressureLevel[] = ['Normal', 'Moderate', 'High', 'Heavy'];
 
+/**
+ * The Compute Pressure API only exists on desktop Chromium. Mobile browsers expose no CPU
+ * pressure telemetry, so the whole panel is pruned from the DOM instead of rendering an
+ * empty card.
+ */
+export function isCpuActivitySupported(): boolean {
+  if (typeof window === 'undefined') return false;
+  const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+  if (/Android|iPhone|iPad|iPod|IEMobile|Opera Mini|Mobile/i.test(ua)) return false;
+  const touchPoints = typeof navigator !== 'undefined' ? navigator.maxTouchPoints ?? 0 : 0;
+  if (touchPoints > 1 && window.innerWidth < 1024) return false;
+  return 'PressureObserver' in window;
+}
+
 function SystemLoadBadge({ level }: { level: DisplayPressureLevel }) {
   // Smooth needle rotation angle:
   // Normal -> towards left (-48deg, green)
@@ -175,6 +189,7 @@ function detectInsideIframe(): boolean {
 }
 
 export function CpuActivityPanel() {
+  const [platformSupported] = useState<boolean>(() => isCpuActivitySupported());
   const [userEnabled, setUserEnabled] = useState<boolean>(true);
   const [status, setStatus] = useState<CpuMonitorStatus>('Initializing');
   const [errorDetail, setErrorDetail] = useState<string | null>(null);
@@ -495,7 +510,27 @@ export function CpuActivityPanel() {
 
     const clockTimer = setInterval(() => {
       if (typeof document === 'undefined' || document.visibilityState !== 'hidden') {
-        setWindowEndMs(Date.now());
+        const nowMs = Date.now();
+        setWindowEndMs(nowMs);
+        // PressureObserver is state-transition driven: a steady CPU load emits no further
+        // callbacks. Carry the last observed level forward once per second so the ring
+        // buffer keeps advancing instead of freezing.
+        setSamples((prev) => {
+          if (prev.length === 0) return prev;
+          const last = prev[prev.length - 1];
+          if (nowMs - last.timestampMs < 1500) return prev;
+          const cutoff = nowMs - FIVE_MINUTES_MS - 15000;
+          return [
+            ...prev.filter((sample) => sample.timestampMs >= cutoff),
+            {
+              id: ++sampleCounterRef.current,
+              timestampMs: nowMs,
+              rawRecordTime: last.rawRecordTime,
+              rawState: last.rawState,
+              displayLevel: last.displayLevel,
+            },
+          ];
+        });
       }
     }, 1000);
 
@@ -686,14 +721,32 @@ export function CpuActivityPanel() {
     ? latestSample.displayLevel
     : 'Normal';
 
+  if (!platformSupported) return null;
+
   return (
     <div className="bg-white dark:bg-[#0A0D14] border border-zinc-200 dark:border-zinc-800/90 rounded-md flex flex-col justify-between overflow-hidden">
       <div>
         {/* Header */}
         <div className="px-4 sm:px-5 py-3 border-b border-zinc-200/70 dark:border-zinc-800/70 flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-xs sm:text-sm font-medium text-zinc-900 dark:text-zinc-100">
-            CPU Activity
-          </h2>
+          <div className="flex items-center gap-2">
+            <svg
+              viewBox="0 0 24 24"
+              className="w-4 h-4 shrink-0 text-zinc-800 dark:text-zinc-200"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <rect x="7" y="7" width="10" height="10" rx="1.5" />
+              <rect x="10.5" y="10.5" width="3" height="3" rx="0.5" />
+              <path d="M9 3v4M15 3v4M9 17v4M15 17v4M3 9h4M3 15h4M17 9h4M17 15h4" />
+            </svg>
+            <h2 className="text-xs sm:text-sm font-medium text-zinc-900 dark:text-zinc-100">
+              CPU Activity
+            </h2>
+          </div>
 
           <div className="flex items-center gap-3">
             <span className="inline-flex items-center gap-1.5 text-xs font-mono tabular-nums text-zinc-900 dark:text-zinc-100">
