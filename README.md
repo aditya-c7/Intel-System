@@ -17,41 +17,6 @@
 
 Intel System is a first-party visitor intelligence dashboard that brings browser identity, hardware fingerprinting, network telemetry, and threat signals into one interface.
 
-## How it works
-
-```mermaid
-flowchart TD
-  subgraph Browser["Browser · React dashboard"]
-    P1["Identity and hardware fingerprint"]
-    P2["Privacy, tampering, active call probes"]
-    P3["Network RTT and CPU pressure"]
-    P4["Sealed envelope: timestamp, nonce, signature"]
-  end
-
-  API["POST /api/visitor/identify"]
-  P1 --> API
-  P2 --> API
-  P3 --> API
-  P4 --> API
-
-  subgraph Server["First-party server · Express or Cloudflare Worker"]
-    V["Verify signature, window and nonce"]
-    N["Resolve IP, ISP, ASN and geolocation"]
-    T["Tor DNSEL and exit list"]
-    C["Bot, AI agent, proxy and emulator checks"]
-    S["Score 4 cards and the calibrated model"]
-    DB[("SQLite / Durable Object")]
-    V --> N --> T --> C --> S --> DB
-  end
-
-  API --> V
-  DB --> R["Response: signals, history, score"]
-  R --> UI["Risk Meter and Smart Signals grid"]
-  UI --> X["Visit history and Event JSON"]
-```
-
-One signed payload goes in. The server verifies it, resolves the network, classifies the visitor, scores every signal, stores the visit and returns the same evidence the dashboard renders.
-
 ## Features
 
 ### Visitor intelligence
@@ -100,17 +65,67 @@ Four core cards and a granular grid rate every visit from `0/10` to `10/10`. The
 - Server-signed history backup for serverless continuity.
 
 ```mermaid
-flowchart LR
-  A(["New visit detected"]) --> B{"Returning visitor?"}
-  B -- "Yes" --> C["Match Visitor ID + Hardware ID"]
-  B -- "No" --> D["Create Visitor ID + Hardware ID"]
-  C --> E["Update visit streak"]
-  D --> E
-  E --> F["Capture IP · location · device"]
-  F --> G["Append signed history record"]
-  G --> H["Render latest 5 visits"]
-  H --> I["Expand older history on demand"]
+flowchart TD
+  subgraph Browser["Browser · React dashboard"]
+    direction TB
+    P1["Identity and hardware fingerprint"]
+    P2["Privacy, tampering and active-call probes"]
+    P3["Network RTT and CPU pressure"]
+    P4["Sealed envelope: timestamp, nonce, signature"]
+    P1 --> P4
+    P2 --> P4
+    P3 --> P4
+  end
+
+  P4 --> API["POST /api/visitor/identify"]
+
+  subgraph Gateway["Request validation"]
+    direction TB
+    V1["Verify SHA-256 signature"]
+    V2["Validate timestamp window"]
+    V3["Check one-time nonce"]
+    V1 --> V2 --> V3
+  end
+
+  API --> V1
+  V3 -->|"Valid"| Resolve
+  V3 -->|"Invalid / replayed"| Reject["Tampered / Replayed 10/10"]
+
+  subgraph Intel["First-party intelligence layer"]
+    direction TB
+    Resolve["Resolve IP, ISP, ASN and geolocation"]
+    Tor["Tor DNSEL and exit-list check"]
+    Classify["Bot, AI-agent, proxy and emulator checks"]
+    Privacy["Privacy and tampering signal analysis"]
+    Velocity["Velocity, rarity and activity windows"]
+    Resolve --> Tor --> Classify --> Privacy --> Velocity
+  end
+
+  Resolve --> Geo[("Geolocation + ASN cache")]
+  Velocity --> Store[("SQLite / Durable Object")]
+
+  subgraph Scoring["Risk scoring"]
+    direction TB
+    Cards["Score four core cards"]
+    Grid["Score granular signal grid"]
+    Model["Compute calibrated 0-100 model"]
+    Cards --> Model
+    Grid --> Model
+  end
+
+  Velocity --> Cards
+  Velocity --> Grid
+  Model --> Persist["Persist visit, signals and score"]
+  Persist --> Store
+
+  Store --> Response["Return signals, history and score"]
+  Response --> UI["Render Risk Meter and Smart Signals"]
+  UI --> History["Update Visit History"]
+  UI --> JSON["Expose Event JSON inspector"]
+  History --> Backup["Server-signed history backup"]
 ```
+
+One signed payload goes in. The server verifies it, resolves the network, classifies the visitor, scores every signal, stores the visit and returns the same evidence the dashboard renders.
 
 > Browser fingerprinting and threat detection rely on heuristic signals. Results can vary with browser privacy settings, proxies, extensions and platform capabilities.
 
