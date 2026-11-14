@@ -2336,6 +2336,8 @@ function parseScreenResolutionWidth(resolution: string): number {
  */
 function classifyEmulatorFromSignals(input: {
   userAgent: string;
+  /** Client-claimed OS family; used as the claim source when the header is generic. */
+  os?: string;
   platform: string;
   maxTouchPoints: number;
   gpuVendor: string;
@@ -2343,6 +2345,7 @@ function classifyEmulatorFromSignals(input: {
   screenResolution: string;
 }): { detected: boolean; reason: string } {
   const ua = typeof input.userAgent === 'string' ? input.userAgent : '';
+  const claimedOs = typeof input.os === 'string' ? input.os : '';
   const platform = (input.platform || '').trim();
   const maxTouchPoints =
     typeof input.maxTouchPoints === 'number' ? Math.max(0, input.maxTouchPoints) : 0;
@@ -2350,8 +2353,8 @@ function classifyEmulatorFromSignals(input: {
   const renderer = (input.gpuRenderer || '').trim();
   const gpuSignature = `${vendor} ${renderer}`;
 
-  const claimsAndroid = /android/i.test(ua);
-  const claimsIos = IOS_DEVICE_UA_PATTERN.test(ua);
+  const claimsAndroid = /android/i.test(ua) || /android/i.test(claimedOs);
+  const claimsIos = IOS_DEVICE_UA_PATTERN.test(ua) || /ipad|ios/i.test(claimedOs);
 
   if (claimsAndroid && NON_ARM_ANDROID_PLATFORM_PATTERN.test(platform)) {
     return {
@@ -4595,6 +4598,7 @@ function sanitizeAndReinforceSecuritySignals(
       requestContext.requestUserAgent ||
       readRequestHeader(requestContext.headers, 'user-agent') ||
       '',
+    os: browserDevice.os,
     platform: browserDevice.platform,
     maxTouchPoints: hardwareSignals.maxTouchPoints,
     gpuVendor: hardwareSignals.gpuVendor,
