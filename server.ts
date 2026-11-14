@@ -1913,7 +1913,9 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
         ].filter(Boolean),
       });
     }
-    if (googleRangesLoaded) {
+    const googleOwnedNetwork =
+      asnIn(input.network.asn, GCP_ASNS) || /google/i.test(input.network.org || '');
+    if (googleRangesLoaded && !googleOwnedNetwork) {
       return aiAgentResult({
         agentId: 'impostor-spoof',
         agentName: 'Spoofed Google Bot Impostor (Unverified IP)',
@@ -2144,21 +2146,6 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
       (aiBotPrefixTable.get('chatgpt-user')?.length ?? 0) > 0 ||
       (aiBotPrefixTable.get('gptbot')?.length ?? 0) > 0;
     const verified = webBotAuth.operator === 'openai' || openAiDns || openAiCidr;
-    if (openAiUa && !verified && openAiRangesLoaded) {
-      return aiAgentResult({
-        agentId: 'impostor-spoof',
-        agentName: 'Spoofed OpenAI Agent (Unverified IP)',
-        operator: 'Unverified OpenAI claim',
-        executionMode: 'Spoofed Impostor',
-        verified: false,
-        confidence: 'Verified',
-        evidence: [
-          `OpenAI user-agent presented: ${ua.slice(0, 120)}`,
-          `Source IP ${input.publicIp} is not inside chatgpt-user.json / gptbot.json / searchbot.json`,
-          'Forward-confirmed reverse DNS does not resolve to openai.com / chatgpt.com',
-        ],
-      });
-    }
     return aiAgentResult({
       agentId: 'openai',
       agentName: directoryHint?.clientName || 'OpenAI ChatGPT Agent / Operator',
