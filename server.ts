@@ -1943,6 +1943,66 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
       ].filter(Boolean)
     : [];
 
+  /* ---------- Rule 0 — remote browser / computer-use harnesses -------------- */
+  // Scraping and agent harnesses (Firecrawl, Browser Use, Skyvern, MultiOn, Steel, Airtop,
+  // Hyperbrowser, Notte, Lightpanda, Browserless and the managed scraping fleets) announce
+  // themselves in the User-Agent because their target sites expect attribution. There is no
+  // vendor CIDR table for them, so the claim is reported as a named remote browser agent with
+  // high confidence rather than as a spoof, and the cursor overlay only renders for these
+  // non-human sessions.
+  const remoteBrowserUa =
+    /firecrawl|browserbase|browser[-_ ]?use|skyvern|multion|hyperbrowser|steel[-_ ]?browser|airtop|\bnotte\b|lightpanda|browserless|scrapingbee|scrapfly|zenrows|brightdata|oxylabs|\bzyte\b/i;
+  if (remoteBrowserUa.test(ua)) {
+    const remoteOperator = /firecrawl/i.test(ua)
+      ? 'Firecrawl'
+      : /browserbase/i.test(ua)
+      ? 'Browserbase'
+      : /browser[-_ ]?use/i.test(ua)
+      ? 'Browser Use'
+      : /skyvern/i.test(ua)
+      ? 'Skyvern'
+      : /multion/i.test(ua)
+      ? 'MultiOn'
+      : /hyperbrowser/i.test(ua)
+      ? 'Hyperbrowser'
+      : /steel[-_ ]?browser/i.test(ua)
+      ? 'Steel'
+      : /airtop/i.test(ua)
+      ? 'Airtop'
+      : /notte/i.test(ua)
+      ? 'Notte'
+      : /lightpanda/i.test(ua)
+      ? 'Lightpanda'
+      : /browserless/i.test(ua)
+      ? 'Browserless'
+      : /scrapingbee/i.test(ua)
+      ? 'ScrapingBee'
+      : /scrapfly/i.test(ua)
+      ? 'Scrapfly'
+      : /zenrows/i.test(ua)
+      ? 'ZenRows'
+      : /brightdata/i.test(ua)
+      ? 'Bright Data'
+      : /oxylabs/i.test(ua)
+      ? 'Oxylabs'
+      : 'Zyte';
+    return aiAgentResult({
+      agentId: 'remote-browser',
+      agentName: `${remoteOperator} Remote Browser Agent`,
+      operator: remoteOperator,
+      executionMode: 'Remote Browser Agent',
+      verified: false,
+      confidence: clientAutomation ? 'High' : 'Medium',
+      evidence: [
+        `Remote browser agent user-agent: ${ua.slice(0, 120)}`,
+        clientAutomation
+          ? 'Automation runtime flags confirmed the harness (WebDriver / CDP / headless)'
+          : 'User-agent claim without an automation flag',
+        networkHaystack ? `Network identity: ${networkHaystack}` : '',
+      ].filter(Boolean),
+    });
+  }
+
   /* --------------- Rule A (prelude) — Googlebot verification ---------------- */
   // Googlebot is a search crawler, not an LLM agent, but a spoofed claim must still be caught.
   // Only flag a spoof when at least one authoritative source actually answered.
@@ -2333,7 +2393,7 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
     });
   }
 
-  /* ------------------ Rule H — spoofed impostor (fallback) ----------------- */
+  /* ------------------ Rule I — spoofed impostor (fallback) ----------------- */
   const officialBotClaim =
     /googlebot|googleother|gemini-deep-research|gptbot|chatgpt-user|perplexitybot|perplexity-user|claudebot|claude-user|grokbot|meta-externalagent|muse/i.test(
       ua

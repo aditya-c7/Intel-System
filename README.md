@@ -57,7 +57,7 @@ Four Smart Signals cards rate each visit from `0/10` to `10/10`, and the granula
 - Browser, OS, CPU, GPU, memory, and display information.
 - Live RTT, jitter, and failed-HTTP-probe monitoring (5s while visible, paused when hidden or offline) on a fixed `0–1000 ms` axis.
 - CPU pressure monitoring through the W3C Compute Pressure API, with a 1 Hz heartbeat so a steady load never freezes the timeline; the panel is pruned on mobile and unsupported browsers.
-- Cursor attribution overlay: the pointer carries a `Human`, `Brave`, `Instinct`, `Claude-User`, `Gemini`, `Grok`, `Perplexity`, `Muse` or `ChatGPT-User` pill, and remote agents that click or focus without moving a pointer are attributed at the interacted element.
+- Cursor attribution overlay for non-human visitors only: a human keeps the native cursor with no pill and no listeners. Remote browser agents get a pill (`Firecrawl`, `Browser Use`, `Skyvern`, `MultiOn`, `Hyperbrowser`, `Steel`, `Airtop`, `Notte`, `Lightpanda`, `Remote Browser`, `Claude-User`, `Gemini`, `Grok`, `Perplexity`, `Muse`, `ChatGPT-User`, `Automated`). Agents that click or focus without moving a pointer are attributed at the interacted element.
 
 ### Visit history
 - Persistent first-party visit records.

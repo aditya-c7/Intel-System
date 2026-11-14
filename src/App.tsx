@@ -773,16 +773,13 @@ export default function App() {
     Math.min(10, Math.round(displayedRiskScore * 10) / 10)
   );
 
-  // Cursor attribution pill: resolved from the first-party bot / agent verdicts.
+  // Cursor attribution pill: resolved from the first-party bot / agent verdicts. Human
+  // visitors resolve to null, so the overlay never mounts for them.
   const cursorIdentity = resolveCursorIdentity({
     botSubtype: data?.securitySignals.botSubtype ?? null,
     isBot: Boolean(data?.securitySignals.isBot),
     agentId: data?.securitySignals.aiAgent?.agentId ?? null,
     agentName: data?.securitySignals.aiAgent?.agentName ?? null,
-    isBrave: Boolean(
-      typeof navigator !== 'undefined' &&
-        (navigator as unknown as { brave?: { isBrave?: () => boolean } }).brave?.isBrave
-    ),
   });
 
   // API v4 event payload rendered by the bottom inspector. Built exclusively from live
@@ -1457,12 +1454,144 @@ export default function App() {
           </section>
         )}
 
-        {/* Dedicated Smart Signals & Threat Analysis (4-signal core grid) + Hardware & Rendering Entropy (2x3 Grid) */}
+        {/* Hardware & Rendering Entropy (2x3 Grid) */}
         {data && data.securitySignals && data.hardwareSignals && (
-          <section
-            id="signals"
-            className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch"
-          >
+          <section id="hardware">
+            {/* RIGHT CARD: Hardware & Rendering Entropy (2x3 Visual Icon Grid) */}
+            <div className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6 flex flex-col justify-between">
+              <div>
+                <div className="flex items-center justify-between gap-3 pb-3.5 border-b border-[#E5E7EB] flex-wrap">
+                  <div className="flex items-center gap-2">
+                    <Cpu className="w-4 h-4 text-[#F05A28] shrink-0" />
+                    <h2 className="text-sm sm:text-base font-semibold text-slate-900">
+                      Hardware &amp; Rendering Entropy
+                    </h2>
+                  </div>
+
+                  <span className="text-xs font-mono text-slate-500">
+                    Native Web API
+                  </span>
+                </div>
+
+                {/* 2x3 Visual Icon Tile Grid */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5 mt-4">
+                  {/* Tile 1: Processor */}
+                  <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
+                    <div className="w-9 h-9 rounded-lg bg-orange-50/60 border border-[#E5E7EB] flex items-center justify-center shrink-0">
+                      <Cpu className="w-4 h-4 text-[#F05A28]" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <span className="block text-[11px] text-slate-500">Processor</span>
+                      <span
+                        className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5"
+                        title={`${
+                          data.hardwareSignals.cpuCores
+                            ? `${data.hardwareSignals.cpuCores} Logical Cores`
+                            : 'Multi-Core'
+                        } • ${data.hardwareSignals.architecture}`}
+                      >
+                        {data.hardwareSignals.cpuCores
+                          ? `${data.hardwareSignals.cpuCores} Cores`
+                          : 'Multi-Core'}{' '}
+                        • {data.hardwareSignals.architecture}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Tile 2: Graphics (Clean GPU Name + Max Texture) */}
+                  <div
+                    className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0"
+                    title={rawGpuTooltip}
+                  >
+                    <div className="w-9 h-9 rounded-lg bg-blue-50/60 border border-blue-200 flex items-center justify-center shrink-0">
+                      <CircuitBoard className="w-4 h-4 text-[#2563EB]" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center justify-between gap-1.5">
+                        <span className="text-[11px] text-slate-500">Graphics (GPU)</span>
+                        {data.hardwareSignals.maxTextureSize > 0 && (
+                          <span className="text-[10px] font-mono text-slate-400 shrink-0">
+                            {data.hardwareSignals.maxTextureSize.toLocaleString()} px
+                          </span>
+                        )}
+                      </div>
+                      <span className="block text-xs sm:text-sm font-semibold text-[#111827] truncate mt-0.5">
+                        {cleanGpuName}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Tile 3: Memory Tier */}
+                  <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
+                    <div className="w-9 h-9 rounded-lg bg-emerald-50/60 border border-emerald-200 flex items-center justify-center shrink-0">
+                      <HardDrive className="w-4 h-4 text-emerald-600" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <span className="block text-[11px] text-slate-500">Memory Tier</span>
+                      <span className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5">
+                        {data.hardwareSignals.deviceMemoryGb
+                          ? `~${data.hardwareSignals.deviceMemoryGb} GB RAM`
+                          : 'Standard RAM'}{' '}
+                        • {data.hardwareSignals.colorDepth}-bit
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Tile 4: Display & Input */}
+                  <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
+                    <div className="w-9 h-9 rounded-lg bg-indigo-50/60 border border-indigo-200 flex items-center justify-center shrink-0">
+                      <Palette className="w-4 h-4 text-indigo-600" />
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <span className="block text-[11px] text-slate-500">
+                        Display &amp; Input
+                      </span>
+                      <span
+                        className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] break-words leading-snug mt-0.5 min-w-0"
+                        title={`${data.hardwareSignals.colorGamut} • ${
+                          data.hardwareSignals.hdrSupported ? 'HDR' : 'SDR'
+                        } • ${
+                          data.hardwareSignals.maxTouchPoints === 0
+                            ? 'No Touch'
+                            : `${data.hardwareSignals.maxTouchPoints}-pt Touch`
+                        }`}
+                      >
+                        {data.hardwareSignals.colorGamut} •{' '}
+                        {data.hardwareSignals.hdrSupported ? 'HDR' : 'SDR'} •{' '}
+                        {data.hardwareSignals.maxTouchPoints === 0
+                          ? 'No Touch'
+                          : `${data.hardwareSignals.maxTouchPoints}-pt Touch`}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Direct GPU Vendor & Raw GPU Renderer Display (Always Visible, No Dropdown) */}
+              <div className="mt-4 pt-3.5 border-t border-[#E5E7EB]">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs text-slate-500 truncate">
+                    Vendor:{' '}
+                    <strong className="font-semibold text-slate-800">
+                      {data.hardwareSignals.gpuVendor}
+                    </strong>
+                  </span>
+                  <span className="text-[11px] font-mono text-slate-400 shrink-0">
+                    Raw GPU
+                  </span>
+                </div>
+
+                <div className="mt-2 p-2.5 rounded-lg bg-slate-50 border border-[#E5E7EB] text-[11px] font-mono text-slate-600 break-all">
+                  {data.hardwareSignals.gpuRenderer}
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* Smart Signals & Threat Analysis (4-signal core grid) */}
+        {data && data.securitySignals && data.hardwareSignals && (
+          <section id="signals">
             {/* LEFT CARD: Smart Signals & Threat Analysis (4-signal core grid) */}
             <div className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6 flex flex-col justify-between">
               <div>
@@ -1610,135 +1739,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* RIGHT CARD: Hardware & Rendering Entropy (2x3 Visual Icon Grid) */}
-            <div className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6 flex flex-col justify-between">
-              <div>
-                <div className="flex items-center justify-between gap-3 pb-3.5 border-b border-[#E5E7EB] flex-wrap">
-                  <div className="flex items-center gap-2">
-                    <Cpu className="w-4 h-4 text-[#F05A28] shrink-0" />
-                    <h2 className="text-sm sm:text-base font-semibold text-slate-900">
-                      Hardware &amp; Rendering Entropy
-                    </h2>
-                  </div>
-
-                  <span className="text-xs font-mono text-slate-500">
-                    Native Web API
-                  </span>
-                </div>
-
-                {/* 2x3 Visual Icon Tile Grid */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5 mt-4">
-                  {/* Tile 1: Processor */}
-                  <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
-                    <div className="w-9 h-9 rounded-lg bg-orange-50/60 border border-[#E5E7EB] flex items-center justify-center shrink-0">
-                      <Cpu className="w-4 h-4 text-[#F05A28]" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <span className="block text-[11px] text-slate-500">Processor</span>
-                      <span
-                        className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5"
-                        title={`${
-                          data.hardwareSignals.cpuCores
-                            ? `${data.hardwareSignals.cpuCores} Logical Cores`
-                            : 'Multi-Core'
-                        } • ${data.hardwareSignals.architecture}`}
-                      >
-                        {data.hardwareSignals.cpuCores
-                          ? `${data.hardwareSignals.cpuCores} Cores`
-                          : 'Multi-Core'}{' '}
-                        • {data.hardwareSignals.architecture}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Tile 2: Graphics (Clean GPU Name + Max Texture) */}
-                  <div
-                    className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0"
-                    title={rawGpuTooltip}
-                  >
-                    <div className="w-9 h-9 rounded-lg bg-blue-50/60 border border-blue-200 flex items-center justify-center shrink-0">
-                      <CircuitBoard className="w-4 h-4 text-[#2563EB]" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center justify-between gap-1.5">
-                        <span className="text-[11px] text-slate-500">Graphics (GPU)</span>
-                        {data.hardwareSignals.maxTextureSize > 0 && (
-                          <span className="text-[10px] font-mono text-slate-400 shrink-0">
-                            {data.hardwareSignals.maxTextureSize.toLocaleString()} px
-                          </span>
-                        )}
-                      </div>
-                      <span className="block text-xs sm:text-sm font-semibold text-[#111827] truncate mt-0.5">
-                        {cleanGpuName}
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Tile 3: Memory Tier */}
-                  <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
-                    <div className="w-9 h-9 rounded-lg bg-emerald-50/60 border border-emerald-200 flex items-center justify-center shrink-0">
-                      <HardDrive className="w-4 h-4 text-emerald-600" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <span className="block text-[11px] text-slate-500">Memory Tier</span>
-                      <span className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5">
-                        {data.hardwareSignals.deviceMemoryGb
-                          ? `~${data.hardwareSignals.deviceMemoryGb} GB RAM`
-                          : 'Standard RAM'}{' '}
-                        • {data.hardwareSignals.colorDepth}-bit
-                      </span>
-                    </div>
-                  </div>
-
-                  {/* Tile 4: Display & Input */}
-                  <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
-                    <div className="w-9 h-9 rounded-lg bg-indigo-50/60 border border-indigo-200 flex items-center justify-center shrink-0">
-                      <Palette className="w-4 h-4 text-indigo-600" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <span className="block text-[11px] text-slate-500">
-                        Display &amp; Input
-                      </span>
-                      <span
-                        className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] break-words leading-snug mt-0.5 min-w-0"
-                        title={`${data.hardwareSignals.colorGamut} • ${
-                          data.hardwareSignals.hdrSupported ? 'HDR' : 'SDR'
-                        } • ${
-                          data.hardwareSignals.maxTouchPoints === 0
-                            ? 'No Touch'
-                            : `${data.hardwareSignals.maxTouchPoints}-pt Touch`
-                        }`}
-                      >
-                        {data.hardwareSignals.colorGamut} •{' '}
-                        {data.hardwareSignals.hdrSupported ? 'HDR' : 'SDR'} •{' '}
-                        {data.hardwareSignals.maxTouchPoints === 0
-                          ? 'No Touch'
-                          : `${data.hardwareSignals.maxTouchPoints}-pt Touch`}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Direct GPU Vendor & Raw GPU Renderer Display (Always Visible, No Dropdown) */}
-              <div className="mt-4 pt-3.5 border-t border-[#E5E7EB]">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs text-slate-500 truncate">
-                    Vendor:{' '}
-                    <strong className="font-semibold text-slate-800">
-                      {data.hardwareSignals.gpuVendor}
-                    </strong>
-                  </span>
-                  <span className="text-[11px] font-mono text-slate-400 shrink-0">
-                    Raw GPU
-                  </span>
-                </div>
-
-                <div className="mt-2 p-2.5 rounded-lg bg-slate-50 border border-[#E5E7EB] text-[11px] font-mono text-slate-600 break-all">
-                  {data.hardwareSignals.gpuRenderer}
-                </div>
-              </div>
-            </div>
           </section>
         )}
 

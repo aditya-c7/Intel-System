@@ -89,6 +89,7 @@ export interface AiAgentAttribution {
     | 'openai'
     | 'claude'
     | 'cloud-browser'
+    | 'remote-browser'
     | 'impostor-spoof'
     | null;
   agentName: string;
@@ -98,6 +99,7 @@ export interface AiAgentAttribution {
     | 'User-Triggered Fetcher'
     | 'Silent Cloud VM Browser'
     | 'Autonomous Crawler'
+    | 'Remote Browser Agent'
     | 'Spoofed Impostor'
     | null;
   verified: boolean;

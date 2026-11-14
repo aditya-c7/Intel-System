@@ -1387,6 +1387,23 @@ async function resolveAiAgentIdentity(input) {
     directoryHint.clientName ? `Agent directory client_name: ${directoryHint.clientName}` : "",
     directoryHint.trigger ? `Agent trigger: ${directoryHint.trigger}` : ""
   ].filter(Boolean) : [];
+  const remoteBrowserUa = /firecrawl|browserbase|browser[-_ ]?use|skyvern|multion|hyperbrowser|steel[-_ ]?browser|airtop|\bnotte\b|lightpanda|browserless|scrapingbee|scrapfly|zenrows|brightdata|oxylabs|\bzyte\b/i;
+  if (remoteBrowserUa.test(ua)) {
+    const remoteOperator = /firecrawl/i.test(ua) ? "Firecrawl" : /browserbase/i.test(ua) ? "Browserbase" : /browser[-_ ]?use/i.test(ua) ? "Browser Use" : /skyvern/i.test(ua) ? "Skyvern" : /multion/i.test(ua) ? "MultiOn" : /hyperbrowser/i.test(ua) ? "Hyperbrowser" : /steel[-_ ]?browser/i.test(ua) ? "Steel" : /airtop/i.test(ua) ? "Airtop" : /notte/i.test(ua) ? "Notte" : /lightpanda/i.test(ua) ? "Lightpanda" : /browserless/i.test(ua) ? "Browserless" : /scrapingbee/i.test(ua) ? "ScrapingBee" : /scrapfly/i.test(ua) ? "Scrapfly" : /zenrows/i.test(ua) ? "ZenRows" : /brightdata/i.test(ua) ? "Bright Data" : /oxylabs/i.test(ua) ? "Oxylabs" : "Zyte";
+    return aiAgentResult({
+      agentId: "remote-browser",
+      agentName: `${remoteOperator} Remote Browser Agent`,
+      operator: remoteOperator,
+      executionMode: "Remote Browser Agent",
+      verified: false,
+      confidence: clientAutomation ? "High" : "Medium",
+      evidence: [
+        `Remote browser agent user-agent: ${ua.slice(0, 120)}`,
+        clientAutomation ? "Automation runtime flags confirmed the harness (WebDriver / CDP / headless)" : "User-agent claim without an automation flag",
+        networkHaystack ? `Network identity: ${networkHaystack}` : ""
+      ].filter(Boolean)
+    });
+  }
   if (/\bgooglebot\b/i.test(ua)) {
     const googleCidr = matchesAiPrefixTable(input.publicIp, [
       "google-common",
