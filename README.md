@@ -23,11 +23,11 @@ Every analysis is performed through a signed first-party API request, scored acr
 
 ## Why it’s different
 
-- **First-party and transparent** — visitor signals are collected and processed through your own API, with no third-party tracking dependency.
-- **Multi-layer analysis** — combines browser identity, hardware fingerprints, network intelligence, privacy settings, and behavioural signals.
-- **Explainable scoring** — each signal has a visible status and score, while the server also produces a calibrated overall risk score.
-- **Persistent visitor history** — recognizes returning visitors and preserves session, IP, location, and device context across visits.
-- **Serverless-ready** — designed for Cloudflare Workers with SQLite-backed Durable Objects, while remaining deployable with Express.
+- **First-party and transparent:** visitor signals are collected and processed through your own API, with no third-party tracking dependency.
+- **Multi-layer analysis:** combines browser identity, hardware fingerprints, network intelligence, privacy settings, and behavioural signals.
+- **Explainable scoring:** each signal has a visible status and score, while the server also produces a calibrated overall risk score.
+- **Persistent visitor history:** recognizes returning visitors and preserves session, IP, location, and device context across visits.
+- **Serverless-ready:** designed for Cloudflare Workers with SQLite-backed Durable Objects, while remaining deployable with Express.
 
 ## What it detects
 
@@ -36,14 +36,16 @@ Every analysis is performed through a signed first-party API request, scored acr
 | Visitor identity | Persistent Visitor ID, Hardware ID, returning visitors, sessions, visit totals, observed IPs, and geolocation history |
 | Incognito / private browsing | IndexedDB durability, OPFS flush timing, and storage quota behaviour |
 | Bots and automation | User-Agent consistency, operator ASN, rDNS, Web Bot Auth, WebDriver, CDP, and headless-rendering signals |
-| VPN, proxy, and Tor | Tor DNSEL and exit lists, datacenter ASN, timezone mismatch, proxy headers, and forwarded-IP chains |
+| AI agents and crawlers | Google Gemini and Gemini Cloud Agent, Grok, Claude, Perplexity, ChatGPT / OpenAI, Muse, and verified Googlebot traffic, with operator and execution-mode attribution |
+| Remote browser agents | Firecrawl, Browser Use, Skyvern, MultiOn, Hyperbrowser, Steel, Airtop, Notte, Lightpanda, and Browserless |
+| VPN, proxy, and Tor | Tor exit nodes, Tor Browser clients, Tor relays, datacenter ASN, timezone mismatch, proxy headers, and forwarded-IP chains |
+| Network classification | Verified crawler networks, AI-agent cloud networks, datacenter or hosting ASN, VPN / datacenter proxy, VPN / timezone relay, and standard ISP traffic |
 | Virtual machines and emulators | GPU vendor/renderer, platform, touch points, screen dimensions, and emulator markers |
 | Browser tampering | DevTools emulation, anti-detect browsers, replaced Navigator getters, and JavaScript-versus-HTTP User-Agent mismatches |
 | Developer tools | Docked DevTools through outer/inner viewport differences |
 | Active calls | WebRTC audio tracks, `navigator.audioSession`, and voice-routed AudioContext state |
 | Privacy settings | Tor Browser RFP, letterboxed viewports, Brave Shields, and canvas anti-fingerprinting noise |
-| Behaviour and rarity | IP, session, country, and event velocity across 5-minute, 1-hour, and 24-hour windows; rare-device comparison against a 30-day baseline |
-| Remote browser agents | Named attribution for Firecrawl, Browser Use, Skyvern, MultiOn, Hyperbrowser, Steel, Airtop, Notte, Lightpanda, and Browserless; Web Bot Auth verification for signed cloud browsers |
+| Behaviour and rarity | Distinct IPs, linked sessions, countries, and events across 5-minute, 1-hour, and 24-hour windows; high activity at 20+ events in 24 hours and rare-device comparison against a 30-day baseline |
 
 The four core cards and granular signal grid rate visits from `0/10` to `10/10`. The server computes both views, and the dashboard mirrors the same rules client-side so the displayed scores remain consistent.
 
@@ -57,6 +59,16 @@ Browser-tampering checks cross-reference the mobile User-Agent with `navigator.p
 Proxy signals include `Proxy-Authorization`, `Proxy-Connection`, a non-CDN `Via` header, an upstream `Forwarded` address, and a three-hop public `X-Forwarded-For` chain. The dashboard identifies the proving header when proxy detection triggers.
 
 </details>
+
+## Dashboard
+
+- **Identity overview:** visitor and hardware identity, returning-visitor state, visit totals, and observed locations.
+- **Hardware & rendering entropy:** browser, OS, CPU, GPU, memory, display, fonts, emoji metrics, canvas stability, WebGL hashes, and math-vector attributes.
+- **Smart Signals & threat analysis:** deterministic signal rows, four core risk cards, and a granular signal grid.
+- **Network stability & CPU activity:** public IP, ISP, ASN, interactive Leaflet geolocation map, live RTT, jitter, failed HTTP probes, and Compute Pressure-based CPU activity.
+- **Visit history:** persistent session, timestamp, IP, location, and device records; latest five visits by default with expand/collapse controls.
+- **Event JSON inspector:** renders and copies the live API v4 payload, including raw device attributes.
+- **Cursor attribution overlay:** appears only for non-human visitors. It identifies agents such as Gemini, Grok, Claude, Perplexity, ChatGPT, and Muse, while human visitors retain the native cursor.
 
 ## How it works
 
@@ -134,20 +146,6 @@ Open the [live demo](https://intel.adityahq.me) and select **Analyze my browser*
 | VPN or proxy | Network type, ASN, timezone, and proxy signals are reassessed |
 | DevTools device emulation | Tampering and device-consistency signals respond immediately |
 | Repeated visits | Visitor recognition, visit totals, and history update |
-
-## Dashboard
-
-- **Identity overview** — visitor and hardware identity, returning-visitor state, visit totals, and observed locations.
-- **Hardware & rendering entropy** — browser, OS, CPU, GPU, memory, display, fonts, emoji metrics, canvas stability, WebGL hashes, and math-vector attributes.
-- **Smart Signals & threat analysis** — deterministic signal rows, four core risk cards, and a granular signal grid.
-- **Network stability & CPU activity** — public IP, ISP, ASN, interactive Leaflet geolocation map, live RTT, jitter, failed HTTP probes, and Compute Pressure-based CPU activity.
-- **Visit history** — persistent session, timestamp, IP, location, and device records; latest five visits by default with expand/collapse controls.
-- **Event JSON inspector** — renders and copies the live API v4 payload, including raw device attributes.
-- **Cursor overlay** — appears only for non-human visitors; humans retain the native cursor, while remote browser agents receive a branded attribution pill.
-
-## Privacy & limitations
-
-Intel System is designed around first-party visitor intelligence. Browser fingerprinting and threat detection rely on heuristic signals, so results can vary with browser privacy settings, proxies, extensions, and platform capabilities.
 
 ## Tech stack
 
