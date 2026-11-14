@@ -2937,8 +2937,6 @@ export function detectActiveCall(): ActiveCallAssessment {
       return '';
     }
   })();
-  const supported = claimsMobile || hasRtc || Boolean(audioSessionType) || maxTouchPoints > 0;
-
   // 1. A connected peer connection carrying a live audio track.
   let connectedAudioCall = false;
   for (const entry of Array.from(trackedPeerConnections)) {
@@ -2967,6 +2965,12 @@ export function detectActiveCall(): ActiveCallAssessment {
   if (audioSessionType === 'play-and-record') {
     reasons.push('navigator.audioSession reports play-and-record');
   }
+
+  // A desktop runtime exposes RTCPeerConnection everywhere, so its mere presence is not a
+  // call capability. The row is only rendered on mobile claims, an audioSession API, or an
+  // actually connected audio call.
+  const supported =
+    claimsMobile || Boolean(audioSessionType) || connectedAudioCall || maxTouchPoints > 0;
 
   // 2. Voice-routed audio hardware: narrowband/wideband voice sample rates, or an iOS
   //    `interrupted` context that only occurs while the audio session is held by a call.

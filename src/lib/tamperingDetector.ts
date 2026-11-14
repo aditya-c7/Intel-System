@@ -203,9 +203,10 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
   const outerHeight = typeof window !== 'undefined' ? Number(window.outerHeight) || 0 : 0;
   const innerWidth = typeof window !== 'undefined' ? Number(window.innerWidth) || 0 : 0;
   const innerHeight = typeof window !== 'undefined' ? Number(window.innerHeight) || 0 : 0;
+  // Only the height delta is used. Embedded desktop shells and side panels also shrink the
+  // inner width, which made a width-based rule fire on legitimate windows.
   const developerTools =
-    (outerWidth > 0 && innerWidth > 0 && outerWidth - innerWidth > 160) ||
-    (outerHeight > 0 && innerHeight > 0 && outerHeight - innerHeight > 160);
+    outerHeight > 0 && innerHeight > 0 && outerHeight - innerHeight > 200;
 
   // 8. The JS user-agent must equal the HTTP User-Agent header the server observed.
   const headerUA = (input.serverHeaderUA || '').trim();

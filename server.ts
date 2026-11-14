@@ -5857,10 +5857,9 @@ app.post('/api/visitor/identify', async (req, res) => {
       currentSessionId
     );
     const rarityReport = computeDeviceRarity(db, browserDevice);
-    const highActivityDevice =
-      velocityReport.events24h >= 20 ||
-      velocityReport.distinctIps24h >= 3 ||
-      velocityReport.velocity.ip_events['24_hours'] >= 20;
+    // The blueprint threshold is 20+ identification events for this visitor in 24 hours.
+    // Per-IP event counts stay in the velocity object but never flag the device on their own.
+    const highActivityDevice = velocityReport.events24h >= 20;
     const clientTampering = rawSecuritySignals?.tampering ?? null;
     const tamperingAssessment =
       clientTampering === null

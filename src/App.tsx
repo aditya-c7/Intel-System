@@ -1550,7 +1550,7 @@ export default function App() {
                     ) : (
                       <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
                     )}
-                    <span>{riskBadgeText}</span>
+                    <span>{`${riskTier} Risk \u2022 ${suspectScore100}/100`}</span>
                   </span>
                 </div>
 
@@ -1600,7 +1600,7 @@ export default function App() {
                     Risk Meter
                   </span>
                   <span className="text-xs font-mono tabular-nums text-slate-500 truncate">
-                    • {riskBadgeText}
+                    • {`${riskTier} Risk \u2022 ${suspectScore100}/100`}
                   </span>
                 </div>
 

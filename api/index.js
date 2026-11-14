@@ -3934,7 +3934,7 @@ app.post("/api/visitor/identify", async (req, res) => {
       currentSessionId
     );
     const rarityReport = computeDeviceRarity(db, browserDevice);
-    const highActivityDevice = velocityReport.events24h >= 20 || velocityReport.distinctIps24h >= 3 || velocityReport.velocity.ip_events["24_hours"] >= 20;
+    const highActivityDevice = velocityReport.events24h >= 20;
     const clientTampering = rawSecuritySignals?.tampering ?? null;
     const tamperingAssessment = clientTampering === null ? null : {
       tampering: Boolean(clientTampering),
