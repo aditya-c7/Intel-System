@@ -5087,6 +5087,17 @@ function sanitizeAndReinforceSecuritySignals(
       // Phase 3 — mobile emulator / simulator verdict
       emulatorDetected,
       emulatorReason,
+      // Phase 5 — browser tampering / docked DevTools (client-probed, echoed for the grid)
+      tampering: Boolean(raw?.tampering),
+      tamperingConfidence: (raw?.tamperingConfidence || 'high') as
+        | 'low'
+        | 'medium'
+        | 'high',
+      tamperingMlScore:
+        typeof raw?.tamperingMlScore === 'number' ? raw.tamperingMlScore : 0.0024,
+      tamperingDetails: raw?.tamperingDetails,
+      developerTools: Boolean(raw?.developerTools),
+      privacySettings: Boolean(raw?.privacySettings || clientTorBrowser),
       // Phase 4 — sealed request envelope verdicts
       tamperedRequest,
       replayDetected,
