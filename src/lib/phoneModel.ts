@@ -29,9 +29,28 @@ export function formatPhoneDisplayLabel(entry: AndroidPhoneEntry): string {
   return entry.modelCode ? `${label} (${entry.modelCode})` : label;
 }
 
-/** Exact, unambiguous resolution of a reported model code; null when unmapped/ambiguous. */
+/**
+ * Exact, unambiguous resolution of a reported model code; null when unmapped/ambiguous.
+ *
+ * Only cosmetic UA decorations are stripped between attempts (Samsung Internet's
+ * `SAMSUNG ` prefix, dual-SIM `/DS` suffix); every attempt is still an exact
+ * catalog hit, so no guessing is introduced.
+ */
 export function resolvePhoneModel(reportedModel?: string): AndroidPhoneEntry | null {
-  return lookupAndroidPhone(normalizeModelCode(reportedModel ?? ''));
+  const base = normalizeModelCode(reportedModel ?? '');
+  if (!base) return null;
+  const variants = new Set<string>([base]);
+  const decorated = base
+    .replace(/^SAMSUNG[\s-]+/i, '')
+    .replace(/\/DS$/i, '')
+    .replace(/_DS$/i, '')
+    .trim();
+  if (decorated) variants.add(decorated);
+  for (const candidate of variants) {
+    const entry = lookupAndroidPhone(candidate);
+    if (entry) return entry;
+  }
+  return null;
 }
 
 /**

@@ -52,6 +52,7 @@ interface NavigatorUAData {
     bitness?: string;
     mobile?: boolean;
     model?: string;
+    formFactors?: string[];
   }>;
 }
 
@@ -787,6 +788,7 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
     bitness?: string;
     mobile?: boolean;
     model?: string;
+    formFactors?: string[];
   } | null = null;
 
   if (uaData && typeof uaData.getHighEntropyValues === 'function') {
@@ -800,6 +802,7 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
           'bitness',
           'mobile',
           'model',
+          'formFactors',
         ]),
         new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
       ]);
@@ -868,6 +871,28 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
   }
 
   let os = 'Unknown';
+  // iOS 26 froze the legacy `CPU iPhone OS 18_7 like Mac OS X` token while
+  // `Version/26.x` carries the real OS, so compare majors and keep the most
+  // precise candidate instead of trusting the frozen token.
+  const resolveIosVersion = (): string => {
+    const candidates: string[] = [];
+    const fromUa = ua.match(/(?:CPU (?:iPhone |iPad )?OS|OS) ([\d_]+) like Mac OS X/)?.[1];
+    if (fromUa) candidates.push(fromUa.replace(/_/g, '.'));
+    const fromVersion = ua.match(/Version\/([\d.]+)/)?.[1];
+    if (fromVersion) candidates.push(fromVersion);
+    if (/^\d+/.test(hintPlatformVersion)) {
+      const hinted = hintPlatformVersion.split('.').slice(0, 3).join('.');
+      if (hinted) candidates.push(hinted);
+    }
+    if (!candidates.length) return '';
+    return candidates
+      .map((value) => {
+        const parts = value.split('.').map((part) => parseInt(part, 10));
+        return { value, parts, major: Number.isNaN(parts[0]) ? 0 : parts[0] };
+      })
+      .sort((a, b) => b.major - a.major || b.parts.length - a.parts.length)
+      .map((entry) => entry.value.replace(/\.$/, ''))[0];
+  };
   const maxTouchPoints = typeof navigator !== 'undefined' ? Number(navigator.maxTouchPoints ?? 0) : 0;
   const hintPlatform = highEntropy?.platform || uaData?.platform || '';
   const hintPlatformVersion = highEntropy?.platformVersion || '';
@@ -889,11 +914,11 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
         : (ua.match(/Android ([\d.]+)/)?.[1] ?? '');
     os = androidVersion ? `Android ${androidVersion}` : 'Android';
   } else if (/iPad/i.test(ua) || (/Macintosh/i.test(ua) && maxTouchPoints > 2)) {
-    const ios = ua.match(/OS ([\d_]+) like Mac OS X/);
-    os = ios ? `iPadOS ${ios[1].replace(/_/g, '.')}` : 'iPadOS';
+    const iosVersion = resolveIosVersion();
+    os = iosVersion ? `iPadOS ${iosVersion}` : 'iPadOS';
   } else if (/iPhone|iPod/i.test(ua) || /iOS/i.test(hintPlatform)) {
-    const ios = ua.match(/OS ([\d_]+) like Mac OS X/);
-    os = ios ? `iOS ${ios[1].replace(/_/g, '.')}` : 'iOS';
+    const iosVersion = resolveIosVersion();
+    os = iosVersion ? `iOS ${iosVersion}` : 'iOS';
   } else if (/macOS|Mac OS/i.test(hintPlatform) || /Macintosh|Mac OS X/i.test(ua)) {
     if (hintPlatformVersion) {
       const parts = hintPlatformVersion.split('.');
@@ -943,6 +968,7 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
     platform: navPlatform,
     architecture: highEntropy?.architecture,
     mobileHint: highEntropy?.mobile ?? uaData?.mobile,
+    formFactors: highEntropy?.formFactors,
     gpuVendor: gpuProbe.gpuVendor,
     gpuRenderer: gpuProbe.gpuRenderer,
     maxTouchPoints: gateTouchPoints,

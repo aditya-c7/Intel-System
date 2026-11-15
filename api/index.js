@@ -3840,12 +3840,12 @@ function detectServerRegion(req) {
 var app = express();
 app.set("trust proxy", true);
 app.use(cookieParser());
-var CLIENT_HINT_HEADER = "Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version-List";
+var CLIENT_HINT_HEADER = "Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Form-Factors, Sec-CH-UA-Full-Version-List";
 app.use((_req, res, next) => {
   res.setHeader("Accept-CH", CLIENT_HINT_HEADER);
   res.setHeader(
     "Permissions-Policy",
-    "compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self)"
+    "compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self), ch-ua-form-factors=(self)"
   );
   next();
 });

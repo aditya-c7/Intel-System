@@ -4474,12 +4474,12 @@ app.use(cookieParser());
 // Compute Pressure available. `Accept-CH` makes `Sec-CH-UA-Model` arrive in HTTP
 // headers on subsequent requests; the JS high-entropy call covers the first visit.
 const CLIENT_HINT_HEADER =
-  'Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version-List';
+  'Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Form-Factors, Sec-CH-UA-Full-Version-List';
 app.use((_req, res, next) => {
   res.setHeader('Accept-CH', CLIENT_HINT_HEADER);
   res.setHeader(
     'Permissions-Policy',
-    'compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self)'
+    'compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self), ch-ua-form-factors=(self)'
   );
   next();
 });

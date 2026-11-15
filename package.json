@@ -16,6 +16,7 @@
     "lint": "tsc --noEmit",
     "test:worker": "node scripts/test-worker.mjs",
     "test:browser": "node scripts/test-browser.mjs",
+    "test:device": "tsx scripts/test-device-detection.ts",
     "phones:generate": "node scripts/generate-phone-models.mjs"
   },
   "dependencies": {

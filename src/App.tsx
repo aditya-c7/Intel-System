@@ -46,7 +46,6 @@ import {
   Palette,
   Bot,
   ChevronRight,
-  Smartphone,
 } from 'lucide-react';
 
 /**
@@ -1310,13 +1309,9 @@ export default function App() {
                 </p>
                 {data.browserDevice.genuineMobile &&
                 data.browserDevice.phoneDisplayLabel ? (
-                  <div className="mt-2.5 flex justify-center">
-                    <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-[11px] sm:text-xs font-semibold text-emerald-800">
-                      <Smartphone className="h-3.5 w-3.5 shrink-0 text-emerald-700" />
-                      <span className="truncate">
-                        {data.browserDevice.phoneDisplayLabel}
-                        {data.browserDevice.os ? ` · ${data.browserDevice.os}` : ''}
-                      </span>
+                  <div className="mt-2 flex justify-center">
+                    <span className="max-w-full truncate text-sm sm:text-[15px] font-semibold tracking-tight text-[#111827]">
+                      {data.browserDevice.phoneDisplayLabel}
                     </span>
                   </div>
                 ) : null}
@@ -1562,22 +1557,30 @@ export default function App() {
                       </div>
                       <div className="min-w-0 flex-1">
                         <span className="block text-[10px] sm:text-[11px] text-slate-500">OS &amp; Device</span>
-                        <span
-                          className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"
-                          title={
-                            data.browserDevice.genuineMobile && data.browserDevice.phoneDisplayLabel
-                              ? `${data.browserDevice.phoneDisplayLabel} · ${data.browserDevice.os}`
-                              : `${activeVisit?.os || data.browserDevice.os} • ${
-                                  activeVisit?.deviceType || data.browserDevice.deviceType
-                                }`
-                          }
-                        >
-                          {data.browserDevice.genuineMobile && data.browserDevice.phoneDisplayLabel
-                            ? `${data.browserDevice.phoneDisplayLabel} · ${data.browserDevice.os}`
-                            : `${activeVisit?.os || data.browserDevice.os} • ${
-                                activeVisit?.deviceType || data.browserDevice.deviceType
-                              }`}
-                        </span>
+                        {data.browserDevice.genuineMobile && data.browserDevice.phoneDisplayLabel ? (
+                          <>
+                            <span
+                              className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"
+                              title={data.browserDevice.phoneDisplayLabel}
+                            >
+                              {data.browserDevice.phoneDisplayLabel}
+                            </span>
+                            <span className="block text-[10px] sm:text-[11px] text-slate-500 leading-snug">
+                              {data.browserDevice.os} •{' '}
+                              {data.browserDevice.phoneBrand || 'Mobile'}
+                            </span>
+                          </>
+                        ) : (
+                          <span
+                            className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"
+                            title={`${activeVisit?.os || data.browserDevice.os} • ${
+                              activeVisit?.deviceType || data.browserDevice.deviceType
+                            }`}
+                          >
+                            {activeVisit?.os || data.browserDevice.os} •{' '}
+                            {activeVisit?.deviceType || data.browserDevice.deviceType}
+                          </span>
+                        )}
                       </div>
                     </div>
 

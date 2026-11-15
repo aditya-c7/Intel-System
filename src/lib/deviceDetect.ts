@@ -55,6 +55,8 @@ export interface DeviceGateInput {
   architecture?: string;
   /** UA-CH `mobile` hint. */
   mobileHint?: boolean;
+  /** UA-CH `formFactors` (e.g. ["Mobile"], ["Tablet"], ["Desktop"]). */
+  formFactors?: string[];
   gpuVendor?: string;
   gpuRenderer?: string;
   maxTouchPoints: number;
@@ -96,11 +98,22 @@ export function classifyGenuineDevice(input: DeviceGateInput): DeviceGateResult 
   const claimsMobileUA =
     claimsIOS ||
     claimsAndroid ||
-    /Mobile|IEMobile|Opera Mini|Silk|Kindle|BlackBerry|webOS/i.test(ua) ||
+    /Mobile|IEMobile|Opera Mini|Silk|Kindle|BlackBerry|webOS|KaiOS/i.test(ua) ||
     input.mobileHint === true;
+
+  const formFactors = Array.isArray(input.formFactors)
+    ? input.formFactors.filter((value): value is string => typeof value === 'string')
+    : [];
+  const formFactorTablet = formFactors.some((value) => /tablet/i.test(value));
+  const formFactorMobile = formFactors.some((value) => /mobile|phone|smartphone/i.test(value));
+  const formFactorDesktop = formFactors.some((value) => /desktop|laptop|tv|watch/i.test(value));
 
   const isDesktopPlatform = DESKTOP_PLATFORM_PATTERN.test(platform);
   const isDesktopArch = DESKTOP_ARCH_PATTERN.test(architecture);
+  // `navigator.platform` is the fallback when UA-CH architecture is withheld
+  // (Firefox Android, KaiOS, Samsung Internet, in-app WebViews): real handsets
+  // report `Linux armv8l` / `Linux armv7l`, desktops report `Linux x86_64`.
+  const isArmPlatform = ARM_ARCH_PATTERN.test(platform) || /linux arm/i.test(platform);
   const isArmArch = ARM_ARCH_PATTERN.test(architecture);
   const hasDesktopGpu = gpuSignature !== '' && DESKTOP_GPU_PATTERN.test(gpuSignature);
   const hasMobileGpu = gpuSignature !== '' && MOBILE_GPU_PATTERN.test(gpuSignature);
@@ -146,6 +159,13 @@ export function classifyGenuineDevice(input: DeviceGateInput): DeviceGateResult 
     return { kind: 'pc', genuineMobile: false, devtoolsDeviceEmulation: true, reasons };
   }
 
+  // Layer 2d — UA-CH says the form factor is a desktop/laptop/tv while the UA
+  // claims mobile: emulation (e.g. an Android UA on a Chromebook).
+  if (claimsMobileUA && formFactorDesktop && !isLegitIpadOs) {
+    reasons.push(`Desktop form factor (${formFactors.join(', ')}) under a mobile user-agent`);
+    return { kind: 'pc', genuineMobile: false, devtoolsDeviceEmulation: true, reasons };
+  }
+
   // A genuine iPad in desktop-class Safari.
   if (isLegitIpadOs && fingerDriven) {
     reasons.push('iPad-class touch hardware with Apple GPU');
@@ -154,7 +174,7 @@ export function classifyGenuineDevice(input: DeviceGateInput): DeviceGateResult 
 
   // iOS: platform + touch silicon must both agree.
   if (claimsIOS) {
-    const isIpad = /iPad/i.test(ua) || platform === 'iPad';
+    const isIpad = /iPad/i.test(ua) || platform === 'iPad' || formFactorTablet;
     if (fingerDriven && !hasDesktopGpu && !isDesktopArch) {
       reasons.push(isIpad ? 'iPad touch hardware' : 'iPhone touch hardware');
       return {
@@ -170,12 +190,23 @@ export function classifyGenuineDevice(input: DeviceGateInput): DeviceGateResult 
 
   // Android / generic handheld: require finger input and non-desktop silicon.
   if (fingerDriven && !hasDesktopGpu && !isDesktopArch) {
-    const androidLike = claimsAndroid || input.mobileHint === true || isArmArch || hasMobileGpu;
+    const androidLike =
+      claimsAndroid ||
+      input.mobileHint === true ||
+      isArmArch ||
+      isArmPlatform ||
+      hasMobileGpu ||
+      formFactorMobile ||
+      formFactorTablet;
     if (androidLike) {
+      // UA-CH `formFactors` is authoritative when present; otherwise a tablet UA
+      // omits the `Mobile` token and reports a wide viewport.
       const tablet =
-        input.mobileHint === false ||
-        /Tablet/i.test(ua) ||
-        (viewportWidth > 767 && !/Mobile/i.test(ua));
+        formFactorTablet ||
+        (!formFactorMobile &&
+          (input.mobileHint === false ||
+            /Tablet/i.test(ua) ||
+            (viewportWidth > 767 && !/Mobile/i.test(ua))));
       reasons.push(
         tablet ? 'Finger-driven tablet-class hardware' : 'Finger-driven ARM/Android hardware'
       );
@@ -200,19 +231,62 @@ export function classifyGenuineDevice(input: DeviceGateInput): DeviceGateResult 
     return { kind: 'pc', genuineMobile: false, devtoolsDeviceEmulation: false, reasons };
   }
 
+  // KaiOS / BlackBerry / Opera Mini feature phones: genuine ARM handsets that
+  // report a `Mobile` UA token but no touch input. Desktop ARM Linux (Raspberry
+  // Pi) always sends `X11` and never a `Mobile` token, so it stays Desktop.
+  const featurePhoneUA =
+    /Mobile|KaiOS|BlackBerry|Opera Mini|webOS|Symbian/i.test(ua) &&
+    !/X11|Windows NT|Macintosh|CrOS|Chromebook/i.test(ua);
+  if (featurePhoneUA && (isArmPlatform || isArmArch) && !hasDesktopGpu && !isDesktopArch && !isDesktopPlatform) {
+    reasons.push('ARM feature-phone user-agent without desktop tokens');
+    return { kind: 'mobile', genuineMobile: true, devtoolsDeviceEmulation: false, reasons };
+  }
+
   return { kind: 'pc', genuineMobile: false, devtoolsDeviceEmulation: false, reasons };
 }
 
-/** Extract the Android `Build.MODEL` token from a User-Agent (fallback when UA-CH is absent). */
+/**
+ * Extract the Android `Build.MODEL` token from a User-Agent (fallback when UA-CH is absent).
+ *
+ * Handles every Android UA shape seen in the wild:
+ *   `(Linux; Android 10; SM-A536B)`                    Chrome
+ *   `(Linux; Android 13; SM-S918B Build/TP1A...; wv)`  WebView
+ *   `(Linux; Android 14; SAMSUNG SM-G991B)`            Samsung Internet
+ *   `(Linux; Android 9; SM-J610F/DS)`                  dual-SIM suffix
+ *   `(Linux; Android 11; moto g power Build/RPMS31...)` spaces in the model
+ *   `(Linux; Android 13; en-us; Pixel 8 Pro)`          locale prefix
+ *   `(Linux; Android 10; K)` / `(Android 12; Mobile; rv:109.0)` reduced UA
+ */
 export function extractAndroidModelFromUA(ua: string): string {
-  const match = ua.match(
-    /Android\s+[\d.]+;\s*(?:[a-z]{2}(?:-[a-zA-Z]{2})?;\s*)?([^;)]+?)(?:\s+Build\/|;?\s*\))/i
-  );
-  const raw = match?.[1]?.trim() ?? '';
-  if (!raw) return '';
-  // Chrome's reduced UA sends a generic "K"; wv/Mobile are WebView tokens, not models.
-  if (/^(k|wv|mobile|tablet|android)$/i.test(raw)) return '';
-  return raw;
+  const group = ua.match(/\(([^()]*\bAndroid\b[^()]*)\)/i)?.[1] ?? '';
+  if (!group) return '';
+
+  // Everything after "Android <version>;" is candidate model information.
+  const tail = group.replace(/^.*?\bAndroid\s+[\dA-Za-z.]+;?\s*/i, '');
+  if (!tail) return '';
+
+  const ignored = /^(wv|mobile|tablet|android|en|us|[a-z]{2}[-_][a-z]{2})$/i;
+  const token =
+    tail
+      .split(/[;]/)
+      .map((part) => part.trim())
+      .find((part) => part && !ignored.test(part)) ?? '';
+  if (!token) return '';
+
+  let model = token
+    // Drop the build fingerprint: " Build/TP1A.220624.014", " Build/RKQ1...".
+    .replace(/\s+Build\/[^\s;]*/i, '')
+    .replace(/\s+Build$/i, '')
+    .trim();
+
+  // Chrome's reduced UA sends a generic "K"; wv/Mobile are WebView tokens.
+  if (/^(k|wv|mobile|tablet|android)$/i.test(model)) return '';
+
+  // Samsung Internet prefixes the retail brand ("SAMSUNG SM-G991B") and dual-SIM
+  // units append "/DS". Both are UA decorations, not part of the catalog code.
+  model = model.replace(/^SAMSUNG[\s-]+/i, '').replace(/\/DS$/i, '').trim();
+
+  return /^[\w.,+\-/ ()]+$/.test(model) ? model : '';
 }
 
 /** In-app and niche mobile browsers that embed Chrome/Safari tokens. */
