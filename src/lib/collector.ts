@@ -885,7 +885,7 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
   } else if (/Android/i.test(hintPlatform) || /Android/i.test(ua)) {
     const androidVersion =
       hintPlatformVersion && /^\d+/.test(hintPlatformVersion)
-        ? hintPlatformVersion.split('.').slice(0, 2).join('.')
+        ? hintPlatformVersion.split('.')[0]
         : (ua.match(/Android ([\d.]+)/)?.[1] ?? '');
     os = androidVersion ? `Android ${androidVersion}` : 'Android';
   } else if (/iPad/i.test(ua) || (/Macintosh/i.test(ua) && maxTouchPoints > 2)) {
