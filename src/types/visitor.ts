@@ -65,7 +65,7 @@ export type NetworkType =
   | 'AI Agent Cloud Network'
   | 'VPN / Proxy Relay'
   | 'Mobile Carrier'
-  | 'Unknown Network';
+  | 'Standard Network';
 
 export interface IspNetworkClassification {
   brandName: string;

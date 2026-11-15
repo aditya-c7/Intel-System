@@ -155,7 +155,8 @@ function formatCleanIspDisplay(
   org: string,
   asn: string
 ): { shortLabel: string; fullTooltip: string } {
-  const cleanIsp = isp && isp !== 'Unknown' && isp !== 'Unavailable' ? isp.trim() : 'Unknown ISP';
+  const cleanIsp =
+    isp && isp !== 'Unknown' && isp !== 'Unavailable' ? isp.trim() : 'Standard Network';
   const cleanAsn = asn && asn !== 'Unknown' && asn !== 'Unavailable' ? asn.trim() : '';
   const cleanOrg = org && org !== 'Unknown' && org !== 'Unavailable' ? org.trim() : '';
 
@@ -254,7 +255,7 @@ const NETWORK_TYPE_BADGE_CLASS: Record<NetworkType, string> = {
   'AI Agent Cloud Network': 'bg-indigo-50 text-indigo-700 border border-indigo-100',
   'VPN / Proxy Relay': 'bg-amber-50 text-amber-700 border border-amber-100',
   'Tor Exit / Anonymity Network': 'bg-rose-50 text-rose-700 border border-rose-100',
-  'Unknown Network': 'bg-slate-100 text-slate-600 border border-slate-200',
+  'Standard Network': 'bg-slate-100 text-slate-600 border border-slate-200',
 };
 
 type SignalTone = 'ok' | 'warn' | 'bad';
@@ -1264,7 +1265,7 @@ export default function App() {
                             <span className="block text-[11px] text-slate-500">ISP / ASN</span>
                             <span className="flex flex-wrap gap-1.5 items-center min-w-0">
                               <span
-                                className="text-xs sm:text-sm font-semibold text-[#111827] truncate"
+                                className="text-xs sm:text-sm font-semibold text-[#111827] break-words leading-snug"
                                 title={
                                   networkType
                                     ? `${ispDisplay.fullTooltip} • ${networkType}`
@@ -1295,7 +1296,7 @@ export default function App() {
                           <div className="min-w-0 flex-1">
                             <span className="block text-[11px] text-slate-500">Location</span>
                             <span
-                              className="block text-xs sm:text-sm font-semibold text-[#111827] truncate"
+                              className="block text-xs sm:text-sm font-semibold text-[#111827] break-words leading-snug"
                               title={formatLocationDisplay(
                                 activeVisit.city,
                                 activeVisit.region,
@@ -1805,11 +1806,11 @@ export default function App() {
                         <td className="py-2.5 px-3 font-mono tabular-nums text-slate-900 whitespace-nowrap">
                           {visit.publicIp}
                         </td>
-                        <td className="py-2.5 px-3 text-slate-800 whitespace-nowrap">
+                        <td className="py-2.5 px-3 text-slate-800 break-words leading-snug min-w-[140px]">
                           {formatShortLocation(visit.city, visit.country)}
                         </td>
                         <td
-                          className="py-2.5 px-3 text-slate-800 whitespace-nowrap max-w-[220px] truncate"
+                          className="py-2.5 px-3 text-slate-800 break-words leading-snug min-w-[150px]"
                           title={rowIspFormatted.fullTooltip}
                         >
                           {rowIspFormatted.shortLabel}

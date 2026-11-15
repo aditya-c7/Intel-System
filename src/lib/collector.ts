@@ -348,7 +348,7 @@ function cleanIspBrandText(ispText: string, orgText: string): string {
     if (!cleaned || UNKNOWN_NETWORK_NAME_PATTERN.test(cleaned)) continue;
     return cleaned;
   }
-  return 'Unknown ISP';
+  return 'Standard Network';
 }
 
 export function classifyIspNetwork(

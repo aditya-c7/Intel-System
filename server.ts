@@ -939,7 +939,8 @@ function matchesTorOperatorAsn(asn: string): boolean {
  *
  * Classification priority is strict and descending: consumer broadband is only ever returned
  * when the ISP positively matches an explicit consumer ISP rule. Every unrecognised network
- * falls back to 'Unknown Network' — never to 'Residential Broadband'.
+ * falls back to 'Standard Network' (brand 'Unresolved Network') — never to
+ * 'Residential Broadband' or an anonymity label.
  */
 export function classifyIspNetwork(isp: string, org: string, asn: string): IspNetworkClassification {
   const cleanIsp = typeof isp === 'string' ? isp.trim() : '';
@@ -1090,8 +1091,8 @@ export function classifyIspNetwork(isp: string, org: string, asn: string): IspNe
         ? cleanIsp
         : cleanOrg && !/^(unknown|unknown isp|n\/a)$/i.test(cleanOrg)
         ? cleanOrg
-        : 'Unknown ISP',
-    networkType: 'Unknown Network',
+        : 'Unresolved Network',
+    networkType: 'Standard Network',
     isConsumerBroadband: false,
     isDatacenterOrHosting: false,
     matchedReason: null,
@@ -1153,7 +1154,7 @@ function applyNetworkOverrides(
     };
   }
   if (base.networkType === 'Residential Broadband' && !base.isConsumerBroadband) {
-    return { ...base, networkType: 'Unknown Network' };
+    return { ...base, networkType: 'Standard Network' };
   }
   return base;
 }
@@ -4934,7 +4935,7 @@ function sanitizeAndReinforceSecuritySignals(
   // that as a consumer-facing "VPN / datacenter proxy" is a false positive produced by two
   // engines disagreeing about the same network, so the tile drops to a low-risk crawler state.
   const verifiedCrawlerNetwork = botSubtype === 'good_bot' && isDatacenterAsn;
-  const ispBrand = classification.brandName || location.isp || 'Unknown ISP';
+  const ispBrand = classification.brandName || location.isp || 'Standard Network';
   const asnSuffix = location.asn !== 'Unknown' ? ` • ${location.asn}` : '';
   const asnLabel =
     location.asn && location.asn !== 'Unknown'
