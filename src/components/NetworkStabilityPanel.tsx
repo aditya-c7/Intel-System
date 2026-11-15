@@ -243,10 +243,9 @@ export function NetworkStabilityPanel() {
       try {
         rawRttMs = await attemptSinglePing(0);
       } catch {
-        // If primary probe hit a transient serverless container recycle or socket reset, retry once immediately
-        if (typeof navigator !== 'undefined' && !navigator.onLine) {
-          throw new Error('Offline');
-        }
+        // A transient serverless container recycle or socket reset gets one immediate retry.
+        // navigator.onLine is intentionally not consulted: it is false in many headless /
+        // cloud-container browsers even when the HTTP stack is healthy.
         rawRttMs = await attemptSinglePing(1);
       }
 
@@ -293,10 +292,6 @@ export function NetworkStabilityPanel() {
       const recordedAtMs = Date.now();
       lastProbeFailedRef.current = true;
       setConsecutiveFailures((prev) => prev + 1);
-      if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        isOnlineRef.current = false;
-        setIsOnline(false);
-      }
       setWindowEndMs(recordedAtMs);
       setSamples((prev) => {
         const cutoff = recordedAtMs - FIVE_MINUTES_MS - 15000;
@@ -355,14 +350,10 @@ export function NetworkStabilityPanel() {
           });
           continue;
         }
-        if (!isOnlineRef.current) {
-          // Explicitly offline: pause probing (and release the tab lease) until connectivity returns.
-          releaseMonitorLease(tabIdRef.current);
-          await new Promise<void>((resolve) => {
-            nextProbeTimer = setTimeout(resolve, 1000);
-          });
-          continue;
-        }
+
+        // NOTE: navigator.onLine is never used to pause or gate the probe loop. Headless and
+        // cloud-container browsers report false inside a virtualised network namespace even
+        // while HTTP probes succeed; only measured probe outcomes may drive the badge.
 
         // One tab per origin performs the probes. The lease expires on its own, so closing a
         // leader recovers automatically; this is a quota safeguard, not a security boundary.
@@ -482,18 +473,27 @@ export function NetworkStabilityPanel() {
   const failureRatePercent =
     totalCount > 0 ? Number(((failedCount / totalCount) * 100).toFixed(1)) : 0;
 
-  // Derived connection status. `Offline` is only reported on hard evidence: the browser says
-  // it has no network, or at least two consecutive measured probes failed. A brand-new panel
-  // therefore reads `Probing...` instead of a false `Offline / 100% packet loss`, and a single
-  // transient failure stays `Online`. High loss or a slow current RTT degrades the label.
+  // Derived connection status — measured probes are authoritative; navigator.onLine is
+  // consulted only as a last resort when no probe has completed yet.
+  //
+  //   Online   : probes > 0, no consecutive failures, RTT measured, RTT <= 500 ms, loss < 15%
+  //   Degraded : probes > 0, RTT > 500 ms or loss >= 15%
+  //   Offline  : two consecutive probe failures, or no probes yet while the browser is offline
+  //   Probing… : no probes yet and the browser is not explicitly offline
   const totalProbes = samples.length;
   const navigatorOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+  const slowRtt = currentLatencyMs !== null && currentLatencyMs > 500;
+  const highLoss = failureRatePercent >= 15;
   const connectionStatus: 'Offline' | 'Probing...' | 'Degraded' | 'Online' =
-    navigatorOffline || (totalProbes > 0 && consecutiveFailures >= 2)
+    totalProbes > 0 && consecutiveFailures >= 2
       ? 'Offline'
       : totalProbes === 0
-      ? 'Probing...'
-      : failureRatePercent > 20 || (currentLatencyMs !== null && currentLatencyMs > 400)
+      ? navigatorOffline
+        ? 'Offline'
+        : 'Probing...'
+      : consecutiveFailures === 0 && currentLatencyMs !== null && !slowRtt && !highLoss
+      ? 'Online'
+      : slowRtt || highLoss || (currentLatencyMs !== null && consecutiveFailures > 0)
       ? 'Degraded'
       : 'Online';
 
