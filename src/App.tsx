@@ -45,6 +45,7 @@ import {
   HardDrive,
   Palette,
   Bot,
+  ChevronRight,
 } from 'lucide-react';
 
 /**
@@ -586,51 +587,236 @@ function buildSignalRows(
   return buildClientSignalRows(signals, incognitoConfirmed, clientEmulator);
 }
 
-const JSON_TOKEN_PATTERN = /("(?:\\.|[^"\\])*")(\s*:)?|([{}[\],])/g;
+interface JsonTreeNodeProps {
+  keyName?: string;
+  propIndex?: number;
+  value: unknown;
+  isLast: boolean;
+  depth?: number;
+}
 
-/**
- * Event JSON in three quiet tones only: structure, keys, and string values. Numbers and
- * literals keep the base text colour so the payload stays readable without turning into a
- * rainbow.
- */
-function JsonPreview({ value }: { value: unknown }) {
-  const text = value === null || value === undefined ? '' : JSON.stringify(value, null, 2);
-  const nodes: ReactNode[] = [];
-  const pattern = new RegExp(JSON_TOKEN_PATTERN.source, 'g');
-  let cursor = 0;
-  let match: RegExpExecArray | null = null;
+function JsonTreeNode({ keyName, propIndex, value, isLast, depth = 0 }: JsonTreeNodeProps) {
+  const [isExpanded, setIsExpanded] = useState<boolean>(true);
 
-  while ((match = pattern.exec(text)) !== null) {
-    if (match.index > cursor) nodes.push(text.slice(cursor, match.index));
+  const prefix = (
+    <>
+      {keyName !== undefined && (
+        <>
+          <span style={{ color: '#E53935' }}>{JSON.stringify(keyName)}</span>
+          <span style={{ color: '#9CA3AF' }}>: </span>
+        </>
+      )}
+      {propIndex !== undefined && (
+        <>
+          <span style={{ color: '#808080' }}>{propIndex}</span>
+          <span style={{ color: '#9CA3AF' }}>: </span>
+        </>
+      )}
+    </>
+  );
 
-    if (match[1] !== undefined) {
-      const isKey = Boolean(match[2]);
-      nodes.push(
-        <span key={`s${match.index}`} className={isKey ? 'text-slate-500' : 'text-slate-800'}>
-          {match[1]}
-        </span>
-      );
-      if (match[2]) {
-        nodes.push(
-          <span key={`c${match.index}`} className="text-slate-400">
-            {match[2]}
-          </span>
-        );
-      }
-    } else {
-      nodes.push(
-        <span key={`p${match.index}`} className="text-slate-400">
-          {match[3]}
-        </span>
+  const suffix = !isLast ? <span style={{ color: '#9CA3AF' }}>,</span> : null;
+
+  if (value === null) {
+    return (
+      <div className="flex items-center min-h-[20px]">
+        <span className="inline-block w-3.5 h-3.5 mr-1 shrink-0" aria-hidden="true" />
+        {prefix}
+        <span style={{ color: '#808080' }}>null</span>
+        {suffix}
+      </div>
+    );
+  }
+
+  if (typeof value === 'boolean') {
+    return (
+      <div className="flex items-center min-h-[20px]">
+        <span className="inline-block w-3.5 h-3.5 mr-1 shrink-0" aria-hidden="true" />
+        {prefix}
+        <span style={{ color: '#9333EA' }}>{String(value)}</span>
+        {suffix}
+      </div>
+    );
+  }
+
+  if (typeof value === 'number') {
+    return (
+      <div className="flex items-center min-h-[20px]">
+        <span className="inline-block w-3.5 h-3.5 mr-1 shrink-0" aria-hidden="true" />
+        {prefix}
+        <span style={{ color: '#4F46E5' }}>{String(value)}</span>
+        {suffix}
+      </div>
+    );
+  }
+
+  if (typeof value === 'string') {
+    return (
+      <div className="flex items-center min-h-[20px]">
+        <span className="inline-block w-3.5 h-3.5 mr-1 shrink-0" aria-hidden="true" />
+        {prefix}
+        <span style={{ color: '#16A34A' }}>{JSON.stringify(value)}</span>
+        {suffix}
+      </div>
+    );
+  }
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return (
+        <div className="flex items-center min-h-[20px]">
+          <span className="inline-block w-3.5 h-3.5 mr-1 shrink-0" aria-hidden="true" />
+          {prefix}
+          <span style={{ color: '#374151' }}>[]</span>
+          {suffix}
+        </div>
       );
     }
 
-    cursor = pattern.lastIndex;
+    return (
+      <div>
+        <div className="flex items-center min-h-[20px]">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsExpanded(!isExpanded);
+            }}
+            className="inline-flex items-center justify-center w-3.5 h-3.5 mr-1 text-slate-400 hover:text-slate-700 cursor-pointer select-none shrink-0"
+            aria-label={isExpanded ? 'Collapse array' : 'Expand array'}
+          >
+            <ChevronRight
+              className={`w-3 h-3 transition-transform duration-150 ${isExpanded ? 'rotate-90' : ''}`}
+            />
+          </button>
+          {prefix}
+          {isExpanded ? (
+            <span style={{ color: '#374151' }}>[</span>
+          ) : (
+            <span
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsExpanded(true);
+              }}
+              className="cursor-pointer select-none"
+              style={{ color: '#374151' }}
+            >
+              […]
+            </span>
+          )}
+          {!isExpanded && suffix}
+        </div>
+        {isExpanded && (
+          <>
+            <div className="pl-4">
+              {value.map((item, idx) => (
+                <JsonTreeNode
+                  key={idx}
+                  propIndex={idx}
+                  value={item}
+                  isLast={idx === value.length - 1}
+                  depth={depth + 1}
+                />
+              ))}
+            </div>
+            <div className="flex items-center min-h-[20px]">
+              <span className="inline-block w-3.5 h-3.5 mr-1 shrink-0" aria-hidden="true" />
+              <span style={{ color: '#374151' }}>]</span>
+              {suffix}
+            </div>
+          </>
+        )}
+      </div>
+    );
   }
 
-  if (cursor < text.length) nodes.push(text.slice(cursor));
+  if (typeof value === 'object') {
+    const keys = Object.keys(value as Record<string, unknown>);
+    if (keys.length === 0) {
+      return (
+        <div className="flex items-center min-h-[20px]">
+          <span className="inline-block w-3.5 h-3.5 mr-1 shrink-0" aria-hidden="true" />
+          {prefix}
+          <span style={{ color: '#374151' }}>{"{}"}</span>
+          {suffix}
+        </div>
+      );
+    }
 
-  return <>{nodes}</>;
+    return (
+      <div>
+        <div className="flex items-center min-h-[20px]">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsExpanded(!isExpanded);
+            }}
+            className="inline-flex items-center justify-center w-3.5 h-3.5 mr-1 text-slate-400 hover:text-slate-700 cursor-pointer select-none shrink-0"
+            aria-label={isExpanded ? 'Collapse object' : 'Expand object'}
+          >
+            <ChevronRight
+              className={`w-3 h-3 transition-transform duration-150 ${isExpanded ? 'rotate-90' : ''}`}
+            />
+          </button>
+          {prefix}
+          {isExpanded ? (
+            <span style={{ color: '#374151' }}>{"{"}</span>
+          ) : (
+            <span
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsExpanded(true);
+              }}
+              className="cursor-pointer select-none"
+              style={{ color: '#374151' }}
+            >
+              {"{…}"}
+            </span>
+          )}
+          {!isExpanded && suffix}
+        </div>
+        {isExpanded && (
+          <>
+            <div className="pl-4">
+              {keys.map((k, idx) => (
+                <JsonTreeNode
+                  key={k}
+                  keyName={k}
+                  value={(value as Record<string, unknown>)[k]}
+                  isLast={idx === keys.length - 1}
+                  depth={depth + 1}
+                />
+              ))}
+            </div>
+            <div className="flex items-center min-h-[20px]">
+              <span className="inline-block w-3.5 h-3.5 mr-1 shrink-0" aria-hidden="true" />
+              <span style={{ color: '#374151' }}>{"}"}</span>
+              {suffix}
+            </div>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center min-h-[20px]">
+      <span className="inline-block w-3.5 h-3.5 mr-1 shrink-0" aria-hidden="true" />
+      {prefix}
+      <span style={{ color: '#808080' }}>{String(value)}</span>
+      {suffix}
+    </div>
+  );
+}
+
+function JsonPreview({ value }: { value: unknown }) {
+  if (value === null || value === undefined) return null;
+  return (
+    <div className="font-mono text-[11px] leading-relaxed select-text">
+      <JsonTreeNode value={value} isLast={true} depth={0} />
+    </div>
+  );
 }
 
 export default function App() {
@@ -1180,83 +1366,8 @@ export default function App() {
               </div>
             </div>
 
-            {/* 2. 4 KPI Summary Counters with Colored Icon Badges */}
-            <div className="order-3 lg:col-span-2 grid grid-cols-2 lg:grid-cols-4 border-b border-[#E5E7EB]">
-              {/* KPI 1: Visits */}
-              <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0 border-r border-b lg:border-b-0 border-[#E5E7EB]">
-                <div className="w-9 h-9 rounded-lg bg-orange-50/40 border border-orange-100 flex items-center justify-center shrink-0">
-                  <Activity className="w-4 h-4 text-[#F05A28]" />
-                </div>
-                <div className="min-w-0">
-                  <span className="block text-[11px] font-medium text-slate-500">
-                    Total Visits
-                  </span>
-                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
-                    {data.statistics.totalVisits}{' '}
-                    <span className="font-sans font-medium text-xs text-slate-500">
-                      {data.statistics.totalVisits === 1 ? 'visit' : 'visits'}
-                    </span>
-                  </span>
-                </div>
-              </div>
-
-              {/* KPI 2: Sessions */}
-              <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0 border-b lg:border-b-0 lg:border-r border-[#E5E7EB]">
-                <div className="w-9 h-9 rounded-lg bg-blue-50/40 border border-blue-100 flex items-center justify-center shrink-0">
-                  <Layers className="w-4 h-4 text-[#2563EB]" />
-                </div>
-                <div className="min-w-0">
-                  <span className="block text-[11px] font-medium text-slate-500">
-                    Active Sessions
-                  </span>
-                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
-                    {data.statistics.totalSessions}{' '}
-                    <span className="font-sans font-medium text-xs text-slate-500">
-                      {data.statistics.totalSessions === 1 ? 'session' : 'sessions'}
-                    </span>
-                  </span>
-                </div>
-              </div>
-
-              {/* KPI 3: Distinct IPs */}
-              <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0 border-r border-[#E5E7EB]">
-                <div className="w-9 h-9 rounded-lg bg-emerald-50/40 border border-emerald-100 flex items-center justify-center shrink-0">
-                  <Globe className="w-4 h-4 text-emerald-600" />
-                </div>
-                <div className="min-w-0">
-                  <span className="block text-[11px] font-medium text-slate-500">
-                    Observed IPs
-                  </span>
-                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
-                    {uniqueIpCount}{' '}
-                    <span className="font-sans font-medium text-xs text-slate-500">
-                      {uniqueIpCount === 1 ? 'IP address' : 'IP addresses'}
-                    </span>
-                  </span>
-                </div>
-              </div>
-
-              {/* KPI 4: Locations */}
-              <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0">
-                <div className="w-9 h-9 rounded-lg bg-indigo-50/40 border border-indigo-100 flex items-center justify-center shrink-0">
-                  <MapPin className="w-4 h-4 text-indigo-600" />
-                </div>
-                <div className="min-w-0">
-                  <span className="block text-[11px] font-medium text-slate-500">
-                    Locations
-                  </span>
-                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
-                    {uniqueLocationCount}{' '}
-                    <span className="font-sans font-medium text-xs text-slate-500">
-                      {uniqueLocationCount === 1 ? 'city' : 'cities'}
-                    </span>
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            {/* 3. Location & Network: the map sits directly under the hero on mobile and in the left column on desktop */}
-            <div className="order-2 lg:col-start-1 lg:row-start-3 w-full flex flex-col lg:border-r border-[#E5E7EB] min-w-0">
+            {/* 2. Location & Network: the map sits directly under the hero on mobile and in the left column on desktop */}
+            <div className="order-2 lg:col-start-1 lg:row-start-2 w-full flex flex-col lg:border-r border-[#E5E7EB] min-w-0">
                 <div className="px-4 sm:px-6 py-3 bg-[#FAFAFA] border-b border-[#E5E7EB] flex items-center justify-between gap-2">
                   <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-800">
                     <MapPin className="w-3.5 h-3.5 text-[#F05A28]" />
@@ -1285,9 +1396,9 @@ export default function App() {
                 )}
             </div>
 
-            {/* 4. Public IP / ISP-ASN / Location / Recognition: last block on mobile, bottom of the left column on desktop */}
+            {/* 3. Below the Map: Public IP / ISP-ASN / Location / Recognition */}
             {activeVisit && (
-              <div className="order-5 lg:col-start-1 lg:row-start-4 w-full lg:border-r border-[#E5E7EB] min-w-0">
+              <div className="order-3 lg:col-start-1 lg:row-start-3 w-full lg:border-r border-b lg:border-b-0 border-[#E5E7EB] min-w-0">
                     {/* Compact 2x2 Icon Grid for Public IP, Location, ISP/ASN, and Recognition */}
                     <div className="grid grid-cols-2">
                       <div className="contents">
@@ -1387,7 +1498,7 @@ export default function App() {
             )}
 
               {/* RIGHT COLUMN (50% width on lg+): Device & Session Summary (2-Column Visual Tile Grid) */}
-              <div className="order-4 lg:col-start-2 lg:row-start-3 lg:row-span-2 w-full flex flex-col justify-between border-b lg:border-b-0 border-[#E5E7EB] bg-white min-w-0">
+              <div className="order-4 lg:col-start-2 lg:row-start-2 lg:row-span-2 w-full flex flex-col justify-between border-b lg:border-b-0 border-[#E5E7EB] bg-white min-w-0">
                 <div className="px-4 sm:px-6 py-3 bg-[#FAFAFA] border-b border-[#E5E7EB] flex items-center justify-between gap-2">
                   <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-800">
                     <Monitor className="w-3.5 h-3.5 text-[#2563EB]" />
@@ -1508,6 +1619,81 @@ export default function App() {
                   </div>
                 </div>
               </div>
+
+            {/* 4. 4 KPI Summary Counters: Total Visits, Active Sessions, Observed IPs, Locations */}
+            <div className="order-5 lg:col-span-2 lg:row-start-4 grid grid-cols-2 lg:grid-cols-4 border-t border-[#E5E7EB]">
+              {/* KPI 1: Visits */}
+              <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0 border-r border-b lg:border-b-0 border-[#E5E7EB]">
+                <div className="w-9 h-9 rounded-lg bg-orange-50/40 border border-orange-100 flex items-center justify-center shrink-0">
+                  <Activity className="w-4 h-4 text-[#F05A28]" />
+                </div>
+                <div className="min-w-0">
+                  <span className="block text-[11px] font-medium text-slate-500">
+                    Total Visits
+                  </span>
+                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
+                    {data.statistics.totalVisits}{' '}
+                    <span className="font-sans font-medium text-xs text-slate-500">
+                      {data.statistics.totalVisits === 1 ? 'visit' : 'visits'}
+                    </span>
+                  </span>
+                </div>
+              </div>
+
+              {/* KPI 2: Sessions */}
+              <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0 border-b lg:border-b-0 lg:border-r border-[#E5E7EB]">
+                <div className="w-9 h-9 rounded-lg bg-blue-50/40 border border-blue-100 flex items-center justify-center shrink-0">
+                  <Layers className="w-4 h-4 text-[#2563EB]" />
+                </div>
+                <div className="min-w-0">
+                  <span className="block text-[11px] font-medium text-slate-500">
+                    Active Sessions
+                  </span>
+                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
+                    {data.statistics.totalSessions}{' '}
+                    <span className="font-sans font-medium text-xs text-slate-500">
+                      {data.statistics.totalSessions === 1 ? 'session' : 'sessions'}
+                    </span>
+                  </span>
+                </div>
+              </div>
+
+              {/* KPI 3: Distinct IPs */}
+              <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0 border-r border-[#E5E7EB]">
+                <div className="w-9 h-9 rounded-lg bg-emerald-50/40 border border-emerald-100 flex items-center justify-center shrink-0">
+                  <Globe className="w-4 h-4 text-emerald-600" />
+                </div>
+                <div className="min-w-0">
+                  <span className="block text-[11px] font-medium text-slate-500">
+                    Observed IPs
+                  </span>
+                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
+                    {uniqueIpCount}{' '}
+                    <span className="font-sans font-medium text-xs text-slate-500">
+                      {uniqueIpCount === 1 ? 'IP address' : 'IP addresses'}
+                    </span>
+                  </span>
+                </div>
+              </div>
+
+              {/* KPI 4: Locations */}
+              <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-indigo-50/40 border border-indigo-100 flex items-center justify-center shrink-0">
+                  <MapPin className="w-4 h-4 text-indigo-600" />
+                </div>
+                <div className="min-w-0">
+                  <span className="block text-[11px] font-medium text-slate-500">
+                    Locations
+                  </span>
+                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
+                    {uniqueLocationCount}{' '}
+                    <span className="font-sans font-medium text-xs text-slate-500">
+                      {uniqueLocationCount === 1 ? 'city' : 'cities'}
+                    </span>
+                  </span>
+                </div>
+              </div>
+            </div>
 
           </section>
         )}
@@ -1960,9 +2146,9 @@ export default function App() {
               </button>
             </div>
           </div>
-          <pre className="mt-3 max-h-[420px] overflow-auto rounded-xl bg-[#F8FAFC] border border-[#E5E7EB] p-3 text-[11px] leading-relaxed font-mono text-slate-600">
-{eventJson ? <JsonPreview value={eventJson} /> : 'Collecting event payload...'}
-          </pre>
+          <div className="mt-3 max-h-[420px] overflow-auto rounded-xl bg-[#F8FAFC] border border-[#E5E7EB] p-3 text-[11px] leading-relaxed font-mono">
+            {eventJson ? <JsonPreview value={eventJson} /> : 'Collecting event payload...'}
+          </div>
         </section>
       </main>
 
