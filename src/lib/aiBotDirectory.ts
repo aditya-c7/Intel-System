@@ -567,14 +567,22 @@ export function detectAiBotFromServerSignals(params: {
   const signature = (headers['signature'] as string) || '';
   const hasWebBotAuth = Boolean(signatureAgent && signatureInput && signature);
 
+  const networkKnown =
+    asnNumber !== null || (Boolean(asnOrg.trim()) && !/^unknown\b/i.test(asnOrg.trim()));
+
   for (const entry of BOT_DIRECTORY) {
     let matched = false;
+    // Only a UA / header claim can name an agent. An ASN match alone confirms the operator
+    // network, it never proves which agent is running, so it cannot upgrade identity to
+    // `verified`.
+    let claimedByUaOrHeader = false;
 
     // UA pattern match
     if (entry.uaPatterns) {
       for (const pattern of entry.uaPatterns) {
         if (pattern.test(ua)) {
           matched = true;
+          claimedByUaOrHeader = true;
           break;
         }
       }
@@ -603,14 +611,27 @@ export function detectAiBotFromServerSignals(params: {
         const hVal = (headers[header] as string) || '';
         if (hVal && pattern.test(hVal)) {
           matched = true;
+          claimedByUaOrHeader = true;
           break;
         }
       }
     }
 
     if (matched) {
-      // Upgrade identity to 'signed' if Web Bot Auth headers are present
-      let identity = entry.identity;
+      let identity: BotIdentity = entry.identity;
+      const networkMatches =
+        (asnNumber !== null && Boolean(entry.asnNumbers?.includes(asnNumber))) ||
+        Boolean(entry.asnPatterns?.some((pattern) => pattern.test(asnOrg)));
+
+      if (identity === 'verified') {
+        if (!claimedByUaOrHeader) {
+          // ASN-only match: the operator network is confirmed, the exact product is not.
+          identity = 'unknown';
+        } else if (!networkMatches) {
+          // Claims an official agent from outside the operator's own infrastructure.
+          identity = hasWebBotAuth ? 'verified' : networkKnown ? 'spoofed' : 'unknown';
+        }
+      }
       if (identity === 'unknown' && hasWebBotAuth) {
         identity = 'signed';
       }
@@ -621,7 +642,7 @@ export function detectAiBotFromServerSignals(params: {
         botInfo: {
           category: entry.category,
           provider: entry.provider,
-          name: entry.name,
+          name: identity === 'spoofed' ? `Spoofed ${entry.name}` : entry.name,
           identity,
         },
       };

@@ -6380,7 +6380,16 @@ app.post('/api/visitor/identify', async (req, res) => {
     if (robodexResult.detected && robodexResult.botInfo) {
       botInfo = robodexResult.botInfo;
       botType = robodexResult.botType;
-      botVerdict = (botType === 'ai_agent' || botType === 'browser_automation') ? 'bad' : 'good';
+      // An unverified or spoofed claim is never a "good" bot. Verified crawlers and
+      // assistants keep the good verdict; signed agent runtimes are always flagged.
+      botVerdict =
+        botInfo?.identity === 'spoofed' || botInfo?.identity === 'unknown'
+          ? 'bad'
+          : botType === 'ai_agent' ||
+            botType === 'ai_browser' ||
+            botType === 'browser_automation'
+          ? 'bad'
+          : 'good';
     } else if (aiAgent.detected) {
       const isImpostor = aiAgent.agentId === 'impostor-spoof';
       botInfo = {

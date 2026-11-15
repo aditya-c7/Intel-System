@@ -563,12 +563,15 @@ function detectAiBotFromServerSignals(params) {
   const signatureInput = headers["signature-input"] || "";
   const signature = headers["signature"] || "";
   const hasWebBotAuth = Boolean(signatureAgent && signatureInput && signature);
+  const networkKnown = asnNumber !== null || Boolean(asnOrg.trim()) && !/^unknown\b/i.test(asnOrg.trim());
   for (const entry of BOT_DIRECTORY) {
     let matched = false;
+    let claimedByUaOrHeader = false;
     if (entry.uaPatterns) {
       for (const pattern of entry.uaPatterns) {
         if (pattern.test(ua)) {
           matched = true;
+          claimedByUaOrHeader = true;
           break;
         }
       }
@@ -591,12 +594,21 @@ function detectAiBotFromServerSignals(params) {
         const hVal = headers[header] || "";
         if (hVal && pattern.test(hVal)) {
           matched = true;
+          claimedByUaOrHeader = true;
           break;
         }
       }
     }
     if (matched) {
       let identity = entry.identity;
+      const networkMatches = asnNumber !== null && Boolean(entry.asnNumbers?.includes(asnNumber)) || Boolean(entry.asnPatterns?.some((pattern) => pattern.test(asnOrg)));
+      if (identity === "verified") {
+        if (!claimedByUaOrHeader) {
+          identity = "unknown";
+        } else if (!networkMatches) {
+          identity = hasWebBotAuth ? "verified" : networkKnown ? "spoofed" : "unknown";
+        }
+      }
       if (identity === "unknown" && hasWebBotAuth) {
         identity = "signed";
       }
@@ -606,7 +618,7 @@ function detectAiBotFromServerSignals(params) {
         botInfo: {
           category: entry.category,
           provider: entry.provider,
-          name: entry.name,
+          name: identity === "spoofed" ? `Spoofed ${entry.name}` : entry.name,
           identity
         }
       };
@@ -4893,7 +4905,7 @@ app.post("/api/visitor/identify", async (req, res) => {
     if (robodexResult.detected && robodexResult.botInfo) {
       botInfo = robodexResult.botInfo;
       botType = robodexResult.botType;
-      botVerdict = botType === "ai_agent" || botType === "browser_automation" ? "bad" : "good";
+      botVerdict = botInfo?.identity === "spoofed" || botInfo?.identity === "unknown" ? "bad" : botType === "ai_agent" || botType === "ai_browser" || botType === "browser_automation" ? "bad" : "good";
     } else if (aiAgent.detected) {
       const isImpostor = aiAgent.agentId === "impostor-spoof";
       botInfo = {
