@@ -89,6 +89,11 @@ interface VisitRow {
   screen_resolution: string;
   language: string;
   timezone: string;
+  suspect_score?: number | null;
+  risk_level?: string | null;
+  score10?: number | null;
+  bot_name?: string | null;
+  recognition_source?: string | null;
 }
 
 interface GeoCacheRow {
@@ -153,9 +158,7 @@ function createInMemoryDbAdapter(): DatabaseAdapter {
             return matches[0];
           }
           if (
-            normalized.includes(
-              'SELECT session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?'
-            )
+            normalized.includes('FROM visits WHERE visitor_id = ? AND page_load_id = ?')
           ) {
             const vid = String(params[0] || '');
             const plId = String(params[1] || '');
@@ -163,7 +166,11 @@ function createInMemoryDbAdapter(): DatabaseAdapter {
               (v) => v.visitor_id === vid && v.page_load_id === plId
             );
             return found
-              ? { session_id: found.session_id, visited_at_utc: found.visited_at_utc }
+              ? {
+                  visit_id: found.visit_id,
+                  session_id: found.session_id,
+                  visited_at_utc: found.visited_at_utc,
+                }
               : undefined;
           }
           if (normalized.includes('COUNT(*) AS total_visits') && normalized.includes('FROM visits WHERE visitor_id = ?')) {
@@ -303,7 +310,23 @@ function createInMemoryDbAdapter(): DatabaseAdapter {
               screen_resolution: String(params[17] || 'Unavailable'),
               language: String(params[18] || 'Unavailable'),
               timezone: String(params[19] || 'Unavailable'),
+              suspect_score: typeof params[20] === 'number' ? params[20] : null,
+              risk_level: typeof params[21] === 'string' ? params[21] : null,
+              score10: typeof params[22] === 'number' ? params[22] : null,
+              bot_name: typeof params[23] === 'string' ? params[23] : null,
+              recognition_source: typeof params[24] === 'string' ? params[24] : null,
             });
+            return { changes: 1 };
+          }
+          if (normalized.includes('UPDATE visits') && normalized.includes('suspect_score = ?')) {
+            const visitId = String(params[5] || '');
+            const target = visitsList.find((v) => v.visit_id === visitId);
+            if (!target) return { changes: 0 };
+            target.suspect_score = typeof params[0] === 'number' ? params[0] : null;
+            target.risk_level = typeof params[1] === 'string' ? params[1] : null;
+            target.score10 = typeof params[2] === 'number' ? params[2] : null;
+            target.bot_name = typeof params[3] === 'string' ? params[3] : null;
+            target.recognition_source = typeof params[4] === 'string' ? params[4] : null;
             return { changes: 1 };
           }
           return { changes: 0 };
