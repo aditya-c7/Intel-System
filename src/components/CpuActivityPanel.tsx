@@ -52,6 +52,13 @@ const PRESSURE_MAP: Record<RawPressureState, DisplayPressureLevel> = {
 
 const DISPLAY_LEVELS: DisplayPressureLevel[] = ['Normal', 'Moderate', 'High', 'Heavy'];
 
+const PRESSURE_STATE_LABELS: Record<RawPressureState, string> = {
+  nominal: 'Normal · Nominal',
+  fair: 'Moderate · Fair',
+  serious: 'High · Serious',
+  critical: 'Heavy · Critical',
+};
+
 /**
  * The Compute Pressure API only exists on desktop Chromium. Mobile browsers expose no CPU
  * pressure telemetry, so the whole panel is pruned from the DOM instead of rendering an
@@ -66,7 +73,13 @@ export function isCpuActivitySupported(): boolean {
   return 'PressureObserver' in window;
 }
 
-function SystemLoadBadge({ level }: { level: DisplayPressureLevel }) {
+function SystemLoadBadge({
+  level,
+  isUnavailable,
+}: {
+  level: DisplayPressureLevel;
+  isUnavailable?: boolean;
+}) {
   // Smooth needle rotation angle:
   // Normal -> towards left (-48deg, green)
   // Moderate -> slightly left (-16deg, amber)
@@ -81,8 +94,9 @@ function SystemLoadBadge({ level }: { level: DisplayPressureLevel }) {
       ? -16
       : -48;
 
-  const badgeColors =
-    level === 'Heavy'
+  const badgeColors = isUnavailable
+    ? 'bg-slate-100 text-slate-500 dark:bg-zinc-800 dark:text-zinc-400'
+    : level === 'Heavy'
       ? 'bg-[#FAD2CF] text-[#C5221F] dark:bg-rose-950/70 dark:text-rose-400'
       : level === 'High'
       ? 'bg-[#FCE8E6] text-[#D93025] dark:bg-orange-950/70 dark:text-orange-400'
@@ -113,7 +127,7 @@ function SystemLoadBadge({ level }: { level: DisplayPressureLevel }) {
           {/* Smoothly shifting gauge pointer needle */}
           <g
             style={{
-              transform: `rotate(${needleAngleDeg}deg)`,
+              transform: `rotate(${isUnavailable ? 0 : needleAngleDeg}deg)`,
               transformOrigin: '12px 14.4px',
               transition: 'transform 550ms cubic-bezier(0.22, 1, 0.36, 1)',
             }}
@@ -135,7 +149,7 @@ function SystemLoadBadge({ level }: { level: DisplayPressureLevel }) {
           System load
         </span>
         <span className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 block truncate">
-          {level}
+          {isUnavailable ? 'Unavailable' : level}
         </span>
       </div>
     </div>
@@ -537,6 +551,17 @@ export function CpuActivityPanel() {
     return () => clearInterval(clockTimer);
   }, [userEnabled, status]);
 
+  // Auto-reconnect loop every 5000ms when Compute Pressure is unsupported or disconnected
+  useEffect(() => {
+    if (status !== 'Unsupported') return;
+    const interval = setInterval(() => {
+      if (typeof window !== 'undefined' && 'PressureObserver' in window) {
+        startCpuObservation(true);
+      }
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [status, startCpuObservation]);
+
   // Rolling 5-minute window bounds
   const windowStartMs = windowEndMs - FIVE_MINUTES_MS;
   const visibleSamples = samples.filter(
@@ -686,7 +711,7 @@ export function CpuActivityPanel() {
       case 'Paused':
         return 'Paused';
       case 'Unsupported':
-        return 'Unsupported';
+        return 'Unavailable · Reconnecting...';
       case 'Blocked':
         return 'Blocked';
       case 'Error':
@@ -696,6 +721,9 @@ export function CpuActivityPanel() {
 
   // Format main current load description concisely
   const renderCurrentLoadValue = () => {
+    if (status === 'Unsupported') {
+      return 'Unavailable';
+    }
     if (status === 'Initializing') {
       return 'Initializing...';
     }
@@ -703,7 +731,7 @@ export function CpuActivityPanel() {
       return 'Awaiting sample';
     }
     if ((status === 'Live' || status === 'Paused' || status === 'Monitoring') && latestSample) {
-      return `${latestSample.displayLevel} (${latestSample.rawState})`;
+      return PRESSURE_STATE_LABELS[latestSample.rawState] || latestSample.displayLevel;
     }
     if (status === 'Paused') {
       return 'Paused';
@@ -711,17 +739,12 @@ export function CpuActivityPanel() {
     if (status === 'Blocked') {
       return insideIframe ? 'Blocked in iframe' : 'Policy blocked';
     }
-    if (status === 'Unsupported') {
-      return 'Unsupported';
-    }
-    return 'Error';
+    return 'Unavailable';
   };
 
   const currentBadgeLevel: DisplayPressureLevel = latestSample
     ? latestSample.displayLevel
     : 'Normal';
-
-  if (!platformSupported) return null;
 
   return (
     <div className="bg-white dark:bg-[#0A0D14] border border-zinc-200 dark:border-zinc-800/90 rounded-md flex flex-col justify-between overflow-hidden">
@@ -762,21 +785,20 @@ export function CpuActivityPanel() {
               <span>{renderStatusText()}</span>
             </span>
 
-            {status === 'Blocked' || status === 'Error' ? (
+            {status === 'Blocked' || status === 'Error' || status === 'Unsupported' ? (
               <button
                 type="button"
                 onClick={() => startCpuObservation(true)}
                 className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-[#0A0D14] hover:bg-zinc-50 dark:hover:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded whitespace-nowrap shrink-0 cursor-pointer transition-colors"
               >
                 <RefreshCw className="w-3 h-3" />
-                <span>Retry</span>
+                <span>{status === 'Unsupported' ? 'Reconnect' : 'Retry'}</span>
               </button>
             ) : (
               <button
                 type="button"
                 onClick={() => setUserEnabled((prev) => !prev)}
-                disabled={status === 'Unsupported'}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-[#0A0D14] hover:bg-zinc-50 dark:hover:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer transition-colors"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-[#0A0D14] hover:bg-zinc-50 dark:hover:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded whitespace-nowrap shrink-0 cursor-pointer transition-colors"
               >
                 {userEnabled ? (
                   <>
@@ -797,7 +819,10 @@ export function CpuActivityPanel() {
         {/* Hairline 4-Column Summary Metrics Row */}
         <div className="grid grid-cols-2 sm:grid-cols-4 border-b border-zinc-200/70 dark:border-zinc-800/70 divide-y sm:divide-y-0 divide-x divide-zinc-200/70 dark:divide-zinc-800/70 text-xs">
           <div className="px-4 py-3 min-w-0">
-            <SystemLoadBadge level={currentBadgeLevel} />
+            <SystemLoadBadge
+              level={currentBadgeLevel}
+              isUnavailable={status === 'Unsupported' || (!latestSample && status !== 'Live')}
+            />
           </div>
 
           <div className="px-4 py-3 min-w-0">
@@ -805,7 +830,7 @@ export function CpuActivityPanel() {
               CPU State
             </span>
             <span
-              className="text-xs sm:text-sm font-mono tabular-nums font-medium text-zinc-900 dark:text-zinc-100 mt-0.5 block truncate"
+              className="text-xs sm:text-sm font-semibold text-zinc-900 dark:text-zinc-100 mt-0.5 block truncate"
               title={errorDetail || renderCurrentLoadValue()}
             >
               {renderCurrentLoadValue()}
