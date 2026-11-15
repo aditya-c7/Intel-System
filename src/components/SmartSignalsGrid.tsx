@@ -241,19 +241,20 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     tone: suspectScore >= 5 ? 'trigger' : suspectScore > 0 ? 'neutral' : 'clean',
   });
 
-  const proximityStatus = data.location.isLocationVerified
-    ? `${city || region || country || 'Verified zone'} ${
-        data.location.latitude !== null && data.location.longitude !== null
-          ? `(${data.location.latitude.toFixed(2)}, ${data.location.longitude.toFixed(2)})`
-          : ''
-      }`.trim()
-    : 'Collecting location...';
+  // Fix 5 — the server always computes the metro-zone geohash synchronously, so this tile
+  // never waits on a browser geolocation callback and never says "Collecting location...".
+  const proximityResolved = Boolean(data.proximity?.resolved);
+  const proximityStatus =
+    data.proximity?.zone_label ||
+    (data.location.isLocationVerified
+      ? `${city || region || country || 'Verified zone'}`
+      : 'Zone Unresolved (IP-only)');
   rows.push({
     key: 'proximity',
     label: 'Proximity Detection',
     status: proximityStatus,
     triggered: false,
-    tone: data.location.isLocationVerified ? 'clean' : 'neutral',
+    tone: proximityResolved ? 'clean' : 'neutral',
   });
 
   rows.push({

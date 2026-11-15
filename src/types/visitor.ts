@@ -404,4 +404,6 @@ export interface IntelVisitorResponse {
   replayed?: boolean;
   tampered?: boolean;
   requestIntegrityReason?: string;
+  /** Fix 5 — synchronous geohash / metro-zone proximity result. */
+  proximity?: import('../lib/geohash').ProximityInfo;
 }

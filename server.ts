@@ -39,6 +39,7 @@ import {
   type EdgeGeoHeaders,
   type EdgeHeaderBag,
 } from './src/lib/geoFallbacks';
+import { buildProximityInfo } from './src/lib/geohash';
 
 dotenv.config();
 
@@ -6239,6 +6240,8 @@ app.post('/api/visitor/identify', async (req, res) => {
       isReturning,
       recognitionSource,
       location,
+      // Fix 5 — deterministic proximity from the IP coordinates, resolved synchronously.
+      proximity: buildProximityInfo(location.latitude, location.longitude),
       browserDevice,
       hardwareSignals,
       securitySignals,
