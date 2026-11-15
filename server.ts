@@ -379,6 +379,11 @@ function initializeDatabase(): DatabaseAdapter {
         screen_resolution TEXT NOT NULL,
         language TEXT NOT NULL,
         timezone TEXT NOT NULL,
+        suspect_score REAL,
+        risk_level TEXT,
+        score10 REAL,
+        bot_name TEXT,
+        recognition_source TEXT,
         UNIQUE(visitor_id, page_load_id),
         FOREIGN KEY (visitor_id) REFERENCES visitors(visitor_id) ON DELETE CASCADE
       );
@@ -431,6 +436,22 @@ function initializeDatabase(): DatabaseAdapter {
         // Column already exists
       }
     }
+    // Per-visit risk persistence (Fix 7): survive serverless cold starts with the exact
+    // score, level and bot attribution that were shown when the visit happened.
+    for (const col of ['suspect_score', 'score10']) {
+      try {
+        sqliteDb.exec(`ALTER TABLE visits ADD COLUMN ${col} REAL`);
+      } catch {
+        // Column already exists
+      }
+    }
+    for (const col of ['risk_level', 'bot_name', 'recognition_source']) {
+      try {
+        sqliteDb.exec(`ALTER TABLE visits ADD COLUMN ${col} TEXT`);
+      } catch {
+        // Column already exists
+      }
+    }
 
     return sqliteDb;
   } catch {
@@ -462,10 +483,17 @@ function computeHistoryBackupSignature(
   totalVisits: number,
   totalSessions: number,
   firstVisitUtc: string,
-  visits: VisitHistoryRecord[]
+  visits: VisitHistoryRecord[],
+  legacyDigest = false
 ): string {
   const visitDigest = visits
-    .map((v) => `${v.visitId}:${v.sessionId}:${v.visitedAtUtc}:${v.publicIp}`)
+    .map((v) =>
+      legacyDigest
+        ? `${v.visitId}:${v.sessionId}:${v.visitedAtUtc}:${v.publicIp}`
+        : `${v.visitId}:${v.sessionId}:${v.visitedAtUtc}:${v.publicIp}:${
+            typeof v.suspectScore === 'number' ? v.suspectScore : 0
+          }:${v.riskLevel ?? 'Low'}:${v.botName ?? ''}`
+    )
     .join('|');
   const payload = `hist:${visitorId}:${totalVisits}:${totalSessions}:${firstVisitUtc}:${visitDigest}`;
   return crypto.createHmac('sha256', HMAC_SECRET).update(payload).digest('hex');
@@ -521,15 +549,28 @@ function verifySignedHistoryBackup(
     backup.firstVisitUtc,
     backup.visits
   );
-  if (expectedSig.length !== backup.signature.length) return false;
-  try {
-    return crypto.timingSafeEqual(
-      Buffer.from(expectedSig, 'hex'),
-      Buffer.from(backup.signature, 'hex')
-    );
-  } catch {
-    return false;
-  }
+  // Backups minted before score persistence used the shorter digest. Accept either so an
+  // existing visitor is never dropped after deploying this change.
+  const legacySig = computeHistoryBackupSignature(
+    backup.visitorId,
+    backup.totalVisits,
+    backup.totalSessions,
+    backup.firstVisitUtc,
+    backup.visits,
+    true
+  );
+  const matches = [expectedSig, legacySig].some((candidate) => {
+    if (candidate.length !== backup.signature.length) return false;
+    try {
+      return crypto.timingSafeEqual(
+        Buffer.from(candidate, 'hex'),
+        Buffer.from(backup.signature, 'hex')
+      );
+    } catch {
+      return false;
+    }
+  });
+  return matches;
 }
 
 function generateVisitorId(): string {
@@ -5471,8 +5512,9 @@ app.post('/api/visitor/identify', async (req, res) => {
             `INSERT OR IGNORE INTO visits (
               visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
               public_ip, city, region, country, latitude, longitude, isp, org, asn,
-              browser, os, device_type, screen_resolution, language, timezone
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              browser, os, device_type, screen_resolution, language, timezone,
+              suspect_score, risk_level, score10, bot_name, recognition_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).run(
             histVisitId,
             verifiedVid,
@@ -5495,7 +5537,16 @@ app.post('/api/visitor/identify', async (req, res) => {
             histVisit.deviceType || 'Unknown',
             histVisit.screenResolution || 'Unavailable',
             histVisit.language || 'Unavailable',
-            histVisit.timezone || 'Unavailable'
+            histVisit.timezone || 'Unavailable',
+            typeof histVisit.suspectScore === 'number' ? histVisit.suspectScore : null,
+            histVisit.riskLevel || null,
+            typeof histVisit.score10 === 'number'
+              ? histVisit.score10
+              : typeof histVisit.suspectScore === 'number'
+              ? histVisit.suspectScore
+              : null,
+            histVisit.botName || null,
+            histVisit.recognitionSource || null
           );
         }
       }
@@ -5518,6 +5569,7 @@ app.post('/api/visitor/identify', async (req, res) => {
     let visitorId: string;
     let visitorToken: string;
     let currentSessionId: string;
+    let currentVisitId = '';
     let isReturning = false;
 
     if (existingVisitor) {
@@ -5532,11 +5584,14 @@ app.post('/api/visitor/identify', async (req, res) => {
         Boolean(clientSessionId) && clientSessionId === existingVisitor.active_session_id;
 
       const existingPageLoadVisit = db
-        .prepare('SELECT session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?')
-        .get(visitorId, safePageLoadId) as { session_id: string; visited_at_utc: string } | undefined;
+        .prepare('SELECT visit_id, session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?')
+        .get(visitorId, safePageLoadId) as
+        | { visit_id: string; session_id: string; visited_at_utc: string }
+        | undefined;
 
       if (existingPageLoadVisit) {
         currentSessionId = existingPageLoadVisit.session_id;
+        currentVisitId = existingPageLoadVisit.visit_id;
       } else {
         if (isExpiredByInactivity || !isSameClientSession) {
           currentSessionId = generateSessionId();
@@ -5545,6 +5600,7 @@ app.post('/api/visitor/identify', async (req, res) => {
         }
 
         const visitId = generateVisitId();
+        currentVisitId = visitId;
         db.prepare(
           `INSERT OR IGNORE INTO visits (
             visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
@@ -5593,6 +5649,7 @@ app.post('/api/visitor/identify', async (req, res) => {
       ).run(visitorId, visitorToken, hardwareId, nowUtc, nowUtc, currentSessionId, nowUtc);
 
       const visitId = generateVisitId();
+      currentVisitId = visitId;
       db.prepare(
         `INSERT OR IGNORE INTO visits (
           visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
@@ -5702,7 +5759,8 @@ app.post('/api/visitor/identify', async (req, res) => {
         `SELECT
           id, visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
           public_ip, city, region, country, latitude, longitude, isp, org, asn,
-          browser, os, device_type, screen_resolution, language, timezone
+          browser, os, device_type, screen_resolution, language, timezone,
+          suspect_score, risk_level, score10, bot_name, recognition_source
          FROM visits
          WHERE visitor_id = ?
          ORDER BY visited_at_utc DESC, id DESC
@@ -6042,13 +6100,23 @@ app.post('/api/visitor/identify', async (req, res) => {
     // Every history row always carries suspectScore / riskLevel / recognitionSource so the UI
     // never renders `undefined`. Stored per-visit risk data is used when present; the current
     // visit falls back to the just-computed security signals; legacy rows use safe defaults.
+    const currentBotName =
+      (aiAgent?.detected ? aiAgent.agentName : '') ||
+      (effectiveBotClassification.subtype !== 'human'
+        ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim()
+        : '');
+
     const visitHistory = rawVisits.map((r) => {
       // Task 2b — legacy rows stored per-visit scores on a 0..100 scale; values above 10 are
       // rescaled so stored scores always render on the same 0..10 scale as the current visit.
+      const storedScore10 =
+        typeof r.score10 === 'number' && Number.isFinite(r.score10)
+          ? Math.max(0, Math.min(10, Math.round(r.score10)))
+          : null;
       const storedSuspectScore =
         typeof r.suspect_score === 'number' && Number.isFinite(r.suspect_score)
           ? normalizeLegacySuspectScore(r.suspect_score)
-          : null;
+          : storedScore10;
       const isCurrentVisitRow = String(r.page_load_id || '') === safePageLoadId;
       const rowSuspectScore =
         storedSuspectScore !== null
@@ -6056,9 +6124,25 @@ app.post('/api/visitor/identify', async (req, res) => {
           : isCurrentVisitRow
           ? securitySignals.suspectScore
           : 0;
+      const storedRiskLevel =
+        r.risk_level === 'High' || r.risk_level === 'Medium' || r.risk_level === 'Low'
+          ? (r.risk_level as RiskLevel)
+          : null;
       const rowRiskLevel: RiskLevel =
-        rowSuspectScore >= 7 ? 'High' : rowSuspectScore >= 3 ? 'Medium' : 'Low';
-      const rowRecognitionSource = isCurrentVisitRow ? recognitionSource : 'Cookie';
+        storedRiskLevel ??
+        (rowSuspectScore >= 7 ? 'High' : rowSuspectScore >= 3 ? 'Medium' : 'Low');
+      const rowRecognitionSource =
+        typeof r.recognition_source === 'string' && r.recognition_source
+          ? r.recognition_source
+          : isCurrentVisitRow
+          ? recognitionSource
+          : 'Cookie';
+      const rowBotName =
+        typeof r.bot_name === 'string' && r.bot_name
+          ? r.bot_name
+          : isCurrentVisitRow
+          ? currentBotName
+          : '';
       const rowCloudOrMaskedGpu = isCurrentVisitRow
         ? Boolean(
             (securitySignals as SecuritySignals & { cloudOrMaskedGpu?: boolean }).cloudOrMaskedGpu
@@ -6087,11 +6171,34 @@ app.post('/api/visitor/identify', async (req, res) => {
         language: String(r.language),
         timezone: String(r.timezone),
         suspectScore: rowSuspectScore,
+        score10: Math.max(0, Math.min(10, Math.round(rowSuspectScore))),
         riskLevel: rowRiskLevel,
+        botName: rowBotName || undefined,
         recognitionSource: rowRecognitionSource,
         cloudOrMaskedGpu: rowCloudOrMaskedGpu,
       };
     });
+
+    // Persist this visit's final risk verdict *after* the per-visit history fallback was read,
+    // so the next request (or a cold start) restores the exact same High • 10/10 row.
+    if (currentVisitId) {
+      try {
+        db.prepare(
+          `UPDATE visits
+           SET suspect_score = ?, risk_level = ?, score10 = ?, bot_name = ?, recognition_source = ?
+           WHERE visit_id = ?`
+        ).run(
+          securitySignals.suspectScore,
+          securitySignals.riskLevel,
+          Math.max(0, Math.min(10, Math.round(securitySignals.suspectScore))),
+          currentBotName || null,
+          recognitionSource,
+          currentVisitId
+        );
+      } catch {
+        // A scoring write must never fail the identification response.
+      }
+    }
 
     const historyBackup = createSignedHistoryBackup(
       visitorId,
@@ -6171,7 +6278,8 @@ app.get('/api/visitor/history/:visitorId', (req, res) => {
       `SELECT
         id, visit_id, visitor_id, session_id, visited_at_utc,
         public_ip, city, region, country, isp, org, asn,
-        browser, os, device_type, screen_resolution, language, timezone
+        browser, os, device_type, screen_resolution, language, timezone,
+        suspect_score, risk_level, score10, bot_name, recognition_source
        FROM visits
        WHERE visitor_id = ?
        ORDER BY visited_at_utc DESC, id DESC
@@ -6183,21 +6291,32 @@ app.get('/api/visitor/history/:visitorId', (req, res) => {
   // for legacy rows that have no stored per-visit risk record). Task 2b — legacy 0..100
   // scores above 10 are rescaled so every response speaks the 0..10 scale.
   const visits = rawVisits.map((row) => {
+    const storedScore10 =
+      typeof row.score10 === 'number' && Number.isFinite(row.score10)
+        ? Math.max(0, Math.min(10, Math.round(row.score10)))
+        : null;
     const storedSuspectScore =
       typeof row.suspect_score === 'number' && Number.isFinite(row.suspect_score)
         ? normalizeLegacySuspectScore(row.suspect_score)
-        : 0;
+        : storedScore10 ?? 0;
     const storedRecognitionSource =
       typeof row.recognition_source === 'string' && row.recognition_source.trim()
         ? row.recognition_source
         : 'Cookie';
+    const storedRiskLevel =
+      row.risk_level === 'High' || row.risk_level === 'Medium' || row.risk_level === 'Low'
+        ? (row.risk_level as RiskLevel)
+        : null;
     const rowRiskLevel: RiskLevel =
-      storedSuspectScore >= 7 ? 'High' : storedSuspectScore >= 3 ? 'Medium' : 'Low';
+      storedRiskLevel ??
+      (storedSuspectScore >= 7 ? 'High' : storedSuspectScore >= 3 ? 'Medium' : 'Low');
 
     return {
       ...row,
       suspectScore: storedSuspectScore,
+      score10: Math.max(0, Math.min(10, Math.round(storedSuspectScore))),
       riskLevel: rowRiskLevel,
+      botName: typeof row.bot_name === 'string' && row.bot_name ? row.bot_name : undefined,
       recognitionSource: storedRecognitionSource,
     };
   });

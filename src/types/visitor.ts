@@ -340,8 +340,11 @@ export interface VisitHistoryRecord {
   language: string;
   timezone: string;
   suspectScore?: number;
+  score10?: number;
   riskLevel?: RiskLevel;
+  botName?: string;
   recognitionSource?: string;
+  cloudOrMaskedGpu?: boolean;
 }
 
 export interface SignedHistoryBackup {
