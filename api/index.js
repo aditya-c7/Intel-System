@@ -1404,8 +1404,8 @@ function classifyIspNetwork(isp, org, asn) {
   const residential = residentialMatch();
   if (residential) return residential;
   return {
-    brandName: cleanIsp && !/^(unknown|unknown isp|n\/a)$/i.test(cleanIsp) ? cleanIsp : cleanOrg && !/^(unknown|unknown isp|n\/a)$/i.test(cleanOrg) ? cleanOrg : "Unknown ISP",
-    networkType: "Unknown Network",
+    brandName: cleanIsp && !/^(unknown|unknown isp|n\/a)$/i.test(cleanIsp) ? cleanIsp : cleanOrg && !/^(unknown|unknown isp|n\/a)$/i.test(cleanOrg) ? cleanOrg : "Unresolved Network",
+    networkType: "Standard Network",
     isConsumerBroadband: false,
     isDatacenterOrHosting: false,
     matchedReason: null
@@ -1449,7 +1449,7 @@ function applyNetworkOverrides(base, context) {
     };
   }
   if (base.networkType === "Residential Broadband" && !base.isConsumerBroadband) {
-    return { ...base, networkType: "Unknown Network" };
+    return { ...base, networkType: "Standard Network" };
   }
   return base;
 }
@@ -3962,7 +3962,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   };
   const isDatacenterAsn = datacenterAsn;
   const verifiedCrawlerNetwork = botSubtype === "good_bot" && isDatacenterAsn;
-  const ispBrand = classification.brandName || location.isp || "Unknown ISP";
+  const ispBrand = classification.brandName || location.isp || "Standard Network";
   const asnSuffix = location.asn !== "Unknown" ? ` \u2022 ${location.asn}` : "";
   const asnLabel = location.asn && location.asn !== "Unknown" ? /^AS/i.test(location.asn) ? location.asn.toUpperCase() : `AS${location.asn}` : "AS unknown";
   const asnOrOrg = `${asnLabel} \xB7 ${location.org !== "Unknown" ? location.org : ispBrand}`;
