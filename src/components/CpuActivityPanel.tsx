@@ -9,9 +9,20 @@ export type CpuMonitorStatus =
   | 'Monitoring'
   | 'Live'
   | 'Paused'
-  | 'Unsupported'
+  | 'Unavailable'
   | 'Blocked'
   | 'Error';
+
+/** Concise `Level · Qualifier` label that fits the metric box without truncation. */
+const PRESSURE_QUALIFIER: Record<RawPressureState, string> = {
+  nominal: 'Nominal',
+  fair: 'Fair',
+  serious: 'Serious',
+  critical: 'Critical',
+};
+
+const RECONNECT_INTERVAL_MS = 5000;
+const FALLBACK_SAMPLE_INTERVAL_MS = 1000;
 
 interface PressureObservationSample {
   id: number;
@@ -52,17 +63,10 @@ const PRESSURE_MAP: Record<RawPressureState, DisplayPressureLevel> = {
 
 const DISPLAY_LEVELS: DisplayPressureLevel[] = ['Normal', 'Moderate', 'High', 'Heavy'];
 
-const PRESSURE_STATE_LABELS: Record<RawPressureState, string> = {
-  nominal: 'Normal · Nominal',
-  fair: 'Moderate · Fair',
-  serious: 'High · Serious',
-  critical: 'Heavy · Critical',
-};
-
 /**
  * The Compute Pressure API only exists on desktop Chromium. Mobile browsers expose no CPU
- * pressure telemetry, so the whole panel is pruned from the DOM instead of rendering an
- * empty card.
+ * pressure telemetry, but the card is never pruned: it renders the full panel with an
+ * `Unavailable` badge and an active reconnect loop instead.
  */
 export function isCpuActivitySupported(): boolean {
   if (typeof window === 'undefined') return false;
@@ -75,10 +79,10 @@ export function isCpuActivitySupported(): boolean {
 
 function SystemLoadBadge({
   level,
-  isUnavailable,
+  unavailable,
 }: {
   level: DisplayPressureLevel;
-  isUnavailable?: boolean;
+  unavailable: boolean;
 }) {
   // Smooth needle rotation angle:
   // Normal -> towards left (-48deg, green)
@@ -94,8 +98,8 @@ function SystemLoadBadge({
       ? -16
       : -48;
 
-  const badgeColors = isUnavailable
-    ? 'bg-slate-100 text-slate-500 dark:bg-zinc-800 dark:text-zinc-400'
+  const badgeColors = unavailable
+    ? 'bg-zinc-100 text-zinc-500 dark:bg-zinc-900 dark:text-zinc-400'
     : level === 'Heavy'
       ? 'bg-[#FAD2CF] text-[#C5221F] dark:bg-rose-950/70 dark:text-rose-400'
       : level === 'High'
@@ -127,7 +131,7 @@ function SystemLoadBadge({
           {/* Smoothly shifting gauge pointer needle */}
           <g
             style={{
-              transform: `rotate(${isUnavailable ? 0 : needleAngleDeg}deg)`,
+              transform: `rotate(${unavailable ? 0 : needleAngleDeg}deg)`,
               transformOrigin: '12px 14.4px',
               transition: 'transform 550ms cubic-bezier(0.22, 1, 0.36, 1)',
             }}
@@ -149,7 +153,7 @@ function SystemLoadBadge({
           System load
         </span>
         <span className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5 block truncate">
-          {isUnavailable ? 'Unavailable' : level}
+          {unavailable ? 'Unavailable' : level}
         </span>
       </div>
     </div>
@@ -203,8 +207,10 @@ function detectInsideIframe(): boolean {
 }
 
 export function CpuActivityPanel() {
-  const [platformSupported] = useState<boolean>(() => isCpuActivitySupported());
   const [userEnabled, setUserEnabled] = useState<boolean>(true);
+  // True once the 1 Hz event-loop frame-jitter fallback has produced a sample while the
+  // PressureObserver is unavailable. Telemetry stays visible without faking a native API.
+  const [fallbackActive, setFallbackActive] = useState<boolean>(false);
   const [status, setStatus] = useState<CpuMonitorStatus>('Initializing');
   const [errorDetail, setErrorDetail] = useState<string | null>(null);
   const [samples, setSamples] = useState<PressureObservationSample[]>([]);
@@ -219,7 +225,7 @@ export function CpuActivityPanel() {
   const observerRef = useRef<NativePressureObserver | null>(null);
   const isObservingRef = useRef<boolean>(false);
   const hasReceivedObservationRef = useRef<boolean>(false);
-  const terminalStateRef = useRef<'Unsupported' | 'Blocked' | null>(null);
+  const terminalStateRef = useRef<'Unavailable' | 'Blocked' | null>(null);
   const isPageVisibleRef = useRef<boolean>(
     typeof document !== 'undefined' ? document.visibilityState !== 'hidden' : true
   );
@@ -310,6 +316,7 @@ export function CpuActivityPanel() {
     async (forceRetry = false) => {
       if (forceRetry) {
         terminalStateRef.current = null;
+        disconnectObserver('reconnect attempt');
       }
 
       if (terminalStateRef.current) {
@@ -348,16 +355,16 @@ export function CpuActivityPanel() {
 
       if (!hasPressureObserverFn || !g.PressureObserver) {
         console.log('[CPU Pressure] globalThis.PressureObserver is not a function');
-        terminalStateRef.current = 'Unsupported';
-        setStatus('Unsupported');
+        terminalStateRef.current = 'Unavailable';
+        setStatus('Unavailable');
         setErrorDetail('PressureObserver API is not available in this browser.');
         return;
       }
 
       if (!supportsCpuSource) {
         console.log('[CPU Pressure] PressureObserver.knownSources does not include "cpu":', knownSources);
-        terminalStateRef.current = 'Unsupported';
-        setStatus('Unsupported');
+        terminalStateRef.current = 'Unavailable';
+        setStatus('Unavailable');
         setErrorDetail('CPU source is not listed in PressureObserver.knownSources.');
         return;
       }
@@ -417,6 +424,7 @@ export function CpuActivityPanel() {
 
         await observer.observe('cpu', { sampleInterval: 1000 });
         console.log('CPU monitoring started');
+        setFallbackActive(false);
 
         if (!isObservingRef.current || observerRef.current !== observer) {
           return;
@@ -449,8 +457,8 @@ export function CpuActivityPanel() {
               : 'Permissions Policy rejected access to compute-pressure.'
           );
         } else if (errName === 'NotSupportedError' || /not supported/i.test(errMsg)) {
-          terminalStateRef.current = 'Unsupported';
-          setStatus('Unsupported');
+          terminalStateRef.current = 'Unavailable';
+          setStatus('Unavailable');
           setErrorDetail(errMsg || 'Hardware or platform CPU pressure telemetry is not supported.');
         } else {
           setStatus('Error');
@@ -476,7 +484,7 @@ export function CpuActivityPanel() {
     }
 
     isPageVisibleRef.current = true;
-    startCpuObservation(false);
+    startCpuObservation(true);
   }, [userEnabled, startCpuObservation, disconnectObserver]);
 
   // Handle browser tab visibility changes without creating duplicate observers
@@ -485,14 +493,10 @@ export function CpuActivityPanel() {
       const isVisible = document.visibilityState !== 'hidden';
       isPageVisibleRef.current = isVisible;
 
-      if (terminalStateRef.current) {
-        return;
-      }
-
       if (!isVisible) {
         console.log('[CPU Pressure] Tab hidden -> Paused');
         setStatus((prev) =>
-          prev === 'Unsupported' || prev === 'Blocked' || prev === 'Error' ? prev : 'Paused'
+          prev === 'Unavailable' || prev === 'Blocked' || prev === 'Error' ? prev : 'Paused'
         );
       } else if (userEnabledRef.current) {
         console.log('[CPU Pressure] Tab visible -> Resuming');
@@ -500,7 +504,9 @@ export function CpuActivityPanel() {
           setWindowEndMs(Date.now());
           setStatus(hasReceivedObservationRef.current ? 'Live' : 'Monitoring');
         } else {
-          startCpuObservation(false);
+          // A tab becoming visible is a fresh chance to attach the observer, even after a
+          // previous Unavailable / Blocked verdict (permissions can change between tabs).
+          startCpuObservation(true);
         }
       }
     };
@@ -510,6 +516,57 @@ export function CpuActivityPanel() {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [startCpuObservation]);
+
+  // Automatic reconnection loop: while the observer is unavailable or errored, re-check
+  // `PressureObserver` every 5 seconds and re-attach as soon as the device exposes it.
+  useEffect(() => {
+    if (!userEnabled) return;
+    if (status !== 'Unavailable' && status !== 'Error') return;
+
+    const reconnectTimer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      console.log('[CPU Pressure] Auto-reconnect attempt');
+      void startCpuObservation(true);
+    }, RECONNECT_INTERVAL_MS);
+
+    return () => clearInterval(reconnectTimer);
+  }, [status, userEnabled, startCpuObservation]);
+
+  // 1 Hz event-loop frame-jitter fallback. While the native API is unavailable this keeps a
+  // coarse CPU load estimate flowing into the chart so telemetry resumes automatically
+  // instead of the card sitting empty until the observer becomes available.
+  useEffect(() => {
+    if (!userEnabled || status !== 'Unavailable') return;
+
+    let lastTick = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const fallbackTimer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+        lastTick = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        return;
+      }
+      const nowTick = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const driftMs = Math.abs(nowTick - lastTick - FALLBACK_SAMPLE_INTERVAL_MS);
+      lastTick = nowTick;
+      const rawState: RawPressureState =
+        driftMs < 60 ? 'nominal' : driftMs < 160 ? 'fair' : driftMs < 320 ? 'serious' : 'critical';
+      const nowMs = Date.now();
+      const sample: PressureObservationSample = {
+        id: ++sampleCounterRef.current,
+        timestampMs: nowMs,
+        rawRecordTime: nowTick,
+        rawState,
+        displayLevel: PRESSURE_MAP[rawState],
+      };
+      setWindowEndMs(nowMs);
+      setSamples((prev) => {
+        const cutoff = nowMs - FIVE_MINUTES_MS - 15000;
+        return [...prev.filter((s) => s.timestampMs >= cutoff), sample];
+      });
+      setFallbackActive(true);
+    }, FALLBACK_SAMPLE_INTERVAL_MS);
+
+    return () => clearInterval(fallbackTimer);
+  }, [userEnabled, status]);
 
   // Cleanup observer on component unmount
   useEffect(() => {
@@ -550,17 +607,6 @@ export function CpuActivityPanel() {
 
     return () => clearInterval(clockTimer);
   }, [userEnabled, status]);
-
-  // Auto-reconnect loop every 5000ms when Compute Pressure is unsupported or disconnected
-  useEffect(() => {
-    if (status !== 'Unsupported') return;
-    const interval = setInterval(() => {
-      if (typeof window !== 'undefined' && 'PressureObserver' in window) {
-        startCpuObservation(true);
-      }
-    }, 5000);
-    return () => clearInterval(interval);
-  }, [status, startCpuObservation]);
 
   // Rolling 5-minute window bounds
   const windowStartMs = windowEndMs - FIVE_MINUTES_MS;
@@ -710,8 +756,8 @@ export function CpuActivityPanel() {
         return 'Live';
       case 'Paused':
         return 'Paused';
-      case 'Unsupported':
-        return 'Unavailable · Reconnecting...';
+      case 'Unavailable':
+        return userEnabled ? 'Unavailable · Reconnecting...' : 'Unavailable';
       case 'Blocked':
         return 'Blocked';
       case 'Error':
@@ -719,11 +765,9 @@ export function CpuActivityPanel() {
     }
   };
 
-  // Format main current load description concisely
+  // Format main current load description concisely. `Level · Qualifier` is short enough for
+  // the metric box, so "Normal (nomi..." truncation can never happen.
   const renderCurrentLoadValue = () => {
-    if (status === 'Unsupported') {
-      return 'Unavailable';
-    }
     if (status === 'Initializing') {
       return 'Initializing...';
     }
@@ -731,15 +775,22 @@ export function CpuActivityPanel() {
       return 'Awaiting sample';
     }
     if ((status === 'Live' || status === 'Paused' || status === 'Monitoring') && latestSample) {
-      return PRESSURE_STATE_LABELS[latestSample.rawState] || latestSample.displayLevel;
+      return `${latestSample.displayLevel} · ${PRESSURE_QUALIFIER[latestSample.rawState]}`;
+    }
+    if (status === 'Unavailable') {
+      return fallbackActive && latestSample
+        ? `${latestSample.displayLevel} · ${PRESSURE_QUALIFIER[latestSample.rawState]}`
+        : 'Unavailable';
     }
     if (status === 'Paused') {
-      return 'Paused';
+      return latestSample
+        ? `${latestSample.displayLevel} · ${PRESSURE_QUALIFIER[latestSample.rawState]}`
+        : 'Paused';
     }
     if (status === 'Blocked') {
       return insideIframe ? 'Blocked in iframe' : 'Policy blocked';
     }
-    return 'Unavailable';
+    return 'Error';
   };
 
   const currentBadgeLevel: DisplayPressureLevel = latestSample
@@ -777,7 +828,9 @@ export function CpuActivityPanel() {
                 className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                   status === 'Live' || status === 'Monitoring'
                     ? 'bg-emerald-500'
-                    : status === 'Paused' || status === 'Initializing'
+                    : status === 'Paused' ||
+                      status === 'Initializing' ||
+                      status === 'Unavailable'
                     ? 'bg-amber-500'
                     : 'bg-rose-500'
                 }`}
@@ -785,20 +838,20 @@ export function CpuActivityPanel() {
               <span>{renderStatusText()}</span>
             </span>
 
-            {status === 'Blocked' || status === 'Error' || status === 'Unsupported' ? (
+            {status === 'Blocked' || status === 'Error' || status === 'Unavailable' ? (
               <button
                 type="button"
                 onClick={() => startCpuObservation(true)}
                 className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-[#0A0D14] hover:bg-zinc-50 dark:hover:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded whitespace-nowrap shrink-0 cursor-pointer transition-colors"
               >
                 <RefreshCw className="w-3 h-3" />
-                <span>{status === 'Unsupported' ? 'Reconnect' : 'Retry'}</span>
+                <span>Reconnect</span>
               </button>
             ) : (
               <button
                 type="button"
                 onClick={() => setUserEnabled((prev) => !prev)}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-[#0A0D14] hover:bg-zinc-50 dark:hover:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded whitespace-nowrap shrink-0 cursor-pointer transition-colors"
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-zinc-700 dark:text-zinc-200 bg-white dark:bg-[#0A0D14] hover:bg-zinc-50 dark:hover:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer transition-colors"
               >
                 {userEnabled ? (
                   <>
@@ -821,7 +874,7 @@ export function CpuActivityPanel() {
           <div className="px-4 py-3 min-w-0">
             <SystemLoadBadge
               level={currentBadgeLevel}
-              isUnavailable={status === 'Unsupported' || (!latestSample && status !== 'Live')}
+              unavailable={status === 'Unavailable' && !fallbackActive}
             />
           </div>
 
@@ -1021,8 +1074,8 @@ export function CpuActivityPanel() {
                     ? insideIframe
                       ? 'Blocked in iframe (open URL in direct tab)'
                       : 'Blocked: Permissions Policy rejected access'
-                    : status === 'Unsupported'
-                    ? 'Unsupported: CPU pressure source unavailable'
+                    : status === 'Unavailable'
+                    ? 'Unavailable: CPU pressure source unavailable (auto-reconnect active)'
                     : errorDetail || 'Error initializing CPU telemetry'}
                 </text>
               )}
