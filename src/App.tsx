@@ -46,6 +46,7 @@ import {
   Palette,
   Bot,
   ChevronRight,
+  Smartphone,
 } from 'lucide-react';
 
 /**
@@ -1028,6 +1029,15 @@ export default function App() {
     const osName = data.browserDevice.os;
     const rawAttributes =
       data.rawDeviceAttributes ?? (s as { rawDeviceAttributes?: unknown }).rawDeviceAttributes ?? null;
+    const phoneDetails =
+      data.browserDevice.genuineMobile && data.browserDevice.phoneModel
+        ? {
+            device_model: data.browserDevice.phoneModel,
+            device_model_code: data.browserDevice.phoneModelCode ?? null,
+            device_brand: data.browserDevice.phoneBrand ?? null,
+            device_code: data.browserDevice.phoneDeviceCode ?? null,
+          }
+        : {};
     return {
       event_id: `${firstVisitMs}.${data.visitorId.slice(-6)}`,
       timestamp: firstVisitMs,
@@ -1065,6 +1075,7 @@ export default function App() {
         os: osName,
         os_version: data.browserDevice.platform,
         device: deviceType,
+        ...phoneDetails,
       },
       active_call: Boolean(data.activeCall ?? s.activeCall),
       bot: data.bot ?? (s.botSubtype === 'bad_bot' || s.botSubtype === 'ai_agent' ? 'bad' : 'not_detected'),
@@ -1133,7 +1144,10 @@ export default function App() {
       rare_device: Boolean(data.rareDevice ?? s.rareDevice),
       rare_device_percentile_bucket:
         data.rareDevicePercentileBucket ?? s.rareDevicePercentileBucket ?? '<p95',
-      raw_device_attributes: rawAttributes,
+      raw_device_attributes:
+        rawAttributes && typeof rawAttributes === 'object'
+          ? { ...(rawAttributes as Record<string, unknown>), ...phoneDetails }
+          : rawAttributes,
     };
   }, [data, displayedSuspectScore]);
 
@@ -1294,6 +1308,18 @@ export default function App() {
                 <p className="text-xs sm:text-[13px] text-slate-500 mt-1">
                   Real-time browser identity, hardware fingerprint, and live connection telemetry.
                 </p>
+                {data.browserDevice.genuineMobile &&
+                data.browserDevice.phoneDisplayLabel ? (
+                  <div className="mt-2.5 flex justify-center">
+                    <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-[11px] sm:text-xs font-semibold text-emerald-800">
+                      <Smartphone className="h-3.5 w-3.5 shrink-0 text-emerald-700" />
+                      <span className="truncate">
+                        {data.browserDevice.phoneDisplayLabel}
+                        {data.browserDevice.os ? ` · ${data.browserDevice.os}` : ''}
+                      </span>
+                    </span>
+                  </div>
+                ) : null}
               </div>
 
               {/* Side-by-Side Interactive Identity Boxes (Visitor ID + Hardware ID) */}
@@ -1505,7 +1531,9 @@ export default function App() {
                     <span>Device &amp; Session Summary</span>
                   </span>
                   <span className="text-[11px] font-mono text-slate-500">
-                    {data.browserDevice.deviceType}
+                    {data.browserDevice.genuineMobile && data.browserDevice.phoneBrand
+                      ? `Mobile · ${data.browserDevice.phoneBrand}`
+                      : data.browserDevice.deviceType}
                   </span>
                 </div>
 
@@ -1536,12 +1564,19 @@ export default function App() {
                         <span className="block text-[10px] sm:text-[11px] text-slate-500">OS &amp; Device</span>
                         <span
                           className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"
-                          title={`${activeVisit?.os || data.browserDevice.os} • ${
-                            activeVisit?.deviceType || data.browserDevice.deviceType
-                          }`}
+                          title={
+                            data.browserDevice.genuineMobile && data.browserDevice.phoneDisplayLabel
+                              ? `${data.browserDevice.phoneDisplayLabel} · ${data.browserDevice.os}`
+                              : `${activeVisit?.os || data.browserDevice.os} • ${
+                                  activeVisit?.deviceType || data.browserDevice.deviceType
+                                }`
+                          }
                         >
-                          {activeVisit?.os || data.browserDevice.os} •{' '}
-                          {activeVisit?.deviceType || data.browserDevice.deviceType}
+                          {data.browserDevice.genuineMobile && data.browserDevice.phoneDisplayLabel
+                            ? `${data.browserDevice.phoneDisplayLabel} · ${data.browserDevice.os}`
+                            : `${activeVisit?.os || data.browserDevice.os} • ${
+                                activeVisit?.deviceType || data.browserDevice.deviceType
+                              }`}
                         </span>
                       </div>
                     </div>

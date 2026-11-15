@@ -7,6 +7,20 @@ export interface BrowserDeviceInfo {
   pixelRatio: string;
   language: string;
   timezone: string;
+  /* Genuine-device gate (hardware invariants, never viewport width). */
+  deviceKind?: 'pc' | 'mobile' | 'tablet';
+  /** True only when platform + CPU + GPU + finger input all confirm mobile silicon. */
+  genuineMobile?: boolean;
+  /** Mobile UA running on desktop hardware (Chrome DevTools device preset). */
+  devtoolsDeviceEmulation?: boolean;
+  /** Browser-reported Android model code (UA-CH `model` or UA Build token). */
+  reportedModel?: string;
+  /* Exact catalog resolution — present only for genuine mobile visitors. */
+  phoneBrand?: string;
+  phoneModel?: string;
+  phoneModelCode?: string;
+  phoneDeviceCode?: string;
+  phoneDisplayLabel?: string;
   /* Storage-physics incognito verdict mirrored onto the device info. */
   incognito?: boolean;
   isIncognito?: boolean;

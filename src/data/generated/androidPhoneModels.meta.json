@@ -1,0 +1,21 @@
+{
+  "sourceUrl": "https://storage.googleapis.com/play_public/supported_devices.html",
+  "generatedAt": "2026-10-31T07:08:37.719Z",
+  "totalEntries": 51297,
+  "phoneEntries": 37889,
+  "excludedEntries": 5302,
+  "ambiguousModelCodes": 3311,
+  "excludedBreakdown": {
+    "malformedRow": 0,
+    "emptyModelCode": 26,
+    "noDisplayName": 3,
+    "chromebook": 100,
+    "tv": 2682,
+    "wearable": 198,
+    "automotive": 33,
+    "router": 11,
+    "audioOrSmartDisplay": 9,
+    "tablet": 2240
+  },
+  "note": "Regenerated from Google's supported-device catalog. Rerun `npm run phones:generate` periodically to include newly released devices."
+}

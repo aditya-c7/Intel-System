@@ -15,7 +15,8 @@
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true});require('fs').rmSync('api/index.js',{force:true})\"",
     "lint": "tsc --noEmit",
     "test:worker": "node scripts/test-worker.mjs",
-    "test:browser": "node scripts/test-browser.mjs"
+    "test:browser": "node scripts/test-browser.mjs",
+    "phones:generate": "node scripts/generate-phone-models.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.3.3",

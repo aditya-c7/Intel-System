@@ -10,7 +10,14 @@ createServer(app).listen(API_PORT);
 function apiResponse(response) {
   const result = new Response(response.body, response);
   result.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, no-transform');
-  result.headers.set('Permissions-Policy', 'compute-pressure=*');
+  result.headers.set(
+    'Accept-CH',
+    'Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version-List'
+  );
+  result.headers.set(
+    'Permissions-Policy',
+    'compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self)'
+  );
   result.headers.set('X-Content-Type-Options', 'nosniff');
   return result;
 }
@@ -44,7 +51,17 @@ export default {
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
     if (pathname !== '/api' && !pathname.startsWith('/api/')) {
-      return env.ASSETS.fetch(request);
+      const asset = await env.ASSETS.fetch(request);
+      const result = new Response(asset.body, asset);
+      result.headers.set(
+        'Accept-CH',
+        'Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version-List'
+      );
+      result.headers.set(
+        'Permissions-Policy',
+        'compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self)'
+      );
+      return result;
     }
     if (!env.VISITOR_HMAC_SECRET || env.VISITOR_HMAC_SECRET.length < 32) {
       return apiResponse(Response.json({ error: 'Configure VISITOR_HMAC_SECRET with at least 32 characters.' }, { status: 503 }));

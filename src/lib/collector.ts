@@ -12,6 +12,15 @@ import type {
 } from '../types/visitor';
 import { detectBrowserTampering } from './tamperingDetector';
 import { detectBotD19Signals } from './aiBotDirectory';
+import {
+  classifyGenuineDevice,
+  detectInAppBrowser,
+  extractAndroidModelFromUA,
+  getPcLock,
+  releaseNonPcLock,
+  savePcLock,
+  type DeviceGateResult,
+} from './deviceDetect';
 
 const STORAGE_KEYS = {
   VISITOR_ID: 'intel_fp_vid',
@@ -41,6 +50,8 @@ interface NavigatorUAData {
     platformVersion?: string;
     architecture?: string;
     bitness?: string;
+    mobile?: boolean;
+    model?: string;
   }>;
 }
 
@@ -774,6 +785,8 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
     platformVersion?: string;
     architecture?: string;
     bitness?: string;
+    mobile?: boolean;
+    model?: string;
   } | null = null;
 
   if (uaData && typeof uaData.getHighEntropyValues === 'function') {
@@ -785,8 +798,10 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
           'platformVersion',
           'architecture',
           'bitness',
+          'mobile',
+          'model',
         ]),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 150)),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
       ]);
     } catch {
       highEntropy = null;
@@ -827,6 +842,8 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
   if (isBrave || braveBrand) {
     const ver = braveBrand?.version || (chromeUa ? chromeUa[1] : '');
     browser = ver ? `Brave ${ver}` : 'Brave';
+  } else if (detectInAppBrowser(ua)) {
+    browser = detectInAppBrowser(ua) as string;
   } else if (edgeBrand || edgUa) {
     const ver = edgUa ? edgUa[1] : edgeBrand?.version || '';
     browser = ver ? `Microsoft Edge ${ver}` : 'Microsoft Edge';
@@ -866,12 +883,17 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
   } else if (/CrOS/i.test(ua) || /Chrome OS|ChromeOS/i.test(hintPlatform)) {
     os = 'ChromeOS';
   } else if (/Android/i.test(hintPlatform) || /Android/i.test(ua)) {
-    const androidMatch = ua.match(/Android ([\d.]+)/);
-    os = androidMatch && androidMatch[1] ? `Android ${androidMatch[1]}` : 'Android';
+    const androidVersion =
+      hintPlatformVersion && /^\d+/.test(hintPlatformVersion)
+        ? hintPlatformVersion.split('.').slice(0, 2).join('.')
+        : (ua.match(/Android ([\d.]+)/)?.[1] ?? '');
+    os = androidVersion ? `Android ${androidVersion}` : 'Android';
   } else if (/iPad/i.test(ua) || (/Macintosh/i.test(ua) && maxTouchPoints > 2)) {
-    os = 'iPadOS';
+    const ios = ua.match(/OS ([\d_]+) like Mac OS X/);
+    os = ios ? `iPadOS ${ios[1].replace(/_/g, '.')}` : 'iPadOS';
   } else if (/iPhone|iPod/i.test(ua) || /iOS/i.test(hintPlatform)) {
-    os = 'iOS';
+    const ios = ua.match(/OS ([\d_]+) like Mac OS X/);
+    os = ios ? `iOS ${ios[1].replace(/_/g, '.')}` : 'iOS';
   } else if (/macOS|Mac OS/i.test(hintPlatform) || /Macintosh|Mac OS X/i.test(ua)) {
     if (hintPlatformVersion) {
       const parts = hintPlatformVersion.split('.');
@@ -888,27 +910,124 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
     os = 'Linux';
   }
 
-  let deviceType: BrowserDeviceInfo['deviceType'] = 'Unknown';
-  if (
-    /iPad|Tablet|PlayBook|Silk/i.test(ua) ||
-    os === 'iPadOS' ||
-    (/Android/i.test(ua) && !/Mobile/i.test(ua))
-  ) {
-    deviceType = 'Tablet';
-  } else if (uaData?.mobile === true || /Mobile|iPhone|iPod|Android.*Mobile|Windows Phone/i.test(ua)) {
-    deviceType = 'Mobile';
-  } else if (
-    uaData?.mobile === false ||
-    os.startsWith('macOS') ||
-    os.startsWith('Windows') ||
-    os === 'Linux' ||
-    os === 'ChromeOS'
-  ) {
-    deviceType = 'Desktop';
-  }
-
   const rawPlatform = hintPlatform || (typeof navigator !== 'undefined' ? navigator.platform : '');
   const platform = rawPlatform && rawPlatform.trim() ? rawPlatform.trim() : 'Unavailable';
+
+  // --- Genuine physical-device gate -------------------------------------------------
+  // Viewport width alone is never a signal. The gate requires the platform, CPU
+  // architecture, GPU silicon and finger input to agree with the User-Agent, so a
+  // resized window or a DevTools device preset can never turn a desktop into a phone.
+  const navPlatform =
+    typeof navigator !== 'undefined' && typeof navigator.platform === 'string'
+      ? navigator.platform
+      : '';
+  const gateTouchPoints =
+    typeof navigator !== 'undefined' ? Number(navigator.maxTouchPoints ?? 0) : 0;
+  const pointerCoarse =
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(pointer: coarse)').matches
+      : false;
+  const hoverNone =
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(hover: none)').matches
+      : false;
+  const hasTouchEvent =
+    typeof window !== 'undefined' && 'ontouchstart' in window;
+  const viewportWidth =
+    typeof window !== 'undefined' ? Number(window.innerWidth) || 0 : 0;
+  const gpuProbe = inspectWebGlGpu();
+  const pcLock = getPcLock();
+
+  const deviceGate: DeviceGateResult = classifyGenuineDevice({
+    ua,
+    platform: navPlatform,
+    architecture: highEntropy?.architecture,
+    mobileHint: highEntropy?.mobile ?? uaData?.mobile,
+    gpuVendor: gpuProbe.gpuVendor,
+    gpuRenderer: gpuProbe.gpuRenderer,
+    maxTouchPoints: gateTouchPoints,
+    pointerCoarse,
+    hoverNone,
+    hasTouchEvent,
+    viewportWidth,
+    pcLocked: pcLock !== null,
+  });
+
+  const deviceType: BrowserDeviceInfo['deviceType'] =
+    typeof navigator === 'undefined'
+      ? 'Unknown'
+      : deviceGate.kind === 'mobile'
+      ? 'Mobile'
+      : deviceGate.kind === 'tablet'
+      ? 'Tablet'
+      : 'Desktop';
+
+  // Persist the desktop lock on genuinely desktop hardware; flush stale snapshots
+  // on a genuine handheld. A valid PC lock survives DevTools emulation.
+  try {
+    if (typeof window !== 'undefined') {
+      if (deviceGate.kind === 'pc') {
+        savePcLock({ deviceLabel: os, browserName: browser }, false);
+      } else if (deviceGate.genuineMobile) {
+        releaseNonPcLock();
+      }
+    }
+  } catch {
+    // Storage blocked: classification still stands for this visit.
+  }
+
+  // --- Exact phone-model resolution (mobile only) -----------------------------------
+  // High-entropy `model` first; Android UA Build token as the fallback for browsers
+  // that do not expose Client Hints (Firefox Android, in-app WebViews, Samsung Internet).
+  let reportedModel = '';
+  if (deviceGate.kind === 'mobile') {
+    const hintModel =
+      typeof highEntropy?.model === 'string' ? highEntropy.model.trim() : '';
+    if (hintModel && !/^(k|unknown)$/i.test(hintModel)) {
+      reportedModel = hintModel;
+    } else if (/Android/i.test(ua)) {
+      reportedModel = extractAndroidModelFromUA(ua);
+    }
+  }
+
+  let phoneBrand = '';
+  let phoneModel = '';
+  let phoneModelCode = '';
+  let phoneDeviceCode = '';
+  let phoneDisplayLabel = '';
+
+  if (deviceGate.kind === 'mobile') {
+    if (/iPhone|iPod/i.test(ua)) {
+      phoneBrand = 'Apple';
+      phoneModel = 'iPhone';
+      phoneDisplayLabel = 'Apple iPhone';
+    } else if (reportedModel) {
+      try {
+        // Lazy chunk: desktop visitors never download the 37k-entry catalog.
+        const { resolvePhoneModel, formatPhoneLabel, formatPhoneDisplayLabel } =
+          await import('./phoneModel');
+        const entry = resolvePhoneModel(reportedModel);
+        if (entry) {
+          phoneBrand = entry.retailBrand;
+          phoneModel = formatPhoneLabel(entry);
+          phoneModelCode = entry.modelCode;
+          phoneDeviceCode = entry.deviceCode;
+          phoneDisplayLabel = formatPhoneDisplayLabel(entry);
+        } else {
+          phoneModel = reportedModel;
+          phoneModelCode = reportedModel;
+          phoneDisplayLabel = reportedModel;
+        }
+      } catch {
+        phoneModel = reportedModel;
+        phoneModelCode = reportedModel;
+        phoneDisplayLabel = reportedModel;
+      }
+    } else {
+      phoneModel = 'Android Smartphone';
+      phoneDisplayLabel = 'Android Smartphone';
+    }
+  }
 
   const sw = typeof window !== 'undefined' && window.screen ? Number(window.screen.width) : 0;
   const sh = typeof window !== 'undefined' && window.screen ? Number(window.screen.height) : 0;
@@ -945,6 +1064,15 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
     pixelRatio,
     language,
     timezone,
+    deviceKind: deviceGate.kind,
+    genuineMobile: deviceGate.genuineMobile,
+    devtoolsDeviceEmulation: deviceGate.devtoolsDeviceEmulation,
+    reportedModel: reportedModel || undefined,
+    phoneBrand: phoneBrand || undefined,
+    phoneModel: phoneModel || undefined,
+    phoneModelCode: phoneModelCode || undefined,
+    phoneDeviceCode: phoneDeviceCode || undefined,
+    phoneDisplayLabel: phoneDisplayLabel || undefined,
     incognito: incognitoVerdict.isPrivate,
     isIncognito: incognitoVerdict.isPrivate,
     privateMode: incognitoVerdict.isPrivate,
@@ -2692,6 +2820,27 @@ export async function evaluateSecuritySignals(
     webglRenderer: hardwareSignals.gpuRenderer,
   });
 
+  // The genuine-device gate adds hard evidence the generic detector cannot see:
+  // a mobile UA over x86/desktop-GPU silicon. Escalate to a tampering verdict so
+  // the Browser Tampering tile and Event JSON both reflect the emulation.
+  if (
+    browserDevice.devtoolsDeviceEmulation &&
+    !tampering.tampering_details.devtools_device_emulation
+  ) {
+    tampering.tampering = true;
+    tampering.tampering_confidence = 'high';
+    tampering.tampering_ml_score = Math.max(0.842, tampering.tampering_ml_score);
+    tampering.tampering_details.devtools_device_emulation = true;
+    tampering.tampering_details.anomaly_score = Math.max(
+      0.55,
+      tampering.tampering_details.anomaly_score
+    );
+    tampering.tampering_details.reasons = [
+      ...tampering.tampering_details.reasons,
+      'Mobile user-agent on desktop x86/GPU hardware (DevTools device emulation)',
+    ];
+  }
+
   // Active call — WebRTC audio transceivers, navigator.audioSession, voice-routed AudioContext.
   const activeCall = detectActiveCall();
 
@@ -2841,7 +2990,18 @@ export async function evaluateSecuritySignals(
     activeCallSupported: activeCall.supported,
     activeCallReasons: activeCall.reasons,
     /* Phase 6 — raw device attributes for the event JSON inspector */
-    rawDeviceAttributes: collectRawDeviceAttributes(),
+    rawDeviceAttributes: (() => {
+      const rawAttributes = collectRawDeviceAttributes() as unknown as Record<string, unknown>;
+      if (browserDevice.genuineMobile && browserDevice.phoneModel) {
+        rawAttributes.device_model = browserDevice.phoneModel;
+        rawAttributes.device_model_code = browserDevice.phoneModelCode || null;
+        rawAttributes.device_brand = browserDevice.phoneBrand || null;
+        rawAttributes.device_code = browserDevice.phoneDeviceCode || null;
+      } else if (browserDevice.deviceType === 'Desktop') {
+        rawAttributes.device = 'Desktop';
+      }
+      return rawAttributes;
+    })(),
     /* Privacy settings: Tor Browser RFP / anti-fingerprinting evidence */
     privacySettings: torBrowserClient.detected,
     /* Removed probes are neutralised so downstream consumers see explicit falses. */

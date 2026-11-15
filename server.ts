@@ -4369,6 +4369,25 @@ function sanitizeBrowserDevice(input: Partial<BrowserDeviceInfo> | undefined): B
       ? Number(input.opfsFlushMs)
       : undefined;
 
+  // Genuine-device gate + exact phone-model fields. Only accepted for visitors the
+  // client classified as mobile, so a desktop payload can never inject a phone name.
+  const deviceKind =
+    input?.deviceKind === 'mobile' || input?.deviceKind === 'tablet' || input?.deviceKind === 'pc'
+      ? input.deviceKind
+      : undefined;
+  const genuineMobile =
+    typeof input?.genuineMobile === 'boolean' ? input.genuineMobile : undefined;
+  const devtoolsDeviceEmulation =
+    typeof input?.devtoolsDeviceEmulation === 'boolean'
+      ? input.devtoolsDeviceEmulation
+      : undefined;
+  const optStr = (val: unknown, max = 96): string | undefined => {
+    if (typeof val !== 'string') return undefined;
+    const t = val.trim();
+    return t ? t.slice(0, max) : undefined;
+  };
+  const mobileFieldsAllowed = deviceKind === 'mobile' && genuineMobile === true;
+
   return {
     browser: safeStr(input?.browser, 'Unknown'),
     os: safeStr(input?.os, 'Unknown'),
@@ -4378,6 +4397,15 @@ function sanitizeBrowserDevice(input: Partial<BrowserDeviceInfo> | undefined): B
     pixelRatio: safeStr(input?.pixelRatio, 'Unavailable'),
     language: safeStr(input?.language, 'Unavailable'),
     timezone: safeStr(input?.timezone, 'Unavailable'),
+    deviceKind,
+    genuineMobile,
+    devtoolsDeviceEmulation,
+    reportedModel: optStr(input?.reportedModel),
+    phoneBrand: mobileFieldsAllowed ? optStr(input?.phoneBrand) : undefined,
+    phoneModel: mobileFieldsAllowed ? optStr(input?.phoneModel) : undefined,
+    phoneModelCode: mobileFieldsAllowed ? optStr(input?.phoneModelCode) : undefined,
+    phoneDeviceCode: mobileFieldsAllowed ? optStr(input?.phoneDeviceCode) : undefined,
+    phoneDisplayLabel: mobileFieldsAllowed ? optStr(input?.phoneDisplayLabel) : undefined,
     incognito: incognitoAlias,
     isIncognito: incognitoAlias,
     privateMode: incognitoAlias,
@@ -4442,9 +4470,17 @@ export const app = express();
 app.set('trust proxy', true);
 app.use(cookieParser());
 
-// Ensure HTTP Permissions-Policy header allows compute-pressure in both top-level and embedded contexts
+// Ask mobile Chromium browsers to expose UA-CH model/architecture hints, and keep
+// Compute Pressure available. `Accept-CH` makes `Sec-CH-UA-Model` arrive in HTTP
+// headers on subsequent requests; the JS high-entropy call covers the first visit.
+const CLIENT_HINT_HEADER =
+  'Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version-List';
 app.use((_req, res, next) => {
-  res.setHeader('Permissions-Policy', 'compute-pressure=*');
+  res.setHeader('Accept-CH', CLIENT_HINT_HEADER);
+  res.setHeader(
+    'Permissions-Policy',
+    'compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self)'
+  );
   next();
 });
 
