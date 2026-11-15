@@ -1399,16 +1399,16 @@ export default function App() {
                 </div>
 
                 <div className="p-4 sm:p-6 flex-1 flex flex-col justify-center">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 sm:gap-4 h-full auto-rows-fr">
+                  <div className="grid grid-cols-3 sm:grid-cols-2 gap-2 sm:gap-4 h-full auto-rows-fr">
                     {/* Tile 1: Browser */}
-                    <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-blue-50/40 border border-blue-100 flex items-center justify-center shrink-0">
-                        <Compass className="w-4 h-4 text-[#2563EB]" />
+                    <div className="p-2.5 sm:p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3.5 min-w-0">
+                      <div className="w-7 h-7 sm:w-9 sm:h-9 rounded-lg bg-blue-50/40 border border-blue-100 flex items-center justify-center shrink-0">
+                        <Compass className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#2563EB]" />
                       </div>
                       <div className="min-w-0 flex-1">
-                        <span className="block text-[11px] text-slate-500">Browser</span>
+                        <span className="block text-[10px] sm:text-[11px] text-slate-500">Browser</span>
                         <span
-                          className="block text-xs sm:text-sm font-semibold text-[#111827] truncate mt-0.5"
+                          className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"
                           title={activeVisit?.browser || data.browserDevice.browser}
                         >
                           {activeVisit?.browser || data.browserDevice.browser}
@@ -1417,14 +1417,14 @@ export default function App() {
                     </div>
 
                     {/* Tile 2: OS & Device */}
-                    <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-emerald-50/40 border border-emerald-100 flex items-center justify-center shrink-0">
-                        <Monitor className="w-4 h-4 text-emerald-600" />
+                    <div className="p-2.5 sm:p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3.5 min-w-0">
+                      <div className="w-7 h-7 sm:w-9 sm:h-9 rounded-lg bg-emerald-50/40 border border-emerald-100 flex items-center justify-center shrink-0">
+                        <Monitor className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-emerald-600" />
                       </div>
                       <div className="min-w-0 flex-1">
-                        <span className="block text-[11px] text-slate-500">OS &amp; Device</span>
+                        <span className="block text-[10px] sm:text-[11px] text-slate-500">OS &amp; Device</span>
                         <span
-                          className="block text-xs sm:text-sm font-semibold text-[#111827] truncate mt-0.5"
+                          className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"
                           title={`${activeVisit?.os || data.browserDevice.os} • ${
                             activeVisit?.deviceType || data.browserDevice.deviceType
                           }`}
@@ -1436,14 +1436,14 @@ export default function App() {
                     </div>
 
                     {/* Tile 3: Display */}
-                    <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-orange-50/40 border border-orange-100 flex items-center justify-center shrink-0">
-                        <Maximize2 className="w-4 h-4 text-[#F05A28]" />
+                    <div className="p-2.5 sm:p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3.5 min-w-0">
+                      <div className="w-7 h-7 sm:w-9 sm:h-9 rounded-lg bg-orange-50/40 border border-orange-100 flex items-center justify-center shrink-0">
+                        <Maximize2 className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#F05A28]" />
                       </div>
                       <div className="min-w-0 flex-1">
-                        <span className="block text-[11px] text-slate-500">Display</span>
+                        <span className="block text-[10px] sm:text-[11px] text-slate-500">Display</span>
                         <span
-                          className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5"
+                          className="block text-[11px] sm:text-sm font-semibold font-mono tabular-nums text-[#111827] break-words leading-snug mt-0.5"
                           title={`${data.browserDevice.screenResolution} (${data.browserDevice.pixelRatio}) • ${
                             data.hardwareSignals?.colorDepth ?? 24
                           }-bit`}
@@ -1455,16 +1455,16 @@ export default function App() {
                     </div>
 
                     {/* Tile 4: Locale & Timezone */}
-                    <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-indigo-50/40 border border-indigo-100 flex items-center justify-center shrink-0">
-                        <Languages className="w-4 h-4 text-indigo-600" />
+                    <div className="p-2.5 sm:p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3.5 min-w-0">
+                      <div className="w-7 h-7 sm:w-9 sm:h-9 rounded-lg bg-indigo-50/40 border border-indigo-100 flex items-center justify-center shrink-0">
+                        <Languages className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-indigo-600" />
                       </div>
                       <div className="min-w-0 flex-1">
-                        <span className="block text-[11px] text-slate-500">
+                        <span className="block text-[10px] sm:text-[11px] text-slate-500">
                           Locale &amp; Timezone
                         </span>
                         <span
-                          className="block text-xs sm:text-sm font-semibold text-[#111827] truncate mt-0.5"
+                          className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"
                           title={`${data.browserDevice.language} • ${data.browserDevice.timezone}`}
                         >
                           {data.browserDevice.language} • {data.browserDevice.timezone}
@@ -1473,14 +1473,14 @@ export default function App() {
                     </div>
 
                     {/* Tile 5: Active Session */}
-                    <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-amber-50/40 border border-amber-100 flex items-center justify-center shrink-0">
-                        <KeyRound className="w-4 h-4 text-amber-700" />
+                    <div className="p-2.5 sm:p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3.5 min-w-0">
+                      <div className="w-7 h-7 sm:w-9 sm:h-9 rounded-lg bg-amber-50/40 border border-amber-100 flex items-center justify-center shrink-0">
+                        <KeyRound className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-amber-700" />
                       </div>
                       <div className="min-w-0 flex-1">
-                        <span className="block text-[11px] text-slate-500">Active Session</span>
+                        <span className="block text-[10px] sm:text-[11px] text-slate-500">Active Session</span>
                         <code
-                          className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5"
+                          className="block text-[11px] sm:text-sm font-semibold font-mono tabular-nums text-[#111827] break-all leading-snug mt-0.5"
                           title={data.statistics.currentSessionId}
                         >
                           {data.statistics.currentSessionId}
@@ -1489,14 +1489,14 @@ export default function App() {
                     </div>
 
                     {/* Tile 6: First / Last Seen */}
-                    <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-emerald-50/40 border border-emerald-100 flex items-center justify-center shrink-0">
-                        <CalendarClock className="w-4 h-4 text-emerald-600" />
+                    <div className="p-2.5 sm:p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3.5 min-w-0">
+                      <div className="w-7 h-7 sm:w-9 sm:h-9 rounded-lg bg-emerald-50/40 border border-emerald-100 flex items-center justify-center shrink-0">
+                        <CalendarClock className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-emerald-600" />
                       </div>
                       <div className="min-w-0 flex-1">
-                        <span className="block text-[11px] text-slate-500">Last Active</span>
+                        <span className="block text-[10px] sm:text-[11px] text-slate-500">Last Active</span>
                         <span
-                          className="block text-xs sm:text-sm font-semibold text-[#111827] truncate mt-0.5"
+                          className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"
                           title={`First seen: ${formatLocalTimestamp(
                             data.statistics.firstVisitUtc
                           )} | Last seen: ${formatLocalTimestamp(data.statistics.lastVisitUtc)}`}
