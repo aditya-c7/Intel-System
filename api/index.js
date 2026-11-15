@@ -3761,6 +3761,15 @@ function sanitizeBrowserDevice(input) {
   const incognitoMethod = typeof input?.incognitoMethod === "string" && input.incognitoMethod.trim() ? input.incognitoMethod.trim().slice(0, 120) : void 0;
   const idbDurabilityRatio = typeof input?.idbDurabilityRatio === "number" && Number.isFinite(input.idbDurabilityRatio) ? Number(input.idbDurabilityRatio) : void 0;
   const opfsFlushMs = typeof input?.opfsFlushMs === "number" && Number.isFinite(input.opfsFlushMs) ? Number(input.opfsFlushMs) : void 0;
+  const deviceKind = input?.deviceKind === "mobile" || input?.deviceKind === "tablet" || input?.deviceKind === "pc" ? input.deviceKind : void 0;
+  const genuineMobile = typeof input?.genuineMobile === "boolean" ? input.genuineMobile : void 0;
+  const devtoolsDeviceEmulation = typeof input?.devtoolsDeviceEmulation === "boolean" ? input.devtoolsDeviceEmulation : void 0;
+  const optStr = (val, max = 96) => {
+    if (typeof val !== "string") return void 0;
+    const t = val.trim();
+    return t ? t.slice(0, max) : void 0;
+  };
+  const mobileFieldsAllowed = deviceKind === "mobile" && genuineMobile === true;
   return {
     browser: safeStr(input?.browser, "Unknown"),
     os: safeStr(input?.os, "Unknown"),
@@ -3770,6 +3779,15 @@ function sanitizeBrowserDevice(input) {
     pixelRatio: safeStr(input?.pixelRatio, "Unavailable"),
     language: safeStr(input?.language, "Unavailable"),
     timezone: safeStr(input?.timezone, "Unavailable"),
+    deviceKind,
+    genuineMobile,
+    devtoolsDeviceEmulation,
+    reportedModel: optStr(input?.reportedModel),
+    phoneBrand: mobileFieldsAllowed ? optStr(input?.phoneBrand) : void 0,
+    phoneModel: mobileFieldsAllowed ? optStr(input?.phoneModel) : void 0,
+    phoneModelCode: mobileFieldsAllowed ? optStr(input?.phoneModelCode) : void 0,
+    phoneDeviceCode: mobileFieldsAllowed ? optStr(input?.phoneDeviceCode) : void 0,
+    phoneDisplayLabel: mobileFieldsAllowed ? optStr(input?.phoneDisplayLabel) : void 0,
     incognito: incognitoAlias,
     isIncognito: incognitoAlias,
     privateMode: incognitoAlias,
@@ -3822,8 +3840,13 @@ function detectServerRegion(req) {
 var app = express();
 app.set("trust proxy", true);
 app.use(cookieParser());
+var CLIENT_HINT_HEADER = "Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Full-Version-List";
 app.use((_req, res, next) => {
-  res.setHeader("Permissions-Policy", "compute-pressure=*");
+  res.setHeader("Accept-CH", CLIENT_HINT_HEADER);
+  res.setHeader(
+    "Permissions-Policy",
+    "compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self)"
+  );
   next();
 });
 var handleNetworkHeadPing = (_req, res) => {
