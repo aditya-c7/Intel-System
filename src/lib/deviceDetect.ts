@@ -275,7 +275,8 @@ export function extractAndroidModelFromUA(ua: string): string {
 
   let model = token
     // Drop the build fingerprint: " Build/TP1A.220624.014", " Build/RKQ1...".
-    .replace(/\s+Build\/[^\s;]*/i, '')
+    // Real UAs also contain typos seen in the wild ("Bulid/NRD90M", "Buidl/...").
+    .replace(/\s+(?:Build|Bulid|Buidl)\/[^\s;]*/i, '')
     .replace(/\s+Build$/i, '')
     .trim();
 

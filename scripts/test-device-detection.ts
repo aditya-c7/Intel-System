@@ -309,6 +309,16 @@ const cases: Case[] = [
     expectModel: 'SM-A546B',
   },
 
+  {
+    name: 'Legacy typo UA (Bulid/)',
+    input: phoneHw(
+      'Mozlila/5.0 (Linux; Android 7.0; SM-G892A Bulid/NRD90M; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/60.0.3112.107 Moblie Safari/537.36'
+    ),
+    expectKind: 'mobile',
+    expectModel: 'SM-G892A',
+    expectLabel: 'Galaxy S8 Active',
+  },
+
   // --- KaiOS / feature phones -----------------------------------------------------
   {
     name: 'KaiOS Nokia 8110 4G',
