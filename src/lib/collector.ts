@@ -801,7 +801,7 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
           'mobile',
           'model',
         ]),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
       ]);
     } catch {
       highEntropy = null;

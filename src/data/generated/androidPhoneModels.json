@@ -1,25 +1,25 @@
 {
   "schemaVersion": 1,
   "sourceUrl": "https://storage.googleapis.com/play_public/supported_devices.html",
-  "generatedAt": "2026-10-31T07:08:37.719Z",
+  "generatedAt": "2026-11-15T18:11:46.123Z",
   "stats": {
-    "totalEntries": 51297,
-    "phoneEntries": 37889,
-    "excludedEntries": 5302,
+    "totalEntries": 51486,
+    "phoneEntries": 37999,
+    "excludedEntries": 5317,
     "duplicateRows": 18,
-    "ambiguousRows": 8088,
-    "ambiguousModelCodes": 3311,
+    "ambiguousRows": 8152,
+    "ambiguousModelCodes": 3328,
     "excludedBreakdown": {
       "malformedRow": 0,
       "emptyModelCode": 26,
       "noDisplayName": 3,
       "chromebook": 100,
-      "tv": 2682,
+      "tv": 2685,
       "wearable": 198,
-      "automotive": 33,
+      "automotive": 34,
       "router": 11,
       "audioOrSmartDisplay": 9,
-      "tablet": 2240
+      "tablet": 2251
     }
   },
   "phones": [
@@ -733,6 +733,12 @@
     },
     {
       "retailBrand": "ADVAN",
+      "marketingName": "VX Nova",
+      "deviceCode": "ADVAN_VX_Nova",
+      "modelCode": "VX Nova"
+    },
+    {
+      "retailBrand": "ADVAN",
       "marketingName": "X1 NEO",
       "deviceCode": "ADVAN_X1_NEO",
       "modelCode": "X1 NEO"
@@ -1138,6 +1144,12 @@
       "marketingName": "ADT_1061",
       "deviceCode": "ADT_1061",
       "modelCode": "ADT_1061"
+    },
+    {
+      "retailBrand": "AIOAPPInc",
+      "marketingName": "k22",
+      "deviceCode": "Kiosk",
+      "modelCode": "Kiosk"
     },
     {
       "retailBrand": "AIPLUS",
@@ -2044,18 +2056,6 @@
       "marketingName": "A68EL",
       "deviceCode": "A68EL",
       "modelCode": "A68EL"
-    },
-    {
-      "retailBrand": "ATID",
-      "marketingName": "AT908",
-      "deviceCode": "AT908",
-      "modelCode": "AT908"
-    },
-    {
-      "retailBrand": "ATID",
-      "marketingName": "AT908_EEA",
-      "deviceCode": "AT908",
-      "modelCode": "AT908_EEA"
     },
     {
       "retailBrand": "ATILIM UNIVERSITY",
@@ -6169,6 +6169,18 @@
     },
     {
       "retailBrand": "Akai",
+      "marketingName": "AKAI",
+      "deviceCode": "eleonas",
+      "modelCode": "AKAI"
+    },
+    {
+      "retailBrand": "Akai",
+      "marketingName": "AKAI FF",
+      "deviceCode": "eleonas",
+      "modelCode": "AKAI FF"
+    },
+    {
+      "retailBrand": "Akai",
       "marketingName": "FZ101",
       "deviceCode": "FZ101",
       "modelCode": "FZ101"
@@ -8590,12 +8602,6 @@
       "marketingName": "PRO_II_16",
       "deviceCode": "PRO_II_16",
       "modelCode": "PRO_II_16"
-    },
-    {
-      "retailBrand": "AngelTech",
-      "marketingName": "PRO_MAX_16",
-      "deviceCode": "PRO_MAX_16",
-      "modelCode": "PRO_MAX_16"
     },
     {
       "retailBrand": "AngelTech",
@@ -11407,6 +11413,18 @@
     },
     {
       "retailBrand": "Artia",
+      "marketingName": "SP626W",
+      "deviceCode": "SP626W",
+      "modelCode": "SP626W"
+    },
+    {
+      "retailBrand": "Artia",
+      "marketingName": "SP676L",
+      "deviceCode": "SP676L",
+      "modelCode": "SP676L"
+    },
+    {
+      "retailBrand": "Artia",
       "marketingName": "SP676W",
       "deviceCode": "SP676W",
       "modelCode": "SP676W"
@@ -11674,6 +11692,12 @@
       "marketingName": "Nitro2",
       "deviceCode": "Nitro2",
       "modelCode": "Nitro2"
+    },
+    {
+      "retailBrand": "Aspera",
+      "marketingName": "Verve",
+      "deviceCode": "Verve",
+      "modelCode": "Aspera Verve"
     },
     {
       "retailBrand": "Aspera",
@@ -14467,6 +14491,12 @@
     },
     {
       "retailBrand": "BASICS",
+      "marketingName": "BT1026FW",
+      "deviceCode": "BT1026FW",
+      "modelCode": "BT1026FW"
+    },
+    {
+      "retailBrand": "BASICS",
       "marketingName": "BT1124FW",
       "deviceCode": "BT1124FW",
       "modelCode": "BT1124FW"
@@ -15946,6 +15976,12 @@
       "marketingName": "ORION_TG05",
       "deviceCode": "Bmobile_ORION_TG05",
       "modelCode": "ORION_TG05"
+    },
+    {
+      "retailBrand": "BMobile",
+      "marketingName": "ROCKET_A1",
+      "deviceCode": "Bmobile_ROCKET_A1",
+      "modelCode": "ROCKET_A1"
     },
     {
       "retailBrand": "BMobile",
@@ -20353,6 +20389,12 @@
     },
     {
       "retailBrand": "Blu",
+      "marketingName": "B1680M",
+      "deviceCode": "B1680M",
+      "modelCode": "B1680M"
+    },
+    {
+      "retailBrand": "Blu",
       "marketingName": "BLU",
       "deviceCode": "G0430WW",
       "modelCode": "G71"
@@ -21010,6 +21052,12 @@
       "marketingName": "G84",
       "deviceCode": "G1050",
       "modelCode": "G84"
+    },
+    {
+      "retailBrand": "Blu",
+      "marketingName": "G85 5G",
+      "deviceCode": "B1680",
+      "modelCode": "B1680W"
     },
     {
       "retailBrand": "Blu",
@@ -21860,6 +21908,12 @@
     {
       "retailBrand": "Blu",
       "marketingName": "View Speed Ultra 5G",
+      "deviceCode": "B1661R",
+      "modelCode": "B1661R"
+    },
+    {
+      "retailBrand": "Blu",
+      "marketingName": "View Speed Ultra 5G",
       "deviceCode": "B1661V",
       "modelCode": "B1661V"
     },
@@ -22686,6 +22740,18 @@
       "modelCode": "BT Home SmartPhone S II"
     },
     {
+      "retailBrand": "Bro(SZ)",
+      "marketingName": "Bro_s_II",
+      "deviceCode": "Bro_s_II",
+      "modelCode": "Bro_s_II"
+    },
+    {
+      "retailBrand": "Bro(SZ)",
+      "marketingName": "Bro_s_III",
+      "deviceCode": "Bro_s_III",
+      "modelCode": "Bro_s_III"
+    },
+    {
       "retailBrand": "Brondi",
       "marketingName": "620SZ",
       "deviceCode": "G223_JH",
@@ -23371,12 +23437,6 @@
     },
     {
       "retailBrand": "CHAINWAY",
-      "marketingName": "CHAINWAY_MC80",
-      "deviceCode": "MC80",
-      "modelCode": "MC80"
-    },
-    {
-      "retailBrand": "CHAINWAY",
       "marketingName": "MC21",
       "deviceCode": "MC21",
       "modelCode": "MC21"
@@ -23404,6 +23464,12 @@
       "marketingName": "MC62",
       "deviceCode": "MC62",
       "modelCode": "MC62"
+    },
+    {
+      "retailBrand": "CHAINWAY",
+      "marketingName": "MC80",
+      "deviceCode": "MC80",
+      "modelCode": "MC80"
     },
     {
       "retailBrand": "CHAINWAY",
@@ -23737,6 +23803,12 @@
     },
     {
       "retailBrand": "COMBUSTECH",
+      "marketingName": "BCQ_IFPD",
+      "deviceCode": "COMBUS_IFPD",
+      "modelCode": "COMBUS_IB4"
+    },
+    {
+      "retailBrand": "COMBUSTECH",
       "marketingName": "COMBUSTECH-IFPD",
       "deviceCode": "oversea_v",
       "modelCode": "COMBUS_IB2"
@@ -23862,6 +23934,12 @@
       "modelCode": "SATURNO2"
     },
     {
+      "retailBrand": "COOP",
+      "marketingName": "URANO",
+      "deviceCode": "URANO",
+      "modelCode": "URANO"
+    },
+    {
       "retailBrand": "COOPERS",
       "marketingName": "CP10",
       "deviceCode": "CP10",
@@ -23932,6 +24010,12 @@
       "marketingName": "CORN_X55",
       "deviceCode": "CORN_X55",
       "modelCode": "CORN X55"
+    },
+    {
+      "retailBrand": "CORN",
+      "marketingName": "CPadPro13",
+      "deviceCode": "CPadPro13",
+      "modelCode": "CPadPro13"
     },
     {
       "retailBrand": "CORN",
@@ -24057,12 +24141,6 @@
       "retailBrand": "CORN",
       "marketingName": "T12Pro",
       "deviceCode": "T12Pro",
-      "modelCode": "P98"
-    },
-    {
-      "retailBrand": "CORN",
-      "marketingName": "T12Pro",
-      "deviceCode": "T12Pro",
       "modelCode": "T12Pro"
     },
     {
@@ -24118,6 +24196,12 @@
       "marketingName": "Y60",
       "deviceCode": "Y60",
       "modelCode": "Y60"
+    },
+    {
+      "retailBrand": "CORNEA",
+      "marketingName": "CORTB_04",
+      "deviceCode": "CORTB_04",
+      "modelCode": "CORTB_04"
     },
     {
       "retailBrand": "CORNEA",
@@ -30385,6 +30469,12 @@
     },
     {
       "retailBrand": "Coolpad",
+      "marketingName": "X200",
+      "deviceCode": "K29",
+      "modelCode": "K29"
+    },
+    {
+      "retailBrand": "Coolpad",
       "marketingName": "Y72-921",
       "deviceCode": "Y72-921",
       "modelCode": "Coolpad Y72-921"
@@ -30943,12 +31033,6 @@
     },
     {
       "retailBrand": "Crosscall",
-      "marketingName": "AD-C3",
-      "deviceCode": "L790",
-      "modelCode": "AD-C3"
-    },
-    {
-      "retailBrand": "Crosscall",
       "marketingName": "Action-X3",
       "deviceCode": "HS8937QC",
       "modelCode": "ACTION-X3"
@@ -31098,6 +31182,12 @@
       "modelCode": "Trekker-X4"
     },
     {
+      "retailBrand": "Crosscall",
+      "marketingName": "XR Smart",
+      "deviceCode": "L790",
+      "modelCode": "AD-C3"
+    },
+    {
       "retailBrand": "CrownHeights",
       "marketingName": "8inchDigitalTablet",
       "deviceCode": "CROWNTAB8",
@@ -31168,6 +31258,12 @@
       "marketingName": "A40",
       "deviceCode": "A40",
       "modelCode": "A40"
+    },
+    {
+      "retailBrand": "Cubot",
+      "marketingName": "C53",
+      "deviceCode": "C53",
+      "modelCode": "C53"
     },
     {
       "retailBrand": "Cubot",
@@ -31276,6 +31372,12 @@
       "marketingName": "KINGKONG 11",
       "deviceCode": "KINGKONG_11",
       "modelCode": "KINGKONG 11"
+    },
+    {
+      "retailBrand": "Cubot",
+      "marketingName": "KINGKONG 13",
+      "deviceCode": "KINGKONG_13",
+      "modelCode": "KINGKONG 13"
     },
     {
       "retailBrand": "Cubot",
@@ -31614,12 +31716,6 @@
       "modelCode": "X30P"
     },
     {
-      "retailBrand": "Cubot",
-      "marketingName": "X50",
-      "deviceCode": "X50",
-      "modelCode": "X50"
-    },
-    {
       "retailBrand": "Custom",
       "marketingName": "Ares",
       "deviceCode": "Ares",
@@ -31747,6 +31843,12 @@
     },
     {
       "retailBrand": "Cyrus",
+      "marketingName": "CS75XA_EEA",
+      "deviceCode": "CS75XA",
+      "modelCode": "CS75XA"
+    },
+    {
+      "retailBrand": "Cyrus",
       "marketingName": "ORSY_Controller",
       "deviceCode": "ORSY_Controller",
       "modelCode": "ORSY_Controller"
@@ -31852,6 +31954,18 @@
       "marketingName": "DAMASCO MOBILE SERIE M-300 VISION",
       "deviceCode": "SERIE_M_300",
       "modelCode": "SERIE_M_300"
+    },
+    {
+      "retailBrand": "DAMASCO",
+      "marketingName": "MC200",
+      "deviceCode": "MC200",
+      "modelCode": "MC200"
+    },
+    {
+      "retailBrand": "DAMASCO",
+      "marketingName": "MC300",
+      "deviceCode": "MC300",
+      "modelCode": "MC300"
     },
     {
       "retailBrand": "DAMASCO",
@@ -31966,6 +32080,12 @@
       "marketingName": "E10_US",
       "deviceCode": "E10_US",
       "modelCode": "E10_US"
+    },
+    {
+      "retailBrand": "DEERTiME",
+      "marketingName": "E11_C",
+      "deviceCode": "E11_C",
+      "modelCode": "E11_C"
     },
     {
       "retailBrand": "DEERTiME",
@@ -33751,6 +33871,12 @@
     },
     {
       "retailBrand": "DOMO",
+      "marketingName": "SSM28",
+      "deviceCode": "SSM28",
+      "modelCode": "SSM28"
+    },
+    {
+      "retailBrand": "DOMO",
       "marketingName": "Slate",
       "deviceCode": "Slate",
       "modelCode": "Slate"
@@ -34384,6 +34510,18 @@
       "marketingName": "Dslide_1095ml",
       "deviceCode": "Dslide_1095ml",
       "modelCode": "Dslide_1095ml"
+    },
+    {
+      "retailBrand": "Dangbei",
+      "marketingName": "D7",
+      "deviceCode": "karjat",
+      "modelCode": "DBD04A"
+    },
+    {
+      "retailBrand": "Dangbei",
+      "marketingName": "D7 Pro",
+      "deviceCode": "munnar",
+      "modelCode": "DBD05A"
     },
     {
       "retailBrand": "Dangbei",
@@ -37207,6 +37345,12 @@
     },
     {
       "retailBrand": "Disney",
+      "marketingName": "CPT06",
+      "deviceCode": "CPT06",
+      "modelCode": "CPT06"
+    },
+    {
+      "retailBrand": "Disney",
       "marketingName": "CTS05",
       "deviceCode": "CTS05",
       "modelCode": "CTS05"
@@ -39400,6 +39544,12 @@
       "marketingName": "ET_tablet",
       "deviceCode": "Byond",
       "modelCode": "VC5"
+    },
+    {
+      "retailBrand": "EASTCOM",
+      "marketingName": "E8600",
+      "deviceCode": "E8600",
+      "modelCode": "E8600"
     },
     {
       "retailBrand": "EASYTECK",
@@ -44683,6 +44833,12 @@
     },
     {
       "retailBrand": "FOXX",
+      "marketingName": "FOXXD A67X",
+      "deviceCode": "BGO",
+      "modelCode": "A67X"
+    },
+    {
+      "retailBrand": "FOXX",
       "marketingName": "G1",
       "deviceCode": "G1",
       "modelCode": "FOXX G1"
@@ -46618,6 +46774,12 @@
       "marketingName": "Foxtel Now box",
       "deviceCode": "dwt765fxt",
       "modelCode": "Foxtel Now box"
+    },
+    {
+      "retailBrand": "Franko",
+      "marketingName": "F17",
+      "deviceCode": "F17",
+      "modelCode": "F17"
     },
     {
       "retailBrand": "Franko",
@@ -49128,6 +49290,12 @@
       "modelCode": "burmese"
     },
     {
+      "retailBrand": "GeneralLuxe",
+      "marketingName": "GLF27",
+      "deviceCode": "GLF27",
+      "modelCode": "GLF27"
+    },
+    {
       "retailBrand": "GeneralMobile",
       "marketingName": "E-Tab10",
       "deviceCode": "blue_eye",
@@ -49174,6 +49342,12 @@
       "marketingName": "GeoMax Zenius08",
       "deviceCode": "Zenius08",
       "modelCode": "GMT-08QA-2301"
+    },
+    {
+      "retailBrand": "GeoPhone",
+      "marketingName": "geo_S8",
+      "deviceCode": "geo_S8",
+      "modelCode": "Geo S8"
     },
     {
       "retailBrand": "GeoPhone",
@@ -49996,6 +50170,12 @@
       "marketingName": "mexico",
       "deviceCode": "Lanix",
       "modelCode": "iliumPAD"
+    },
+    {
+      "retailBrand": "Gigaset",
+      "marketingName": "GIG-X10",
+      "deviceCode": "GIG-X10",
+      "modelCode": "GIG-X10"
     },
     {
       "retailBrand": "Gigaset",
@@ -51352,12 +51532,6 @@
       "marketingName": "N11",
       "deviceCode": "S5506LA",
       "modelCode": "S5506L"
-    },
-    {
-      "retailBrand": "GoMo",
-      "marketingName": "S6712L",
-      "deviceCode": "S6712LA",
-      "modelCode": "S6712L"
     },
     {
       "retailBrand": "GoPlus",
@@ -57001,6 +57175,12 @@
     },
     {
       "retailBrand": "HUGEROCK",
+      "marketingName": "H-Smart-H61",
+      "deviceCode": "H61-5G-M60",
+      "modelCode": "H-Smart"
+    },
+    {
+      "retailBrand": "HUGEROCK",
       "marketingName": "H8",
       "deviceCode": "H8",
       "modelCode": "H8"
@@ -57040,6 +57220,12 @@
       "marketingName": "HT738-01",
       "deviceCode": "HT738-01",
       "modelCode": "HT738-01"
+    },
+    {
+      "retailBrand": "HYMA",
+      "marketingName": "HYMA A10",
+      "deviceCode": "PNX",
+      "modelCode": "HYMA A10"
     },
     {
       "retailBrand": "HYPERTECH",
@@ -58585,6 +58771,12 @@
     },
     {
       "retailBrand": "Helio",
+      "marketingName": "helio_63",
+      "deviceCode": "helio_63",
+      "modelCode": "helio 63"
+    },
+    {
+      "retailBrand": "Helio",
       "marketingName": "helio_65",
       "deviceCode": "helio_65",
       "modelCode": "helio 65"
@@ -58996,6 +59188,18 @@
       "marketingName": "P16_TU",
       "deviceCode": "P16_TU",
       "modelCode": "P16_TU"
+    },
+    {
+      "retailBrand": "Hiking",
+      "marketingName": "PAD_1",
+      "deviceCode": "PAD_1",
+      "modelCode": "PAD_1"
+    },
+    {
+      "retailBrand": "Hiking",
+      "marketingName": "PAD_PRO_1",
+      "deviceCode": "PAD_PRO_1",
+      "modelCode": "PAD_PRO_1"
     },
     {
       "retailBrand": "Hiking",
@@ -63463,6 +63667,12 @@
     },
     {
       "retailBrand": "Honor",
+      "marketingName": "HONOR Magic9 Pro Max",
+      "deviceCode": "HNWKLX",
+      "modelCode": "WKL-N59"
+    },
+    {
+      "retailBrand": "Honor",
       "marketingName": "HONOR MagicPad2",
       "deviceCode": "HNROD2-Q",
       "modelCode": "ROD2-W09"
@@ -64267,9 +64477,21 @@
     },
     {
       "retailBrand": "Hosan",
+      "marketingName": "L62",
+      "deviceCode": "L62",
+      "modelCode": "L62"
+    },
+    {
+      "retailBrand": "Hosan",
       "marketingName": "L67",
       "deviceCode": "4G_Smart_Phone",
       "modelCode": "L67"
+    },
+    {
+      "retailBrand": "Hosan",
+      "marketingName": "L67W",
+      "deviceCode": "L67W",
+      "modelCode": "L67W"
     },
     {
       "retailBrand": "Hosoton",
@@ -64546,6 +64768,12 @@
       "marketingName": "Cyber 18",
       "deviceCode": "Cyber_18",
       "modelCode": "Cyber 18"
+    },
+    {
+      "retailBrand": "Hotwav",
+      "marketingName": "Cyber 19 Pro",
+      "deviceCode": "Cyber_19_Pro",
+      "modelCode": "Cyber 19 Pro"
     },
     {
       "retailBrand": "Hotwav",
@@ -74047,6 +74275,12 @@
     },
     {
       "retailBrand": "IZZI Telecom",
+      "marketingName": "B866V2FIX",
+      "deviceCode": "B866V2FIX",
+      "modelCode": "B866V2FIX"
+    },
+    {
+      "retailBrand": "IZZI Telecom",
       "marketingName": "HP2714",
       "deviceCode": "HPH65",
       "modelCode": "HP2714"
@@ -74086,6 +74320,12 @@
       "marketingName": "Portal_10i",
       "deviceCode": "Portal_10i",
       "modelCode": "NTMC17"
+    },
+    {
+      "retailBrand": "Ifinex",
+      "marketingName": "S26_Ultra_Max",
+      "deviceCode": "S26_Ultra_Max",
+      "modelCode": "S26 Ultra Max"
     },
     {
       "retailBrand": "IguanaPad",
@@ -80173,6 +80413,12 @@
     },
     {
       "retailBrand": "JUEDUR",
+      "marketingName": "R600_U",
+      "deviceCode": "R600_U",
+      "modelCode": "R600_U"
+    },
+    {
+      "retailBrand": "JUEDUR",
       "marketingName": "R700_EEA",
       "deviceCode": "R700_EEA",
       "modelCode": "R700_EEA"
@@ -82444,6 +82690,12 @@
       "marketingName": "Black_G_2",
       "deviceCode": "Black_G_2",
       "modelCode": "Black_G_2"
+    },
+    {
+      "retailBrand": "Kalley",
+      "marketingName": "Black_S2",
+      "deviceCode": "Black_S2",
+      "modelCode": "Black S2"
     },
     {
       "retailBrand": "Kalley",
@@ -86248,6 +86500,18 @@
       "marketingName": "X701",
       "deviceCode": "LEGEND_X701",
       "modelCode": "X701"
+    },
+    {
+      "retailBrand": "LENIX",
+      "marketingName": "LENIX MAX",
+      "deviceCode": "LENIX_MAX",
+      "modelCode": "H67A2"
+    },
+    {
+      "retailBrand": "LENIX",
+      "marketingName": "LENIX Pro",
+      "deviceCode": "LENIX_100_Pro",
+      "modelCode": "H67M1"
     },
     {
       "retailBrand": "LENIX",
@@ -92407,6 +92671,12 @@
     },
     {
       "retailBrand": "LOGIC",
+      "marketingName": "LOGIC_T10MW",
+      "deviceCode": "LOGIC_T10MW",
+      "modelCode": "T10MW"
+    },
+    {
+      "retailBrand": "LOGIC",
       "marketingName": "Logic L67 PRO MAX",
       "deviceCode": "Logic_L67_PRO_MAX",
       "modelCode": "Logic L67 PRO MAX"
@@ -92800,6 +93070,12 @@
       "marketingName": "LT_mobile_S40",
       "deviceCode": "LT_mobile_S40",
       "modelCode": "LT S40"
+    },
+    {
+      "retailBrand": "LT_Mobile",
+      "marketingName": "LT_mobile_S60",
+      "deviceCode": "LT_mobile_S60",
+      "modelCode": "LT S60"
     },
     {
       "retailBrand": "LUCOMS-T",
@@ -93829,6 +94105,12 @@
     },
     {
       "retailBrand": "Laser",
+      "marketingName": "MID-10A16B-404",
+      "deviceCode": "MID-10A16B-404",
+      "modelCode": "MID-10A16B-404"
+    },
+    {
+      "retailBrand": "Laser",
       "marketingName": "MID-787",
       "deviceCode": "MID-787",
       "modelCode": "MID-787"
@@ -94390,6 +94672,12 @@
       "marketingName": "Shark 2 5G",
       "deviceCode": "LXX528",
       "modelCode": "LAVA LXX528"
+    },
+    {
+      "retailBrand": "Lava",
+      "marketingName": "Shark 3 5G",
+      "deviceCode": "LXX532",
+      "modelCode": "LAVA LXX532"
     },
     {
       "retailBrand": "Lava",
@@ -102499,6 +102787,18 @@
     },
     {
       "retailBrand": "Mason",
+      "marketingName": "MDM250A",
+      "deviceCode": "MDM250A",
+      "modelCode": "MDM250"
+    },
+    {
+      "retailBrand": "Mason",
+      "marketingName": "MDM350A",
+      "deviceCode": "MDM350A",
+      "modelCode": "MDM350"
+    },
+    {
+      "retailBrand": "Mason",
       "marketingName": "MDQ300",
       "deviceCode": "MDQ300A",
       "modelCode": "MDQ300"
@@ -103258,6 +103558,18 @@
       "marketingName": "Gravity_7P",
       "deviceCode": "Gravity_7P",
       "modelCode": "Gravity_7P"
+    },
+    {
+      "retailBrand": "Maxwest",
+      "marketingName": "INFINITY F65",
+      "deviceCode": "MX-IN65MM",
+      "modelCode": "INFINITY F65"
+    },
+    {
+      "retailBrand": "Maxwest",
+      "marketingName": "INFINITY F67",
+      "deviceCode": "MX-IN67MM",
+      "modelCode": "INFINITY F67"
     },
     {
       "retailBrand": "Maxwest",
@@ -105373,6 +105685,12 @@
     },
     {
       "retailBrand": "Meswao",
+      "marketingName": "MES-B3Lite",
+      "deviceCode": "MES-B3Lite",
+      "modelCode": "MES-B3Lite"
+    },
+    {
+      "retailBrand": "Meswao",
       "marketingName": "MES-B4",
       "deviceCode": "MES-B4",
       "modelCode": "MES-B4"
@@ -107430,6 +107748,12 @@
       "modelCode": "MioPhone2017"
     },
     {
+      "retailBrand": "MiraTab",
+      "marketingName": "MT8",
+      "deviceCode": "MT8",
+      "modelCode": "MT8"
+    },
+    {
       "retailBrand": "Mirage",
       "marketingName": "43T",
       "deviceCode": "MI-JI-43T",
@@ -107586,6 +107910,12 @@
       "modelCode": "MITO A16"
     },
     {
+      "retailBrand": "Mivi",
+      "marketingName": "MVNOE",
+      "deviceCode": "MVNOE",
+      "modelCode": "MVNOE"
+    },
+    {
       "retailBrand": "MoT(Mobility Technologies)",
       "marketingName": "S22-8A",
       "deviceCode": "S22-8A",
@@ -107734,12 +108064,6 @@
       "marketingName": "F51",
       "deviceCode": "F51",
       "modelCode": "F51"
-    },
-    {
-      "retailBrand": "Mobicel",
-      "marketingName": "F51",
-      "deviceCode": "F51",
-      "modelCode": "F52"
     },
     {
       "retailBrand": "Mobicel",
@@ -108994,12 +109318,6 @@
       "marketingName": "H6682_VDC_TZ",
       "deviceCode": "H6682",
       "modelCode": "H6682_VDC_TZ"
-    },
-    {
-      "retailBrand": "Mobiwire",
-      "marketingName": "H67A1",
-      "deviceCode": "H67A1",
-      "modelCode": "H67A1"
     },
     {
       "retailBrand": "Mobiwire",
@@ -111541,6 +111859,12 @@
     },
     {
       "retailBrand": "Motorola",
+      "marketingName": "moto g37j",
+      "deviceCode": "sydney",
+      "modelCode": "moto g37j"
+    },
+    {
+      "retailBrand": "Motorola",
       "marketingName": "moto g40 fusion",
       "deviceCode": "hanoip",
       "modelCode": "moto g(40) fusion"
@@ -112159,9 +112483,9 @@
     },
     {
       "retailBrand": "Motorola",
-      "marketingName": "motorola signature",
-      "deviceCode": "vantage",
-      "modelCode": "motorola signature"
+      "marketingName": "motorola signature 27",
+      "deviceCode": "wukong",
+      "modelCode": "motorola signature 27"
     },
     {
       "retailBrand": "Motorola Solutions",
@@ -112396,6 +112720,18 @@
       "marketingName": "Telefonica ATV",
       "deviceCode": "vip5242a",
       "modelCode": "VIP5242A"
+    },
+    {
+      "retailBrand": "Movitel",
+      "marketingName": "M5941",
+      "deviceCode": "M5941",
+      "modelCode": "M5941"
+    },
+    {
+      "retailBrand": "Movitel",
+      "marketingName": "M5942",
+      "deviceCode": "M5942",
+      "modelCode": "M5942"
     },
     {
       "retailBrand": "Movitel",
@@ -114600,6 +114936,12 @@
       "modelCode": "P68"
     },
     {
+      "retailBrand": "NAVATAB",
+      "marketingName": "N18_Pro",
+      "deviceCode": "N18_Pro",
+      "modelCode": "N18 Pro"
+    },
+    {
       "retailBrand": "NAXA",
       "marketingName": "NID-7011",
       "deviceCode": "NID-7011",
@@ -115488,6 +115830,12 @@
       "modelCode": "Hi10_XPro"
     },
     {
+      "retailBrand": "NIS(NWTF)",
+      "marketingName": "TK-P617",
+      "deviceCode": "TK-P617",
+      "modelCode": "TK-P617"
+    },
+    {
       "retailBrand": "NOA Mobile",
       "marketingName": "Forte_se",
       "deviceCode": "Forte_se",
@@ -115582,6 +115930,12 @@
       "marketingName": "NV10",
       "deviceCode": "NV10",
       "modelCode": "NV10"
+    },
+    {
+      "retailBrand": "NOW Express",
+      "marketingName": "B866V6M1 Express",
+      "deviceCode": "B866V6M1_Express",
+      "modelCode": "B866V6M1 Express"
     },
     {
       "retailBrand": "NOWADA",
@@ -116740,6 +117094,12 @@
       "marketingName": "Newsday_N2+",
       "deviceCode": "Newsday_N2_",
       "modelCode": "Newsday_N2+"
+    },
+    {
+      "retailBrand": "Nexel",
+      "marketingName": "INFINITY_V2",
+      "deviceCode": "INFINITY_V2",
+      "modelCode": "INFINITY_V2"
     },
     {
       "retailBrand": "Nexel",
@@ -118195,6 +118555,12 @@
     },
     {
       "retailBrand": "Noryox",
+      "marketingName": "CommercialTerminal",
+      "deviceCode": "CommercialTerminal",
+      "modelCode": "CommercialTerminal"
+    },
+    {
+      "retailBrand": "Noryox",
       "marketingName": "Handheld-POS-EEA",
       "deviceCode": "Handheld-POS",
       "modelCode": "Handheld-POS"
@@ -118606,12 +118972,6 @@
       "marketingName": "N22",
       "deviceCode": "S6010LA",
       "modelCode": "S6010L"
-    },
-    {
-      "retailBrand": "Nuu",
-      "marketingName": "N22",
-      "deviceCode": "S6516LA",
-      "modelCode": "S6516L"
     },
     {
       "retailBrand": "Nuu",
@@ -119059,9 +119419,21 @@
     },
     {
       "retailBrand": "OKAPI",
+      "marketingName": "Okapi_Tab_18_Pro",
+      "deviceCode": "Okapi_Tab_18_Pro",
+      "modelCode": "Okapi_Tab_18_Pro"
+    },
+    {
+      "retailBrand": "OKAPI",
       "marketingName": "Tab10",
       "deviceCode": "Tab10",
       "modelCode": "Tab10"
+    },
+    {
+      "retailBrand": "OKING",
+      "marketingName": "OK17ProMax4G",
+      "deviceCode": "OK17ProMax4G",
+      "modelCode": "OK17ProMax4G"
     },
     {
       "retailBrand": "OKSI",
@@ -119224,6 +119596,12 @@
       "marketingName": "X700",
       "deviceCode": "X700",
       "modelCode": "X700"
+    },
+    {
+      "retailBrand": "OMMI",
+      "marketingName": "OMMI_A08",
+      "deviceCode": "OMMI_A08",
+      "modelCode": "OMMI_A08"
     },
     {
       "retailBrand": "OMMI",
@@ -120010,6 +120388,12 @@
       "marketingName": "Olternix_A11",
       "deviceCode": "Olternix_A11",
       "modelCode": "Olternix_A11"
+    },
+    {
+      "retailBrand": "Olternix",
+      "marketingName": "Olternix_A16",
+      "deviceCode": "Olternix_A16",
+      "modelCode": "Olternix_A16"
     },
     {
       "retailBrand": "Olvy",
@@ -122293,12 +122677,6 @@
     },
     {
       "retailBrand": "Oppo",
-      "marketingName": "A7 Pro 5G",
-      "deviceCode": "OP620BL1",
-      "modelCode": "PYE130"
-    },
-    {
-      "retailBrand": "Oppo",
       "marketingName": "A7 Pro Max 5G",
       "deviceCode": "OP6210L1",
       "modelCode": "CPH2909"
@@ -123550,6 +123928,12 @@
       "marketingName": "K15 Pro+",
       "deviceCode": "OP61E5L1",
       "modelCode": "PMG110"
+    },
+    {
+      "retailBrand": "Oppo",
+      "marketingName": "K15s",
+      "deviceCode": "OP620BL1",
+      "modelCode": "PYE130"
     },
     {
       "retailBrand": "Oppo",
@@ -124969,6 +125353,18 @@
     },
     {
       "retailBrand": "Oppo",
+      "marketingName": "Reno17",
+      "deviceCode": "OP65AFL1",
+      "modelCode": "PYK110"
+    },
+    {
+      "retailBrand": "Oppo",
+      "marketingName": "Reno17 Pro",
+      "deviceCode": "OP669FL1",
+      "modelCode": "PND110"
+    },
+    {
+      "retailBrand": "Oppo",
       "marketingName": "Reno2 Z",
       "deviceCode": "OP4B65L1",
       "modelCode": "CPH1945"
@@ -125416,6 +125812,18 @@
       "marketingName": "DV9651",
       "deviceCode": "DV9651-KPO",
       "modelCode": "DV9651"
+    },
+    {
+      "retailBrand": "Orange",
+      "marketingName": "DV9651-OFR",
+      "deviceCode": "DV9651-OFR",
+      "modelCode": "DV9651-OFR"
+    },
+    {
+      "retailBrand": "Orange",
+      "marketingName": "DV9651-OFRBYC",
+      "deviceCode": "DV9651-OFRBYC",
+      "modelCode": "DV9651-OFRBYC"
     },
     {
       "retailBrand": "Orange",
@@ -126121,12 +126529,6 @@
     },
     {
       "retailBrand": "Oukitel",
-      "marketingName": "C53",
-      "deviceCode": "C53",
-      "modelCode": "C53"
-    },
-    {
-      "retailBrand": "Oukitel",
       "marketingName": "C57_Pro_EEA",
       "deviceCode": "C57_Pro",
       "modelCode": "C57 Pro"
@@ -126322,6 +126724,18 @@
       "marketingName": "OT5_EEA",
       "deviceCode": "OT5",
       "modelCode": "OT5"
+    },
+    {
+      "retailBrand": "Oukitel",
+      "marketingName": "OT6_Air_Kids_ROW",
+      "deviceCode": "OT6_Air_Kids",
+      "modelCode": "OT6 Air Kids"
+    },
+    {
+      "retailBrand": "Oukitel",
+      "marketingName": "OT6_Air_ROW",
+      "deviceCode": "OT6_Air",
+      "modelCode": "OT6 Air"
     },
     {
       "retailBrand": "Oukitel",
@@ -127081,6 +127495,12 @@
     },
     {
       "retailBrand": "PAITANRY",
+      "marketingName": "Y85Pro",
+      "deviceCode": "Y85Pro",
+      "modelCode": "Y85Pro"
+    },
+    {
+      "retailBrand": "PAITANRY",
       "marketingName": "Y95",
       "deviceCode": "Y95",
       "modelCode": "Y95"
@@ -127798,6 +128218,12 @@
       "marketingName": "TP10A664",
       "deviceCode": "TP10A664",
       "modelCode": "TP10A664"
+    },
+    {
+      "retailBrand": "PHONELINETAB",
+      "marketingName": "F58-8inch",
+      "deviceCode": "F58-8inch",
+      "modelCode": "F58-8inch"
     },
     {
       "retailBrand": "PHYWE",
@@ -128686,6 +129112,12 @@
       "marketingName": "K726",
       "deviceCode": "K726",
       "modelCode": "K726"
+    },
+    {
+      "retailBrand": "PROTON",
+      "marketingName": "Dynamo",
+      "deviceCode": "Dynamo",
+      "modelCode": "Dynamo"
     },
     {
       "retailBrand": "PROTON",
@@ -130282,6 +130714,12 @@
       "marketingName": "IPHDCK16H",
       "deviceCode": "IPHDCK16H",
       "modelCode": "IPHDCK16H"
+    },
+    {
+      "retailBrand": "Pantas",
+      "marketingName": "H130101",
+      "deviceCode": "H130101",
+      "modelCode": "H130101"
     },
     {
       "retailBrand": "Pantech",
@@ -133084,12 +133522,6 @@
       "marketingName": "V45M",
       "deviceCode": "V45M",
       "modelCode": "CARBON_PRO4543"
-    },
-    {
-      "retailBrand": "Polaroid",
-      "marketingName": "V7",
-      "deviceCode": "nuclear-M7021",
-      "modelCode": "V7"
     },
     {
       "retailBrand": "Polaroid",
@@ -136260,16 +136692,22 @@
       "modelCode": "X6_Pro"
     },
     {
+      "retailBrand": "PrimeTab",
+      "marketingName": "PrimeTabP11",
+      "deviceCode": "PrimeTab",
+      "modelCode": "PrimeTabP11"
+    },
+    {
+      "retailBrand": "PrimeTab",
+      "marketingName": "PrimeTabP9",
+      "deviceCode": "PrimeTab",
+      "modelCode": "PrimeTabP9"
+    },
+    {
       "retailBrand": "Primebook",
       "marketingName": "PB1310",
       "deviceCode": "PB1310",
       "modelCode": "Primebook Duo Pro"
-    },
-    {
-      "retailBrand": "Primebook",
-      "marketingName": "PB1380",
-      "deviceCode": "PB1380",
-      "modelCode": "Primebook Duo Max"
     },
     {
       "retailBrand": "Primux",
@@ -138532,6 +138970,12 @@
       "marketingName": "RADDY_JANJA_PRO",
       "deviceCode": "RADDY_JANJA_PRO",
       "modelCode": "R-6502"
+    },
+    {
+      "retailBrand": "RADDY",
+      "marketingName": "Raddy_Aquamate",
+      "deviceCode": "Raddy_Aquamate",
+      "modelCode": "RADDY AQUAMATE"
     },
     {
       "retailBrand": "RAMTECHNOLOGY",
@@ -143233,12 +143677,6 @@
     },
     {
       "retailBrand": "RockTek",
-      "marketingName": "GT1",
-      "deviceCode": "RMQ",
-      "modelCode": "UHD Streaming STB"
-    },
-    {
-      "retailBrand": "RockTek",
       "marketingName": "RT-G1",
       "deviceCode": "RTBox",
       "modelCode": "RT-G1"
@@ -143569,6 +144007,18 @@
     },
     {
       "retailBrand": "Ruio",
+      "marketingName": "S5518",
+      "deviceCode": "S5518",
+      "modelCode": "S5518"
+    },
+    {
+      "retailBrand": "Ruio",
+      "marketingName": "S6209",
+      "deviceCode": "S6209",
+      "modelCode": "S6209"
+    },
+    {
+      "retailBrand": "Ruio",
       "marketingName": "S6506",
       "deviceCode": "S6506",
       "modelCode": "S6506"
@@ -143623,9 +144073,27 @@
     },
     {
       "retailBrand": "Ruio",
+      "marketingName": "S6605",
+      "deviceCode": "S6712",
+      "modelCode": "S6605"
+    },
+    {
+      "retailBrand": "Ruio",
       "marketingName": "S6705",
       "deviceCode": "S6705",
       "modelCode": "S6705"
+    },
+    {
+      "retailBrand": "Ruio",
+      "marketingName": "S6709M",
+      "deviceCode": "S6709M",
+      "modelCode": "S6709M"
+    },
+    {
+      "retailBrand": "Ruio",
+      "marketingName": "S6901",
+      "deviceCode": "S6901",
+      "modelCode": "S6901"
     },
     {
       "retailBrand": "Ruio",
@@ -144154,6 +144622,12 @@
       "marketingName": "Smart 20 GO",
       "deviceCode": "Smart_20_GO",
       "modelCode": "Smart 20 GO"
+    },
+    {
+      "retailBrand": "SEGO",
+      "marketingName": "Smart20_Pro_Max",
+      "deviceCode": "Smart20_Pro_Max",
+      "modelCode": "Smart20 Pro Max"
     },
     {
       "retailBrand": "SEGO",
@@ -163627,6 +164101,12 @@
     },
     {
       "retailBrand": "Samsung",
+      "marketingName": "心系天下 三星 W27",
+      "deviceCode": "q8q",
+      "modelCode": "SM-W9027"
+    },
+    {
+      "retailBrand": "Samsung",
       "marketingName": "领世旗舰8",
       "deviceCode": "venenoltechn",
       "modelCode": "SM-G9298"
@@ -164479,7 +164959,7 @@
     },
     {
       "retailBrand": "Sharp",
-      "marketingName": "4T-**S7A/X7A",
+      "marketingName": "4T-**S7A/X7A/X5A, 4T-48S9A",
       "deviceCode": "tcmar3uj",
       "modelCode": "AQUOS-4KTVJ26-2"
     },
@@ -164551,13 +165031,13 @@
     },
     {
       "retailBrand": "Sharp",
-      "marketingName": "4T-C**HP1/HS1/HQ1/HV1",
+      "marketingName": "4T-C**HP1/HS1/HQ1/HV1, 4T-C65HN2, 4T-65L51A",
       "deviceCode": "tcmar2uj",
       "modelCode": "AQUOS-4KTVJ25-1"
     },
     {
       "retailBrand": "Sharp",
-      "marketingName": "4T-C**HP2/HQ2/HN2",
+      "marketingName": "4T-C**HP2/HQ2/HN2, 4T-**L51A",
       "deviceCode": "tcmar2uj",
       "modelCode": "AQUOS-4KTVJ25-2"
     },
@@ -173989,6 +174469,12 @@
     },
     {
       "retailBrand": "Stylo",
+      "marketingName": "Jaguar",
+      "deviceCode": "Jaguar",
+      "modelCode": "Jaguar"
+    },
+    {
+      "retailBrand": "Stylo",
       "marketingName": "Jupiter",
       "deviceCode": "DQR22",
       "modelCode": "DQR22"
@@ -174822,6 +175308,12 @@
       "modelCode": "V3_PLUS"
     },
     {
+      "retailBrand": "Sunmi",
+      "marketingName": "V3_A16",
+      "deviceCode": "V3_A16",
+      "modelCode": "V3_A16"
+    },
+    {
       "retailBrand": "Sunny",
       "marketingName": "SN01DNGL300",
       "deviceCode": "YQB",
@@ -175225,9 +175717,21 @@
     },
     {
       "retailBrand": "Symphony",
+      "marketingName": "MAX 20",
+      "deviceCode": "MAX_20",
+      "modelCode": "MAX 20"
+    },
+    {
+      "retailBrand": "Symphony",
       "marketingName": "MAX 30",
       "deviceCode": "MAX_30",
       "modelCode": "MAX 30"
+    },
+    {
+      "retailBrand": "Symphony",
+      "marketingName": "MAX_50",
+      "deviceCode": "MAX_50",
+      "modelCode": "MAX 50"
     },
     {
       "retailBrand": "Symphony",
@@ -181837,6 +182341,12 @@
     },
     {
       "retailBrand": "TCT (Alcatel)",
+      "marketingName": "Alcatel A83 5G",
+      "deviceCode": "Primrose",
+      "modelCode": "A801M"
+    },
+    {
+      "retailBrand": "TCT (Alcatel)",
       "marketingName": "Alcatel AXEL™",
       "deviceCode": "Dubai_Plus_ATT",
       "modelCode": "Alcatel_5004R"
@@ -185508,6 +186018,12 @@
       "modelCode": "Telecentro 4K S2"
     },
     {
+      "retailBrand": "TPLAY",
+      "marketingName": "Telecentro 4K Z1",
+      "deviceCode": "B866V6NT_Telecentro",
+      "modelCode": "Telecentro 4K Z1"
+    },
+    {
       "retailBrand": "TPS",
       "marketingName": "ALTAB08",
       "deviceCode": "ALTAB08",
@@ -186076,6 +186592,12 @@
       "marketingName": "Teachmint_XC",
       "deviceCode": "Teachmint_XC",
       "modelCode": "Teachmint_XC"
+    },
+    {
+      "retailBrand": "Teachmint_X",
+      "marketingName": "Teachmint_X_L",
+      "deviceCode": "Teachmint_X_L",
+      "modelCode": "Teachmint_X_L"
     },
     {
       "retailBrand": "Tech 4u",
@@ -186673,6 +187195,12 @@
     },
     {
       "retailBrand": "Teclast",
+      "marketingName": "M60_B_ROW",
+      "deviceCode": "M60_B_ROW",
+      "modelCode": "M60_B_ROW"
+    },
+    {
+      "retailBrand": "Teclast",
       "marketingName": "M60_ROW",
       "deviceCode": "M60",
       "modelCode": "M60_ROW"
@@ -187012,6 +187540,12 @@
       "marketingName": "P50_ROW",
       "deviceCode": "P50",
       "modelCode": "P50_ROW"
+    },
+    {
+      "retailBrand": "Teclast",
+      "marketingName": "P50_YB_EEA",
+      "deviceCode": "P50_YB",
+      "modelCode": "P50_YB"
     },
     {
       "retailBrand": "Teclast",
@@ -188800,6 +189334,12 @@
       "marketingName": "TECNO CAMON 50 Pro",
       "deviceCode": "TECNO-CN5c",
       "modelCode": "TECNO CN5c"
+    },
+    {
+      "retailBrand": "Tecno",
+      "marketingName": "TECNO CAMON Slim 5G",
+      "deviceCode": "TECNO-CN6",
+      "modelCode": "TECNO CN6"
     },
     {
       "retailBrand": "Tecno",
@@ -207241,6 +207781,12 @@
     },
     {
       "retailBrand": "XGIMI",
+      "marketingName": "Elfin Flip Pro",
+      "deviceCode": "meghamalai",
+      "modelCode": "WM04R"
+    },
+    {
+      "retailBrand": "XGIMI",
       "marketingName": "HORIZON 20",
       "deviceCode": "kasol",
       "modelCode": "XR13A"
@@ -207433,9 +207979,21 @@
     },
     {
       "retailBrand": "XREAL",
+      "marketingName": "Aura",
+      "deviceCode": "axrpuck",
+      "modelCode": "Android XR Puck"
+    },
+    {
+      "retailBrand": "XREAL",
       "marketingName": "Beam Pro",
       "deviceCode": "X4000",
       "modelCode": "X4000"
+    },
+    {
+      "retailBrand": "XRZ(sz)",
+      "marketingName": "XRZPro_EEA",
+      "deviceCode": "Smartphone",
+      "modelCode": "XRZ"
     },
     {
       "retailBrand": "XTRA",
@@ -209466,6 +210024,12 @@
       "modelCode": "KT-755M"
     },
     {
+      "retailBrand": "XuanPad",
+      "marketingName": "RD-811",
+      "deviceCode": "coorg",
+      "modelCode": "RD-811"
+    },
+    {
       "retailBrand": "Xwave",
       "marketingName": "Xpad",
       "deviceCode": "Xpad",
@@ -210595,6 +211159,18 @@
     },
     {
       "retailBrand": "ZIOVO",
+      "marketingName": "Z138_U_US",
+      "deviceCode": "Z138_U_US",
+      "modelCode": "Z138_U"
+    },
+    {
+      "retailBrand": "ZIOVO",
+      "marketingName": "Z138_U_US",
+      "deviceCode": "Z138_U_US",
+      "modelCode": "Z138_U_US"
+    },
+    {
+      "retailBrand": "ZIOVO",
       "marketingName": "Z138_V_EEA",
       "deviceCode": "Z138_V_EEA",
       "modelCode": "Z138_V_EEA"
@@ -210754,6 +211330,18 @@
       "marketingName": "ZM10_EEA",
       "deviceCode": "ZM10",
       "modelCode": "ZM10"
+    },
+    {
+      "retailBrand": "ZOOMSMART",
+      "marketingName": "ZM600",
+      "deviceCode": "ZM600",
+      "modelCode": "ZM600"
+    },
+    {
+      "retailBrand": "ZTAP",
+      "marketingName": "S00754",
+      "deviceCode": "S00754",
+      "modelCode": "S00754"
     },
     {
       "retailBrand": "ZTE",
@@ -219805,15 +220393,15 @@
     },
     {
       "retailBrand": "Zuum",
-      "marketingName": "MAGNO_P4",
-      "deviceCode": "MAGNO_P4",
-      "modelCode": "MAGNO P4"
-    },
-    {
-      "retailBrand": "Zuum",
       "marketingName": "MAGNO_R_II",
       "deviceCode": "MAGNO_R_II",
       "modelCode": "MAGNO R II"
+    },
+    {
+      "retailBrand": "Zuum",
+      "marketingName": "MAGNO_Z",
+      "deviceCode": "MAGNO_Z",
+      "modelCode": "MAGNO Z"
     },
     {
       "retailBrand": "Zuum",
@@ -220824,6 +221412,12 @@
       "modelCode": "TAE10N13"
     },
     {
+      "retailBrand": "eNOVA",
+      "marketingName": "TAE10N14",
+      "deviceCode": "TAE10N14",
+      "modelCode": "TAE10N14"
+    },
+    {
       "retailBrand": "eSSL",
       "marketingName": "Emerald",
       "deviceCode": "Emerald",
@@ -220956,6 +221550,12 @@
       "modelCode": "edu-africa2026_ROW"
     },
     {
+      "retailBrand": "edu-africa",
+      "marketingName": "eduafrica2026",
+      "deviceCode": "eduafrica2026",
+      "modelCode": "edu-africa2026"
+    },
+    {
       "retailBrand": "elevn",
       "marketingName": "elevn_eTab",
       "deviceCode": "elevn_eTab",
@@ -220984,6 +221584,12 @@
       "marketingName": "F10_US",
       "deviceCode": "F10_US",
       "modelCode": "F10_US"
+    },
+    {
+      "retailBrand": "fezawio",
+      "marketingName": "F11_C",
+      "deviceCode": "F11_C",
+      "modelCode": "F11_C"
     },
     {
       "retailBrand": "fezawio",
@@ -222949,6 +223555,12 @@
     },
     {
       "retailBrand": "iMuz",
+      "marketingName": "IM-S291",
+      "deviceCode": "IM-S291",
+      "modelCode": "IM-S291"
+    },
+    {
+      "retailBrand": "iMuz",
       "marketingName": "IM-S881",
       "deviceCode": "IM-S881",
       "modelCode": "IM-S881"
@@ -223246,6 +223858,12 @@
       "marketingName": "iQOO Z11x 5G",
       "deviceCode": "I2507",
       "modelCode": "I2507"
+    },
+    {
+      "retailBrand": "iQOO",
+      "marketingName": "iQOO Z12 Lite 5G",
+      "deviceCode": "I2510",
+      "modelCode": "I2516"
     },
     {
       "retailBrand": "iQOO",
@@ -223938,6 +224556,12 @@
       "modelCode": "TK807"
     },
     {
+      "retailBrand": "momentplus",
+      "marketingName": "PAD001",
+      "deviceCode": "PAD001",
+      "modelCode": "PAD001"
+    },
+    {
       "retailBrand": "myBoard",
       "marketingName": "myBoard_Horizon",
       "deviceCode": "myBoard_Horizon",
@@ -224263,6 +224887,12 @@
     },
     {
       "retailBrand": "onn.",
+      "marketingName": "PM116A",
+      "deviceCode": "PM116A",
+      "modelCode": "PM116A"
+    },
+    {
+      "retailBrand": "onn.",
       "marketingName": "PM116T",
       "deviceCode": "PM116T",
       "modelCode": "PM116T"
@@ -224287,6 +224917,12 @@
     },
     {
       "retailBrand": "onn.",
+      "marketingName": "PM876A",
+      "deviceCode": "PM876A",
+      "modelCode": "PM876A"
+    },
+    {
+      "retailBrand": "onn.",
       "marketingName": "PM876T",
       "deviceCode": "PM876T",
       "modelCode": "PM876T"
@@ -224296,6 +224932,12 @@
       "marketingName": "PP86AK",
       "deviceCode": "PP86AK",
       "modelCode": "PP86AK"
+    },
+    {
+      "retailBrand": "onn.",
+      "marketingName": "PP88AK",
+      "deviceCode": "PP88AK",
+      "modelCode": "PP88AK"
     },
     {
       "retailBrand": "onn.",
@@ -226411,6 +227053,12 @@
     },
     {
       "retailBrand": "vivo",
+      "marketingName": "T6 Lite 5G",
+      "deviceCode": "V2553",
+      "modelCode": "V2667"
+    },
+    {
+      "retailBrand": "vivo",
       "marketingName": "V60",
       "deviceCode": "V2511",
       "modelCode": "V2511"
@@ -226771,6 +227419,12 @@
     },
     {
       "retailBrand": "vivo",
+      "marketingName": "Y11s 5G",
+      "deviceCode": "V2553",
+      "modelCode": "V2669"
+    },
+    {
+      "retailBrand": "vivo",
       "marketingName": "Y19s 5G",
       "deviceCode": "V2446",
       "modelCode": "V2541"
@@ -226810,6 +227464,12 @@
       "marketingName": "Y21d",
       "deviceCode": "V2520",
       "modelCode": "V2560"
+    },
+    {
+      "retailBrand": "vivo",
+      "marketingName": "Y21s 5G",
+      "deviceCode": "V2553",
+      "modelCode": "V2670"
     },
     {
       "retailBrand": "vivo",
@@ -229099,6 +229759,11 @@
         },
         {
           "retailBrand": "Pritom",
+          "marketingName": "M10_B09_US",
+          "deviceCode": "M10_B09_US"
+        },
+        {
+          "retailBrand": "Pritom",
           "marketingName": "M10_B10",
           "deviceCode": "M10_B10"
         },
@@ -229256,6 +229921,11 @@
           "retailBrand": "Pritom",
           "marketingName": "M10_C12_USA",
           "deviceCode": "M10_C12_USA"
+        },
+        {
+          "retailBrand": "Pritom",
+          "marketingName": "M10_C13",
+          "deviceCode": "M10_C13"
         },
         {
           "retailBrand": "Pritom",
@@ -230214,6 +230884,11 @@
         },
         {
           "retailBrand": "ATMPC",
+          "marketingName": "IT_801BA9",
+          "deviceCode": "IT_801BA9"
+        },
+        {
+          "retailBrand": "ATMPC",
           "marketingName": "IT_801BA9_EEA",
           "deviceCode": "IT_801BA9_EEA"
         }
@@ -231078,6 +231753,11 @@
           "deviceCode": "A60"
         },
         {
+          "retailBrand": "Cubot",
+          "marketingName": "A60",
+          "deviceCode": "A60"
+        },
+        {
           "retailBrand": "Gloria",
           "marketingName": "A60",
           "deviceCode": "gloria_A60"
@@ -231810,6 +232490,21 @@
       ]
     },
     {
+      "modelCode": "KB1001T",
+      "variants": [
+        {
+          "retailBrand": "Ainmel",
+          "marketingName": "KB1001T_G",
+          "deviceCode": "KB1001T"
+        },
+        {
+          "retailBrand": "Ainmel",
+          "marketingName": "KB1001T_US",
+          "deviceCode": "KB1001T"
+        }
+      ]
+    },
+    {
       "modelCode": "KB1004",
       "variants": [
         {
@@ -232500,6 +233195,21 @@
       ]
     },
     {
+      "modelCode": "PRO_MAX_16",
+      "variants": [
+        {
+          "retailBrand": "AngelTech",
+          "marketingName": "PRO_MAX_16",
+          "deviceCode": "PRO_MAX_16"
+        },
+        {
+          "retailBrand": "AngelTech",
+          "marketingName": "PRO_MAX_16_EEA",
+          "deviceCode": "PRO_MAX_16"
+        }
+      ]
+    },
+    {
       "modelCode": "ASP320Q_ANDi",
       "variants": [
         {
@@ -232621,6 +233331,71 @@
           "retailBrand": "Workmate",
           "marketingName": "U13",
           "deviceCode": "U13"
+        }
+      ]
+    },
+    {
+      "modelCode": "S2",
+      "variants": [
+        {
+          "retailBrand": "Anyreal",
+          "marketingName": "S2",
+          "deviceCode": "S2"
+        },
+        {
+          "retailBrand": "Bluboo",
+          "marketingName": "S2",
+          "deviceCode": "S2"
+        },
+        {
+          "retailBrand": "Cellecor",
+          "marketingName": "S2",
+          "deviceCode": "S2"
+        },
+        {
+          "retailBrand": "FOSSiBOT",
+          "marketingName": "S2",
+          "deviceCode": "FOSSiBOT_S2"
+        },
+        {
+          "retailBrand": "Helio",
+          "marketingName": "S2",
+          "deviceCode": "WBL7519SY"
+        },
+        {
+          "retailBrand": "Kyocera",
+          "marketingName": "Android One S2",
+          "deviceCode": "S2_sprout"
+        },
+        {
+          "retailBrand": "Lenovo",
+          "marketingName": "S2",
+          "deviceCode": "S2"
+        },
+        {
+          "retailBrand": "Lexia Mobile",
+          "marketingName": "S2",
+          "deviceCode": "S2"
+        },
+        {
+          "retailBrand": "MAXHUB",
+          "marketingName": "S2",
+          "deviceCode": "S2"
+        },
+        {
+          "retailBrand": "MyFon",
+          "marketingName": "S2",
+          "deviceCode": "S2"
+        },
+        {
+          "retailBrand": "Smooth",
+          "marketingName": "S2",
+          "deviceCode": "S2"
+        },
+        {
+          "retailBrand": "Xstar",
+          "marketingName": "S2",
+          "deviceCode": "S2"
         }
       ]
     },
@@ -234991,6 +235766,11 @@
           "retailBrand": "Pritom",
           "marketingName": "L10_001_USA",
           "deviceCode": "L10_001"
+        },
+        {
+          "retailBrand": "Pritom",
+          "marketingName": "L10_005",
+          "deviceCode": "L10_005"
         },
         {
           "retailBrand": "Pritom",
@@ -237615,6 +238395,31 @@
       ]
     },
     {
+      "modelCode": "K3",
+      "variants": [
+        {
+          "retailBrand": "Blu",
+          "marketingName": "K3",
+          "deviceCode": "K0270"
+        },
+        {
+          "retailBrand": "KOOLNEE",
+          "marketingName": "K3",
+          "deviceCode": "K3"
+        },
+        {
+          "retailBrand": "Oukitel",
+          "marketingName": "Coosea",
+          "deviceCode": "K3"
+        },
+        {
+          "retailBrand": "Oukitel",
+          "marketingName": "K3",
+          "deviceCode": "K3"
+        }
+      ]
+    },
+    {
       "modelCode": "M6",
       "variants": [
         {
@@ -237966,66 +238771,6 @@
           "retailBrand": "SGIN",
           "marketingName": "C8",
           "deviceCode": "C8"
-        }
-      ]
-    },
-    {
-      "modelCode": "S2",
-      "variants": [
-        {
-          "retailBrand": "Bluboo",
-          "marketingName": "S2",
-          "deviceCode": "S2"
-        },
-        {
-          "retailBrand": "Cellecor",
-          "marketingName": "S2",
-          "deviceCode": "S2"
-        },
-        {
-          "retailBrand": "FOSSiBOT",
-          "marketingName": "S2",
-          "deviceCode": "FOSSiBOT_S2"
-        },
-        {
-          "retailBrand": "Helio",
-          "marketingName": "S2",
-          "deviceCode": "WBL7519SY"
-        },
-        {
-          "retailBrand": "Kyocera",
-          "marketingName": "Android One S2",
-          "deviceCode": "S2_sprout"
-        },
-        {
-          "retailBrand": "Lenovo",
-          "marketingName": "S2",
-          "deviceCode": "S2"
-        },
-        {
-          "retailBrand": "Lexia Mobile",
-          "marketingName": "S2",
-          "deviceCode": "S2"
-        },
-        {
-          "retailBrand": "MAXHUB",
-          "marketingName": "S2",
-          "deviceCode": "S2"
-        },
-        {
-          "retailBrand": "MyFon",
-          "marketingName": "S2",
-          "deviceCode": "S2"
-        },
-        {
-          "retailBrand": "Smooth",
-          "marketingName": "S2",
-          "deviceCode": "S2"
-        },
-        {
-          "retailBrand": "Xstar",
-          "marketingName": "S2",
-          "deviceCode": "S2"
         }
       ]
     },
@@ -238798,6 +239543,11 @@
           "deviceCode": "E30"
         },
         {
+          "retailBrand": "Gevo",
+          "marketingName": "E30",
+          "deviceCode": "E30"
+        },
+        {
           "retailBrand": "Inhon",
           "marketingName": "E30",
           "deviceCode": "E30"
@@ -238976,6 +239726,21 @@
           "retailBrand": "Techpad",
           "marketingName": "R10",
           "deviceCode": "R10"
+        }
+      ]
+    },
+    {
+      "modelCode": "P98",
+      "variants": [
+        {
+          "retailBrand": "CORN",
+          "marketingName": "T12Pro",
+          "deviceCode": "T12Pro"
+        },
+        {
+          "retailBrand": "TPS",
+          "marketingName": "SZTPS",
+          "deviceCode": "A101"
         }
       ]
     },
@@ -239311,6 +240076,11 @@
           "retailBrand": "Teclast",
           "marketingName": "P30_ROW",
           "deviceCode": "P30_B"
+        },
+        {
+          "retailBrand": "edu-africa",
+          "marketingName": "eduafrica2026",
+          "deviceCode": "eduafrica2026"
         }
       ]
     },
@@ -241450,6 +242220,41 @@
       ]
     },
     {
+      "modelCode": "X50",
+      "variants": [
+        {
+          "retailBrand": "Cubot",
+          "marketingName": "X50",
+          "deviceCode": "X50"
+        },
+        {
+          "retailBrand": "Doogee",
+          "marketingName": "X50",
+          "deviceCode": "X50"
+        },
+        {
+          "retailBrand": "Huion",
+          "marketingName": "Huion_Note_E_US",
+          "deviceCode": "Huion_Note_E"
+        },
+        {
+          "retailBrand": "Lava",
+          "marketingName": "X50",
+          "deviceCode": "X50"
+        },
+        {
+          "retailBrand": "Winmax",
+          "marketingName": "X50",
+          "deviceCode": "X50"
+        },
+        {
+          "retailBrand": "shoudum",
+          "marketingName": "X50",
+          "deviceCode": "X50"
+        }
+      ]
+    },
+    {
       "modelCode": "X70",
       "variants": [
         {
@@ -243178,6 +243983,11 @@
           "deviceCode": "M23"
         },
         {
+          "retailBrand": "Gevo",
+          "marketingName": "V30",
+          "deviceCode": "V30"
+        },
+        {
           "retailBrand": "Trecfone",
           "marketingName": "V30",
           "deviceCode": "V30"
@@ -243680,6 +244490,11 @@
         {
           "retailBrand": "ECOPAD",
           "marketingName": "A30Pro_A_EEA",
+          "deviceCode": "A30Pro_A"
+        },
+        {
+          "retailBrand": "ECOPAD",
+          "marketingName": "A30Pro_A_US",
           "deviceCode": "A30Pro_A"
         }
       ]
@@ -246940,6 +247755,21 @@
       ]
     },
     {
+      "modelCode": "S6516L",
+      "variants": [
+        {
+          "retailBrand": "GoMo",
+          "marketingName": "GoMo N22",
+          "deviceCode": "S6516LA"
+        },
+        {
+          "retailBrand": "Nuu",
+          "marketingName": "N22",
+          "deviceCode": "S6516LA"
+        }
+      ]
+    },
+    {
       "modelCode": "S6518L",
       "variants": [
         {
@@ -246951,6 +247781,21 @@
           "retailBrand": "Nuu",
           "marketingName": "N22",
           "deviceCode": "S6518LA"
+        }
+      ]
+    },
+    {
+      "modelCode": "S6712L",
+      "variants": [
+        {
+          "retailBrand": "GoMo",
+          "marketingName": "S6712L",
+          "deviceCode": "S6712LA"
+        },
+        {
+          "retailBrand": "Nuu",
+          "marketingName": "N22",
+          "deviceCode": "S6712LA"
         }
       ]
     },
@@ -247671,6 +248516,11 @@
           "retailBrand": "Relndoo",
           "marketingName": "TB02_US",
           "deviceCode": "TB02_US"
+        },
+        {
+          "retailBrand": "Relndoo",
+          "marketingName": "TB02_Y_US",
+          "deviceCode": "TB02_Y_US"
         }
       ]
     },
@@ -253346,6 +254196,11 @@
           "retailBrand": "Hyundai",
           "marketingName": "HT10WC1MSG03",
           "deviceCode": "HT10WC1MSG03"
+        },
+        {
+          "retailBrand": "Hyundai",
+          "marketingName": "HT10WC1MSG03_US",
+          "deviceCode": "HT10WC1MSG03_US"
         }
       ]
     },
@@ -255411,26 +256266,6 @@
           "retailBrand": "Unnion Technologies",
           "marketingName": "Unnion SP10",
           "deviceCode": "SP10"
-        }
-      ]
-    },
-    {
-      "modelCode": "K3",
-      "variants": [
-        {
-          "retailBrand": "KOOLNEE",
-          "marketingName": "K3",
-          "deviceCode": "K3"
-        },
-        {
-          "retailBrand": "Oukitel",
-          "marketingName": "Coosea",
-          "deviceCode": "K3"
-        },
-        {
-          "retailBrand": "Oukitel",
-          "marketingName": "K3",
-          "deviceCode": "K3"
         }
       ]
     },
@@ -258965,6 +259800,51 @@
       ]
     },
     {
+      "modelCode": "POWER_1",
+      "variants": [
+        {
+          "retailBrand": "M-Horse",
+          "marketingName": "POWER_1",
+          "deviceCode": "POWER_1"
+        },
+        {
+          "retailBrand": "M-Horse",
+          "marketingName": "POWER_1_EEA",
+          "deviceCode": "POWER_1"
+        },
+        {
+          "retailBrand": "M-Horse",
+          "marketingName": "POWER_1_RU",
+          "deviceCode": "POWER_1"
+        },
+        {
+          "retailBrand": "M-Horse",
+          "marketingName": "POWER_1_US",
+          "deviceCode": "POWER_1"
+        }
+      ]
+    },
+    {
+      "modelCode": "POWER_1_Max",
+      "variants": [
+        {
+          "retailBrand": "M-Horse",
+          "marketingName": "POWER_1_Max",
+          "deviceCode": "POWER_1_Max"
+        },
+        {
+          "retailBrand": "M-Horse",
+          "marketingName": "POWER_1_Max_RU",
+          "deviceCode": "POWER_1_Max"
+        },
+        {
+          "retailBrand": "M-Horse",
+          "marketingName": "POWER_1_Max_US",
+          "deviceCode": "POWER_1_Max"
+        }
+      ]
+    },
+    {
       "modelCode": "Pad_17",
       "variants": [
         {
@@ -259226,6 +260106,11 @@
           "retailBrand": "MTN",
           "marketingName": "5.99",
           "deviceCode": "H6032_MTN"
+        },
+        {
+          "retailBrand": "Mobiwire",
+          "marketingName": "GH6032",
+          "deviceCode": "GH6032"
         },
         {
           "retailBrand": "Mobiwire",
@@ -259860,6 +260745,26 @@
       ]
     },
     {
+      "modelCode": "F52",
+      "variants": [
+        {
+          "retailBrand": "Mobicel",
+          "marketingName": "F51",
+          "deviceCode": "F51"
+        },
+        {
+          "retailBrand": "Mobicel",
+          "marketingName": "F52VR",
+          "deviceCode": "F52VR"
+        },
+        {
+          "retailBrand": "Mobicel",
+          "marketingName": "F52VS",
+          "deviceCode": "F52VS"
+        }
+      ]
+    },
+    {
       "modelCode": "P11 Plus",
       "variants": [
         {
@@ -259999,6 +260904,11 @@
       "variants": [
         {
           "retailBrand": "Mobiwire",
+          "marketingName": "H6032",
+          "deviceCode": "H6032"
+        },
+        {
+          "retailBrand": "Mobiwire",
           "marketingName": "H6033",
           "deviceCode": "H6032"
         },
@@ -260026,6 +260936,26 @@
           "retailBrand": "Mobiwire",
           "marketingName": "MTN",
           "deviceCode": "GH6733_Pro"
+        },
+        {
+          "retailBrand": "Mobiwire",
+          "marketingName": "Rodiall",
+          "deviceCode": "H6733Pro"
+        }
+      ]
+    },
+    {
+      "modelCode": "H67A1",
+      "variants": [
+        {
+          "retailBrand": "Mobiwire",
+          "marketingName": "H67A1",
+          "deviceCode": "H67A1"
+        },
+        {
+          "retailBrand": "Mobiwire",
+          "marketingName": "Rodiall Pro",
+          "deviceCode": "GH67A1"
         }
       ]
     },
@@ -260086,6 +261016,31 @@
           "retailBrand": "Nextel",
           "marketingName": "V.45",
           "deviceCode": "H26-VSN"
+        }
+      ]
+    },
+    {
+      "modelCode": "V7",
+      "variants": [
+        {
+          "retailBrand": "Morep",
+          "marketingName": "Morep_V7G",
+          "deviceCode": "V7G"
+        },
+        {
+          "retailBrand": "Polaroid",
+          "marketingName": "V7",
+          "deviceCode": "nuclear-M7021"
+        },
+        {
+          "retailBrand": "SparX",
+          "marketingName": "V7",
+          "deviceCode": "Sparx_V7"
+        },
+        {
+          "retailBrand": "TOPELOTEK",
+          "marketingName": "V7",
+          "deviceCode": "V7"
         }
       ]
     },
@@ -262291,6 +263246,21 @@
           "retailBrand": "Motorola",
           "marketingName": "motorola razr plus 2025",
           "deviceCode": "arcfox"
+        }
+      ]
+    },
+    {
+      "modelCode": "motorola signature",
+      "variants": [
+        {
+          "retailBrand": "Motorola",
+          "marketingName": "motorola signature",
+          "deviceCode": "vantage"
+        },
+        {
+          "retailBrand": "Motorola",
+          "marketingName": "motorola signature 27",
+          "deviceCode": "wukong"
         }
       ]
     },
@@ -266515,6 +267485,21 @@
       ]
     },
     {
+      "modelCode": "Primebook Duo Max",
+      "variants": [
+        {
+          "retailBrand": "Primebook",
+          "marketingName": "PB1380",
+          "deviceCode": "PB1380"
+        },
+        {
+          "retailBrand": "Primebook",
+          "marketingName": "PB1380_US",
+          "deviceCode": "PB1380"
+        }
+      ]
+    },
+    {
       "modelCode": "TOUCH 7",
       "variants": [
         {
@@ -267646,6 +268631,21 @@
           "retailBrand": "Rhino",
           "marketingName": "RHINO PACE A1",
           "deviceCode": "portal"
+        }
+      ]
+    },
+    {
+      "modelCode": "UHD Streaming STB",
+      "variants": [
+        {
+          "retailBrand": "RockTek",
+          "marketingName": "GT1",
+          "deviceCode": "RMQ"
+        },
+        {
+          "retailBrand": "Strong",
+          "marketingName": "LEAP-S4",
+          "deviceCode": "DAD"
         }
       ]
     },
@@ -273204,6 +274204,11 @@
       "variants": [
         {
           "retailBrand": "Teclast",
+          "marketingName": "P50T_BC_ROW",
+          "deviceCode": "P50T_BC_ROW"
+        },
+        {
+          "retailBrand": "Teclast",
           "marketingName": "P50T_Y_EEA",
           "deviceCode": "P50T_Y"
         },
@@ -274681,6 +275686,21 @@
           "retailBrand": "URAO",
           "marketingName": "X107_EEA",
           "deviceCode": "X107"
+        }
+      ]
+    },
+    {
+      "modelCode": "X108K",
+      "variants": [
+        {
+          "retailBrand": "URAO",
+          "marketingName": "X108K_EEA",
+          "deviceCode": "X108K"
+        },
+        {
+          "retailBrand": "URAO",
+          "marketingName": "X108K_G",
+          "deviceCode": "X108K"
         }
       ]
     },
@@ -278291,6 +279311,26 @@
           "retailBrand": "XPPen",
           "marketingName": "XPPen_Magic_Drawing_Pad_RU",
           "deviceCode": "Titan_XPPen"
+        }
+      ]
+    },
+    {
+      "modelCode": "XRZDual2",
+      "variants": [
+        {
+          "retailBrand": "XRZDual2",
+          "marketingName": "XRZDual2_A16_EEA",
+          "deviceCode": "XRZDual2_A16"
+        },
+        {
+          "retailBrand": "XRZDual2",
+          "marketingName": "XRZDual2_A16_NEU",
+          "deviceCode": "XRZDual2_A16"
+        },
+        {
+          "retailBrand": "XRZDual2",
+          "marketingName": "XRZDual2_A16_US",
+          "deviceCode": "XRZDual2_A16"
         }
       ]
     },
@@ -281950,6 +282990,21 @@
       ]
     },
     {
+      "modelCode": "MAGNO P4",
+      "variants": [
+        {
+          "retailBrand": "Zuum",
+          "marketingName": "MAGNO P4",
+          "deviceCode": "MAGNO_P4_I"
+        },
+        {
+          "retailBrand": "Zuum",
+          "marketingName": "MAGNO_P4",
+          "deviceCode": "MAGNO_P4"
+        }
+      ]
+    },
+    {
       "modelCode": "SENS PLUS",
       "variants": [
         {
@@ -283410,6 +284465,11 @@
         {
           "retailBrand": "vivo",
           "marketingName": "Y600 Pro AI版",
+          "deviceCode": "PD2561"
+        },
+        {
+          "retailBrand": "vivo",
+          "marketingName": "Y600s Pro AI版",
           "deviceCode": "PD2561"
         }
       ]
