@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, useCallback } from 'react';
+import type { ReactNode } from 'react';
 import { identifyCurrentVisitor, detectIncognitoMode, detectEmulatorEvidence } from './lib/collector';
 import type { EmulatorEvidence } from './lib/collector';
 import type {
@@ -13,6 +14,7 @@ import type {
 import { LocationMap } from './components/LocationMap';
 import { NetworkStabilityPanel } from './components/NetworkStabilityPanel';
 import { CpuActivityPanel } from './components/CpuActivityPanel';
+import { isMobileDevice } from './lib/deviceClass';
 import { SmartSignalsGrid } from './components/SmartSignalsGrid';
 import {
   CursorAttributionOverlay,
@@ -584,6 +586,53 @@ function buildSignalRows(
   return buildClientSignalRows(signals, incognitoConfirmed, clientEmulator);
 }
 
+const JSON_TOKEN_PATTERN = /("(?:\\.|[^"\\])*")(\s*:)?|([{}[\],])/g;
+
+/**
+ * Event JSON in three quiet tones only: structure, keys, and string values. Numbers and
+ * literals keep the base text colour so the payload stays readable without turning into a
+ * rainbow.
+ */
+function JsonPreview({ value }: { value: unknown }) {
+  const text = value === null || value === undefined ? '' : JSON.stringify(value, null, 2);
+  const nodes: ReactNode[] = [];
+  const pattern = new RegExp(JSON_TOKEN_PATTERN.source, 'g');
+  let cursor = 0;
+  let match: RegExpExecArray | null = null;
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > cursor) nodes.push(text.slice(cursor, match.index));
+
+    if (match[1] !== undefined) {
+      const isKey = Boolean(match[2]);
+      nodes.push(
+        <span key={`s${match.index}`} className={isKey ? 'text-slate-500' : 'text-slate-800'}>
+          {match[1]}
+        </span>
+      );
+      if (match[2]) {
+        nodes.push(
+          <span key={`c${match.index}`} className="text-slate-400">
+            {match[2]}
+          </span>
+        );
+      }
+    } else {
+      nodes.push(
+        <span key={`p${match.index}`} className="text-slate-400">
+          {match[3]}
+        </span>
+      );
+    }
+
+    cursor = pattern.lastIndex;
+  }
+
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+
+  return <>{nodes}</>;
+}
+
 export default function App() {
   const [data, setData] = useState<IntelVisitorResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
@@ -1043,10 +1092,10 @@ export default function App() {
         {data && (
           <section
             id="overview"
-            className="bg-white rounded-2xl border border-[#E5E7EB] shadow-2xs overflow-hidden"
+            className="bg-white rounded-2xl border border-[#E5E7EB] shadow-2xs overflow-hidden flex flex-col lg:grid lg:grid-cols-2 lg:items-stretch"
           >
             {/* 1. Simplified Hero Identity Header */}
-            <div className="px-4 sm:px-7 py-5 border-b border-[#E5E7EB] flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div className="order-1 lg:col-span-2 px-4 sm:px-7 py-5 border-b border-[#E5E7EB] flex flex-col lg:flex-row lg:items-center justify-between gap-4">
               <div className="min-w-0">
                 <div className="flex items-center gap-2.5 flex-wrap">
                   <h1 className="text-lg sm:text-xl font-bold tracking-tight text-[#111827]">
@@ -1066,7 +1115,7 @@ export default function App() {
                 {/* Visitor ID Box */}
                 <div className="flex items-center justify-between gap-2.5 px-3 py-2 rounded-xl bg-slate-50 border border-[#E5E7EB] min-w-0">
                   <div className="flex items-center gap-2.5 min-w-0">
-                    <div className="w-8 h-8 rounded-lg bg-orange-50/60 border border-[#E5E7EB] flex items-center justify-center shrink-0">
+                    <div className="w-8 h-8 rounded-lg bg-orange-50/40 border border-orange-100 flex items-center justify-center shrink-0">
                       <Fingerprint className="w-4 h-4 text-[#F05A28]" />
                     </div>
                     <div className="min-w-0">
@@ -1099,7 +1148,7 @@ export default function App() {
                 {/* Hardware ID Box */}
                 <div className="flex items-center justify-between gap-2.5 px-3 py-2 rounded-xl bg-slate-50 border border-[#E5E7EB] min-w-0">
                   <div className="flex items-center gap-2.5 min-w-0">
-                    <div className="w-8 h-8 rounded-lg bg-blue-50/60 border border-blue-200 flex items-center justify-center shrink-0">
+                    <div className="w-8 h-8 rounded-lg bg-blue-50/40 border border-blue-100 flex items-center justify-center shrink-0">
                       <Cpu className="w-4 h-4 text-[#2563EB]" />
                     </div>
                     <div className="min-w-0">
@@ -1132,17 +1181,17 @@ export default function App() {
             </div>
 
             {/* 2. 4 KPI Summary Counters with Colored Icon Badges */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 border-b border-[#E5E7EB] divide-y sm:divide-y-0 sm:divide-x divide-[#E5E7EB]">
+            <div className="order-3 lg:col-span-2 grid grid-cols-2 lg:grid-cols-4 border-b border-[#E5E7EB]">
               {/* KPI 1: Visits */}
-              <div className="px-4 sm:px-6 py-3.5 flex items-center gap-3.5 min-w-0">
-                <div className="w-9 h-9 rounded-lg bg-orange-50/60 border border-[#E5E7EB] flex items-center justify-center shrink-0">
+              <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0 border-r border-b lg:border-b-0 border-[#E5E7EB]">
+                <div className="w-9 h-9 rounded-lg bg-orange-50/40 border border-orange-100 flex items-center justify-center shrink-0">
                   <Activity className="w-4 h-4 text-[#F05A28]" />
                 </div>
                 <div className="min-w-0">
                   <span className="block text-[11px] font-medium text-slate-500">
                     Total Visits
                   </span>
-                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] truncate">
+                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
                     {data.statistics.totalVisits}{' '}
                     <span className="font-sans font-medium text-xs text-slate-500">
                       {data.statistics.totalVisits === 1 ? 'visit' : 'visits'}
@@ -1152,15 +1201,15 @@ export default function App() {
               </div>
 
               {/* KPI 2: Sessions */}
-              <div className="px-4 sm:px-6 py-3.5 flex items-center gap-3.5 min-w-0">
-                <div className="w-9 h-9 rounded-lg bg-blue-50/60 border border-blue-200 flex items-center justify-center shrink-0">
+              <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0 border-b lg:border-b-0 lg:border-r border-[#E5E7EB]">
+                <div className="w-9 h-9 rounded-lg bg-blue-50/40 border border-blue-100 flex items-center justify-center shrink-0">
                   <Layers className="w-4 h-4 text-[#2563EB]" />
                 </div>
                 <div className="min-w-0">
                   <span className="block text-[11px] font-medium text-slate-500">
                     Active Sessions
                   </span>
-                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] truncate">
+                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
                     {data.statistics.totalSessions}{' '}
                     <span className="font-sans font-medium text-xs text-slate-500">
                       {data.statistics.totalSessions === 1 ? 'session' : 'sessions'}
@@ -1170,15 +1219,15 @@ export default function App() {
               </div>
 
               {/* KPI 3: Distinct IPs */}
-              <div className="px-4 sm:px-6 py-3.5 flex items-center gap-3.5 min-w-0">
-                <div className="w-9 h-9 rounded-lg bg-emerald-50/60 border border-emerald-200 flex items-center justify-center shrink-0">
+              <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0 border-r border-[#E5E7EB]">
+                <div className="w-9 h-9 rounded-lg bg-emerald-50/40 border border-emerald-100 flex items-center justify-center shrink-0">
                   <Globe className="w-4 h-4 text-emerald-600" />
                 </div>
                 <div className="min-w-0">
                   <span className="block text-[11px] font-medium text-slate-500">
                     Observed IPs
                   </span>
-                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] truncate">
+                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
                     {uniqueIpCount}{' '}
                     <span className="font-sans font-medium text-xs text-slate-500">
                       {uniqueIpCount === 1 ? 'IP address' : 'IP addresses'}
@@ -1188,15 +1237,15 @@ export default function App() {
               </div>
 
               {/* KPI 4: Locations */}
-              <div className="px-4 sm:px-6 py-3.5 flex items-center gap-3.5 min-w-0">
-                <div className="w-9 h-9 rounded-lg bg-indigo-50/60 border border-indigo-200 flex items-center justify-center shrink-0">
+              <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0">
+                <div className="w-9 h-9 rounded-lg bg-indigo-50/40 border border-indigo-100 flex items-center justify-center shrink-0">
                   <MapPin className="w-4 h-4 text-indigo-600" />
                 </div>
                 <div className="min-w-0">
                   <span className="block text-[11px] font-medium text-slate-500">
                     Locations
                   </span>
-                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] truncate">
+                  <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
                     {uniqueLocationCount}{' '}
                     <span className="font-sans font-medium text-xs text-slate-500">
                       {uniqueLocationCount === 1 ? 'city' : 'cities'}
@@ -1206,49 +1255,51 @@ export default function App() {
               </div>
             </div>
 
-            {/* 3. Main 2-Column Split (50% / 50% Equal Width): Left (Location & Network) | Right (Device & Session Summary) */}
-            <div className="grid grid-cols-1 lg:grid-cols-2 items-stretch">
-              {/* LEFT COLUMN (50% width on lg+): Location Map + 2x2 Where & Network Grid */}
-              <div className="w-full flex flex-col justify-between border-b lg:border-b-0 lg:border-r border-[#E5E7EB] min-w-0">
+            {/* 3. Location & Network: the map sits directly under the hero on mobile and in the left column on desktop */}
+            <div className="order-2 lg:col-start-1 lg:row-start-3 w-full flex flex-col lg:border-r border-[#E5E7EB] min-w-0">
                 <div className="px-4 sm:px-6 py-3 bg-[#FAFAFA] border-b border-[#E5E7EB] flex items-center justify-between gap-2">
                   <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-800">
                     <MapPin className="w-3.5 h-3.5 text-[#F05A28]" />
-                    <span>Location &amp; Network</span>
+                    <span className="whitespace-nowrap">Location &amp; Network</span>
                   </span>
-                  <span className="text-[11px] font-mono tabular-nums text-slate-500">
-                    Visit #{data.statistics.totalVisits - selectedVisitIndex} of{' '}
+                  <span className="text-[11px] font-mono tabular-nums text-slate-500 whitespace-nowrap">
+                    <span className="hidden sm:inline">Visit </span>#
+                    {data.statistics.totalVisits - selectedVisitIndex} of{' '}
                     {data.statistics.totalVisits} •{' '}
                     {formatRelativeVisitTime(activeVisit?.visitedAtUtc)}
                   </span>
                 </div>
 
-                {/* Interactive Leaflet Map */}
                 {activeVisit && (
-                  <div className="flex-1 flex flex-col justify-between">
-                    <div className="border-b border-[#E5E7EB] h-[215px] sm:h-[235px]">
-                      <LocationMap
-                        latitude={activeLatitude}
-                        longitude={activeLongitude}
-                        city={activeVisit.city}
-                        region={activeVisit.region}
-                        country={activeVisit.country}
-                        publicIp={activeVisit.publicIp}
-                        timezone={activeVisit.timezone || data.browserDevice.timezone}
-                      />
-                    </div>
+                  <div className="border-b border-[#E5E7EB] h-[215px] sm:h-[235px]">
+                    <LocationMap
+                      latitude={activeLatitude}
+                      longitude={activeLongitude}
+                      city={activeVisit.city}
+                      region={activeVisit.region}
+                      country={activeVisit.country}
+                      publicIp={activeVisit.publicIp}
+                      timezone={activeVisit.timezone || data.browserDevice.timezone}
+                    />
+                  </div>
+                )}
+            </div>
 
+            {/* 4. Public IP / ISP-ASN / Location / Recognition: last block on mobile, bottom of the left column on desktop */}
+            {activeVisit && (
+              <div className="order-5 lg:col-start-1 lg:row-start-4 w-full lg:border-r border-[#E5E7EB] min-w-0">
                     {/* Compact 2x2 Icon Grid for Public IP, Location, ISP/ASN, and Recognition */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 divide-y sm:divide-y-0 sm:divide-x divide-[#E5E7EB]">
-                      <div className="divide-y divide-[#E5E7EB]">
+                    <div className="grid grid-cols-2">
+                      <div className="contents">
                         {/* Tile 1: Public IP */}
-                        <div className="p-3.5 sm:px-5 flex items-center gap-3 min-w-0">
-                          <div className="w-9 h-9 rounded-lg bg-blue-50/60 border border-blue-200 flex items-center justify-center shrink-0">
+                        <div className="p-3.5 sm:px-5 flex items-center gap-3 min-w-0 max-[359px]:flex-col max-[359px]:items-start max-[359px]:gap-2.5 border-r border-b border-[#E5E7EB]">
+                          <div className="w-9 h-9 rounded-lg bg-blue-50/40 border border-blue-100 flex items-center justify-center shrink-0">
                             <Globe className="w-4 h-4 text-[#2563EB]" />
                           </div>
                           <div className="min-w-0 flex-1">
                             <span className="block text-[11px] text-slate-500">Public IP</span>
                             <span
-                              className="block text-xs sm:text-sm font-bold font-mono tabular-nums text-[#111827] truncate"
+                              className="block text-xs sm:text-sm font-bold font-mono tabular-nums text-[#111827] break-all leading-snug"
                               title={activeVisit.publicIp}
                             >
                               {activeVisit.publicIp}
@@ -1257,8 +1308,8 @@ export default function App() {
                         </div>
 
                         {/* Tile 3: ISP / ASN */}
-                        <div className="p-3.5 sm:px-5 flex items-center gap-3 min-w-0">
-                          <div className="w-9 h-9 rounded-lg bg-indigo-50/60 border border-indigo-200 flex items-center justify-center shrink-0">
+                        <div className="p-3.5 sm:px-5 flex items-center gap-3 min-w-0 max-[359px]:flex-col max-[359px]:items-start max-[359px]:gap-2.5 border-b border-[#E5E7EB]">
+                          <div className="w-9 h-9 rounded-lg bg-indigo-50/40 border border-indigo-100 flex items-center justify-center shrink-0">
                             <Wifi className="w-4 h-4 text-indigo-600" />
                           </div>
                           <div className="min-w-0 flex-1">
@@ -1287,10 +1338,10 @@ export default function App() {
                         </div>
                       </div>
 
-                      <div className="divide-y divide-[#E5E7EB]">
+                      <div className="contents">
                         {/* Tile 2: Location */}
-                        <div className="p-3.5 sm:px-5 flex items-center gap-3 min-w-0">
-                          <div className="w-9 h-9 rounded-lg bg-orange-50/60 border border-[#E5E7EB] flex items-center justify-center shrink-0">
+                        <div className="p-3.5 sm:px-5 flex items-center gap-3 min-w-0 max-[359px]:flex-col max-[359px]:items-start max-[359px]:gap-2.5 border-r border-[#E5E7EB]">
+                          <div className="w-9 h-9 rounded-lg bg-orange-50/40 border border-orange-100 flex items-center justify-center shrink-0">
                             <MapPin className="w-4 h-4 text-[#F05A28]" />
                           </div>
                           <div className="min-w-0 flex-1">
@@ -1313,14 +1364,14 @@ export default function App() {
                         </div>
 
                         {/* Tile 4: Recognition */}
-                        <div className="p-3.5 sm:px-5 flex items-center gap-3 min-w-0">
-                          <div className="w-9 h-9 rounded-lg bg-emerald-50/60 border border-emerald-200 flex items-center justify-center shrink-0">
+                        <div className="p-3.5 sm:px-5 flex items-center gap-3 min-w-0 max-[359px]:flex-col max-[359px]:items-start max-[359px]:gap-2.5">
+                          <div className="w-9 h-9 rounded-lg bg-emerald-50/40 border border-emerald-100 flex items-center justify-center shrink-0">
                             <ShieldCheck className="w-4 h-4 text-emerald-600" />
                           </div>
                           <div className="min-w-0 flex-1">
                             <span className="block text-[11px] text-slate-500">Recognition</span>
                             <span
-                              className="block text-xs sm:text-sm font-semibold text-emerald-700 truncate"
+                              className="block text-xs sm:text-sm font-semibold text-emerald-700 break-words leading-snug"
                               title={data.recognitionSource}
                             >
                               {data.recognitionSource ===
@@ -1332,12 +1383,11 @@ export default function App() {
                         </div>
                       </div>
                     </div>
-                  </div>
-                )}
               </div>
+            )}
 
               {/* RIGHT COLUMN (50% width on lg+): Device & Session Summary (2-Column Visual Tile Grid) */}
-              <div className="w-full flex flex-col justify-between bg-white min-w-0">
+              <div className="order-4 lg:col-start-2 lg:row-start-3 lg:row-span-2 w-full flex flex-col justify-between border-b lg:border-b-0 border-[#E5E7EB] bg-white min-w-0">
                 <div className="px-4 sm:px-6 py-3 bg-[#FAFAFA] border-b border-[#E5E7EB] flex items-center justify-between gap-2">
                   <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-800">
                     <Monitor className="w-3.5 h-3.5 text-[#2563EB]" />
@@ -1352,7 +1402,7 @@ export default function App() {
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 sm:gap-4 h-full auto-rows-fr">
                     {/* Tile 1: Browser */}
                     <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-blue-50/60 border border-blue-200 flex items-center justify-center shrink-0">
+                      <div className="w-9 h-9 rounded-lg bg-blue-50/40 border border-blue-100 flex items-center justify-center shrink-0">
                         <Compass className="w-4 h-4 text-[#2563EB]" />
                       </div>
                       <div className="min-w-0 flex-1">
@@ -1368,7 +1418,7 @@ export default function App() {
 
                     {/* Tile 2: OS & Device */}
                     <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-emerald-50/60 border border-emerald-200 flex items-center justify-center shrink-0">
+                      <div className="w-9 h-9 rounded-lg bg-emerald-50/40 border border-emerald-100 flex items-center justify-center shrink-0">
                         <Monitor className="w-4 h-4 text-emerald-600" />
                       </div>
                       <div className="min-w-0 flex-1">
@@ -1387,7 +1437,7 @@ export default function App() {
 
                     {/* Tile 3: Display */}
                     <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-orange-50/60 border border-[#E5E7EB] flex items-center justify-center shrink-0">
+                      <div className="w-9 h-9 rounded-lg bg-orange-50/40 border border-orange-100 flex items-center justify-center shrink-0">
                         <Maximize2 className="w-4 h-4 text-[#F05A28]" />
                       </div>
                       <div className="min-w-0 flex-1">
@@ -1406,7 +1456,7 @@ export default function App() {
 
                     {/* Tile 4: Locale & Timezone */}
                     <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-indigo-50/60 border border-indigo-200 flex items-center justify-center shrink-0">
+                      <div className="w-9 h-9 rounded-lg bg-indigo-50/40 border border-indigo-100 flex items-center justify-center shrink-0">
                         <Languages className="w-4 h-4 text-indigo-600" />
                       </div>
                       <div className="min-w-0 flex-1">
@@ -1424,7 +1474,7 @@ export default function App() {
 
                     {/* Tile 5: Active Session */}
                     <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-amber-50/60 border border-amber-200 flex items-center justify-center shrink-0">
+                      <div className="w-9 h-9 rounded-lg bg-amber-50/40 border border-amber-100 flex items-center justify-center shrink-0">
                         <KeyRound className="w-4 h-4 text-amber-700" />
                       </div>
                       <div className="min-w-0 flex-1">
@@ -1440,7 +1490,7 @@ export default function App() {
 
                     {/* Tile 6: First / Last Seen */}
                     <div className="p-4 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-center gap-3.5 min-w-0">
-                      <div className="w-9 h-9 rounded-lg bg-emerald-50/60 border border-emerald-200 flex items-center justify-center shrink-0">
+                      <div className="w-9 h-9 rounded-lg bg-emerald-50/40 border border-emerald-100 flex items-center justify-center shrink-0">
                         <CalendarClock className="w-4 h-4 text-emerald-600" />
                       </div>
                       <div className="min-w-0 flex-1">
@@ -1458,7 +1508,7 @@ export default function App() {
                   </div>
                 </div>
               </div>
-            </div>
+
           </section>
         )}
 
@@ -1485,7 +1535,7 @@ export default function App() {
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5 mt-4">
                   {/* Tile 1: Processor */}
                   <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
-                    <div className="w-9 h-9 rounded-lg bg-orange-50/60 border border-[#E5E7EB] flex items-center justify-center shrink-0">
+                    <div className="w-9 h-9 rounded-lg bg-orange-50/40 border border-orange-100 flex items-center justify-center shrink-0">
                       <Cpu className="w-4 h-4 text-[#F05A28]" />
                     </div>
                     <div className="min-w-0 flex-1">
@@ -1511,7 +1561,7 @@ export default function App() {
                     className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0"
                     title={rawGpuTooltip}
                   >
-                    <div className="w-9 h-9 rounded-lg bg-blue-50/60 border border-blue-200 flex items-center justify-center shrink-0">
+                    <div className="w-9 h-9 rounded-lg bg-blue-50/40 border border-blue-100 flex items-center justify-center shrink-0">
                       <CircuitBoard className="w-4 h-4 text-[#2563EB]" />
                     </div>
                     <div className="min-w-0 flex-1">
@@ -1531,7 +1581,7 @@ export default function App() {
 
                   {/* Tile 3: Memory Tier */}
                   <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
-                    <div className="w-9 h-9 rounded-lg bg-emerald-50/60 border border-emerald-200 flex items-center justify-center shrink-0">
+                    <div className="w-9 h-9 rounded-lg bg-emerald-50/40 border border-emerald-100 flex items-center justify-center shrink-0">
                       <HardDrive className="w-4 h-4 text-emerald-600" />
                     </div>
                     <div className="min-w-0 flex-1">
@@ -1547,7 +1597,7 @@ export default function App() {
 
                   {/* Tile 4: Display & Input */}
                   <div className="p-3.5 rounded-xl bg-slate-50/70 border border-[#E5E7EB] flex items-start gap-3 min-w-0">
-                    <div className="w-9 h-9 rounded-lg bg-indigo-50/60 border border-indigo-200 flex items-center justify-center shrink-0">
+                    <div className="w-9 h-9 rounded-lg bg-indigo-50/40 border border-indigo-100 flex items-center justify-center shrink-0">
                       <Palette className="w-4 h-4 text-indigo-600" />
                     </div>
                     <div className="min-w-0 flex-1">
@@ -1726,7 +1776,9 @@ export default function App() {
         {/* Network Stability & System CPU Pressure (Responsive Side-by-Side Grid) */}
         <section id="diagnostics" className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch">
           <NetworkStabilityPanel />
-          <CpuActivityPanel />
+          {/* Real phones expose no compute pressure telemetry, so the panel is omitted there.
+              Desktop browsers keep it even when narrowed to a phone-sized viewport. */}
+          {!isMobileDevice && <CpuActivityPanel />}
         </section>
 
         {/* Full SQLite Visit History Table */}
@@ -1908,8 +1960,8 @@ export default function App() {
               </button>
             </div>
           </div>
-          <pre className="mt-3 max-h-[420px] overflow-auto rounded-xl bg-[#F8FAFC] border border-[#E5E7EB] p-3 text-[11px] leading-relaxed font-mono text-slate-700">
-{eventJson ? JSON.stringify(eventJson, null, 2) : 'Collecting event payload...'}
+          <pre className="mt-3 max-h-[420px] overflow-auto rounded-xl bg-[#F8FAFC] border border-[#E5E7EB] p-3 text-[11px] leading-relaxed font-mono text-slate-600">
+{eventJson ? <JsonPreview value={eventJson} /> : 'Collecting event payload...'}
           </pre>
         </section>
       </main>
