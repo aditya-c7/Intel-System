@@ -1710,33 +1710,6 @@ export default function App() {
                   <SmartSignalsGrid data={data} />
                 </div>
               </div>
-
-              {/* Clean Visual Trust Meter Footer Bar */}
-              <div className="mt-4 pt-3.5 border-t border-[#E5E7EB] flex items-center justify-between gap-4">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="text-xs font-medium text-slate-600 whitespace-nowrap">
-                    Risk Meter
-                  </span>
-                  <span className="text-xs font-mono tabular-nums text-slate-500 truncate">
-                    • {`${riskTier} Risk \u2022 ${displayedSuspectScore}/10`}
-                  </span>
-                </div>
-
-                <div className="w-28 sm:w-36 h-2 rounded-full bg-slate-100 overflow-hidden shrink-0 border border-[#E5E7EB]">
-                  <div
-                    className={`h-full transition-all duration-300 ${
-                      riskTier === 'High'
-                        ? 'bg-rose-600'
-                        : riskTier === 'Medium'
-                        ? 'bg-amber-500'
-                        : 'bg-emerald-500'
-                    }`}
-                    style={{
-                      width: `${Math.max(2, displayedSuspectScore * 10)}%`,
-                    }}
-                  />
-                </div>
-              </div>
             </div>
 
           </section>
