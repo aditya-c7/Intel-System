@@ -1566,8 +1566,7 @@ export default function App() {
                               {data.browserDevice.phoneDisplayLabel}
                             </span>
                             <span className="block text-[10px] sm:text-[11px] text-slate-500 leading-snug">
-                              {data.browserDevice.os} •{' '}
-                              {data.browserDevice.phoneBrand || 'Mobile'}
+                              {data.browserDevice.os} • {data.browserDevice.deviceType}
                             </span>
                           </>
                         ) : (

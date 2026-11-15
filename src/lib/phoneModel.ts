@@ -26,7 +26,12 @@ export function formatPhoneLabel(entry: AndroidPhoneEntry): string {
 /** e.g. "OnePlus Nord CE 5 (CPH2661)" or "Samsung Galaxy S24 Ultra (SM-S928B)". */
 export function formatPhoneDisplayLabel(entry: AndroidPhoneEntry): string {
   const label = formatPhoneLabel(entry);
-  return entry.modelCode ? `${label} (${entry.modelCode})` : label;
+  // Pixel and a few other catalog rows use the marketing name as the model code,
+  // so "Google Pixel 9 Pro (Pixel 9 Pro)" would repeat itself.
+  if (!entry.modelCode || label.toLowerCase().includes(entry.modelCode.toLowerCase())) {
+    return label;
+  }
+  return `${label} (${entry.modelCode})`;
 }
 
 /**
