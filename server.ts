@@ -29,6 +29,16 @@ import type {
   VelocitySignals,
   VelocityWindowCounts,
 } from './src/types/visitor';
+import {
+  cloudProviderOrgForAsn,
+  countryNameFromCode,
+  isMissingGeoValue,
+  mergeLocationWithEdge,
+  normalizeAsnLabel,
+  readEdgeGeoHeaders,
+  type EdgeGeoHeaders,
+  type EdgeHeaderBag,
+} from './src/lib/geoFallbacks';
 
 dotenv.config();
 
@@ -925,6 +935,10 @@ export function classifyIspNetwork(isp: string, org: string, asn: string): IspNe
 
   // Tor relay operators, before any hosting rule: anonymity infrastructure must never be
   // reported as a consumer connection or a generic cloud host.
+  // Tor relay operators run their relays on their own hosting ASNs. An ASN / organisation
+  // match is NOT proof that this visitor is on the Tor network, so the operator is labelled
+  // neutrally here. Only a verified exit verdict (`torDetection.isTorExit === true`) may
+  // upgrade the network type to `Tor Exit / Anonymity Network` in applyNetworkOverrides.
   const asnTokenHits = Array.from(asnNumbers).map((n) => `AS${n}`);
   const torAsnHit = asnTokenHits.find((token) => matchesTorOperatorAsn(token));
   const torOrgHit = TOR_OPERATOR_ORG_PATTERN.test(keywordHaystack);
@@ -936,10 +950,11 @@ export function classifyIspNetwork(isp: string, org: string, asn: string): IspNe
           : cleanOrg && !/^unknown( isp)?$/i.test(cleanOrg)
           ? cleanOrg
           : 'Tor Relay Operator',
-      networkType: 'Tor Exit / Anonymity Network',
+      networkType: 'Cloud / Datacenter',
       isConsumerBroadband: false,
       isDatacenterOrHosting: true,
-      matchedReason: torAsnHit !== undefined ? `Tor operator ASN ${torAsnHit}` : 'Tor operator organisation',
+      matchedReason:
+        torAsnHit !== undefined ? `Tor operator ASN ${torAsnHit}` : 'Tor operator organisation',
     };
   }
 
@@ -949,7 +964,16 @@ export function classifyIspNetwork(isp: string, org: string, asn: string): IspNe
     /google llc|google cloud|amazonaws|cloudflare|digitalocean|hetzner|m247|datacamp|linode|ovh|choopa|vultr|leaseweb|hostinger|contabo|akamai|oracle cloud|alibaba|aliyun|tencent cloud/i;
   if (cloudAsnHit !== undefined || cloudKeywords.test(keywordHaystack)) {
     return {
-      brandName: 'Cloud Provider / Datacenter',
+      // Prefer the real operator name (Google LLC, Amazon.com, Inc., Microsoft
+      // Corporation, Cloudflare, Inc.) so an unresolved provider lookup never surfaces a
+      // generic or anonymous cloud label.
+      brandName:
+        cloudProviderOrgForAsn(`AS${cloudAsnHit ?? ''}`) ||
+        (cleanIsp && !/^unknown( isp)?$/i.test(cleanIsp)
+          ? cleanIsp
+          : cleanOrg && !/^unknown( isp)?$/i.test(cleanOrg)
+          ? cleanOrg
+          : 'Cloud Provider / Datacenter'),
       networkType: 'Cloud / Datacenter',
       isConsumerBroadband: false,
       isDatacenterOrHosting: true,
@@ -1023,11 +1047,9 @@ function applyNetworkOverrides(
     vpnSuspected: boolean;
   }
 ): IspNetworkClassification {
-  const torNetwork =
-    context.torExit ||
-    context.torOperatorHint ||
-    context.isTorBrowserClient ||
-    base.networkType === 'Tor Exit / Anonymity Network';
+  // Strict: an anonymity-network label requires a verified Tor exit verdict. An operator
+  // ASN match or a Tor Browser fingerprint alone must never relabel a normal connection.
+  const torNetwork = context.torExit;
   if (torNetwork) {
     return {
       ...base,
@@ -3267,8 +3289,11 @@ async function resolveTorExitStatus(
     return { isExit: false, isRelay: true, verdict, viaOperatorHint: false, operator, relay };
   }
   if (verdict === 'unknown' && matchesTorOperatorHint({ ...location, publicIp })) {
+    // Operator attribution proves relay infrastructure, never egress. Strict policy: only a
+    // bulk-list or live DNSEL `exit` verdict may set `isExit`, so a normal customer of a
+    // Tor-friendly hosting ASN is never labelled as a Tor exit.
     return {
-      isExit: true,
+      isExit: false,
       isRelay: true,
       verdict: 'relay',
       viaOperatorHint: true,
@@ -4295,37 +4320,12 @@ app.get('/api/health', async (req, res) => {
   res.json({ status: 'ok', visitorsCount, visitsCount, regionCode, regionLabel });
 });
 
-function extractVercelEdgeGeo(req: express.Request): {
-  city: string;
-  region: string;
-  country: string;
-  timezone: string;
-  latitude: number | null;
-  longitude: number | null;
-} {
-  const decodeHeader = (val: unknown): string => {
-    if (typeof val !== 'string' || !val.trim()) return '';
-    try {
-      return decodeURIComponent(val.trim());
-    } catch {
-      return val.trim();
-    }
-  };
-  const city = decodeHeader(req.headers['x-vercel-ip-city']);
-  const region = decodeHeader(req.headers['x-vercel-ip-country-region']);
-  const country = decodeHeader(req.headers['x-vercel-ip-country']);
-  const timezone = decodeHeader(req.headers['x-vercel-ip-timezone']);
-  const rawLat = parseFloat(String(req.headers['x-vercel-ip-latitude'] || ''));
-  const rawLon = parseFloat(String(req.headers['x-vercel-ip-longitude'] || ''));
-
-  return {
-    city,
-    region,
-    country,
-    timezone,
-    latitude: Number.isFinite(rawLat) ? rawLat : null,
-    longitude: Number.isFinite(rawLon) ? rawLon : null,
-  };
+/**
+ * Vercel + Cloudflare edge geolocation. The heavy lifting lives in
+ * `src/lib/geoFallbacks.ts` so the same normalisation is shared with the collector.
+ */
+function extractEdgeGeo(req: express.Request): EdgeGeoHeaders {
+  return readEdgeGeoHeaders(req.headers as EdgeHeaderBag);
 }
 
 const SERVER_TIMEZONE_ALIAS_MAP: Record<string, string> = {
@@ -5312,12 +5312,17 @@ app.post('/api/visitor/identify', async (req, res) => {
       () => 'unknown' as TorExitVerdict
     );
 
-    let location = await lookupVerifiedGeolocation(extractedIp, isPublic);
-    const vercelGeo = extractVercelEdgeGeo(req);
+    // Edge headers (Vercel / Cloudflare) are merged field by field onto whatever the
+    // provider cascade returned. A rate-limited or cold-start provider can no longer blank
+    // the location: city / region / country / lat / lon / timezone survive from the edge.
+    const edgeGeo = extractEdgeGeo(req);
+    let location = mergeLocationWithEdge(
+      await lookupVerifiedGeolocation(extractedIp, isPublic),
+      edgeGeo
+    );
 
     if (
       isPublic &&
-      (!location.isLocationVerified || location.isp === 'Unknown' || location.latitude === null) &&
       clientGeoHint &&
       normalizeIpCandidate(clientGeoHint.ip)?.toLowerCase() === extractedIp.toLowerCase()
     ) {
@@ -5330,67 +5335,50 @@ app.post('/api/visitor/identify', async (req, res) => {
       const hintLat =
         typeof clientGeoHint.latitude === 'number' && Number.isFinite(clientGeoHint.latitude)
           ? clientGeoHint.latitude
-          : vercelGeo.latitude;
+          : edgeGeo.latitude;
       const hintLon =
         typeof clientGeoHint.longitude === 'number' && Number.isFinite(clientGeoHint.longitude)
           ? clientGeoHint.longitude
-          : vercelGeo.longitude;
-      location = {
-        publicIp: extractedIp,
-        city:
-          location.city !== 'Unavailable' && location.city !== 'Unknown'
-            ? location.city
-            : (typeof clientGeoHint.city === 'string' && clientGeoHint.city) ||
-              vercelGeo.city ||
-              'Unknown',
-        region:
-          location.region !== 'Unavailable' && location.region !== 'Unknown'
-            ? location.region
-            : (typeof clientGeoHint.region === 'string' && clientGeoHint.region) ||
-              vercelGeo.region ||
-              'Unknown',
-        country:
-          location.country !== 'Unavailable' && location.country !== 'Unknown'
-            ? location.country
-            : (typeof clientGeoHint.country === 'string' && clientGeoHint.country) ||
-              vercelGeo.country ||
-              'Unknown',
-        countryCode:
-          location.countryCode ||
-          (typeof clientGeoHint.countryCode === 'string' ? clientGeoHint.countryCode : '') ||
-          vercelGeo.country,
-        latitude: location.latitude !== null ? location.latitude : hintLat,
-        longitude: location.longitude !== null ? location.longitude : hintLon,
-        isp: location.isp !== 'Unknown' ? location.isp : hintNet.isp,
-        org: location.org !== 'Unknown' ? location.org : hintNet.org,
-        asn: location.asn !== 'Unknown' ? location.asn : hintNet.asn,
-        isVpnOrHosting: location.isVpnOrHosting || hintNet.isVpnOrHosting,
-        isIpVerified: true,
-        isLocationVerified: true,
-      };
-    } else if (
-      isPublic &&
-      (!location.isLocationVerified || location.latitude === null) &&
-      (vercelGeo.city || vercelGeo.country || vercelGeo.latitude !== null)
-    ) {
+          : edgeGeo.longitude;
+      const hintCity = typeof clientGeoHint.city === 'string' ? clientGeoHint.city.trim() : '';
+      const hintRegion =
+        typeof clientGeoHint.region === 'string' ? clientGeoHint.region.trim() : '';
+      const hintCountry =
+        typeof clientGeoHint.country === 'string' ? clientGeoHint.country.trim() : '';
+      const hintCountryCode =
+        typeof clientGeoHint.countryCode === 'string'
+          ? clientGeoHint.countryCode.trim()
+          : '';
+      // `Autonomous System ASxxxxx` is a placeholder, not a resolved ISP: a trusted client
+      // hint is allowed to replace it.
+      const ispIsPlaceholder =
+        isMissingGeoValue(location.isp) || /^autonomous system\b/i.test(location.isp);
+
       location = {
         ...location,
-        city:
-          location.city !== 'Unavailable' && location.city !== 'Unknown'
-            ? location.city
-            : vercelGeo.city || 'Unknown',
-        region:
-          location.region !== 'Unavailable' && location.region !== 'Unknown'
-            ? location.region
-            : vercelGeo.region || 'Unknown',
-        country:
-          location.country !== 'Unavailable' && location.country !== 'Unknown'
-            ? location.country
-            : vercelGeo.country || 'Unknown',
-        countryCode: location.countryCode || vercelGeo.country,
-        latitude: location.latitude !== null ? location.latitude : vercelGeo.latitude,
-        longitude: location.longitude !== null ? location.longitude : vercelGeo.longitude,
-        isLocationVerified: true,
+        city: isMissingGeoValue(location.city)
+          ? hintCity || edgeGeo.city || 'Unknown'
+          : location.city,
+        region: isMissingGeoValue(location.region)
+          ? hintRegion || edgeGeo.region || 'Unknown'
+          : location.region,
+        country: isMissingGeoValue(location.country)
+          ? countryNameFromCode(hintCountryCode) || hintCountry || edgeGeo.country || 'Unknown'
+          : location.country,
+        countryCode:
+          location.countryCode ||
+          hintCountryCode.toUpperCase() ||
+          edgeGeo.countryCode,
+        latitude: location.latitude !== null ? location.latitude : hintLat,
+        longitude: location.longitude !== null ? location.longitude : hintLon,
+        isp: ispIsPlaceholder ? hintNet.isp : location.isp,
+        org: isMissingGeoValue(location.org) ? hintNet.org : location.org,
+        asn: normalizeAsnLabel(location.asn) || hintNet.asn || edgeGeo.asn,
+        isVpnOrHosting: location.isVpnOrHosting || hintNet.isVpnOrHosting,
+        isIpVerified: true,
+        isLocationVerified:
+          location.isLocationVerified ||
+          Boolean(hintCity || hintCountry || hintLat !== null),
       };
     }
 
@@ -5710,7 +5698,7 @@ app.post('/api/visitor/identify', async (req, res) => {
 
     const ipTimezoneHint =
       (typeof clientGeoHint?.timezone === 'string' && clientGeoHint.timezone.trim()) ||
-      vercelGeo.timezone ||
+      edgeGeo.timezone ||
       '';
 
     // Task 3 — visit velocity / IP rotation across the last hour. rawVisits is fetched AFTER
