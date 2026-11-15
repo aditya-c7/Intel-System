@@ -397,4 +397,8 @@ export interface IntelVisitorResponse {
   activeCall?: boolean;
   activeCallSupported?: boolean;
   rawDeviceAttributes?: unknown;
+  /** Phase 4 — a reused nonce is reported here instead of as an HTTP error. */
+  replayed?: boolean;
+  tampered?: boolean;
+  requestIntegrityReason?: string;
 }

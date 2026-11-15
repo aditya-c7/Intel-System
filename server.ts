@@ -3414,9 +3414,10 @@ function lookupSuspiciousIp(ip: string): { blocklisted: boolean; reasons: string
 /* -------------------------------------------------------------------------- */
 
 // A signed payload may only be replayed inside the nonce window; anything older is stale.
-// The window is deliberately generous so a visitor whose system clock drifted (dead CMOS
-// battery, wrong timezone offset, throttled VM clock) is never labelled as tampered.
-const ENVELOPE_FRESHNESS_WINDOW_MS = 10 * 60 * 1000;
+// The window is deliberately generous (5 minutes) so a visitor whose system clock drifted
+// (dead CMOS battery, wrong timezone offset, throttled VM clock) or a serverless cold start
+// is never labelled as tampered. Manual button clicks stay well inside it.
+const ENVELOPE_FRESHNESS_WINDOW_MS = 300_000;
 const NONCE_TTL_MS = 15 * 60 * 1000;
 const NONCE_CACHE_MAX_ENTRIES = 5000;
 const seenEnvelopeNonces = new Map<string, number>();
@@ -3528,7 +3529,7 @@ function verifySecurityEnvelope(args: {
   // never produces a tamper verdict; the nonce cache below covers replays inside the window.
   if (timestamp > 0 && Math.abs(nowMs - timestamp) > ENVELOPE_FRESHNESS_WINDOW_MS) {
     tamperedRequest = true;
-    reasons.push('Expired or replayed payload timestamp (>10m)');
+    reasons.push('Expired or replayed payload timestamp (>5m)');
   }
 
   // Replay: a nonce may be used exactly once inside the 15-minute window.
@@ -5455,6 +5456,17 @@ app.post('/api/visitor/identify', async (req, res) => {
       if (validHistoryBackup && validHistoryBackup.visits.length > 0) {
         const orderedAsc = [...validHistoryBackup.visits].reverse();
         for (const histVisit of orderedAsc) {
+          // Legacy backups may omit newer columns. better-sqlite3 rejects `undefined`
+          // bindings, which used to surface as a 500 on the in-page Analyze / Record Visit
+          // button, so every field is coerced to a SQLite-safe value.
+          const histVisitId =
+            typeof histVisit.visitId === 'string' && histVisit.visitId.trim()
+              ? histVisit.visitId.trim()
+              : generateVisitId();
+          const histVisitedAt =
+            typeof histVisit.visitedAtUtc === 'string' && histVisit.visitedAtUtc.trim()
+              ? histVisit.visitedAtUtc
+              : new Date().toISOString();
           db.prepare(
             `INSERT OR IGNORE INTO visits (
               visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
@@ -5462,26 +5474,28 @@ app.post('/api/visitor/identify', async (req, res) => {
               browser, os, device_type, screen_resolution, language, timezone
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).run(
-            histVisit.visitId,
+            histVisitId,
             verifiedVid,
-            histVisit.sessionId,
-            `rehydrated_${histVisit.visitId}`,
-            histVisit.visitedAtUtc,
-            histVisit.publicIp,
-            histVisit.city,
-            histVisit.region,
-            histVisit.country,
-            histVisit.latitude,
-            histVisit.longitude,
+            typeof histVisit.sessionId === 'string' && histVisit.sessionId
+              ? histVisit.sessionId
+              : clientSessionId || generateSessionId(),
+            `rehydrated_${histVisitId}`,
+            histVisitedAt,
+            histVisit.publicIp || 'Unavailable',
+            histVisit.city || 'Unknown',
+            histVisit.region || 'Unknown',
+            histVisit.country || 'Unknown',
+            typeof histVisit.latitude === 'number' ? histVisit.latitude : null,
+            typeof histVisit.longitude === 'number' ? histVisit.longitude : null,
             histVisit.isp || 'Unknown',
             histVisit.org || 'Unknown',
             histVisit.asn || 'Unknown',
-            histVisit.browser,
-            histVisit.os,
-            histVisit.deviceType,
-            histVisit.screenResolution,
-            histVisit.language,
-            histVisit.timezone
+            histVisit.browser || 'Unknown',
+            histVisit.os || 'Unknown',
+            histVisit.deviceType || 'Unknown',
+            histVisit.screenResolution || 'Unavailable',
+            histVisit.language || 'Unavailable',
+            histVisit.timezone || 'Unavailable'
           );
         }
       }
@@ -6120,6 +6134,12 @@ app.post('/api/visitor/identify', async (req, res) => {
       activeCall,
       activeCallSupported,
       rawDeviceAttributes: rawSecuritySignals?.rawDeviceAttributes ?? null,
+      // Phase 4 verdicts mirrored at the top level. A duplicate nonce is reported as
+      // `replayed: true` inside a normal 200 payload — it is never an HTTP error that
+      // would break the in-page Record Visit / Analyze button.
+      replayed: envelopeVerdict.replayDetected,
+      tampered: envelopeVerdict.tamperedRequest,
+      requestIntegrityReason: envelopeVerdict.requestIntegrityReason,
     };
 
     res.json(payload);
