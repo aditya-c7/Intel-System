@@ -1276,15 +1276,21 @@ export default function App() {
         )}
 
         {loading && !data && (
-          <div className="bg-white border border-[#E5E7EB] rounded-2xl p-6 sm:p-8 space-y-6">
-            <div className="h-7 w-64 max-w-full bg-slate-100 rounded" />
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 pt-4 border-t border-slate-100">
-              <div className="h-16 bg-slate-100 rounded-xl" />
-              <div className="h-16 bg-slate-100 rounded-xl" />
-              <div className="h-16 bg-slate-100 rounded-xl" />
-              <div className="h-16 bg-slate-100 rounded-xl" />
+          <div className="bg-white border border-[#E5E7EB] rounded-2xl p-6 sm:p-8 space-y-6" role="status" aria-label="Loading device intelligence">
+            <div className="space-y-2">
+              <div className="skeleton-shimmer h-7 w-64 max-w-full rounded" />
+              <div className="skeleton-shimmer h-3 w-80 max-w-full rounded" />
+              <div className="pt-2 flex justify-center">
+                <div className="skeleton-shimmer h-4 w-44 max-w-full rounded" />
+              </div>
             </div>
-            <div className="h-64 bg-slate-100 rounded-xl" />
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 pt-4 border-t border-slate-100">
+              <div className="skeleton-shimmer h-16 rounded-xl" />
+              <div className="skeleton-shimmer h-16 rounded-xl" />
+              <div className="skeleton-shimmer h-16 rounded-xl" />
+              <div className="skeleton-shimmer h-16 rounded-xl" />
+            </div>
+            <div className="skeleton-shimmer h-64 rounded-xl" />
           </div>
         )}
 
@@ -1307,12 +1313,19 @@ export default function App() {
                 <p className="text-xs sm:text-[13px] text-slate-500 mt-1">
                   Real-time browser identity, hardware fingerprint, and live connection telemetry.
                 </p>
-                {data.browserDevice.genuineMobile &&
-                data.browserDevice.phoneDisplayLabel ? (
+                {data.browserDevice.genuineMobile ? (
                   <div className="mt-2 flex justify-center">
-                    <span className="max-w-full truncate text-sm sm:text-[15px] font-semibold tracking-tight text-[#111827]">
-                      {data.browserDevice.phoneDisplayLabel}
-                    </span>
+                    {data.browserDevice.phoneModel ? (
+                      <span className="max-w-full truncate text-sm sm:text-[15px] font-semibold tracking-tight text-[#111827]">
+                        {data.browserDevice.phoneModel}
+                      </span>
+                    ) : (
+                      <span
+                        className="skeleton-shimmer h-4 w-40 rounded"
+                        aria-label="Resolving phone model"
+                        role="status"
+                      />
+                    )}
                   </div>
                 ) : null}
               </div>
@@ -1557,7 +1570,12 @@ export default function App() {
                       </div>
                       <div className="min-w-0 flex-1">
                         <span className="block text-[10px] sm:text-[11px] text-slate-500">OS &amp; Device</span>
-                        {data.browserDevice.genuineMobile && data.browserDevice.phoneDisplayLabel ? (
+                        {data.browserDevice.genuineMobile && !data.browserDevice.phoneDisplayLabel ? (
+                          <span className="mt-1 block space-y-1" role="status" aria-label="Resolving device details">
+                            <span className="skeleton-shimmer block h-3.5 w-40 max-w-full rounded" />
+                            <span className="skeleton-shimmer block h-2.5 w-24 max-w-full rounded" />
+                          </span>
+                        ) : data.browserDevice.genuineMobile && data.browserDevice.phoneDisplayLabel ? (
                           <>
                             <span
                               className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"

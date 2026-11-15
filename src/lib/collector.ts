@@ -1025,7 +1025,7 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
   if (deviceGate.kind === 'mobile') {
     if (/iPhone|iPod/i.test(ua)) {
       phoneBrand = 'Apple';
-      phoneModel = 'iPhone';
+      phoneModel = 'Apple iPhone';
       phoneDisplayLabel = 'Apple iPhone';
     } else if (reportedModel) {
       try {
