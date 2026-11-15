@@ -12,6 +12,634 @@ import fs from "fs";
 import dns from "node:dns/promises";
 import { createRequire } from "module";
 import dotenv from "dotenv";
+
+// src/lib/geoFallbacks.ts
+var MISSING_TOKENS = /* @__PURE__ */ new Set([
+  "",
+  "unknown",
+  "unavailable",
+  "n/a",
+  "na",
+  "null",
+  "undefined",
+  "-",
+  "xx"
+]);
+function isMissingGeoValue(value) {
+  if (typeof value !== "string") return true;
+  return MISSING_TOKENS.has(value.trim().toLowerCase());
+}
+var COUNTRY_NAME_FALLBACK = {
+  AE: "United Arab Emirates",
+  AR: "Argentina",
+  AT: "Austria",
+  AU: "Australia",
+  BD: "Bangladesh",
+  BE: "Belgium",
+  BG: "Bulgaria",
+  BR: "Brazil",
+  CA: "Canada",
+  CH: "Switzerland",
+  CL: "Chile",
+  CN: "China",
+  CO: "Colombia",
+  CZ: "Czechia",
+  DE: "Germany",
+  DK: "Denmark",
+  EG: "Egypt",
+  ES: "Spain",
+  FI: "Finland",
+  FR: "France",
+  GB: "United Kingdom",
+  GR: "Greece",
+  HK: "Hong Kong",
+  HU: "Hungary",
+  ID: "Indonesia",
+  IE: "Ireland",
+  IL: "Israel",
+  IN: "India",
+  IT: "Italy",
+  JP: "Japan",
+  KE: "Kenya",
+  KR: "South Korea",
+  LK: "Sri Lanka",
+  LT: "Lithuania",
+  LU: "Luxembourg",
+  MY: "Malaysia",
+  MX: "Mexico",
+  NG: "Nigeria",
+  NL: "The Netherlands",
+  NO: "Norway",
+  NP: "Nepal",
+  NZ: "New Zealand",
+  PE: "Peru",
+  PH: "Philippines",
+  PK: "Pakistan",
+  PL: "Poland",
+  PT: "Portugal",
+  RO: "Romania",
+  RU: "Russia",
+  SA: "Saudi Arabia",
+  SE: "Sweden",
+  SG: "Singapore",
+  SK: "Slovakia",
+  TH: "Thailand",
+  TR: "Turkey",
+  TW: "Taiwan",
+  UA: "Ukraine",
+  US: "United States",
+  VN: "Vietnam",
+  ZA: "South Africa"
+};
+var cachedRegionDisplayNames;
+function getRegionDisplayNames() {
+  if (cachedRegionDisplayNames !== void 0) return cachedRegionDisplayNames;
+  try {
+    const ctor = Intl.DisplayNames;
+    cachedRegionDisplayNames = ctor ? new ctor(["en"], { type: "region" }) : null;
+  } catch {
+    cachedRegionDisplayNames = null;
+  }
+  return cachedRegionDisplayNames;
+}
+function countryNameFromCode(raw) {
+  if (typeof raw !== "string") return "";
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  const upper = trimmed.toUpperCase();
+  if (upper === "XX" || upper === "T1") return "";
+  if (upper.length !== 2) {
+    if (isMissingGeoValue(trimmed)) return "";
+    return trimmed;
+  }
+  const fallback = COUNTRY_NAME_FALLBACK[upper];
+  try {
+    const display = getRegionDisplayNames();
+    const resolved = display?.of(upper);
+    if (resolved && resolved !== upper) return resolved;
+  } catch {
+  }
+  return fallback || upper;
+}
+function headerValue(headers, names) {
+  for (const name of names) {
+    const raw = headers[name] ?? headers[name.toLowerCase()];
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+function decodeCity(raw) {
+  if (!raw) return "";
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+function parseCoord(raw) {
+  if (!raw) return null;
+  const value = Number.parseFloat(raw);
+  return Number.isFinite(value) && Math.abs(value) <= 180 ? value : null;
+}
+function normalizeAsnLabel(raw) {
+  if (typeof raw !== "string") return "";
+  const match = raw.trim().match(/^(?:as)?\s*(\d{1,10})$/i);
+  return match ? `AS${match[1]}` : "";
+}
+function readEdgeGeoHeaders(headers) {
+  const vercelCountryCode = headerValue(headers, [
+    "x-vercel-ip-country",
+    "x-vercel-ip-country-code"
+  ]);
+  const cloudflareCountryCode = headerValue(headers, ["cf-ipcountry"]);
+  const rawCountryCode = vercelCountryCode || cloudflareCountryCode;
+  const countryCode = rawCountryCode && !/^(xx|t1)$/i.test(rawCountryCode) ? rawCountryCode.toUpperCase() : "";
+  const city = decodeCity(
+    headerValue(headers, ["x-vercel-ip-city"]) || decodeCity(headerValue(headers, ["cf-ipcity"]))
+  );
+  const region = headerValue(headers, [
+    "x-vercel-ip-country-region",
+    "cf-region",
+    "cf-region-code"
+  ]);
+  const timezone = headerValue(headers, ["x-vercel-ip-timezone", "cf-timezone"]);
+  const latitude = parseCoord(headerValue(headers, ["x-vercel-ip-latitude", "cf-iplatitude"]));
+  const longitude = parseCoord(
+    headerValue(headers, ["x-vercel-ip-longitude", "cf-iplongitude"])
+  );
+  const asn = normalizeAsnLabel(
+    headerValue(headers, ["x-vercel-ip-as-number", "x-vercel-ip-asn", "cf-asn"])
+  );
+  const postalCode = headerValue(headers, ["x-vercel-ip-postal-code", "cf-postal-code"]);
+  const source = headerValue(headers, ["x-vercel-id", "x-vercel-ip-country"]) ? "vercel" : headerValue(headers, ["cf-ipcountry", "cf-ray"]) ? "cloudflare" : "none";
+  return {
+    city: isMissingGeoValue(city) ? "" : city,
+    region: isMissingGeoValue(region) ? "" : region,
+    country: countryNameFromCode(countryCode),
+    countryCode,
+    timezone: isMissingGeoValue(timezone) ? "" : timezone,
+    latitude,
+    longitude,
+    asn,
+    postalCode: isMissingGeoValue(postalCode) ? "" : postalCode,
+    source
+  };
+}
+var CLOUD_ASN_ORG = {
+  AS15169: "Google LLC",
+  AS396982: "Google Cloud",
+  AS19527: "Google LLC",
+  AS16591: "Google Fiber",
+  AS16509: "Amazon.com, Inc.",
+  AS14618: "Amazon.com, Inc.",
+  AS8987: "Amazon.com, Inc.",
+  AS8075: "Microsoft Corporation",
+  AS8068: "Microsoft Corporation",
+  AS20940: "Akamai Technologies",
+  AS63949: "Akamai / Linode",
+  AS13335: "Cloudflare, Inc.",
+  AS132892: "Cloudflare, Inc.",
+  AS14061: "DigitalOcean, LLC",
+  AS24940: "Hetzner Online GmbH",
+  AS16276: "OVH SAS",
+  AS20473: "Vultr Holdings",
+  AS31898: "Oracle Cloud",
+  AS45102: "Alibaba Cloud",
+  AS132203: "Tencent Cloud",
+  AS32934: "Meta Platforms, Inc.",
+  AS714: "Apple Inc.",
+  AS2906: "Netflix, Inc."
+};
+function cloudProviderOrgForAsn(rawAsn) {
+  const asn = normalizeAsnLabel(rawAsn);
+  return asn ? CLOUD_ASN_ORG[asn] || "" : "";
+}
+function meaningful(value) {
+  return typeof value === "string" && !isMissingGeoValue(value);
+}
+function mergeLocationWithEdge(location, edge) {
+  const countryCodeRaw = meaningful(location.countryCode) ? location.countryCode : edge.countryCode;
+  const providerCountry = meaningful(location.country) && !/^[a-z]{2}$/i.test(location.country) ? location.country : "";
+  const country = providerCountry || countryNameFromCode(countryCodeRaw) || countryNameFromCode(location.country) || edge.country || "Unknown";
+  const asn = normalizeAsnLabel(location.asn) || edge.asn;
+  const edgeOrg = cloudProviderOrgForAsn(edge.asn);
+  const isp = meaningful(location.isp) ? location.isp : meaningful(location.org) ? location.org : edgeOrg || (asn ? `Autonomous System ${asn}` : "Unknown");
+  const org = meaningful(location.org) ? location.org : edgeOrg || isp;
+  const latitude = location.latitude !== null ? location.latitude : edge.latitude;
+  const longitude = location.longitude !== null ? location.longitude : edge.longitude;
+  const city = meaningful(location.city) ? location.city : edge.city || "Unknown";
+  const region = meaningful(location.region) ? location.region : edge.region || "Unknown";
+  const timezone = meaningful(location.timezone) ? location.timezone : edge.timezone || void 0;
+  return {
+    ...location,
+    city,
+    region,
+    country,
+    countryCode: countryCodeRaw.toUpperCase(),
+    latitude,
+    longitude,
+    timezone,
+    isp,
+    org,
+    asn,
+    isLocationVerified: location.isLocationVerified || Boolean(edge.city || edge.countryCode || latitude !== null)
+  };
+}
+
+// src/lib/geohash.ts
+var GEOHASH_BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz";
+function isValidCoordinate(latitude, longitude) {
+  return typeof latitude === "number" && typeof longitude === "number" && Number.isFinite(latitude) && Number.isFinite(longitude) && Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180;
+}
+function encodeGeohash(latitude, longitude, precision = 6) {
+  if (!isValidCoordinate(latitude, longitude)) return null;
+  const chars = Math.max(1, Math.min(12, Math.floor(precision)));
+  let latMin = -90;
+  let latMax = 90;
+  let lonMin = -180;
+  let lonMax = 180;
+  let hash = "";
+  let bits = 0;
+  let bitCount = 0;
+  let even = true;
+  while (hash.length < chars) {
+    if (even) {
+      const mid = (lonMin + lonMax) / 2;
+      if (longitude >= mid) {
+        bits = bits << 1 | 1;
+        lonMin = mid;
+      } else {
+        bits = bits << 1;
+        lonMax = mid;
+      }
+    } else {
+      const mid = (latMin + latMax) / 2;
+      if (latitude >= mid) {
+        bits = bits << 1 | 1;
+        latMin = mid;
+      } else {
+        bits = bits << 1;
+        latMax = mid;
+      }
+    }
+    even = !even;
+    bitCount += 1;
+    if (bitCount === 5) {
+      hash += GEOHASH_BASE32[bits];
+      bits = 0;
+      bitCount = 0;
+    }
+  }
+  return hash;
+}
+function formatCoordinatePair(latitude, longitude) {
+  if (!isValidCoordinate(latitude, longitude)) return "";
+  const lat = `${Math.abs(latitude).toFixed(2)}\xB0${latitude >= 0 ? "N" : "S"}`;
+  const lon = `${Math.abs(longitude).toFixed(2)}\xB0${longitude >= 0 ? "E" : "W"}`;
+  return `${lat}, ${lon}`;
+}
+function buildProximityInfo(latitude, longitude) {
+  const geohash = encodeGeohash(latitude, longitude, 6);
+  if (!geohash) {
+    return {
+      id: "prox_unresolved",
+      geohash: null,
+      zone_label: "Zone Unresolved (IP-only)",
+      precision_radius: 5e3,
+      confidence: 0,
+      resolved: false
+    };
+  }
+  const coords = formatCoordinatePair(latitude, longitude);
+  return {
+    id: `prox_${geohash}`,
+    geohash,
+    zone_label: `Zone ${geohash}${coords ? ` \xB7 ${coords}` : ""}`,
+    precision_radius: 5e3,
+    confidence: 0.92,
+    resolved: true
+  };
+}
+
+// src/lib/aiBotDirectory.ts
+var BOT_DIRECTORY = [
+  // OpenAI - verified (CIDR/FCrDNS verified)
+  {
+    name: "ChatGPT-User",
+    provider: "OpenAI",
+    category: "ai_assistant",
+    identity: "verified",
+    uaPatterns: [/ChatGPT-User/i]
+  },
+  {
+    name: "OAI-SearchBot",
+    provider: "OpenAI",
+    category: "ai_search",
+    identity: "verified",
+    uaPatterns: [/OAI-SearchBot/i]
+  },
+  {
+    name: "GPTBot",
+    provider: "OpenAI",
+    category: "ai_crawler",
+    identity: "verified",
+    uaPatterns: [/GPTBot/i]
+  },
+  // OpenAI - signed (Web Bot Auth)
+  {
+    name: "ChatGPT Agent",
+    provider: "OpenAI",
+    category: "ai_agent",
+    identity: "signed",
+    requiresWebBotAuth: true,
+    asnPatterns: [/openai|azure/i],
+    uaPatterns: [/ChatGPT-Agent/i]
+  },
+  // OpenAI - unknown
+  {
+    name: "Codex",
+    provider: "OpenAI",
+    category: "ai_agent",
+    identity: "unknown",
+    uaPatterns: [/\bCodex\b/i]
+  },
+  // Google - verified
+  {
+    name: "Gemini Deep Research",
+    provider: "Google",
+    category: "ai_agent",
+    identity: "verified",
+    asnNumbers: [15169, 396982],
+    asnPatterns: [/google llc|google cloud|AS15169|AS396982/i],
+    uaPatterns: [/Googlebot|Google-Extended|Google-Agent|Mariner|Gemini/i]
+  },
+  {
+    name: "Google-Agent",
+    provider: "Google",
+    category: "ai_agent",
+    identity: "verified",
+    uaPatterns: [/Google-Agent/i]
+  },
+  {
+    name: "Google NotebookLM",
+    provider: "Google",
+    category: "ai_assistant",
+    identity: "verified",
+    uaPatterns: [/NotebookLM/i]
+  },
+  // Anthropic - verified
+  {
+    name: "Claude-User",
+    provider: "Anthropic",
+    category: "ai_assistant",
+    identity: "verified",
+    uaPatterns: [/Claude-User/i]
+  },
+  {
+    name: "Claude-SearchBot",
+    provider: "Anthropic",
+    category: "ai_search",
+    identity: "verified",
+    uaPatterns: [/Claude-SearchBot/i]
+  },
+  {
+    name: "ClaudeBot",
+    provider: "Anthropic",
+    category: "ai_crawler",
+    identity: "verified",
+    uaPatterns: [/ClaudeBot/i]
+  },
+  // Anthropic - unknown
+  {
+    name: "Claude Code",
+    provider: "Anthropic",
+    category: "ai_agent",
+    identity: "unknown",
+    uaPatterns: [/Claude Code|claude-code/i]
+  },
+  {
+    name: "Claude Duet",
+    provider: "Anthropic",
+    category: "ai_agent",
+    identity: "unknown",
+    uaPatterns: [/Claude-Duet|claude-duet/i]
+  },
+  // Perplexity - verified
+  {
+    name: "Perplexity-User",
+    provider: "Perplexity",
+    category: "ai_assistant",
+    identity: "verified",
+    uaPatterns: [/Perplexity-User/i]
+  },
+  {
+    name: "PerplexityBot",
+    provider: "Perplexity",
+    category: "ai_search",
+    identity: "verified",
+    uaPatterns: [/PerplexityBot/i]
+  },
+  // Meta
+  {
+    name: "Muse",
+    provider: "Meta",
+    category: "ai_agent",
+    identity: "unknown",
+    asnNumbers: [32934],
+    asnPatterns: [/meta platforms|AS32934/i],
+    uaPatterns: [/\bMuse\b/i]
+  },
+  {
+    name: "Meta-ExternalAgent",
+    provider: "Meta",
+    category: "ai_search",
+    identity: "verified",
+    uaPatterns: [/Meta-ExternalAgent|meta-externalagent/i]
+  },
+  {
+    name: "Meta-WebIndexer",
+    provider: "Meta",
+    category: "ai_search",
+    identity: "verified",
+    uaPatterns: [/Meta-WebIndexer/i]
+  },
+  // xAI
+  {
+    name: "Grok Bot",
+    provider: "xAI",
+    category: "ai_agent",
+    identity: "unknown",
+    uaPatterns: [/Grok-Bot|GrokBot|grok/i]
+  },
+  // Cloud Browser Agents - signed
+  {
+    name: "Browserbase Agent",
+    provider: "Browserbase",
+    category: "ai_agent",
+    identity: "signed",
+    uaPatterns: [/Browserbase/i],
+    requiresWebBotAuth: true
+  },
+  {
+    name: "Bedrock AgentCore",
+    provider: "AWS",
+    category: "ai_agent",
+    identity: "signed",
+    asnNumbers: [16509, 14618],
+    uaPatterns: [/BedrockAgentCore|bedrock-agent/i]
+  },
+  {
+    name: "Anchor Browser",
+    provider: "Anchor",
+    category: "ai_browser",
+    identity: "signed",
+    uaPatterns: [/AnchorBrowser|anchor-browser/i]
+  },
+  {
+    name: "Notte Browser",
+    provider: "Notte",
+    category: "ai_browser",
+    identity: "signed",
+    uaPatterns: [/NotteBrowser|notte/i]
+  },
+  {
+    name: "Manus Agent",
+    provider: "Manus",
+    category: "ai_agent",
+    identity: "signed",
+    uaPatterns: [/ManusAgent|manus-agent/i]
+  },
+  {
+    name: "AGI Agent",
+    provider: "AGI Inc",
+    category: "ai_agent",
+    identity: "signed",
+    uaPatterns: [/AGIAgent|agi-agent/i]
+  },
+  // Other - unknown
+  {
+    name: "Cursor",
+    provider: "Anysphere",
+    category: "ai_agent",
+    identity: "unknown",
+    uaPatterns: [/\bCursor\b/i],
+    headerPatterns: [{ header: "x-cursor-agent", pattern: /.*/ }]
+  },
+  {
+    name: "DuckAssistBot",
+    provider: "DuckDuckGo",
+    category: "ai_assistant",
+    identity: "verified",
+    uaPatterns: [/DuckAssistBot/i]
+  },
+  {
+    name: "Kimi-User",
+    provider: "Moonshot AI",
+    category: "ai_assistant",
+    identity: "verified",
+    uaPatterns: [/Kimi-User/i]
+  },
+  {
+    name: "Cloudflare Browser Rendering",
+    provider: "Cloudflare",
+    category: "browser_automation",
+    identity: "unknown",
+    asnNumbers: [13335],
+    uaPatterns: [/CloudflareBot|cf-browser/i]
+  },
+  {
+    name: "Instinct",
+    provider: "Spear Street Technology",
+    category: "ai_agent",
+    identity: "unknown",
+    uaPatterns: [/\bInstinct\b/i]
+  }
+];
+function detectAiBotFromServerSignals(params) {
+  const { userAgent, asnNumber, asnOrg, headers } = params;
+  const ua = userAgent || "";
+  const signatureAgent = headers["signature-agent"] || "";
+  const signatureInput = headers["signature-input"] || "";
+  const signature = headers["signature"] || "";
+  const hasWebBotAuth = Boolean(signatureAgent && signatureInput && signature);
+  for (const entry of BOT_DIRECTORY) {
+    let matched = false;
+    if (entry.uaPatterns) {
+      for (const pattern of entry.uaPatterns) {
+        if (pattern.test(ua)) {
+          matched = true;
+          break;
+        }
+      }
+    }
+    if (!matched && asnNumber !== null && entry.asnNumbers) {
+      if (entry.asnNumbers.includes(asnNumber)) {
+        matched = true;
+      }
+    }
+    if (!matched && entry.asnPatterns) {
+      for (const pattern of entry.asnPatterns) {
+        if (pattern.test(asnOrg)) {
+          matched = true;
+          break;
+        }
+      }
+    }
+    if (!matched && entry.headerPatterns) {
+      for (const { header, pattern } of entry.headerPatterns) {
+        const hVal = headers[header] || "";
+        if (hVal && pattern.test(hVal)) {
+          matched = true;
+          break;
+        }
+      }
+    }
+    if (matched) {
+      let identity = entry.identity;
+      if (identity === "unknown" && hasWebBotAuth) {
+        identity = "signed";
+      }
+      return {
+        detected: true,
+        botType: entry.category,
+        botInfo: {
+          category: entry.category,
+          provider: entry.provider,
+          name: entry.name,
+          identity
+        }
+      };
+    }
+  }
+  if (/HeadlessChrome|Headless/i.test(ua)) {
+    return {
+      detected: true,
+      botType: "browser_automation",
+      botInfo: {
+        category: "browser_automation",
+        provider: "Unknown",
+        name: "Headless Browser",
+        identity: "unknown"
+      }
+    };
+  }
+  if (/Playwright|puppeteer|selenium|PhantomJS|Sequentum/i.test(ua)) {
+    return {
+      detected: true,
+      botType: "browser_automation",
+      botInfo: {
+        category: "browser_automation",
+        provider: "Unknown",
+        name: "Browser Automation",
+        identity: "unknown"
+      }
+    };
+  }
+  return { detected: false, botType: null, botInfo: null };
+}
+
+// server.ts
 dotenv.config();
 var PORT = Number(process.env.PORT) || 3e3;
 var SESSION_TIMEOUT_MINUTES = 30;
@@ -52,15 +680,17 @@ function createInMemoryDbAdapter() {
             const matches = Array.from(visitorsMap.values()).filter((v) => v.hardware_id === hwid).sort((a, b) => b.updated_at_utc.localeCompare(a.updated_at_utc));
             return matches[0];
           }
-          if (normalized.includes(
-            "SELECT session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?"
-          )) {
+          if (normalized.includes("FROM visits WHERE visitor_id = ? AND page_load_id = ?")) {
             const vid = String(params[0] || "");
             const plId = String(params[1] || "");
             const found = visitsList.find(
               (v) => v.visitor_id === vid && v.page_load_id === plId
             );
-            return found ? { session_id: found.session_id, visited_at_utc: found.visited_at_utc } : void 0;
+            return found ? {
+              visit_id: found.visit_id,
+              session_id: found.session_id,
+              visited_at_utc: found.visited_at_utc
+            } : void 0;
           }
           if (normalized.includes("COUNT(*) AS total_visits") && normalized.includes("FROM visits WHERE visitor_id = ?")) {
             const vid = String(params[0] || "");
@@ -185,8 +815,24 @@ function createInMemoryDbAdapter() {
               device_type: String(params[16] || "Unknown"),
               screen_resolution: String(params[17] || "Unavailable"),
               language: String(params[18] || "Unavailable"),
-              timezone: String(params[19] || "Unavailable")
+              timezone: String(params[19] || "Unavailable"),
+              suspect_score: typeof params[20] === "number" ? params[20] : null,
+              risk_level: typeof params[21] === "string" ? params[21] : null,
+              score10: typeof params[22] === "number" ? params[22] : null,
+              bot_name: typeof params[23] === "string" ? params[23] : null,
+              recognition_source: typeof params[24] === "string" ? params[24] : null
             });
+            return { changes: 1 };
+          }
+          if (normalized.includes("UPDATE visits") && normalized.includes("suspect_score = ?")) {
+            const visitId = String(params[5] || "");
+            const target = visitsList.find((v) => v.visit_id === visitId);
+            if (!target) return { changes: 0 };
+            target.suspect_score = typeof params[0] === "number" ? params[0] : null;
+            target.risk_level = typeof params[1] === "string" ? params[1] : null;
+            target.score10 = typeof params[2] === "number" ? params[2] : null;
+            target.bot_name = typeof params[3] === "string" ? params[3] : null;
+            target.recognition_source = typeof params[4] === "string" ? params[4] : null;
             return { changes: 1 };
           }
           return { changes: 0 };
@@ -255,6 +901,11 @@ function initializeDatabase() {
         screen_resolution TEXT NOT NULL,
         language TEXT NOT NULL,
         timezone TEXT NOT NULL,
+        suspect_score REAL,
+        risk_level TEXT,
+        score10 REAL,
+        bot_name TEXT,
+        recognition_source TEXT,
         UNIQUE(visitor_id, page_load_id),
         FOREIGN KEY (visitor_id) REFERENCES visitors(visitor_id) ON DELETE CASCADE
       );
@@ -300,6 +951,18 @@ function initializeDatabase() {
       } catch {
       }
     }
+    for (const col of ["suspect_score", "score10"]) {
+      try {
+        sqliteDb.exec(`ALTER TABLE visits ADD COLUMN ${col} REAL`);
+      } catch {
+      }
+    }
+    for (const col of ["risk_level", "bot_name", "recognition_source"]) {
+      try {
+        sqliteDb.exec(`ALTER TABLE visits ADD COLUMN ${col} TEXT`);
+      } catch {
+      }
+    }
     return sqliteDb;
   } catch {
     return createInMemoryDbAdapter();
@@ -321,8 +984,10 @@ function verifyVisitorToken(visitorId, token) {
     return false;
   }
 }
-function computeHistoryBackupSignature(visitorId, totalVisits, totalSessions, firstVisitUtc, visits) {
-  const visitDigest = visits.map((v) => `${v.visitId}:${v.sessionId}:${v.visitedAtUtc}:${v.publicIp}`).join("|");
+function computeHistoryBackupSignature(visitorId, totalVisits, totalSessions, firstVisitUtc, visits, legacyDigest = false) {
+  const visitDigest = visits.map(
+    (v) => legacyDigest ? `${v.visitId}:${v.sessionId}:${v.visitedAtUtc}:${v.publicIp}` : `${v.visitId}:${v.sessionId}:${v.visitedAtUtc}:${v.publicIp}:${typeof v.suspectScore === "number" ? v.suspectScore : 0}:${v.riskLevel ?? "Low"}:${v.botName ?? ""}`
+  ).join("|");
   const payload = `hist:${visitorId}:${totalVisits}:${totalSessions}:${firstVisitUtc}:${visitDigest}`;
   return crypto.createHmac("sha256", HMAC_SECRET).update(payload).digest("hex");
 }
@@ -356,15 +1021,26 @@ function verifySignedHistoryBackup(expectedVisitorId, backup) {
     backup.firstVisitUtc,
     backup.visits
   );
-  if (expectedSig.length !== backup.signature.length) return false;
-  try {
-    return crypto.timingSafeEqual(
-      Buffer.from(expectedSig, "hex"),
-      Buffer.from(backup.signature, "hex")
-    );
-  } catch {
-    return false;
-  }
+  const legacySig = computeHistoryBackupSignature(
+    backup.visitorId,
+    backup.totalVisits,
+    backup.totalSessions,
+    backup.firstVisitUtc,
+    backup.visits,
+    true
+  );
+  const matches = [expectedSig, legacySig].some((candidate) => {
+    if (candidate.length !== backup.signature.length) return false;
+    try {
+      return crypto.timingSafeEqual(
+        Buffer.from(candidate, "hex"),
+        Buffer.from(backup.signature, "hex")
+      );
+    } catch {
+      return false;
+    }
+  });
+  return matches;
 }
 function generateVisitorId() {
   return "vid_" + crypto.randomBytes(10).toString("hex");
@@ -683,7 +1359,7 @@ function classifyIspNetwork(isp, org, asn) {
   if (torAsnHit !== void 0 || torOrgHit) {
     return {
       brandName: cleanIsp && !/^unknown( isp)?$/i.test(cleanIsp) ? cleanIsp : cleanOrg && !/^unknown( isp)?$/i.test(cleanOrg) ? cleanOrg : "Tor Relay Operator",
-      networkType: "Tor Exit / Anonymity Network",
+      networkType: "Cloud / Datacenter",
       isConsumerBroadband: false,
       isDatacenterOrHosting: true,
       matchedReason: torAsnHit !== void 0 ? `Tor operator ASN ${torAsnHit}` : "Tor operator organisation"
@@ -693,7 +1369,10 @@ function classifyIspNetwork(isp, org, asn) {
   const cloudKeywords = /google llc|google cloud|amazonaws|cloudflare|digitalocean|hetzner|m247|datacamp|linode|ovh|choopa|vultr|leaseweb|hostinger|contabo|akamai|oracle cloud|alibaba|aliyun|tencent cloud/i;
   if (cloudAsnHit !== void 0 || cloudKeywords.test(keywordHaystack)) {
     return {
-      brandName: "Cloud Provider / Datacenter",
+      // Prefer the real operator name (Google LLC, Amazon.com, Inc., Microsoft
+      // Corporation, Cloudflare, Inc.) so an unresolved provider lookup never surfaces a
+      // generic or anonymous cloud label.
+      brandName: cloudProviderOrgForAsn(`AS${cloudAsnHit ?? ""}`) || (cleanIsp && !/^unknown( isp)?$/i.test(cleanIsp) ? cleanIsp : cleanOrg && !/^unknown( isp)?$/i.test(cleanOrg) ? cleanOrg : "Cloud Provider / Datacenter"),
       networkType: "Cloud / Datacenter",
       isConsumerBroadband: false,
       isDatacenterOrHosting: true,
@@ -733,7 +1412,7 @@ function classifyIspNetwork(isp, org, asn) {
   };
 }
 function applyNetworkOverrides(base, context) {
-  const torNetwork = context.torExit || context.torOperatorHint || context.isTorBrowserClient || base.networkType === "Tor Exit / Anonymity Network";
+  const torNetwork = context.torExit;
   if (torNetwork) {
     return {
       ...base,
@@ -2332,7 +3011,7 @@ async function resolveTorExitStatus(publicIp, location, prefetched) {
   }
   if (verdict === "unknown" && matchesTorOperatorHint({ ...location, publicIp })) {
     return {
-      isExit: true,
+      isExit: false,
       isRelay: true,
       verdict: "relay",
       viaOperatorHint: true,
@@ -2424,7 +3103,7 @@ function lookupSuspiciousIp(ip) {
     reasons: [...suspiciousIpReasons.get(cleanIp) ?? []]
   };
 }
-var ENVELOPE_FRESHNESS_WINDOW_MS = 10 * 60 * 1e3;
+var ENVELOPE_FRESHNESS_WINDOW_MS = 3e5;
 var NONCE_TTL_MS = 15 * 60 * 1e3;
 var NONCE_CACHE_MAX_ENTRIES = 5e3;
 var seenEnvelopeNonces = /* @__PURE__ */ new Map();
@@ -2491,7 +3170,7 @@ function verifySecurityEnvelope(args) {
   }
   if (timestamp > 0 && Math.abs(nowMs - timestamp) > ENVELOPE_FRESHNESS_WINDOW_MS) {
     tamperedRequest = true;
-    reasons.push("Expired or replayed payload timestamp (>10m)");
+    reasons.push("Expired or replayed payload timestamp (>5m)");
   }
   let replayDetected = false;
   if (requestNonce) {
@@ -3075,29 +3754,8 @@ app.get("/api/health", async (req, res) => {
   }
   res.json({ status: "ok", visitorsCount, visitsCount, regionCode, regionLabel });
 });
-function extractVercelEdgeGeo(req) {
-  const decodeHeader = (val) => {
-    if (typeof val !== "string" || !val.trim()) return "";
-    try {
-      return decodeURIComponent(val.trim());
-    } catch {
-      return val.trim();
-    }
-  };
-  const city = decodeHeader(req.headers["x-vercel-ip-city"]);
-  const region = decodeHeader(req.headers["x-vercel-ip-country-region"]);
-  const country = decodeHeader(req.headers["x-vercel-ip-country"]);
-  const timezone = decodeHeader(req.headers["x-vercel-ip-timezone"]);
-  const rawLat = parseFloat(String(req.headers["x-vercel-ip-latitude"] || ""));
-  const rawLon = parseFloat(String(req.headers["x-vercel-ip-longitude"] || ""));
-  return {
-    city,
-    region,
-    country,
-    timezone,
-    latitude: Number.isFinite(rawLat) ? rawLat : null,
-    longitude: Number.isFinite(rawLon) ? rawLon : null
-  };
+function extractEdgeGeo(req) {
+  return readEdgeGeoHeaders(req.headers);
 }
 var SERVER_TIMEZONE_ALIAS_MAP = {
   "asia/calcutta": "asia/kolkata",
@@ -3539,42 +4197,39 @@ app.post("/api/visitor/identify", async (req, res) => {
     const torLookupPromise = resolveTorExitVerdict(extractedIp).catch(
       () => "unknown"
     );
-    let location = await lookupVerifiedGeolocation(extractedIp, isPublic);
-    const vercelGeo = extractVercelEdgeGeo(req);
-    if (isPublic && (!location.isLocationVerified || location.isp === "Unknown" || location.latitude === null) && clientGeoHint && normalizeIpCandidate(clientGeoHint.ip)?.toLowerCase() === extractedIp.toLowerCase()) {
+    const edgeGeo = extractEdgeGeo(req);
+    let location = mergeLocationWithEdge(
+      await lookupVerifiedGeolocation(extractedIp, isPublic),
+      edgeGeo
+    );
+    if (isPublic && clientGeoHint && normalizeIpCandidate(clientGeoHint.ip)?.toLowerCase() === extractedIp.toLowerCase()) {
       const hintNet = normalizeIspAndOrg(
         clientGeoHint.isp,
         clientGeoHint.org,
         clientGeoHint.asn,
         Boolean(clientGeoHint.isVpnOrHosting)
       );
-      const hintLat = typeof clientGeoHint.latitude === "number" && Number.isFinite(clientGeoHint.latitude) ? clientGeoHint.latitude : vercelGeo.latitude;
-      const hintLon = typeof clientGeoHint.longitude === "number" && Number.isFinite(clientGeoHint.longitude) ? clientGeoHint.longitude : vercelGeo.longitude;
-      location = {
-        publicIp: extractedIp,
-        city: location.city !== "Unavailable" && location.city !== "Unknown" ? location.city : typeof clientGeoHint.city === "string" && clientGeoHint.city || vercelGeo.city || "Unknown",
-        region: location.region !== "Unavailable" && location.region !== "Unknown" ? location.region : typeof clientGeoHint.region === "string" && clientGeoHint.region || vercelGeo.region || "Unknown",
-        country: location.country !== "Unavailable" && location.country !== "Unknown" ? location.country : typeof clientGeoHint.country === "string" && clientGeoHint.country || vercelGeo.country || "Unknown",
-        countryCode: location.countryCode || (typeof clientGeoHint.countryCode === "string" ? clientGeoHint.countryCode : "") || vercelGeo.country,
-        latitude: location.latitude !== null ? location.latitude : hintLat,
-        longitude: location.longitude !== null ? location.longitude : hintLon,
-        isp: location.isp !== "Unknown" ? location.isp : hintNet.isp,
-        org: location.org !== "Unknown" ? location.org : hintNet.org,
-        asn: location.asn !== "Unknown" ? location.asn : hintNet.asn,
-        isVpnOrHosting: location.isVpnOrHosting || hintNet.isVpnOrHosting,
-        isIpVerified: true,
-        isLocationVerified: true
-      };
-    } else if (isPublic && (!location.isLocationVerified || location.latitude === null) && (vercelGeo.city || vercelGeo.country || vercelGeo.latitude !== null)) {
+      const hintLat = typeof clientGeoHint.latitude === "number" && Number.isFinite(clientGeoHint.latitude) ? clientGeoHint.latitude : edgeGeo.latitude;
+      const hintLon = typeof clientGeoHint.longitude === "number" && Number.isFinite(clientGeoHint.longitude) ? clientGeoHint.longitude : edgeGeo.longitude;
+      const hintCity = typeof clientGeoHint.city === "string" ? clientGeoHint.city.trim() : "";
+      const hintRegion = typeof clientGeoHint.region === "string" ? clientGeoHint.region.trim() : "";
+      const hintCountry = typeof clientGeoHint.country === "string" ? clientGeoHint.country.trim() : "";
+      const hintCountryCode = typeof clientGeoHint.countryCode === "string" ? clientGeoHint.countryCode.trim() : "";
+      const ispIsPlaceholder = isMissingGeoValue(location.isp) || /^autonomous system\b/i.test(location.isp);
       location = {
         ...location,
-        city: location.city !== "Unavailable" && location.city !== "Unknown" ? location.city : vercelGeo.city || "Unknown",
-        region: location.region !== "Unavailable" && location.region !== "Unknown" ? location.region : vercelGeo.region || "Unknown",
-        country: location.country !== "Unavailable" && location.country !== "Unknown" ? location.country : vercelGeo.country || "Unknown",
-        countryCode: location.countryCode || vercelGeo.country,
-        latitude: location.latitude !== null ? location.latitude : vercelGeo.latitude,
-        longitude: location.longitude !== null ? location.longitude : vercelGeo.longitude,
-        isLocationVerified: true
+        city: isMissingGeoValue(location.city) ? hintCity || edgeGeo.city || "Unknown" : location.city,
+        region: isMissingGeoValue(location.region) ? hintRegion || edgeGeo.region || "Unknown" : location.region,
+        country: isMissingGeoValue(location.country) ? countryNameFromCode(hintCountryCode) || hintCountry || edgeGeo.country || "Unknown" : location.country,
+        countryCode: location.countryCode || hintCountryCode.toUpperCase() || edgeGeo.countryCode,
+        latitude: location.latitude !== null ? location.latitude : hintLat,
+        longitude: location.longitude !== null ? location.longitude : hintLon,
+        isp: ispIsPlaceholder ? hintNet.isp : location.isp,
+        org: isMissingGeoValue(location.org) ? hintNet.org : location.org,
+        asn: normalizeAsnLabel(location.asn) || hintNet.asn || edgeGeo.asn,
+        isVpnOrHosting: location.isVpnOrHosting || hintNet.isVpnOrHosting,
+        isIpVerified: true,
+        isLocationVerified: location.isLocationVerified || Boolean(hintCity || hintCountry || hintLat !== null)
       };
     }
     const classification = classifyIspNetwork(location.isp, location.org, location.asn);
@@ -3617,33 +4272,41 @@ app.post("/api/visitor/identify", async (req, res) => {
       if (validHistoryBackup && validHistoryBackup.visits.length > 0) {
         const orderedAsc = [...validHistoryBackup.visits].reverse();
         for (const histVisit of orderedAsc) {
+          const histVisitId = typeof histVisit.visitId === "string" && histVisit.visitId.trim() ? histVisit.visitId.trim() : generateVisitId();
+          const histVisitedAt = typeof histVisit.visitedAtUtc === "string" && histVisit.visitedAtUtc.trim() ? histVisit.visitedAtUtc : (/* @__PURE__ */ new Date()).toISOString();
           db.prepare(
             `INSERT OR IGNORE INTO visits (
               visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
               public_ip, city, region, country, latitude, longitude, isp, org, asn,
-              browser, os, device_type, screen_resolution, language, timezone
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              browser, os, device_type, screen_resolution, language, timezone,
+              suspect_score, risk_level, score10, bot_name, recognition_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).run(
-            histVisit.visitId,
+            histVisitId,
             verifiedVid,
-            histVisit.sessionId,
-            `rehydrated_${histVisit.visitId}`,
-            histVisit.visitedAtUtc,
-            histVisit.publicIp,
-            histVisit.city,
-            histVisit.region,
-            histVisit.country,
-            histVisit.latitude,
-            histVisit.longitude,
+            typeof histVisit.sessionId === "string" && histVisit.sessionId ? histVisit.sessionId : clientSessionId || generateSessionId(),
+            `rehydrated_${histVisitId}`,
+            histVisitedAt,
+            histVisit.publicIp || "Unavailable",
+            histVisit.city || "Unknown",
+            histVisit.region || "Unknown",
+            histVisit.country || "Unknown",
+            typeof histVisit.latitude === "number" ? histVisit.latitude : null,
+            typeof histVisit.longitude === "number" ? histVisit.longitude : null,
             histVisit.isp || "Unknown",
             histVisit.org || "Unknown",
             histVisit.asn || "Unknown",
-            histVisit.browser,
-            histVisit.os,
-            histVisit.deviceType,
-            histVisit.screenResolution,
-            histVisit.language,
-            histVisit.timezone
+            histVisit.browser || "Unknown",
+            histVisit.os || "Unknown",
+            histVisit.deviceType || "Unknown",
+            histVisit.screenResolution || "Unavailable",
+            histVisit.language || "Unavailable",
+            histVisit.timezone || "Unavailable",
+            typeof histVisit.suspectScore === "number" ? histVisit.suspectScore : null,
+            histVisit.riskLevel || null,
+            typeof histVisit.score10 === "number" ? histVisit.score10 : typeof histVisit.suspectScore === "number" ? histVisit.suspectScore : null,
+            histVisit.botName || null,
+            histVisit.recognitionSource || null
           );
         }
       }
@@ -3660,6 +4323,7 @@ app.post("/api/visitor/identify", async (req, res) => {
     let visitorId;
     let visitorToken;
     let currentSessionId;
+    let currentVisitId = "";
     let isReturning = false;
     if (existingVisitor) {
       visitorId = existingVisitor.visitor_id;
@@ -3668,9 +4332,10 @@ app.post("/api/visitor/identify", async (req, res) => {
       const lastActivityMs = new Date(existingVisitor.last_activity_utc).getTime();
       const isExpiredByInactivity = Number.isNaN(lastActivityMs) || nowMs - lastActivityMs > SESSION_EXPIRATION_MS;
       const isSameClientSession = Boolean(clientSessionId) && clientSessionId === existingVisitor.active_session_id;
-      const existingPageLoadVisit = db.prepare("SELECT session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?").get(visitorId, safePageLoadId);
+      const existingPageLoadVisit = db.prepare("SELECT visit_id, session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?").get(visitorId, safePageLoadId);
       if (existingPageLoadVisit) {
         currentSessionId = existingPageLoadVisit.session_id;
+        currentVisitId = existingPageLoadVisit.visit_id;
       } else {
         if (isExpiredByInactivity || !isSameClientSession) {
           currentSessionId = generateSessionId();
@@ -3678,6 +4343,7 @@ app.post("/api/visitor/identify", async (req, res) => {
           currentSessionId = existingVisitor.active_session_id;
         }
         const visitId = generateVisitId();
+        currentVisitId = visitId;
         db.prepare(
           `INSERT OR IGNORE INTO visits (
             visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
@@ -3723,6 +4389,7 @@ app.post("/api/visitor/identify", async (req, res) => {
         ) VALUES (?, ?, ?, ?, ?, ?, ?)`
       ).run(visitorId, visitorToken, hardwareId, nowUtc, nowUtc, currentSessionId, nowUtc);
       const visitId = generateVisitId();
+      currentVisitId = visitId;
       db.prepare(
         `INSERT OR IGNORE INTO visits (
           visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
@@ -3800,13 +4467,14 @@ app.post("/api/visitor/identify", async (req, res) => {
       `SELECT
           id, visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
           public_ip, city, region, country, latitude, longitude, isp, org, asn,
-          browser, os, device_type, screen_resolution, language, timezone
+          browser, os, device_type, screen_resolution, language, timezone,
+          suspect_score, risk_level, score10, bot_name, recognition_source
          FROM visits
          WHERE visitor_id = ?
          ORDER BY visited_at_utc DESC, id DESC
          LIMIT 50`
     ).all(visitorId);
-    const ipTimezoneHint = typeof clientGeoHint?.timezone === "string" && clientGeoHint.timezone.trim() || vercelGeo.timezone || "";
+    const ipTimezoneHint = typeof clientGeoHint?.timezone === "string" && clientGeoHint.timezone.trim() || edgeGeo.timezone || "";
     const oneHourAgoMs = Date.now() - 3600 * 1e3;
     const lastHourVisitRows = rawVisits.filter((r) => {
       const visitedAtMs = Date.parse(String(r.visited_at_utc || ""));
@@ -4030,12 +4698,16 @@ app.post("/api/visitor/identify", async (req, res) => {
       developerTools,
       rareDevice: rarityReport.rareDevice
     });
+    const currentBotName = (aiAgent?.detected ? aiAgent.agentName : "") || (effectiveBotClassification.subtype !== "human" ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim() : "");
     const visitHistory = rawVisits.map((r) => {
-      const storedSuspectScore = typeof r.suspect_score === "number" && Number.isFinite(r.suspect_score) ? normalizeLegacySuspectScore(r.suspect_score) : null;
+      const storedScore10 = typeof r.score10 === "number" && Number.isFinite(r.score10) ? Math.max(0, Math.min(10, Math.round(r.score10))) : null;
+      const storedSuspectScore = typeof r.suspect_score === "number" && Number.isFinite(r.suspect_score) ? normalizeLegacySuspectScore(r.suspect_score) : storedScore10;
       const isCurrentVisitRow = String(r.page_load_id || "") === safePageLoadId;
       const rowSuspectScore = storedSuspectScore !== null ? storedSuspectScore : isCurrentVisitRow ? securitySignals.suspectScore : 0;
-      const rowRiskLevel = rowSuspectScore >= 7 ? "High" : rowSuspectScore >= 3 ? "Medium" : "Low";
-      const rowRecognitionSource = isCurrentVisitRow ? recognitionSource : "Cookie";
+      const storedRiskLevel = r.risk_level === "High" || r.risk_level === "Medium" || r.risk_level === "Low" ? r.risk_level : null;
+      const rowRiskLevel = storedRiskLevel ?? (rowSuspectScore >= 7 ? "High" : rowSuspectScore >= 3 ? "Medium" : "Low");
+      const rowRecognitionSource = typeof r.recognition_source === "string" && r.recognition_source ? r.recognition_source : isCurrentVisitRow ? recognitionSource : "Cookie";
+      const rowBotName = typeof r.bot_name === "string" && r.bot_name ? r.bot_name : isCurrentVisitRow ? currentBotName : "";
       const rowCloudOrMaskedGpu = isCurrentVisitRow ? Boolean(
         securitySignals.cloudOrMaskedGpu
       ) : false;
@@ -4061,11 +4733,30 @@ app.post("/api/visitor/identify", async (req, res) => {
         language: String(r.language),
         timezone: String(r.timezone),
         suspectScore: rowSuspectScore,
+        score10: Math.max(0, Math.min(10, Math.round(rowSuspectScore))),
         riskLevel: rowRiskLevel,
+        botName: rowBotName || void 0,
         recognitionSource: rowRecognitionSource,
         cloudOrMaskedGpu: rowCloudOrMaskedGpu
       };
     });
+    if (currentVisitId) {
+      try {
+        db.prepare(
+          `UPDATE visits
+           SET suspect_score = ?, risk_level = ?, score10 = ?, bot_name = ?, recognition_source = ?
+           WHERE visit_id = ?`
+        ).run(
+          securitySignals.suspectScore,
+          securitySignals.riskLevel,
+          Math.max(0, Math.min(10, Math.round(securitySignals.suspectScore))),
+          currentBotName || null,
+          recognitionSource,
+          currentVisitId
+        );
+      } catch {
+      }
+    }
     const historyBackup = createSignedHistoryBackup(
       visitorId,
       statistics.totalVisits,
@@ -4074,6 +4765,53 @@ app.post("/api/visitor/identify", async (req, res) => {
       visitHistory,
       hardwareId
     );
+    const asnNumMatch = (location.asn || "").match(/\d+/);
+    const asnNumber = asnNumMatch ? Number.parseInt(asnNumMatch[0], 10) : null;
+    const robodexResult = detectAiBotFromServerSignals({
+      userAgent: fullRequestUserAgent,
+      asnNumber,
+      asnOrg: `${location.org} ${location.isp}`,
+      headers: rawRequestHeaders
+    });
+    let botInfo = null;
+    let botType = null;
+    let botVerdict = "not_detected";
+    if (robodexResult.detected && robodexResult.botInfo) {
+      botInfo = robodexResult.botInfo;
+      botType = robodexResult.botType;
+      botVerdict = botType === "ai_agent" || botType === "browser_automation" ? "bad" : "good";
+    } else if (aiAgent.detected) {
+      const isImpostor = aiAgent.agentId === "impostor-spoof";
+      botInfo = {
+        category: isImpostor ? "browser_automation" : "ai_agent",
+        provider: aiAgent.operator || "Unknown",
+        name: aiAgent.agentName,
+        identity: isImpostor ? "spoofed" : aiAgent.verified ? aiAgent.executionMode === "RFC 9421 Signed Agent" ? "signed" : "verified" : "unknown"
+      };
+      botType = "ai_agent";
+      botVerdict = "bad";
+    } else if (effectiveBotClassification.subtype === "bad_bot") {
+      botInfo = {
+        category: "browser_automation",
+        provider: effectiveBotClassification.provider || "Unknown",
+        name: effectiveBotClassification.label || "Automated Tool",
+        identity: "unknown"
+      };
+      botType = "browser_automation";
+      botVerdict = "bad";
+    } else if (effectiveBotClassification.subtype === "good_bot") {
+      botInfo = {
+        category: "ai_crawler",
+        provider: effectiveBotClassification.provider || "Search Engine",
+        name: effectiveBotClassification.label || "Search Crawler",
+        identity: "verified"
+      };
+      botType = "ai_crawler";
+      botVerdict = "good";
+    }
+    if (botInfo) {
+      securitySignals.botInfo = botInfo;
+    }
     const payload = {
       visitorId,
       visitorToken,
@@ -4081,6 +4819,12 @@ app.post("/api/visitor/identify", async (req, res) => {
       isReturning,
       recognitionSource,
       location,
+      // Fix 5 — deterministic proximity from the IP coordinates, resolved synchronously.
+      proximity: buildProximityInfo(location.latitude, location.longitude),
+      // Fix 8 — structured bot & AI agent identification ("Robodex" + BotD).
+      bot: botVerdict,
+      bot_type: botType,
+      bot_info: botInfo,
       browserDevice,
       hardwareSignals,
       securitySignals,
@@ -4105,7 +4849,13 @@ app.post("/api/visitor/identify", async (req, res) => {
       tamperingDetails: tamperingAssessment?.details,
       activeCall,
       activeCallSupported,
-      rawDeviceAttributes: rawSecuritySignals?.rawDeviceAttributes ?? null
+      rawDeviceAttributes: rawSecuritySignals?.rawDeviceAttributes ?? null,
+      // Phase 4 verdicts mirrored at the top level. A duplicate nonce is reported as
+      // `replayed: true` inside a normal 200 payload — it is never an HTTP error that
+      // would break the in-page Record Visit / Analyze button.
+      replayed: envelopeVerdict.replayDetected,
+      tampered: envelopeVerdict.tamperedRequest,
+      requestIntegrityReason: envelopeVerdict.requestIntegrityReason
     };
     res.json(payload);
   } catch (err) {
@@ -4130,20 +4880,25 @@ app.get("/api/visitor/history/:visitorId", (req, res) => {
     `SELECT
         id, visit_id, visitor_id, session_id, visited_at_utc,
         public_ip, city, region, country, isp, org, asn,
-        browser, os, device_type, screen_resolution, language, timezone
+        browser, os, device_type, screen_resolution, language, timezone,
+        suspect_score, risk_level, score10, bot_name, recognition_source
        FROM visits
        WHERE visitor_id = ?
        ORDER BY visited_at_utc DESC, id DESC
        LIMIT 50`
   ).all(requestedVisitorId);
   const visits = rawVisits.map((row) => {
-    const storedSuspectScore = typeof row.suspect_score === "number" && Number.isFinite(row.suspect_score) ? normalizeLegacySuspectScore(row.suspect_score) : 0;
+    const storedScore10 = typeof row.score10 === "number" && Number.isFinite(row.score10) ? Math.max(0, Math.min(10, Math.round(row.score10))) : null;
+    const storedSuspectScore = typeof row.suspect_score === "number" && Number.isFinite(row.suspect_score) ? normalizeLegacySuspectScore(row.suspect_score) : storedScore10 ?? 0;
     const storedRecognitionSource = typeof row.recognition_source === "string" && row.recognition_source.trim() ? row.recognition_source : "Cookie";
-    const rowRiskLevel = storedSuspectScore >= 7 ? "High" : storedSuspectScore >= 3 ? "Medium" : "Low";
+    const storedRiskLevel = row.risk_level === "High" || row.risk_level === "Medium" || row.risk_level === "Low" ? row.risk_level : null;
+    const rowRiskLevel = storedRiskLevel ?? (storedSuspectScore >= 7 ? "High" : storedSuspectScore >= 3 ? "Medium" : "Low");
     return {
       ...row,
       suspectScore: storedSuspectScore,
+      score10: Math.max(0, Math.min(10, Math.round(storedSuspectScore))),
       riskLevel: rowRiskLevel,
+      botName: typeof row.bot_name === "string" && row.bot_name ? row.bot_name : void 0,
       recognitionSource: storedRecognitionSource
     };
   });
@@ -4279,9 +5034,9 @@ function restoreOriginalApiUrl(req) {
     return;
   }
   if (pathPart === "/api/index" || pathPart === "/api/index.js") {
-    const headerValue = req.headers["x-vercel-original-path"] || req.headers["x-original-url"] || req.headers["x-rewrite-url"] || req.headers["x-matched-path"];
-    if (headerValue) {
-      const original = headerValue.startsWith("http") ? new URL(headerValue).pathname + new URL(headerValue).search : headerValue;
+    const headerValue2 = req.headers["x-vercel-original-path"] || req.headers["x-original-url"] || req.headers["x-rewrite-url"] || req.headers["x-matched-path"];
+    if (headerValue2) {
+      const original = headerValue2.startsWith("http") ? new URL(headerValue2).pathname + new URL(headerValue2).search : headerValue2;
       const normalized = original.startsWith("/") ? original : `/${original}`;
       const normQIdx = normalized.indexOf("?");
       const normPath = normQIdx === -1 ? normalized : normalized.slice(0, normQIdx);

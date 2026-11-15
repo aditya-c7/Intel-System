@@ -831,7 +831,14 @@ export default function App() {
         device: deviceType,
       },
       active_call: Boolean(data.activeCall ?? s.activeCall),
-      bot: s.botSubtype === 'bad_bot' || s.botSubtype === 'ai_agent' ? 'bad' : 'not_detected',
+      bot: data.bot ?? (s.botSubtype === 'bad_bot' || s.botSubtype === 'ai_agent' ? 'bad' : 'not_detected'),
+      bot_type: data.bot_type ?? (s.botSubtype ?? (s.aiAgent?.detected ? 'ai_agent' : null)),
+      bot_info: data.bot_info ?? (s.aiAgent?.detected ? {
+        category: 'ai_agent',
+        provider: s.aiAgent.operator || 'Unknown',
+        name: s.aiAgent.agentName,
+        identity: s.aiAgent.verified ? 'verified' : 'unknown',
+      } : null),
       developer_tools: Boolean(s.developerTools),
       ip_blocklist: {
         email_spam: false,

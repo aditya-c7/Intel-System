@@ -142,6 +142,13 @@ export interface SmartSignals {
  */
 export type BotSubtype = 'human' | 'good_bot' | 'ai_agent' | 'bad_bot';
 
+export interface BotInfo {
+  category: string;
+  provider: string;
+  name: string;
+  identity: 'verified' | 'signed' | 'unknown' | 'spoofed';
+}
+
 /**
  * Phase 4 — one-time cryptographic envelope attached to every identification
  * payload. The server recomputes `signature` over the canonical string
@@ -229,6 +236,7 @@ export interface SecuritySignals {
   botProvider?: string;
   botCategory?: string;
   botIdentityConfidence?: number;
+  botInfo?: BotInfo | null;
 
   /* Phase 2 — authoritative Tor exit relay + local abuse blocklist */
   torExitNode?: boolean;
@@ -406,4 +414,8 @@ export interface IntelVisitorResponse {
   requestIntegrityReason?: string;
   /** Fix 5 — synchronous geohash / metro-zone proximity result. */
   proximity?: import('../lib/geohash').ProximityInfo;
+  /** Fix 8 — structured bot & AI agent identification ("Robodex" + BotD). */
+  bot?: string;
+  bot_type?: string | null;
+  bot_info?: BotInfo | null;
 }

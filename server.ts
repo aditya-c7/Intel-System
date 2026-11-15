@@ -40,6 +40,8 @@ import {
   type EdgeHeaderBag,
 } from './src/lib/geoFallbacks';
 import { buildProximityInfo } from './src/lib/geohash';
+import { detectAiBotFromServerSignals } from './src/lib/aiBotDirectory';
+import type { BotInfo } from './src/types/visitor';
 
 dotenv.config();
 
@@ -6233,6 +6235,58 @@ app.post('/api/visitor/identify', async (req, res) => {
       hardwareId
     );
 
+    // Fix 8 — Robodex Bot Directory & structured bot_info evaluation
+    const asnNumMatch = (location.asn || '').match(/\d+/);
+    const asnNumber = asnNumMatch ? Number.parseInt(asnNumMatch[0], 10) : null;
+    const robodexResult = detectAiBotFromServerSignals({
+      userAgent: fullRequestUserAgent,
+      asnNumber,
+      asnOrg: `${location.org} ${location.isp}`,
+      headers: rawRequestHeaders,
+    });
+
+    let botInfo: BotInfo | null = null;
+    let botType: string | null = null;
+    let botVerdict = 'not_detected';
+
+    if (robodexResult.detected && robodexResult.botInfo) {
+      botInfo = robodexResult.botInfo;
+      botType = robodexResult.botType;
+      botVerdict = (botType === 'ai_agent' || botType === 'browser_automation') ? 'bad' : 'good';
+    } else if (aiAgent.detected) {
+      const isImpostor = aiAgent.agentId === 'impostor-spoof';
+      botInfo = {
+        category: isImpostor ? 'browser_automation' : 'ai_agent',
+        provider: aiAgent.operator || 'Unknown',
+        name: aiAgent.agentName,
+        identity: isImpostor ? 'spoofed' : aiAgent.verified ? (aiAgent.executionMode === 'RFC 9421 Signed Agent' ? 'signed' : 'verified') : 'unknown',
+      };
+      botType = 'ai_agent';
+      botVerdict = 'bad';
+    } else if (effectiveBotClassification.subtype === 'bad_bot') {
+      botInfo = {
+        category: 'browser_automation',
+        provider: effectiveBotClassification.provider || 'Unknown',
+        name: effectiveBotClassification.label || 'Automated Tool',
+        identity: 'unknown',
+      };
+      botType = 'browser_automation';
+      botVerdict = 'bad';
+    } else if (effectiveBotClassification.subtype === 'good_bot') {
+      botInfo = {
+        category: 'ai_crawler',
+        provider: effectiveBotClassification.provider || 'Search Engine',
+        name: effectiveBotClassification.label || 'Search Crawler',
+        identity: 'verified',
+      };
+      botType = 'ai_crawler';
+      botVerdict = 'good';
+    }
+
+    if (botInfo) {
+      securitySignals.botInfo = botInfo;
+    }
+
     const payload: IntelVisitorResponse = {
       visitorId,
       visitorToken,
@@ -6242,6 +6296,10 @@ app.post('/api/visitor/identify', async (req, res) => {
       location,
       // Fix 5 — deterministic proximity from the IP coordinates, resolved synchronously.
       proximity: buildProximityInfo(location.latitude, location.longitude),
+      // Fix 8 — structured bot & AI agent identification ("Robodex" + BotD).
+      bot: botVerdict,
+      bot_type: botType,
+      bot_info: botInfo,
       browserDevice,
       hardwareSignals,
       securitySignals,

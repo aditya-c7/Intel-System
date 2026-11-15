@@ -11,6 +11,7 @@ import type {
   SignedHistoryBackup,
 } from '../types/visitor';
 import { detectBrowserTampering } from './tamperingDetector';
+import { detectBotD19Signals } from './aiBotDirectory';
 
 const STORAGE_KEYS = {
   VISITOR_ID: 'intel_fp_vid',
@@ -1094,6 +1095,7 @@ export interface BotAutomationSignals {
   botReason: string;
   webdriver: boolean;
   cdpDetected: boolean;
+  botSignals?: string[];
 }
 
 /**
@@ -1559,6 +1561,14 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
 
   let isBot = false;
   let botReason = 'Verified human runtime & native DOM prototypes';
+  const allBotReasons: string[] = [];
+
+  // Run all 19 fingerprintjs/BotD detectors
+  const botD19 = detectBotD19Signals(gpuRenderer);
+  if (botD19.detected) {
+    isBot = true;
+    allBotReasons.push(...botD19.reasons);
+  }
 
   if (webdriver) {
     isBot = true;
@@ -1581,9 +1591,15 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
   } else if (emptyLanguages) {
     isBot = true;
     botReason = 'navigator.languages array is empty';
+  } else if (botD19.detected && botD19.reasons.length > 0) {
+    botReason = botD19.reasons[0];
   }
 
-  return { isBot, isHeadless, botReason, webdriver, cdpDetected };
+  if (botReason !== 'Verified human runtime & native DOM prototypes' && !allBotReasons.includes(botReason)) {
+    allBotReasons.unshift(botReason);
+  }
+
+  return { isBot, isHeadless: isHeadless || botD19.signals.window_size || botD19.signals.webgl || botD19.signals.user_agent, botReason, webdriver: webdriver || botD19.signals.webdriver, cdpDetected: cdpDetected || botD19.signals.distinctive_properties, botSignals: allBotReasons };
 }
 
 /**
@@ -2539,7 +2555,11 @@ export async function evaluateSecuritySignals(
 ): Promise<SecuritySignals> {
   // 1. Automation & Headless Bot Detection (CDP bindings, native prototype checks)
   const botAssessment = detectBotAndAutomation(hardwareSignals.gpuRenderer);
-  const botSignals: string[] = botAssessment.isBot ? [botAssessment.botReason] : [];
+  const botSignals: string[] = botAssessment.isBot
+    ? (botAssessment.botSignals && botAssessment.botSignals.length > 0
+        ? botAssessment.botSignals
+        : [botAssessment.botReason])
+    : [];
 
   // 2. VPN / Proxy & Network Classification (Task 1 classifier)
   const browserTimezone = browserDevice.timezone || 'Unavailable';
