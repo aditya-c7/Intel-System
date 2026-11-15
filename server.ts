@@ -4192,6 +4192,133 @@ async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): 
     // Ignore
   }
 
+  // Provider 4: ipinfo.io/{visitorIp}/json — organisation string carries `AS15169 Google LLC`.
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const resp = await fetch(`https://ipinfo.io/${encodeURIComponent(visitorIp)}/json`, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json', 'User-Agent': 'IntelSystem/1.0' },
+    });
+    clearTimeout(timer);
+
+    if (resp.ok) {
+      const data = (await resp.json()) as Record<string, unknown>;
+      const countryCodeRaw = typeof data.country === 'string' ? data.country.trim() : '';
+      const country = countryNameFromCode(countryCodeRaw) || cleanField(data.country);
+      const locParts = typeof data.loc === 'string' ? data.loc.split(',') : [];
+      const latitude = locParts[0] ? Number.parseFloat(locParts[0]) : null;
+      const longitude = locParts[1] ? Number.parseFloat(locParts[1]) : null;
+      const orgRaw = typeof data.org === 'string' ? data.org.trim() : '';
+      const asnMatch = /^(AS\d+)\s+(.+)$/i.exec(orgRaw);
+      const orgName = asnMatch?.[2] || orgRaw;
+      const netDetails = normalizeIspAndOrg(orgName, orgName, asnMatch?.[1] || '', false);
+      const city = cleanField(data.city);
+      const region = cleanField(data.region);
+
+      if (city !== 'Unknown' || country !== 'Unknown' || netDetails.isp !== 'Unknown') {
+        db.prepare(
+          `INSERT OR REPLACE INTO verified_geo_cache_v3 (
+            ip_address, city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          visitorIp,
+          city,
+          region,
+          country,
+          countryCodeRaw.toUpperCase(),
+          latitude,
+          longitude,
+          netDetails.isp,
+          netDetails.org,
+          netDetails.asn,
+          netDetails.isVpnOrHosting ? 1 : 0,
+          nowMs
+        );
+
+        return {
+          publicIp: visitorIp,
+          city,
+          region,
+          country,
+          countryCode: countryCodeRaw.toUpperCase(),
+          latitude,
+          longitude,
+          isp: netDetails.isp,
+          org: netDetails.org,
+          asn: netDetails.asn,
+          isVpnOrHosting: netDetails.isVpnOrHosting,
+          isIpVerified: true,
+          isLocationVerified: city !== 'Unknown' || country !== 'Unknown',
+        };
+      }
+    }
+  } catch {
+    // Ignore
+  }
+
+  // Provider 5: RIPE Stat prefix overview — ASN attribution when no provider returned geo.
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const resp = await fetch(
+      `https://stat.ripe.net/data/prefix-overview/data.json?resource=${encodeURIComponent(visitorIp)}`,
+      {
+        signal: controller.signal,
+        headers: { Accept: 'application/json', 'User-Agent': 'IntelSystem/1.0' },
+      }
+    );
+    clearTimeout(timer);
+
+    if (resp.ok) {
+      const data = (await resp.json()) as {
+        data?: { asns?: Array<{ asn?: number }> };
+      };
+      const asnNumber = data.data?.asns?.[0]?.asn;
+      if (typeof asnNumber === 'number' && Number.isFinite(asnNumber)) {
+        const asn = `AS${asnNumber}`;
+        const org = cloudProviderOrgForAsn(asn) || 'Standard Network';
+        const netDetails = normalizeIspAndOrg(org, org, asn, false);
+        db.prepare(
+          `INSERT OR REPLACE INTO verified_geo_cache_v3 (
+            ip_address, city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).run(
+          visitorIp,
+          'Unavailable',
+          'Unavailable',
+          'Unavailable',
+          '',
+          null,
+          null,
+          netDetails.isp,
+          netDetails.org,
+          netDetails.asn,
+          0,
+          nowMs
+        );
+
+        return {
+          publicIp: visitorIp,
+          city: 'Unavailable',
+          region: 'Unavailable',
+          country: 'Unavailable',
+          countryCode: '',
+          latitude: null,
+          longitude: null,
+          isp: netDetails.isp,
+          org: netDetails.org,
+          asn: netDetails.asn,
+          isVpnOrHosting: false,
+          isIpVerified: true,
+          isLocationVerified: false,
+        };
+      }
+    }
+  } catch {
+    // Ignore
+  }
+
   return {
     publicIp: visitorIp,
     city: 'Unavailable',
