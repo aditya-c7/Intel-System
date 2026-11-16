@@ -10,9 +10,8 @@ import puppeteer from 'puppeteer-core';
  * and the plan expect it:
  *
  *   - canvas geometry/text are deterministic 32-character hex digests, never
- *     "unstable";
- *   - the font probe reaches the 67-font catalogue;
- *   - WebGL and audio entropy are present;
+ *     "unstable", and identical across page loads;
+ *   - the font, WebGL, audio and math probes all produce entropy;
  *   - os/os_version are not swapped and browser_major_version is never empty;
  *   - a plain desktop browser is not labelled bot.
  *
@@ -22,6 +21,7 @@ import puppeteer from 'puppeteer-core';
 
 const BASE_URL = (process.env.INTEL_BASE_URL || 'http://127.0.0.1:4622').replace(/\/+$/, '');
 const HEX32 = /^[0-9a-f]{32}$/i;
+const RUNS = Number(process.env.INTEL_RUNS || 2);
 
 function chromiumPath() {
   const candidates = [
@@ -64,25 +64,26 @@ const browser = await puppeteer.launch({
   ],
 });
 
-try {
+/** Loads the dashboard once and returns the identify request/response pair. */
+async function capture() {
   const page = await browser.newPage();
   await page.setViewport({ width: 1440, height: 1000 });
   await page.setUserAgent(
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36',
   );
 
-  /** @type {{ payload: any, response: any } | null} */
   let captured = null;
   page.on('response', async (response) => {
-    if (!response.url().includes('/api/visitor/identify') || captured) return;
-    try {
-      const payload = response.request().postData();
-      captured = {
-        payload: payload ? JSON.parse(payload) : null,
-        response: await response.json(),
-      };
-    } catch {
-      /* ignore non-JSON responses */
+    if (response.url().includes('/api/visitor/identify') && !captured) {
+      try {
+        const body = response.request().postData();
+        captured = {
+          payload: body ? JSON.parse(body) : {},
+          response: await response.json(),
+        };
+      } catch {
+        /* ignore non-JSON responses */
+      }
     }
   });
 
@@ -90,15 +91,22 @@ try {
   for (let i = 0; i < 40 && !captured; i += 1) {
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
+  await page.close();
   assert.ok(captured, 'The dashboard never posted an identify request');
+  return captured;
+}
 
-  const payload = captured.payload || {};
+try {
+  const runs = [];
+  for (let i = 0; i < Math.max(1, RUNS); i += 1) runs.push(await capture());
+
+  const first = runs[0];
+  const payload = first.payload || {};
+  const event = first.response || {};
   if (process.env.INTEL_DUMP) {
     console.log('PAYLOAD KEYS:', Object.keys(payload).join(', '));
-    console.log('identityProfile keys:', Object.keys(payload.identityProfile || {}).join(', '));
     console.log(JSON.stringify(payload.identityProfile, null, 1).slice(0, 5000));
   }
-  const event = captured.response || {};
 
   /* The collector sends the tri-layer profile under `identityProfile`; the
    * server echoes a flattened copy as rawDeviceAttributes. */
@@ -115,7 +123,6 @@ try {
   const canvas = raw.canvas || {};
   const geometry = String(canvas.geometry ?? canvas.geometry_hash ?? '');
   const text = String(canvas.text ?? canvas.text_hash ?? '');
-  console.log(`  info  canvas ${geometry.slice(0, 12)}… / ${text.slice(0, 12)}…`);
   check('canvas geometry is a 32-character hex digest', HEX32.test(geometry), geometry || 'missing');
   check('canvas text is a 32-character hex digest', HEX32.test(text), text || 'missing');
   check('canvas is never reported unstable', canvas.unstable !== true && !/unstable/i.test(geometry + text));
@@ -143,6 +150,23 @@ try {
     String(raw.hardwareFingerprint || raw.hardware_fingerprint),
   );
 
+  if (runs.length > 1) {
+    console.log(`\n=== T-01b canvas determinism across ${runs.length} loads ===`);
+    for (const run of runs.slice(1)) {
+      const other = (run.payload?.identityProfile || {}).canvas || {};
+      check(
+        'canvas geometry is stable between page loads',
+        String(other.geometry ?? '') === geometry,
+        `${String(other.geometry ?? '').slice(0, 12)} vs ${geometry.slice(0, 12)}`,
+      );
+      check(
+        'canvas text is stable between page loads',
+        String(other.text ?? '') === text,
+        `${String(other.text ?? '').slice(0, 12)} vs ${text.slice(0, 12)}`,
+      );
+    }
+  }
+
   console.log('\n=== T-05 normalized identity ===');
   const browserDetails = event.browserDevice || event.browser_details || {};
   const os = String(browserDetails.os ?? raw.os?.family ?? '');
@@ -159,7 +183,11 @@ try {
     !event.consistency || event.consistency.agent_verdict === 'human',
     String(event.consistency?.agent_verdict),
   );
-  check('identification confidence is present', typeof event.identification?.confidence?.score === 'number', String(event.identification?.confidence?.score));
+  check(
+    'identification confidence is present',
+    typeof event.identification?.confidence?.score === 'number',
+    String(event.identification?.confidence?.score),
+  );
 } finally {
   await browser.close();
 }
