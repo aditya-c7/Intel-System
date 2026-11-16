@@ -469,7 +469,10 @@ function resolveOs(
   /* --- iOS / iPadOS (checked before macOS: iPad UA looks like macOS) ------- */
   const uaIosPhone = /(?:iPhone|iPod)/.test(ua);
   const uaIpad = /iPad/.test(ua);
-  const macTouch = /macintel/i.test(platformStr) && touch > 1;
+  /* iPadOS 13+ masquerades as desktop Safari: `Macintosh` UA, `MacIntel` platform and a
+   * multi-touch screen. Chrome's UA-CH platform for the same device is `macOS`, so the
+   * touch count alone (with a Macintosh UA) is also accepted. */
+  const macTouch = touch > 1 && (/macintel/i.test(platformStr) || /macintosh/i.test(ua));
   const macTabletFormFactor =
     uadPlatform.toLowerCase() === 'macos' &&
     formFactors.map((f) => f.toLowerCase()).indexOf('tablet') !== -1;
@@ -728,4 +731,258 @@ export function normalizeIdentity(input: NormalizeIdentityInput): NormalizedIden
   } catch {
     return { ...BLANK_IDENTITY };
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Public API — camelCase contract (UA + client hints)                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * `Sec-CH-UA*` header values and / or `navigator.userAgentData` high-entropy
+ * values. Header-style keys (`'sec-ch-ua-platform'`) are also accepted, so a
+ * server can pass `{ ...parsedClientHints, 'sec-ch-ua-platform': 'Windows' }`
+ * without reshaping it first.
+ */
+export interface ClientHintsInput {
+  brands?: Array<{ brand: string; version: string }> | string;
+  fullVersionList?: Array<{ brand: string; version: string }> | string;
+  platform?: string;
+  platformVersion?: string;
+  architecture?: string;
+  /** Alias used by some header parsers (`Sec-CH-UA-Arch`). */
+  arch?: string;
+  bitness?: string;
+  model?: string;
+  mobile?: boolean | string;
+  formFactors?: string[];
+  uaFullVersion?: string;
+  wow64?: boolean;
+}
+
+export interface NormalizeUserAgentInput {
+  userAgent?: string;
+  /** Parsed `Sec-CH-UA*` values plus optional high-entropy `userAgentData` values. */
+  clientHints?: ClientHintsInput | null;
+  /** `navigator.platform` (needed for the iPadOS `MacIntel` check). */
+  platform?: string;
+  maxTouchPoints?: number;
+}
+
+export interface NormalizedUserAgent {
+  os: string;
+  osVersion: string;
+  device: DeviceKind;
+  browserName: string;
+  browserMajorVersion: string;
+  browserFullVersion: string;
+  architecture: string;
+  bitness: string;
+  model: string;
+}
+
+const BLANK_USER_AGENT: NormalizedUserAgent = {
+  os: 'Unknown',
+  osVersion: '',
+  device: 'Unknown',
+  browserName: 'Unknown',
+  browserMajorVersion: '',
+  browserFullVersion: '',
+  architecture: '',
+  bitness: '',
+  model: '',
+};
+
+/** Serialises a brand list back into a `Sec-CH-UA*` structured-field string. */
+function serializeBrandList(brands: Array<{ brand: string; version: string }>): string {
+  return brands
+    .filter((entry) => entry && typeof entry.brand === 'string')
+    .map((entry) => `"${entry.brand}";v="${entry.version ?? ''}"`)
+    .join(', ');
+}
+
+/** Reads a hint from a mixed bag: structured camelCase first, then header keys. */
+function readBagKey(hints: ClientHintsInput, key: string): string {
+  const bag = hints as unknown as Record<string, unknown>;
+  const direct = bag[key];
+  if (typeof direct === 'string') return direct;
+  const lower = key.toLowerCase();
+  for (const candidate of Object.keys(bag)) {
+    if (candidate.toLowerCase() === lower) {
+      const value = bag[candidate];
+      if (typeof value === 'string') return value;
+    }
+  }
+  return '';
+}
+
+function hintFromBag(hints: ClientHintsInput, name: string): string {
+  const bag = hints as unknown as Record<string, unknown>;
+  const structured = bag[name];
+  if (typeof structured === 'string') return unquote(structured);
+  const headerKey = `sec-ch-ua-${name.replace(/([A-Z])/g, '-$1').toLowerCase()}`;
+  return unquote(readBagKey(hints, headerKey));
+}
+
+function brandsFromValue(value: unknown): BrandEntry[] {
+  if (Array.isArray(value)) {
+    return value
+      .filter((entry): entry is BrandEntry => Boolean(entry) && typeof (entry as BrandEntry).brand === 'string')
+      .map((entry) => ({ brand: entry.brand, version: String(entry.version ?? '') }));
+  }
+  if (typeof value === 'string') return parseBrandList(value);
+  return [];
+}
+
+/**
+ * Coerces the mixed client-hints bag into the two shapes the core resolver
+ * already understands: `uaData` (JS API) and `secCh` (request headers).
+ */
+function coerceClientHints(hints: ClientHintsInput | null | undefined): {
+  uaData: UaDataHighEntropy | null;
+  secCh: Record<string, string> | undefined;
+} {
+  if (!hints || typeof hints !== 'object') return { uaData: null, secCh: undefined };
+
+  const fullVersionList = brandsFromValue(
+    hints.fullVersionList && (Array.isArray(hints.fullVersionList) ? hints.fullVersionList.length > 0 : true)
+      ? hints.fullVersionList
+      : readBagKey(hints, 'sec-ch-ua-full-version-list')
+  );
+  const brands = brandsFromValue(
+    hints.brands && (Array.isArray(hints.brands) ? hints.brands.length > 0 : true)
+      ? hints.brands
+      : readBagKey(hints, 'sec-ch-ua')
+  );
+  const platform = hintFromBag(hints, 'platform');
+  const platformVersion = hintFromBag(hints, 'platformVersion');
+  const architecture = hints.architecture || hintFromBag(hints, 'arch');
+  const bitness = hints.bitness ?? hintFromBag(hints, 'bitness');
+  const model = hints.model ?? hintFromBag(hints, 'model');
+  const mobileRaw = hints.mobile;
+  const mobile =
+    typeof mobileRaw === 'boolean' ? mobileRaw : String(mobileRaw ?? hintFromBag(hints, 'mobile')) === '?1';
+
+  const secCh: Record<string, string> = {};
+  if (brands.length > 0) secCh['sec-ch-ua'] = serializeBrandList(brands);
+  if (fullVersionList.length > 0) {
+    secCh['sec-ch-ua-full-version-list'] = serializeBrandList(fullVersionList);
+  }
+  if (platform) secCh['sec-ch-ua-platform'] = `"${platform}"`;
+  if (platformVersion) secCh['sec-ch-ua-platform-version'] = `"${platformVersion}"`;
+  if (architecture) secCh['sec-ch-ua-arch'] = `"${architecture}"`;
+  if (bitness) secCh['sec-ch-ua-bitness'] = `"${bitness}"`;
+  if (model) secCh['sec-ch-ua-model'] = `"${model}"`;
+  if (hints.formFactors && hints.formFactors.length > 0) {
+    secCh['sec-ch-ua-form-factors'] = hints.formFactors.map((f) => `"${f}"`).join(', ');
+  }
+
+  const uaData: UaDataHighEntropy = {
+    fullVersionList,
+    platform,
+    platformVersion,
+    architecture,
+    bitness,
+    model,
+    formFactors: hints.formFactors,
+    uaFullVersion: hints.uaFullVersion,
+    wow64: hints.wow64,
+  };
+
+  return { uaData, secCh: Object.keys(secCh).length > 0 ? secCh : undefined };
+}
+
+/**
+ * Canonical camelCase entry point: `{ userAgent, clientHints }` in,
+ * `{ os, osVersion, device, browserName, browserMajorVersion, … }` out.
+ *
+ * `os` is always the family with no digits ('Windows', 'Mac OS X', 'Android',
+ * 'iOS', 'Linux'); `osVersion` carries the version ('11', '10', '15.3.1').
+ * Total: never throws, degrades to an 'Unknown' identity.
+ */
+export function normalizeUserAgent(input: NormalizeUserAgentInput): NormalizedUserAgent {
+  try {
+    const { uaData, secCh } = coerceClientHints(input?.clientHints);
+    const identity = normalizeIdentity({
+      userAgent: input?.userAgent ?? '',
+      platform: input?.platform ?? '',
+      maxTouchPoints: input?.maxTouchPoints,
+      uaData,
+      secCh,
+    });
+
+    const mobile = input?.clientHints?.mobile;
+    const mobileFlag = mobile === true || mobile === 'true' || mobile === '?1';
+    const device: DeviceKind =
+      identity.device === 'Unknown' && mobileFlag ? 'Mobile' : identity.device;
+
+    return {
+      os: identity.os,
+      osVersion: identity.os_version,
+      device,
+      browserName: identity.browser_name,
+      browserMajorVersion: identity.browser_major_version,
+      browserFullVersion: identity.browser_full_version,
+      architecture: identity.architecture,
+      bitness: identity.bitness,
+      model: identity.device_model,
+    };
+  } catch {
+    return { ...BLANK_USER_AGENT };
+  }
+}
+
+/** Accepts either the camelCase or the snake_case identity shape. */
+function readIdentityField(
+  value: NormalizedUserAgent | NormalizedIdentity,
+  camel: keyof NormalizedUserAgent,
+  snake: keyof NormalizedIdentity,
+): string {
+  const bag = value as unknown as Record<string, unknown>;
+  const raw = bag[camel] ?? bag[snake];
+  return typeof raw === 'string' ? raw.trim() : '';
+}
+
+/**
+ * Post-normalization invariant check. Returns every violation as a readable
+ * string (empty array = valid). Rules:
+ *   1. `os` must not contain digits (family only, 'Windows' not 'Windows 11').
+ *   2. `osVersion` must never equal `os`.
+ *   3. `browserMajorVersion` must not be empty when `browserFullVersion` is known.
+ *   4. A known full version must yield a numeric major version.
+ */
+export function validateUserAgentNormalization(
+  value: NormalizedUserAgent | NormalizedIdentity,
+): string[] {
+  const issues: string[] = [];
+  if (!value || typeof value !== 'object') return ['identity must be a non-null object'];
+
+  const os = readIdentityField(value, 'os', 'os');
+  const osVersion = readIdentityField(value, 'osVersion', 'os_version');
+  const major = readIdentityField(value, 'browserMajorVersion', 'browser_major_version');
+  const full = readIdentityField(value, 'browserFullVersion', 'browser_full_version');
+
+  if (os && /\d/.test(os)) {
+    issues.push(`os "${os}" contains digits — os must be the family only`);
+  }
+  if (os && osVersion && os === osVersion) {
+    issues.push(`os_version "${osVersion}" must not equal os`);
+  }
+  if (full && !major) {
+    issues.push(`browser_major_version is empty while browser_full_version "${full}" is known`);
+  } else if (major && !/^\d+$/.test(major)) {
+    issues.push(`browser_major_version "${major}" is not a numeric string`);
+  }
+
+  return issues;
+}
+
+/**
+ * Throwing variant of `validateUserAgentNormalization`: raises the first
+ * violation. Intended for tests and server-side self-audits.
+ */
+export function assertUserAgentNormalization(
+  value: NormalizedUserAgent | NormalizedIdentity,
+): void {
+  const issues = validateUserAgentNormalization(value);
+  if (issues.length > 0) throw new Error(issues[0]);
 }
