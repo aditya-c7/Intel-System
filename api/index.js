@@ -3303,6 +3303,567 @@ function clientHintsMiddleware(req, res, next) {
   next();
 }
 
+// src/shared/normalization/uaNormalizer.ts
+var GREASE_RE = /not.?a.?brand/i;
+var CHROMIUM_PLACEHOLDER = "chromium";
+function parseBrandList2(raw) {
+  const out = [];
+  if (!raw) return out;
+  const re = /"([^"]*)"\s*;\s*v\s*=\s*"([^"]*)"/g;
+  let m = re.exec(raw);
+  while (m !== null) {
+    const brand = (m[1] ?? "").trim();
+    if (brand) out.push({ brand, version: (m[2] ?? "").trim() });
+    m = re.exec(raw);
+  }
+  return out;
+}
+function filterBrands(brands) {
+  const real = brands.filter((b) => !GREASE_RE.test(b.brand));
+  const nonChromium = real.filter((b) => b.brand.toLowerCase() !== CHROMIUM_PLACEHOLDER);
+  return nonChromium.length > 0 ? nonChromium : real;
+}
+function headerValue3(secCh, name) {
+  if (!secCh) return "";
+  const lower = name.toLowerCase();
+  for (const key of Object.keys(secCh)) {
+    if (key.toLowerCase() === lower) {
+      const v = secCh[key];
+      return typeof v === "string" ? v : "";
+    }
+  }
+  return "";
+}
+function unquote2(value) {
+  const v = value.trim();
+  if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) return v.slice(1, -1);
+  return v;
+}
+function parseSecCh(secCh) {
+  const fullListRaw = headerValue3(secCh, "sec-ch-ua-full-version-list");
+  const majorListRaw = headerValue3(secCh, "sec-ch-ua");
+  const brands = fullListRaw ? parseBrandList2(fullListRaw) : parseBrandList2(majorListRaw);
+  return {
+    brands: filterBrands(brands),
+    hasFullVersionList: Boolean(fullListRaw),
+    platform: unquote2(headerValue3(secCh, "sec-ch-ua-platform")),
+    platformVersion: unquote2(headerValue3(secCh, "sec-ch-ua-platform-version")),
+    model: unquote2(headerValue3(secCh, "sec-ch-ua-model")),
+    architecture: unquote2(headerValue3(secCh, "sec-ch-ua-arch")),
+    bitness: unquote2(headerValue3(secCh, "sec-ch-ua-bitness")),
+    formFactors: unquote2(headerValue3(secCh, "sec-ch-ua-form-factors")).split(",").map((f) => unquote2(f)).filter((f) => f.length > 0)
+  };
+}
+var BROWSER_SPECS = [
+  {
+    name: "Cursor",
+    brands: ["cursor"],
+    uaTokens: [/Cursor\/([\d.]+)/]
+  },
+  {
+    name: "Manus",
+    brands: ["manus"],
+    uaTokens: [/Manus-User\/([\d.]+)/]
+  },
+  {
+    name: "Microsoft Edge",
+    brands: ["microsoft edge"],
+    uaTokens: [/EdgA?\/([\d.]+)/, /EdgiOS\/([\d.]+)/, /Edge\/([\d.]+)/]
+  },
+  {
+    name: "Opera",
+    brands: ["opera", "opera gx"],
+    uaTokens: [/OPR\/([\d.]+)/, /OPX\/([\d.]+)/]
+  },
+  {
+    name: "Brave",
+    brands: ["brave"],
+    uaTokens: [/Brave\/([\d.]+)/]
+  },
+  {
+    name: "Samsung Internet",
+    brands: ["samsung internet"],
+    uaTokens: [/SamsungBrowser\/([\d.]+)/]
+  },
+  {
+    name: "Headless Chrome",
+    brands: ["headlesschrome"],
+    uaTokens: [/HeadlessChrome\/([\d.]+)/]
+  },
+  {
+    name: "Google Chrome",
+    brands: ["google chrome", "chrome"],
+    uaTokens: [/CriOS\/([\d.]+)/, /Chrome\/([\d.]+)/]
+  },
+  {
+    name: "Chromium",
+    brands: [CHROMIUM_PLACEHOLDER],
+    uaTokens: [/Chrome\/([\d.]+)/]
+  },
+  {
+    name: "Firefox",
+    brands: ["firefox"],
+    uaTokens: [/FxiOS\/([\d.]+)/, /Firefox\/([\d.]+)/]
+  },
+  {
+    name: "Safari",
+    brands: ["safari"],
+    uaTokens: [/Version\/([\d.]+).*Safari/]
+  }
+];
+function firstMatch(token, ua) {
+  const m = token.exec(ua);
+  if (m === null) return null;
+  return (m[1] ?? "").trim() || null;
+}
+function brandToSpec(brands) {
+  for (const spec of BROWSER_SPECS) {
+    for (const entry of brands) {
+      if (spec.brands.indexOf(entry.brand.toLowerCase()) !== -1) return spec;
+    }
+  }
+  return null;
+}
+function uaToSpec(ua) {
+  for (const spec of BROWSER_SPECS) {
+    for (const token of spec.uaTokens) {
+      if (token.test(ua)) return spec;
+    }
+  }
+  return null;
+}
+function tokensForName(name) {
+  const spec = BROWSER_SPECS.find((s) => s.name === name);
+  if (spec) return spec.uaTokens;
+  if (name === "Manus") return [/Manus-User\/([\d.]+)/];
+  return [];
+}
+function pickFullerVersion(preferred, candidate) {
+  if (!candidate) return preferred;
+  if (!preferred) return candidate;
+  const a = preferred.split(".").length;
+  const b = candidate.split(".").length;
+  return b > a ? candidate : preferred;
+}
+function resolveBrowser(ua, uad, secCh) {
+  const empty = { name: "Unknown", full: "", major: "" };
+  const uadBrands = filterBrands((uad?.fullVersionList ?? []).filter((b) => !!b));
+  const candidates = [];
+  if (uadBrands.length > 0) candidates.push({ brands: uadBrands, source: "uad" });
+  if (secCh.brands.length > 0) candidates.push({ brands: secCh.brands, source: "secch" });
+  for (const candidate of candidates) {
+    const spec = brandToSpec(candidate.brands);
+    if (!spec) continue;
+    const entry = candidate.brands.find(
+      (b) => spec.brands.indexOf(b.brand.toLowerCase()) !== -1
+    );
+    let version = entry ? entry.version : "";
+    if (version && version.indexOf(".") === -1) {
+      version = pickFullerVersion(version, findUaVersion(spec, ua));
+    }
+    if (!version) version = findUaVersion(spec, ua) ?? "";
+    return { name: spec.name, full: version, major: majorOf(version) };
+  }
+  const uaSpec = ua ? uaToSpec(ua) : null;
+  if (uaSpec) {
+    const version = findUaVersion(uaSpec, ua) ?? "";
+    return { name: uaSpec.name, full: version, major: majorOf(version) };
+  }
+  const uaFull = (uad?.uaFullVersion ?? "").trim();
+  if (uaFull) return { name: "Unknown", full: uaFull, major: majorOf(uaFull) };
+  return empty;
+}
+function findUaVersion(spec, ua) {
+  for (const token of spec.uaTokens) {
+    const v = firstMatch(token, ua);
+    if (v) return v;
+  }
+  return null;
+}
+function majorOf(version) {
+  if (!version) return "";
+  const major = version.split(".")[0];
+  return /^\d+$/.test(major) ? major : "";
+}
+function versionSourceExists(ua, uad, secCh) {
+  if ((uad?.fullVersionList ?? []).length > 0) return true;
+  if ((uad?.uaFullVersion ?? "").trim()) return true;
+  if (secCh.brands.length > 0) return true;
+  return ua ? uaToSpec(ua) !== null : false;
+}
+function fallbackMajorFromUa(browserName, ua) {
+  if (!ua) return { name: browserName, full: "", major: "" };
+  const tokens = [...tokensForName(browserName)];
+  for (const spec of BROWSER_SPECS) {
+    for (const token of spec.uaTokens) {
+      if (tokens.indexOf(token) === -1) tokens.push(token);
+    }
+  }
+  for (const token of tokens) {
+    const v = firstMatch(token, ua);
+    if (v) return { name: browserName, full: v, major: majorOf(v) };
+  }
+  return { name: browserName, full: "", major: "" };
+}
+function parseIntSafe(value) {
+  const m = /^\s*(\d+)/.exec(value ?? "");
+  if (m === null) return null;
+  const n = parseInt(m[1], 10);
+  return isFinite(n) ? n : null;
+}
+function windowsVersionFromPlatformVersion(pv) {
+  const parts = (pv ?? "").trim().split(".");
+  const major = parseIntSafe(parts[0] ?? "");
+  if (major === null) return null;
+  if (major >= 13) return "11";
+  if (major >= 1) return "10";
+  const sub = parseIntSafe(parts[1] ?? "");
+  if (sub === 1) return "7";
+  if (sub === 2) return "8";
+  if (sub === 3) return "8.1";
+  return null;
+}
+function windowsVersionFromUa(ua) {
+  const m = /Windows NT ([\d.]+)/.exec(ua);
+  if (m === null) return null;
+  const nt = m[1];
+  if (nt === "6.1") return "7";
+  if (nt === "6.2") return "8";
+  if (nt === "6.3") return "8.1";
+  if (nt === "10.0") return "10";
+  return null;
+}
+function underscoresToDots(v) {
+  return v.replace(/_/g, ".");
+}
+function macVersionFromSafariUa(ua) {
+  const safari = /Version\/(\d+)(?:\.(\d+))?.*Safari/.exec(ua);
+  if (safari === null) return null;
+  const safariMajor = parseIntSafe(safari[1] ?? "");
+  if (safariMajor === null) return null;
+  const macMajor = safariMajor - 3;
+  if (macMajor <= 10) return "10.15";
+  return `${macMajor}.0`;
+}
+function looksAndroidTablet(model, formFactors) {
+  if (formFactors.map((f) => f.toLowerCase()).indexOf("tablet") !== -1) return true;
+  return /\b(tab|pad|sm-t|nexus 9|nexus 10|pixel c)\b/i.test(model);
+}
+function androidModelFromUa(ua) {
+  const m = /Android[^;)]*;\s*([^;)]+?)\s*(?:Build\/|\))/.exec(ua);
+  const raw = m === null ? "" : (m[1] ?? "").trim();
+  if (!raw || raw.toLowerCase() === "wv") return "";
+  return raw;
+}
+function resolveOs(ua, platformStr, touch, uad, secCh) {
+  const uadPlatform = (uad?.platform ?? "").trim();
+  const uadPv = (uad?.platformVersion ?? "").trim();
+  const formFactors = [...uad?.formFactors ?? [], ...secCh.formFactors];
+  const uaIosPhone = /(?:iPhone|iPod)/.test(ua);
+  const uaIpad = /iPad/.test(ua);
+  const macTouch = touch > 1 && (/macintel/i.test(platformStr) || /macintosh/i.test(ua));
+  const macTabletFormFactor = uadPlatform.toLowerCase() === "macos" && formFactors.map((f) => f.toLowerCase()).indexOf("tablet") !== -1;
+  if (uaIosPhone || uaIpad || macTouch || macTabletFormFactor) {
+    let osVersion = "";
+    const m = /(?:iPhone|iPad|iPod)[\s\S]*?OS (\d+(?:[_\d]*)?)\s+like/.exec(ua);
+    if (m !== null && m[1]) {
+      osVersion = underscoresToDots(m[1]);
+    } else if (macTabletFormFactor && uadPv) {
+      osVersion = underscoresToDots(uadPv);
+    }
+    const device = uaIpad || macTouch || macTabletFormFactor ? "Tablet" : "Mobile";
+    return {
+      os: "iOS",
+      os_version: osVersion,
+      platformFamily: "ios",
+      device,
+      device_model: (uad?.model ?? "").trim()
+    };
+  }
+  if (uadPlatform === "Android" || secCh.platform === "Android" || /Android/.test(ua)) {
+    let osVersion = "";
+    let model = (uad?.model ?? "").trim() || secCh.model;
+    if (uadPlatform === "Android" || secCh.platform === "Android") {
+      const major = parseIntSafe(uadPv || secCh.platformVersion);
+      if (major !== null) osVersion = String(major);
+    }
+    if (!osVersion) {
+      const m = /Android\s+([\d.]+)/.exec(ua);
+      if (m !== null) osVersion = majorOf(m[1]);
+    }
+    if (!model) model = androidModelFromUa(ua);
+    const device = looksAndroidTablet(model, formFactors) ? "Tablet" : "Mobile";
+    return {
+      os: "Android",
+      os_version: osVersion,
+      platformFamily: "android",
+      device,
+      device_model: model
+    };
+  }
+  if (uadPlatform === "Windows" || secCh.platform === "Windows" || /Windows NT/.test(ua)) {
+    let osVersion = windowsVersionFromPlatformVersion(uadPv) ?? windowsVersionFromPlatformVersion(secCh.platformVersion);
+    if (!osVersion) osVersion = windowsVersionFromUa(ua);
+    return {
+      os: "Windows",
+      os_version: osVersion ?? "",
+      platformFamily: "windows",
+      device: "Desktop",
+      device_model: ""
+    };
+  }
+  if (uadPlatform === "macOS" || secCh.platform === "macOS" || /Mac OS X|Macintosh/.test(ua)) {
+    let osVersion = uadPv || secCh.platformVersion;
+    if (!osVersion) {
+      const m = /Mac OS X ([\d_]+)/.exec(ua);
+      if (m !== null && m[1]) osVersion = underscoresToDots(m[1]);
+    }
+    if (!osVersion) osVersion = macVersionFromSafariUa(ua) ?? "";
+    return {
+      os: "Mac OS X",
+      os_version: osVersion,
+      platformFamily: "mac",
+      device: "Desktop",
+      device_model: ""
+    };
+  }
+  if (uadPlatform === "Linux" || uadPlatform === "Chrome OS" || secCh.platform === "Linux" || secCh.platform === "Chrome OS" || /Linux/.test(ua)) {
+    let osVersion = "";
+    if (uadPlatform === "Linux" || uadPlatform === "Chrome OS") {
+      const major = parseIntSafe(uadPv);
+      if (major !== null) osVersion = String(major);
+    } else if (secCh.platform === "Linux" || secCh.platform === "Chrome OS") {
+      const major = parseIntSafe(secCh.platformVersion);
+      if (major !== null) osVersion = String(major);
+    }
+    return {
+      os: "Linux",
+      os_version: osVersion,
+      platformFamily: "linux",
+      device: "Desktop",
+      device_model: ""
+    };
+  }
+  const p = platformStr.trim();
+  if (/^Win(?:dows)?(32|64|NT)?$/i.test(p)) {
+    return { os: "Windows", os_version: "", platformFamily: "windows", device: "Desktop", device_model: "" };
+  }
+  if (/^Mac/i.test(p)) {
+    return { os: "Mac OS X", os_version: "", platformFamily: "mac", device: "Desktop", device_model: "" };
+  }
+  if (/^Linux/i.test(p)) {
+    return { os: "Linux", os_version: "", platformFamily: "linux", device: "Desktop", device_model: "" };
+  }
+  if (/iPhone|iPod/i.test(p)) {
+    return { os: "iOS", os_version: "", platformFamily: "ios", device: "Mobile", device_model: "" };
+  }
+  if (/iPad/i.test(p)) {
+    return { os: "iOS", os_version: "", platformFamily: "ios", device: "Tablet", device_model: "" };
+  }
+  return {
+    os: "Unknown",
+    os_version: "",
+    platformFamily: "unknown",
+    device: "Unknown",
+    device_model: ""
+  };
+}
+function resolveArchitecture(ua, platformStr, uad, secCh) {
+  const arch = (uad?.architecture ?? secCh.architecture ?? "").trim().toLowerCase();
+  const bit = (uad?.bitness ?? secCh.bitness ?? "").trim();
+  const wow64 = uad?.wow64 === true;
+  if (arch.indexOf("arm") !== -1) {
+    return { architecture: bit === "32" ? "ARM" : "ARM64", bitness: bit === "32" ? "32" : "64" };
+  }
+  if (arch.indexOf("x86") !== -1 || arch === "amd64" || arch === "x64" || arch === "ia64") {
+    return { architecture: bit === "32" ? "x86" : "x86_64", bitness: bit === "32" ? "32" : "64" };
+  }
+  if (wow64) {
+    return { architecture: "x86_64", bitness: "64" };
+  }
+  const hay = `${ua} ${platformStr}`.toLowerCase();
+  if (/arm64|aarch64|armv8/.test(hay)) return { architecture: "ARM64", bitness: "64" };
+  if (/x86_64|x64|win64|wow64|amd64/.test(hay)) return { architecture: "x86_64", bitness: "64" };
+  if (/armv[3-7]|arm;/.test(hay)) return { architecture: "ARM", bitness: "32" };
+  if (/i[3456]86|x86\b/.test(hay)) return { architecture: "x86", bitness: "32" };
+  return { architecture: "", bitness: bit === "32" || bit === "64" ? bit : "" };
+}
+function sanitizeOs(os2, osVersion) {
+  let o = (os2 ?? "").trim();
+  let v = (osVersion ?? "").trim();
+  if (o && /\d/.test(o)) {
+    const m = /^([^\d]+?)\s*([\d][\d.]*)$/.exec(o);
+    if (m !== null && m[1].trim()) {
+      o = m[1].trim();
+      if (!v) v = m[2];
+    } else {
+      o = "Unknown";
+    }
+  }
+  if (v && o && v === o) v = "";
+  return { os: o, osVersion: v };
+}
+var BLANK_IDENTITY = {
+  os: "Unknown",
+  os_version: "",
+  browser_name: "Unknown",
+  browser_major_version: "",
+  browser_full_version: "",
+  device: "Unknown",
+  device_model: "",
+  architecture: "",
+  bitness: "",
+  platformFamily: "unknown"
+};
+function normalizeIdentity(input) {
+  try {
+    const ua = (input?.userAgent ?? "").toString();
+    const platformStr = (input?.platform ?? "").toString();
+    const rawTouch = input?.maxTouchPoints;
+    const touch = typeof rawTouch === "number" && isFinite(rawTouch) ? rawTouch : 0;
+    const uad = input?.uaData ?? null;
+    const secCh = parseSecCh(input?.secCh);
+    const osRes = resolveOs(ua, platformStr, touch, uad, secCh);
+    const browser = resolveBrowser(ua, uad, secCh);
+    const archRes = resolveArchitecture(ua, platformStr, uad, secCh);
+    const identity = {
+      os: osRes.os,
+      os_version: osRes.os_version,
+      browser_name: browser.name,
+      browser_major_version: browser.major,
+      browser_full_version: browser.full,
+      device: osRes.device,
+      device_model: osRes.device_model,
+      architecture: archRes.architecture,
+      bitness: archRes.bitness,
+      platformFamily: osRes.platformFamily
+    };
+    if (versionSourceExists(ua, uad, secCh) && !identity.browser_major_version) {
+      const fallback = fallbackMajorFromUa(identity.browser_name, ua);
+      if (fallback.major) {
+        identity.browser_full_version = fallback.full;
+        identity.browser_major_version = fallback.major;
+      }
+    }
+    const safe = sanitizeOs(identity.os, identity.os_version);
+    identity.os = safe.os;
+    identity.os_version = safe.osVersion;
+    return identity;
+  } catch {
+    return { ...BLANK_IDENTITY };
+  }
+}
+var BLANK_USER_AGENT = {
+  os: "Unknown",
+  osVersion: "",
+  device: "Unknown",
+  browserName: "Unknown",
+  browserMajorVersion: "",
+  browserFullVersion: "",
+  architecture: "",
+  bitness: "",
+  model: ""
+};
+function serializeBrandList(brands) {
+  return brands.filter((entry) => entry && typeof entry.brand === "string").map((entry) => `"${entry.brand}";v="${entry.version ?? ""}"`).join(", ");
+}
+function readBagKey(hints, key) {
+  const bag = hints;
+  const direct = bag[key];
+  if (typeof direct === "string") return direct;
+  const lower = key.toLowerCase();
+  for (const candidate of Object.keys(bag)) {
+    if (candidate.toLowerCase() === lower) {
+      const value = bag[candidate];
+      if (typeof value === "string") return value;
+    }
+  }
+  return "";
+}
+function hintFromBag(hints, name) {
+  const bag = hints;
+  const structured = bag[name];
+  if (typeof structured === "string") return unquote2(structured);
+  const headerKey = `sec-ch-ua-${name.replace(/([A-Z])/g, "-$1").toLowerCase()}`;
+  return unquote2(readBagKey(hints, headerKey));
+}
+function brandsFromValue(value) {
+  if (Array.isArray(value)) {
+    return value.filter((entry) => Boolean(entry) && typeof entry.brand === "string").map((entry) => ({ brand: entry.brand, version: String(entry.version ?? "") }));
+  }
+  if (typeof value === "string") return parseBrandList2(value);
+  return [];
+}
+function coerceClientHints(hints) {
+  if (!hints || typeof hints !== "object") return { uaData: null, secCh: void 0 };
+  const fullVersionList = brandsFromValue(
+    hints.fullVersionList && (Array.isArray(hints.fullVersionList) ? hints.fullVersionList.length > 0 : true) ? hints.fullVersionList : readBagKey(hints, "sec-ch-ua-full-version-list")
+  );
+  const brands = brandsFromValue(
+    hints.brands && (Array.isArray(hints.brands) ? hints.brands.length > 0 : true) ? hints.brands : readBagKey(hints, "sec-ch-ua")
+  );
+  const platform = hintFromBag(hints, "platform");
+  const platformVersion = hintFromBag(hints, "platformVersion");
+  const architecture = hints.architecture || hintFromBag(hints, "arch");
+  const bitness = hints.bitness ?? hintFromBag(hints, "bitness");
+  const model = hints.model ?? hintFromBag(hints, "model");
+  const mobileRaw = hints.mobile;
+  const mobile = typeof mobileRaw === "boolean" ? mobileRaw : String(mobileRaw ?? hintFromBag(hints, "mobile")) === "?1";
+  const secCh = {};
+  if (brands.length > 0) secCh["sec-ch-ua"] = serializeBrandList(brands);
+  if (fullVersionList.length > 0) {
+    secCh["sec-ch-ua-full-version-list"] = serializeBrandList(fullVersionList);
+  }
+  if (platform) secCh["sec-ch-ua-platform"] = `"${platform}"`;
+  if (platformVersion) secCh["sec-ch-ua-platform-version"] = `"${platformVersion}"`;
+  if (architecture) secCh["sec-ch-ua-arch"] = `"${architecture}"`;
+  if (bitness) secCh["sec-ch-ua-bitness"] = `"${bitness}"`;
+  if (model) secCh["sec-ch-ua-model"] = `"${model}"`;
+  if (hints.formFactors && hints.formFactors.length > 0) {
+    secCh["sec-ch-ua-form-factors"] = hints.formFactors.map((f) => `"${f}"`).join(", ");
+  }
+  const uaData = {
+    fullVersionList,
+    platform,
+    platformVersion,
+    architecture,
+    bitness,
+    model,
+    formFactors: hints.formFactors,
+    uaFullVersion: hints.uaFullVersion,
+    wow64: hints.wow64
+  };
+  return { uaData, secCh: Object.keys(secCh).length > 0 ? secCh : void 0 };
+}
+function normalizeUserAgent(input) {
+  try {
+    const { uaData, secCh } = coerceClientHints(input?.clientHints);
+    const identity = normalizeIdentity({
+      userAgent: input?.userAgent ?? "",
+      platform: input?.platform ?? "",
+      maxTouchPoints: input?.maxTouchPoints,
+      uaData,
+      secCh
+    });
+    const mobile = input?.clientHints?.mobile;
+    const mobileFlag = mobile === true || mobile === "true" || mobile === "?1";
+    const device = identity.device === "Unknown" && mobileFlag ? "Mobile" : identity.device;
+    return {
+      os: identity.os,
+      osVersion: identity.os_version,
+      device,
+      browserName: identity.browser_name,
+      browserMajorVersion: identity.browser_major_version,
+      browserFullVersion: identity.browser_full_version,
+      architecture: identity.architecture,
+      bitness: identity.bitness,
+      model: identity.device_model
+    };
+  } catch {
+    return { ...BLANK_USER_AGENT };
+  }
+}
+
 // src/server/network/asnRegistry.json
 var asnRegistry_default = [
   {
@@ -3411,7 +3972,7 @@ var asnRegistry_default = [
   },
   {
     asn: 14061,
-    asn_name: "DigitalOcean LLC",
+    asn_name: "DigitalOcean, LLC",
     handle: "DO-13",
     asn_type: "datacenter",
     datacenter_result: true,
@@ -3547,7 +4108,7 @@ var asnRegistry_default = [
   },
   {
     asn: 400645,
-    asn_name: "Axxess Networks LLC",
+    asn_name: "OpenAI",
     handle: "ANL-362",
     asn_type: "datacenter",
     datacenter_result: true,
@@ -3563,7 +4124,7 @@ var asnRegistry_default = [
   },
   {
     asn: 396986,
-    asn_name: "ByteDance Inc.",
+    asn_name: "ByteDance",
     handle: "BYTED",
     asn_type: "ai_operator",
     datacenter_result: true,
@@ -3774,8 +4335,50 @@ function ipv6ReverseNibbles(ip) {
   }
   return nibbles.reverse();
 }
-var CYMRU_TIMEOUT_MS = 4e3;
+var CYMRU_TIMEOUT_MS = 1500;
 var DOH_ENDPOINTS = ["https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"];
+function withBudget(task, fallback, ms) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(fallback);
+    }, ms);
+    task.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(fallback);
+      }
+    );
+  });
+}
+async function dnsTxtRecords(name) {
+  try {
+    const dns2 = await import("node:dns/promises");
+    if (!dns2 || typeof dns2.resolveTxt !== "function") return [];
+    const lookup = dns2.resolveTxt(name).then(
+      (records2) => records2.map((chunks) => chunks.join(""))
+    );
+    const records = await withBudget(lookup, [], CYMRU_TIMEOUT_MS);
+    return records.filter((record) => typeof record === "string" && record.length > 0);
+  } catch {
+    return [];
+  }
+}
+async function cymruTextRecords(name) {
+  const fromDns = await dnsTxtRecords(name);
+  if (fromDns.length > 0) return fromDns;
+  return dohTextRecords(name);
+}
 async function dohTextRecords(name) {
   if (typeof fetch !== "function") return [];
   const signal = typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(CYMRU_TIMEOUT_MS) : void 0;
@@ -3798,6 +4401,17 @@ async function dohTextRecords(name) {
 function firstCymruRecord(raw) {
   return String(raw ?? "").replace(/^"+|"+$/g, "").split(/"\s*"/)[0] ?? "";
 }
+var CYMRU_DATE_FIELD = /^\d{4}-\d{2}-\d{2}$/;
+var CYMRU_REGISTRY_FIELD = /^(?:apnic|arin|ripe|ripe-ncc|afrinic|lacnic|iana|arin-.*)$/i;
+function pickCymruAsName(fields) {
+  const candidates = [fields[4], fields[5], fields[fields.length - 1]].map((value) => String(value ?? "").trim()).filter((value) => value.length > 0);
+  for (const candidate of candidates) {
+    if (/[A-Za-z]/.test(candidate) && !CYMRU_DATE_FIELD.test(candidate) && !CYMRU_REGISTRY_FIELD.test(candidate)) {
+      return candidate;
+    }
+  }
+  return "";
+}
 function parseCymruOriginLine(raw) {
   const fields = firstCymruRecord(raw).split("|").map((field) => field.trim());
   const asn = Number.parseInt(fields[0] ?? "", 10);
@@ -3809,7 +4423,7 @@ async function lookupCymruByIp(ip) {
   if (!text) return null;
   const name = text.includes(":") ? `${ipv6ReverseNibbles(text).join(".")}.origin6.asn.cymru.com` : `${ipv4ReverseOctets(text).join(".")}.origin.asn.cymru.com`;
   if (name.startsWith(".origin") || name.endsWith(".origin") || name.startsWith(".") || name.endsWith(".")) return null;
-  for (const record of await dohTextRecords(name)) {
+  for (const record of await cymruTextRecords(name)) {
     const parsed = parseCymruOriginLine(record);
     if (parsed) return parsed;
   }
@@ -3819,11 +4433,12 @@ async function lookupCymruAsName(asn) {
   const key = `asname:${asn}`;
   const cached = cacheGet(key);
   if (cached !== void 0) return typeof cached === "string" ? cached : null;
-  for (const record of await dohTextRecords(`AS${asn}.asn.cymru.com`)) {
+  for (const record of await cymruTextRecords(`AS${asn}.asn.cymru.com`)) {
     const fields = firstCymruRecord(record).split("|").map((field) => field.trim());
-    if (fields.length >= 5 && fields[4]) {
-      cacheSet(key, fields[4], ASN_META_TTL_MS);
-      return fields[4];
+    const rawName = pickCymruAsName(fields);
+    if (rawName) {
+      cacheSet(key, rawName, ASN_META_TTL_MS);
+      return rawName;
     }
   }
   cacheSet(key, null, NEGATIVE_TTL_MS);
@@ -3847,6 +4462,55 @@ function toAsnNumber(value) {
     if (Number.isInteger(parsed) && parsed > 0 && parsed <= 4294967295) return parsed;
   }
   return null;
+}
+async function resolveAsnOrganization(asn) {
+  const number = toAsnNumber(asn);
+  const empty = {
+    asn: number === null ? "" : String(number),
+    asn_name: "",
+    asn_type: "isp",
+    datacenter_result: false,
+    source: "none"
+  };
+  if (number === null) return empty;
+  const cacheKey = `asnorg:${number}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== void 0 && typeof cached === "object" && cached !== null) {
+    return { ...cached };
+  }
+  const entry = registryEntryForAsn(number);
+  if (entry) {
+    const result = {
+      asn: String(number),
+      asn_name: entry.asn_name,
+      asn_type: entry.asn_type,
+      datacenter_result: entry.datacenter_result,
+      source: "registry"
+    };
+    cacheSet(cacheKey, result, ASN_META_TTL_MS);
+    return result;
+  }
+  try {
+    const rawName = await lookupCymruAsName(number);
+    if (rawName) {
+      const name = cleanCymruAsName(rawName);
+      if (name) {
+        const heuristic = heuristicAsnType(name);
+        const result = {
+          asn: String(number),
+          asn_name: name,
+          asn_type: heuristic.type,
+          datacenter_result: heuristic.datacenter,
+          source: "cymru"
+        };
+        cacheSet(cacheKey, result, ASN_META_TTL_MS);
+        return result;
+      }
+    }
+  } catch {
+  }
+  cacheSet(cacheKey, empty, NEGATIVE_TTL_MS);
+  return empty;
 }
 async function enrichNetwork(ip, edge = {}) {
   try {
@@ -3895,6 +4559,19 @@ async function enrichNetwork(ip, edge = {}) {
           asn_type: entry.asn_type,
           datacenter_result: entry.datacenter_result,
           source: "registry"
+        };
+        cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+        return result;
+      }
+      const byAsn = await resolveAsnOrganization(edgeAsn);
+      if (byAsn.source !== "none") {
+        const result = {
+          asn: String(edgeAsn),
+          asn_name: byAsn.asn_name,
+          asn_network: registryEntryForIp(ipClean)?.prefix ?? "",
+          asn_type: byAsn.asn_type,
+          datacenter_result: byAsn.datacenter_result,
+          source: byAsn.source
         };
         cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
         return result;
@@ -6059,7 +6736,7 @@ function classifyIspNetwork(isp, org, asn) {
   const residential = residentialMatch();
   if (residential) return residential;
   return {
-    brandName: cleanIsp && !/^(unknown|unknown isp|n\/a)$/i.test(cleanIsp) ? cleanIsp : cleanOrg && !/^(unknown|unknown isp|n\/a)$/i.test(cleanOrg) ? cleanOrg : "Unresolved Network",
+    brandName: cleanIsp && !/^(unknown|unknown isp|n\/a)$/i.test(cleanIsp) ? cleanIsp : cleanOrg && !/^(unknown|unknown isp|n\/a)$/i.test(cleanOrg) ? cleanOrg : asnTokenHits[0] ?? "Standard Network",
     networkType: "Standard Network",
     isConsumerBroadband: false,
     isDatacenterOrHosting: false,
@@ -8336,7 +9013,7 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic) {
       const asnNumber = data.data?.asns?.[0]?.asn;
       if (typeof asnNumber === "number" && Number.isFinite(asnNumber)) {
         const asn = `AS${asnNumber}`;
-        const org = cloudProviderOrgForAsn(asn) || "Standard Network";
+        const org = cloudProviderOrgForAsn(asn) || asn;
         const netDetails = normalizeIspAndOrg(org, org, asn, false);
         db.prepare(
           `INSERT OR REPLACE INTO verified_geo_cache_v3 (
@@ -8959,6 +9636,35 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     }
   };
 }
+function mergeRequestClientHints(headers, body) {
+  const h = headers ?? null;
+  const b = body && typeof body === "object" ? body : null;
+  const firstText = (...values) => {
+    for (const value of values) {
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return "";
+  };
+  const firstList = (a, bb) => {
+    if (Array.isArray(a) && a.length > 0) return a;
+    if (Array.isArray(bb) && bb.length > 0) return bb;
+    if (typeof bb === "string" && bb.trim()) return bb;
+    return void 0;
+  };
+  return {
+    brands: firstList(h?.brands, b?.brands),
+    fullVersionList: firstList(h?.fullVersionList, b?.fullVersionList),
+    platform: firstText(h?.platform, b?.platform),
+    platformVersion: firstText(h?.platformVersion, b?.platformVersion),
+    architecture: firstText(h?.architecture, b?.architecture, b?.arch),
+    bitness: firstText(h?.bitness, b?.bitness),
+    model: firstText(h?.model, b?.model),
+    mobile: b?.mobile ?? h?.mobile,
+    formFactors: Array.isArray(b?.formFactors) ? b.formFactors : void 0,
+    uaFullVersion: b?.uaFullVersion,
+    wow64: typeof b?.wow64 === "boolean" ? b.wow64 : void 0
+  };
+}
 app.post("/api/visitor/identify", async (req, res) => {
   try {
     void refreshTorBulkList();
@@ -8978,6 +9684,21 @@ app.post("/api/visitor/identify", async (req, res) => {
     const browserDevice = sanitizeBrowserDevice(rawBrowserDevice);
     const hardwareSignals = sanitizeHardwareSignals(rawHardwareSignals, browserDevice);
     const hardwareId = hardwareSignals.hardwareId;
+    const uaIdentity = normalizeUserAgent({
+      userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : "",
+      platform: typeof rawBrowserDevice?.platform === "string" ? rawBrowserDevice.platform : "",
+      maxTouchPoints: hardwareSignals.maxTouchPoints,
+      clientHints: mergeRequestClientHints(
+        req.intelClientHints,
+        requestBody.clientHints
+      )
+    });
+    if (uaIdentity.os !== "Unknown" && /^unknown|^$/i.test(browserDevice.os || "")) {
+      browserDevice.os = uaIdentity.os;
+    }
+    if (uaIdentity.browserName !== "Unknown" && /^unknown|^$/i.test(browserDevice.browser || "")) {
+      browserDevice.browser = uaIdentity.browserName;
+    }
     let { ip: extractedIp, isPublic } = extractVisitorIp(req);
     if (!isPublic && clientGeoHint && typeof clientGeoHint.ip === "string") {
       const normalizedHintIp = normalizeIpCandidate(clientGeoHint.ip);
@@ -9029,16 +9750,28 @@ app.post("/api/visitor/identify", async (req, res) => {
       asn: Number.isInteger(edgeAsnNumber) && edgeAsnNumber > 0 ? edgeAsnNumber : void 0,
       country: edgeGeo.countryCode || void 0
     });
+    const placeholderIspBefore = isMissingGeoValue(location.isp) || /^autonomous system\b/i.test(location.isp) || location.isp === "Standard Network";
+    const placeholderOrgBefore = isMissingGeoValue(location.org) || location.org === "Standard Network";
     if (enrichedNetwork.source !== "none") {
       const resolvedAsn = normalizeAsnLabel(enrichedNetwork.asn);
-      const placeholderIsp = isMissingGeoValue(location.isp) || /^autonomous system\b/i.test(location.isp) || location.isp === "Standard Network";
-      const placeholderOrg = isMissingGeoValue(location.org) || location.org === "Standard Network";
       location = {
         ...location,
         asn: normalizeAsnLabel(location.asn) || resolvedAsn || location.asn,
-        isp: placeholderIsp && enrichedNetwork.asn_name ? enrichedNetwork.asn_name : location.isp,
-        org: placeholderOrg && enrichedNetwork.asn_name ? enrichedNetwork.asn_name : location.org,
+        isp: placeholderIspBefore && enrichedNetwork.asn_name ? enrichedNetwork.asn_name : location.isp,
+        org: placeholderOrgBefore && enrichedNetwork.asn_name ? enrichedNetwork.asn_name : location.org,
         isVpnOrHosting: location.isVpnOrHosting || enrichedNetwork.datacenter_result
+      };
+    }
+    const knownAsnLabel = normalizeAsnLabel(location.asn) || normalizeAsnLabel(edgeGeo.asn) || "";
+    const stillPlaceholder = isMissingGeoValue(location.isp) || /^autonomous system\b/i.test(location.isp) || location.isp === "Standard Network";
+    if (knownAsnLabel && stillPlaceholder) {
+      const byAsn = await resolveAsnOrganization(knownAsnLabel);
+      location = {
+        ...location,
+        asn: knownAsnLabel,
+        isp: byAsn.asn_name || knownAsnLabel,
+        org: isMissingGeoValue(location.org) || location.org === "Standard Network" ? byAsn.asn_name || knownAsnLabel : location.org,
+        isVpnOrHosting: location.isVpnOrHosting || byAsn.datacenter_result
       };
     }
     const classification = classifyIspNetwork(location.isp, location.org, location.asn);
@@ -9701,6 +10434,20 @@ app.post("/api/visitor/identify", async (req, res) => {
       bot_type: botType,
       bot_info: botInfo,
       browserDevice,
+      // Server-normalized UA / client-hints identity. `os` is the family only and the
+      // version lives in `os_version`; `browser_details` mirrors the event contract so
+      // `browser_major_version` is never empty when a full version is known.
+      os: uaIdentity.os,
+      os_version: uaIdentity.osVersion,
+      browser_details: {
+        browser_name: uaIdentity.browserName,
+        browser_full_version: uaIdentity.browserFullVersion,
+        browser_major_version: uaIdentity.browserMajorVersion,
+        os: uaIdentity.os,
+        os_version: uaIdentity.osVersion,
+        device: uaIdentity.device,
+        device_model: uaIdentity.model || browserDevice.reportedModel || browserDevice.phoneModel || ""
+      },
       hardwareSignals,
       securitySignals,
       statistics,
@@ -9935,9 +10682,9 @@ function restoreOriginalApiUrl(req) {
     return;
   }
   if (pathPart === "/api/index" || pathPart === "/api/index.js") {
-    const headerValue3 = req.headers["x-vercel-original-path"] || req.headers["x-original-url"] || req.headers["x-rewrite-url"] || req.headers["x-matched-path"];
-    if (headerValue3) {
-      const original = headerValue3.startsWith("http") ? new URL(headerValue3).pathname + new URL(headerValue3).search : headerValue3;
+    const headerValue4 = req.headers["x-vercel-original-path"] || req.headers["x-original-url"] || req.headers["x-rewrite-url"] || req.headers["x-matched-path"];
+    if (headerValue4) {
+      const original = headerValue4.startsWith("http") ? new URL(headerValue4).pathname + new URL(headerValue4).search : headerValue4;
       const normalized = original.startsWith("/") ? original : `/${original}`;
       const normQIdx = normalized.indexOf("?");
       const normPath = normQIdx === -1 ? normalized : normalized.slice(0, normQIdx);
