@@ -1,0 +1,731 @@
+/**
+ * Intel System — pure dual-target UA / Client-Hints normalizer.
+ *
+ * Pure TypeScript, dual-target (browser + Cloudflare Workers). No Node APIs,
+ * no project imports. `normalizeIdentity` is total: it never throws and
+ * degrades to an 'Unknown' identity when signals are missing.
+ *
+ * Source priority:
+ *   1. `uaData.fullVersionList` + `uaData.platformVersion` (UA-CH JS API)
+ *   2. `secCh` headers ('sec-ch-ua-full-version-list', 'sec-ch-ua-platform', …)
+ *   3. UA-string regex fallback
+ *
+ * Post-normalization invariants (enforced by an internal self-check):
+ *   - `browser_major_version` is a non-empty string whenever ANY version
+ *     source exists (brands, secCh, or UA regexes).
+ *   - `os` never contains digits (family only).
+ *   - `os_version` never equals `os`.
+ */
+
+/* -------------------------------------------------------------------------- */
+/* Public types                                                                */
+/* -------------------------------------------------------------------------- */
+
+export interface UaDataHighEntropy {
+  architecture?: string;
+  bitness?: string;
+  formFactors?: string[];
+  fullVersionList?: Array<{ brand: string; version: string }>;
+  model?: string;
+  platform?: string;
+  platformVersion?: string;
+  uaFullVersion?: string;
+  wow64?: boolean;
+}
+
+export type PlatformFamily = 'windows' | 'mac' | 'linux' | 'android' | 'ios' | 'unknown';
+
+export type DeviceKind = 'Desktop' | 'Mobile' | 'Tablet' | 'Unknown';
+
+export interface NormalizedIdentity {
+  os: string;
+  os_version: string;
+  browser_name: string;
+  browser_major_version: string;
+  browser_full_version: string;
+  device: DeviceKind;
+  device_model: string;
+  architecture: string;
+  bitness: string;
+  platformFamily: PlatformFamily;
+}
+
+export interface NormalizeIdentityInput {
+  userAgent?: string;
+  platform?: string;
+  maxTouchPoints?: number;
+  uaData?: UaDataHighEntropy | null;
+  secCh?: Record<string, string>;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Internal helpers — parsing                                                  */
+/* -------------------------------------------------------------------------- */
+
+interface BrandEntry {
+  brand: string;
+  version: string;
+}
+
+interface SecChHints {
+  brands: BrandEntry[];
+  /** True when the full-version-list header was present (vs major-only). */
+  hasFullVersionList: boolean;
+  platform: string;
+  platformVersion: string;
+  model: string;
+  architecture: string;
+  bitness: string;
+  formFactors: string[];
+}
+
+/** GREASE brand filter, per UA-CH spec ('Not.A/Brand', 'Not/A)Brand', …). */
+const GREASE_RE = /not.?a.?brand/i;
+
+const CHROMIUM_PLACEHOLDER = 'chromium';
+
+/** Parses `"Chromium";v="153", "Google Chrome";v="153"` style brand lists. */
+function parseBrandList(raw: string): BrandEntry[] {
+  const out: BrandEntry[] = [];
+  if (!raw) return out;
+  const re = /"([^"]*)"\s*;\s*v\s*=\s*"([^"]*)"/g;
+  let m: RegExpExecArray | null = re.exec(raw);
+  while (m !== null) {
+    const brand = (m[1] ?? '').trim();
+    if (brand) out.push({ brand, version: (m[2] ?? '').trim() });
+    m = re.exec(raw);
+  }
+  return out;
+}
+
+/** Removes GREASE brands, then the placeholder 'Chromium' if a real brand exists. */
+function filterBrands(brands: BrandEntry[]): BrandEntry[] {
+  const real = brands.filter((b) => !GREASE_RE.test(b.brand));
+  const nonChromium = real.filter((b) => b.brand.toLowerCase() !== CHROMIUM_PLACEHOLDER);
+  return nonChromium.length > 0 ? nonChromium : real;
+}
+
+function headerValue(secCh: Record<string, string> | undefined, name: string): string {
+  if (!secCh) return '';
+  const lower = name.toLowerCase();
+  for (const key of Object.keys(secCh)) {
+    if (key.toLowerCase() === lower) {
+      const v = secCh[key];
+      return typeof v === 'string' ? v : '';
+    }
+  }
+  return '';
+}
+
+function unquote(value: string): string {
+  const v = value.trim();
+  if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) return v.slice(1, -1);
+  return v;
+}
+
+function parseSecCh(secCh: Record<string, string> | undefined): SecChHints {
+  const fullListRaw = headerValue(secCh, 'sec-ch-ua-full-version-list');
+  const majorListRaw = headerValue(secCh, 'sec-ch-ua');
+  const brands = fullListRaw ? parseBrandList(fullListRaw) : parseBrandList(majorListRaw);
+  return {
+    brands: filterBrands(brands),
+    hasFullVersionList: Boolean(fullListRaw),
+    platform: unquote(headerValue(secCh, 'sec-ch-ua-platform')),
+    platformVersion: unquote(headerValue(secCh, 'sec-ch-ua-platform-version')),
+    model: unquote(headerValue(secCh, 'sec-ch-ua-model')),
+    architecture: unquote(headerValue(secCh, 'sec-ch-ua-arch')),
+    bitness: unquote(headerValue(secCh, 'sec-ch-ua-bitness')),
+    formFactors: unquote(headerValue(secCh, 'sec-ch-ua-form-factors'))
+      .split(',')
+      .map((f) => unquote(f))
+      .filter((f) => f.length > 0),
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Internal helpers — browser brand catalog                                    */
+/* -------------------------------------------------------------------------- */
+
+interface BrowserSpec {
+  /** Canonical output name. */
+  name: string;
+  /** Lowercase brand strings (from brands lists) that map to this browser. */
+  brands: string[];
+  /** UA-string tokens with capture group 1 = version. Checked in order. */
+  uaTokens: RegExp[];
+}
+
+/**
+ * Brand priority (highest first). Firefox/Safari sit last because they do not
+ * send UA-CH and are only detectable from the UA string. 'Cursor' and
+ * 'Manus-User' are AI-agent Chromium forks detected from their UA tokens —
+ * they are listed first in the UA regex fallback chain (per spec ordering).
+ */
+const BROWSER_SPECS: BrowserSpec[] = [
+  {
+    name: 'Cursor',
+    brands: ['cursor'],
+    uaTokens: [/Cursor\/([\d.]+)/],
+  },
+  {
+    name: 'Manus',
+    brands: ['manus'],
+    uaTokens: [/Manus-User\/([\d.]+)/],
+  },
+  {
+    name: 'Microsoft Edge',
+    brands: ['microsoft edge'],
+    uaTokens: [/EdgA?\/([\d.]+)/, /EdgiOS\/([\d.]+)/, /Edge\/([\d.]+)/],
+  },
+  {
+    name: 'Opera',
+    brands: ['opera', 'opera gx'],
+    uaTokens: [/OPR\/([\d.]+)/, /OPX\/([\d.]+)/],
+  },
+  {
+    name: 'Brave',
+    brands: ['brave'],
+    uaTokens: [/Brave\/([\d.]+)/],
+  },
+  {
+    name: 'Samsung Internet',
+    brands: ['samsung internet'],
+    uaTokens: [/SamsungBrowser\/([\d.]+)/],
+  },
+  {
+    name: 'Headless Chrome',
+    brands: ['headlesschrome'],
+    uaTokens: [/HeadlessChrome\/([\d.]+)/],
+  },
+  {
+    name: 'Google Chrome',
+    brands: ['google chrome', 'chrome'],
+    uaTokens: [/CriOS\/([\d.]+)/, /Chrome\/([\d.]+)/],
+  },
+  {
+    name: 'Chromium',
+    brands: [CHROMIUM_PLACEHOLDER],
+    uaTokens: [/Chrome\/([\d.]+)/],
+  },
+  {
+    name: 'Firefox',
+    brands: ['firefox'],
+    uaTokens: [/FxiOS\/([\d.]+)/, /Firefox\/([\d.]+)/],
+  },
+  {
+    name: 'Safari',
+    brands: ['safari'],
+    uaTokens: [/Version\/([\d.]+).*Safari/],
+  },
+];
+
+function firstMatch(token: RegExp, ua: string): string | null {
+  const m = token.exec(ua);
+  if (m === null) return null;
+  return (m[1] ?? '').trim() || null;
+}
+
+/**
+ * Picks the first spec matching a brand list (case-insensitive) in priority
+ * order. Returns null when no brand maps to a known browser.
+ */
+function brandToSpec(brands: BrandEntry[]): BrowserSpec | null {
+  for (const spec of BROWSER_SPECS) {
+    for (const entry of brands) {
+      if (spec.brands.indexOf(entry.brand.toLowerCase()) !== -1) return spec;
+    }
+  }
+  return null;
+}
+
+/** UA-only fallback: scan the specs' tokens in priority order. */
+function uaToSpec(ua: string): BrowserSpec | null {
+  for (const spec of BROWSER_SPECS) {
+    for (const token of spec.uaTokens) {
+      if (token.test(ua)) return spec;
+    }
+  }
+  return null;
+}
+
+/** Every UA token that could carry a version for the given canonical name. */
+function tokensForName(name: string): RegExp[] {
+  const spec = BROWSER_SPECS.find((s) => s.name === name);
+  if (spec) return spec.uaTokens;
+  /* Extra regexes required by the self-check fallback chain. */
+  if (name === 'Manus') return [/Manus-User\/([\d.]+)/];
+  return [];
+}
+
+/**
+ * Keeps the version with more dotted segments (4-part full version wins over
+ * a major-only token). Ties keep `preferred`.
+ */
+function pickFullerVersion(preferred: string, candidate: string | null): string {
+  if (!candidate) return preferred;
+  if (!preferred) return candidate;
+  const a = preferred.split('.').length;
+  const b = candidate.split('.').length;
+  return b > a ? candidate : preferred;
+}
+
+interface BrowserResolution {
+  name: string;
+  full: string;
+  major: string;
+}
+
+/**
+ * Resolves the browser identity. Strategy:
+ *   1. uaData.fullVersionList brands (after GREASE/placeholder filtering).
+ *   2. secCh brand headers (full list when present, else major-only).
+ *   3. UA-string token scan.
+ * When the selected brand version is major-only, the full version is backfilled
+ * from the UA token for the same browser when one exists.
+ */
+function resolveBrowser(
+  ua: string,
+  uad: UaDataHighEntropy | null,
+  secCh: SecChHints,
+): BrowserResolution {
+  const empty: BrowserResolution = { name: 'Unknown', full: '', major: '' };
+
+  const uadBrands = filterBrands((uad?.fullVersionList ?? []).filter((b) => !!b));
+  const candidates: Array<{ brands: BrandEntry[]; source: 'uad' | 'secch' }> = [];
+  if (uadBrands.length > 0) candidates.push({ brands: uadBrands, source: 'uad' });
+  if (secCh.brands.length > 0) candidates.push({ brands: secCh.brands, source: 'secch' });
+
+  for (const candidate of candidates) {
+    const spec = brandToSpec(candidate.brands);
+    if (!spec) continue;
+    const entry = candidate.brands.find(
+      (b) => spec.brands.indexOf(b.brand.toLowerCase()) !== -1,
+    );
+    let version = entry ? entry.version : '';
+    /* Backfill a major-only brand version from the UA token. */
+    if (version && version.indexOf('.') === -1) {
+      version = pickFullerVersion(version, findUaVersion(spec, ua));
+    }
+    if (!version) version = findUaVersion(spec, ua) ?? '';
+    return { name: spec.name, full: version, major: majorOf(version) };
+  }
+
+  /* No usable brand lists — UA token scan. */
+  const uaSpec = ua ? uaToSpec(ua) : null;
+  if (uaSpec) {
+    const version = findUaVersion(uaSpec, ua) ?? '';
+    return { name: uaSpec.name, full: version, major: majorOf(version) };
+  }
+
+  /* uaFullVersion without a recognizable brand: report major version only. */
+  const uaFull = (uad?.uaFullVersion ?? '').trim();
+  if (uaFull) return { name: 'Unknown', full: uaFull, major: majorOf(uaFull) };
+
+  return empty;
+}
+
+function findUaVersion(spec: BrowserSpec, ua: string): string | null {
+  for (const token of spec.uaTokens) {
+    const v = firstMatch(token, ua);
+    if (v) return v;
+  }
+  return null;
+}
+
+function majorOf(version: string): string {
+  if (!version) return '';
+  const major = version.split('.')[0];
+  return /^\d+$/.test(major) ? major : '';
+}
+
+/**
+ * Version sources the self-check considers: brand lists, secCh brand headers,
+ * uaFullVersion, or any recognizable UA browser token.
+ */
+function versionSourceExists(
+  ua: string,
+  uad: UaDataHighEntropy | null,
+  secCh: SecChHints,
+): boolean {
+  if ((uad?.fullVersionList ?? []).length > 0) return true;
+  if ((uad?.uaFullVersion ?? '').trim()) return true;
+  if (secCh.brands.length > 0) return true;
+  return ua ? uaToSpec(ua) !== null : false;
+}
+
+/**
+ * Last-resort major-version extraction, used only when a version source exists
+ * but the primary resolution produced an empty major. The token matching the
+ * already-detected browser name is tried first, then the spec fallback chain:
+ * Cursor/, Manus-User/, EdgA?/, OPR/, FxiOS/, Firefox/, CriOS/,
+ * HeadlessChrome/, Chrome/, Version/…Safari.
+ */
+function fallbackMajorFromUa(browserName: string, ua: string): BrowserResolution {
+  if (!ua) return { name: browserName, full: '', major: '' };
+  const tokens: RegExp[] = [...tokensForName(browserName)];
+  for (const spec of BROWSER_SPECS) {
+    for (const token of spec.uaTokens) {
+      if (tokens.indexOf(token) === -1) tokens.push(token);
+    }
+  }
+  for (const token of tokens) {
+    const v = firstMatch(token, ua);
+    if (v) return { name: browserName, full: v, major: majorOf(v) };
+  }
+  return { name: browserName, full: '', major: '' };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Internal helpers — OS resolution                                            */
+/* -------------------------------------------------------------------------- */
+
+interface OsResolution {
+  os: string;
+  os_version: string;
+  platformFamily: PlatformFamily;
+  device: DeviceKind;
+  device_model: string;
+}
+
+function parseIntSafe(value: string): number | null {
+  const m = /^\s*(\d+)/.exec(value ?? '');
+  if (m === null) return null;
+  const n = parseInt(m[1], 10);
+  return isFinite(n) ? n : null;
+}
+
+/**
+ * Windows UA-CH platformVersion → marketing version.
+ *   major ≥ 13 → '11'; 1–12 → '10'; 0.1/0.2/0.3 → '7'/'8'/'8.1'; 0.0 → null.
+ */
+function windowsVersionFromPlatformVersion(pv: string): string | null {
+  const parts = (pv ?? '').trim().split('.');
+  const major = parseIntSafe(parts[0] ?? '');
+  if (major === null) return null;
+  if (major >= 13) return '11';
+  if (major >= 1) return '10';
+  const sub = parseIntSafe(parts[1] ?? '');
+  if (sub === 1) return '7';
+  if (sub === 2) return '8';
+  if (sub === 3) return '8.1';
+  return null;
+}
+
+function windowsVersionFromUa(ua: string): string | null {
+  const m = /Windows NT ([\d.]+)/.exec(ua);
+  if (m === null) return null;
+  const nt = m[1];
+  if (nt === '6.1') return '7';
+  if (nt === '6.2') return '8';
+  if (nt === '6.3') return '8.1';
+  if (nt === '10.0') return '10';
+  return null;
+}
+
+function underscoresToDots(v: string): string {
+  return v.replace(/_/g, '.');
+}
+
+/**
+ * Safari UA carries no macOS version. Heuristic (documented): the macOS major
+ * tracks the Safari major minus 3 (Safari 18 ⇒ macOS 15, Safari 17 ⇒ 14, …).
+ * The formula's output ≤ 10 (Safari ≤ 13, incl. Intel-clamped UAs that hide
+ * the real version) is floored at '10.15' — the last 10.x release. Only the
+ * major is reliable, so '.0' is used as the minor.
+ */
+function macVersionFromSafariUa(ua: string): string | null {
+  const safari = /Version\/(\d+)(?:\.(\d+))?.*Safari/.exec(ua);
+  if (safari === null) return null;
+  const safariMajor = parseIntSafe(safari[1] ?? '');
+  if (safariMajor === null) return null;
+  const macMajor = safariMajor - 3;
+  if (macMajor <= 10) return '10.15';
+  return `${macMajor}.0`;
+}
+
+function looksAndroidTablet(model: string, formFactors: string[]): boolean {
+  if (formFactors.map((f) => f.toLowerCase()).indexOf('tablet') !== -1) return true;
+  return /\b(tab|pad|sm-t|nexus 9|nexus 10|pixel c)\b/i.test(model);
+}
+
+function androidModelFromUa(ua: string): string {
+  const m = /Android[^;)]*;\s*([^;)]+?)\s*(?:Build\/|\))/.exec(ua);
+  const raw = m === null ? '' : (m[1] ?? '').trim();
+  if (!raw || raw.toLowerCase() === 'wv') return '';
+  return raw;
+}
+
+function resolveOs(
+  ua: string,
+  platformStr: string,
+  touch: number,
+  uad: UaDataHighEntropy | null,
+  secCh: SecChHints,
+): OsResolution {
+  const uadPlatform = (uad?.platform ?? '').trim();
+  const uadPv = (uad?.platformVersion ?? '').trim();
+  const formFactors = [...(uad?.formFactors ?? []), ...secCh.formFactors];
+
+  /* --- iOS / iPadOS (checked before macOS: iPad UA looks like macOS) ------- */
+  const uaIosPhone = /(?:iPhone|iPod)/.test(ua);
+  const uaIpad = /iPad/.test(ua);
+  const macTouch = /macintel/i.test(platformStr) && touch > 1;
+  const macTabletFormFactor =
+    uadPlatform.toLowerCase() === 'macos' &&
+    formFactors.map((f) => f.toLowerCase()).indexOf('tablet') !== -1;
+
+  if (uaIosPhone || uaIpad || macTouch || macTabletFormFactor) {
+    let osVersion = '';
+    const m = /(?:iPhone|iPad|iPod)[\s\S]*?OS (\d+(?:[_\d]*)?)\s+like/.exec(ua);
+    if (m !== null && m[1]) {
+      osVersion = underscoresToDots(m[1]);
+    } else if (macTabletFormFactor && uadPv) {
+      osVersion = underscoresToDots(uadPv);
+    }
+    const device: DeviceKind = uaIpad || macTouch || macTabletFormFactor ? 'Tablet' : 'Mobile';
+    return {
+      os: 'iOS',
+      os_version: osVersion,
+      platformFamily: 'ios',
+      device,
+      device_model: (uad?.model ?? '').trim(),
+    };
+  }
+
+  /* --- Android (before Linux: Android UAs contain 'Linux') ----------------- */
+  if (uadPlatform === 'Android' || secCh.platform === 'Android' || /Android/.test(ua)) {
+    let osVersion = '';
+    let model = (uad?.model ?? '').trim() || secCh.model;
+    if (uadPlatform === 'Android' || secCh.platform === 'Android') {
+      const major = parseIntSafe(uadPv || secCh.platformVersion);
+      if (major !== null) osVersion = String(major);
+    }
+    if (!osVersion) {
+      const m = /Android\s+([\d.]+)/.exec(ua);
+      if (m !== null) osVersion = majorOf(m[1]);
+    }
+    if (!model) model = androidModelFromUa(ua);
+    const device: DeviceKind = looksAndroidTablet(model, formFactors) ? 'Tablet' : 'Mobile';
+    return {
+      os: 'Android',
+      os_version: osVersion,
+      platformFamily: 'android',
+      device,
+      device_model: model,
+    };
+  }
+
+  /* --- Windows ------------------------------------------------------------- */
+  if (uadPlatform === 'Windows' || secCh.platform === 'Windows' || /Windows NT/.test(ua)) {
+    let osVersion =
+      windowsVersionFromPlatformVersion(uadPv) ??
+      windowsVersionFromPlatformVersion(secCh.platformVersion);
+    if (!osVersion) osVersion = windowsVersionFromUa(ua);
+    return {
+      os: 'Windows',
+      os_version: osVersion ?? '',
+      platformFamily: 'windows',
+      device: 'Desktop',
+      device_model: '',
+    };
+  }
+
+  /* --- macOS --------------------------------------------------------------- */
+  if (uadPlatform === 'macOS' || secCh.platform === 'macOS' || /Mac OS X|Macintosh/.test(ua)) {
+    let osVersion = uadPv || secCh.platformVersion;
+    if (!osVersion) {
+      const m = /Mac OS X ([\d_]+)/.exec(ua);
+      if (m !== null && m[1]) osVersion = underscoresToDots(m[1]);
+    }
+    if (!osVersion) osVersion = macVersionFromSafariUa(ua) ?? '';
+    return {
+      os: 'Mac OS X',
+      os_version: osVersion,
+      platformFamily: 'mac',
+      device: 'Desktop',
+      device_model: '',
+    };
+  }
+
+  /* --- Linux / Chrome OS ---------------------------------------------------- */
+  if (
+    uadPlatform === 'Linux' ||
+    uadPlatform === 'Chrome OS' ||
+    secCh.platform === 'Linux' ||
+    secCh.platform === 'Chrome OS' ||
+    /Linux/.test(ua)
+  ) {
+    let osVersion = '';
+    if (uadPlatform === 'Linux' || uadPlatform === 'Chrome OS') {
+      const major = parseIntSafe(uadPv);
+      if (major !== null) osVersion = String(major);
+    } else if (secCh.platform === 'Linux' || secCh.platform === 'Chrome OS') {
+      const major = parseIntSafe(secCh.platformVersion);
+      if (major !== null) osVersion = String(major);
+    }
+    return {
+      os: 'Linux',
+      os_version: osVersion,
+      platformFamily: 'linux',
+      device: 'Desktop',
+      device_model: '',
+    };
+  }
+
+  /* --- platform-string fallback -------------------------------------------- */
+  const p = platformStr.trim();
+  if (/^Win(?:dows)?(32|64|NT)?$/i.test(p)) {
+    return { os: 'Windows', os_version: '', platformFamily: 'windows', device: 'Desktop', device_model: '' };
+  }
+  if (/^Mac/i.test(p)) {
+    return { os: 'Mac OS X', os_version: '', platformFamily: 'mac', device: 'Desktop', device_model: '' };
+  }
+  if (/^Linux/i.test(p)) {
+    return { os: 'Linux', os_version: '', platformFamily: 'linux', device: 'Desktop', device_model: '' };
+  }
+  if (/iPhone|iPod/i.test(p)) {
+    return { os: 'iOS', os_version: '', platformFamily: 'ios', device: 'Mobile', device_model: '' };
+  }
+  if (/iPad/i.test(p)) {
+    return { os: 'iOS', os_version: '', platformFamily: 'ios', device: 'Tablet', device_model: '' };
+  }
+
+  return {
+    os: 'Unknown',
+    os_version: '',
+    platformFamily: 'unknown',
+    device: 'Unknown',
+    device_model: '',
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Internal helpers — architecture                                             */
+/* -------------------------------------------------------------------------- */
+
+function resolveArchitecture(
+  ua: string,
+  platformStr: string,
+  uad: UaDataHighEntropy | null,
+  secCh: SecChHints,
+): { architecture: string; bitness: string } {
+  const arch = (uad?.architecture ?? secCh.architecture ?? '').trim().toLowerCase();
+  const bit = (uad?.bitness ?? secCh.bitness ?? '').trim();
+  const wow64 = uad?.wow64 === true;
+
+  if (arch.indexOf('arm') !== -1) {
+    return { architecture: bit === '32' ? 'ARM' : 'ARM64', bitness: bit === '32' ? '32' : '64' };
+  }
+  if (arch.indexOf('x86') !== -1 || arch === 'amd64' || arch === 'x64' || arch === 'ia64') {
+    return { architecture: bit === '32' ? 'x86' : 'x86_64', bitness: bit === '32' ? '32' : '64' };
+  }
+  if (wow64) {
+    /* 32-bit process on a 64-bit OS: the OS is still 64-bit x86. */
+    return { architecture: 'x86_64', bitness: '64' };
+  }
+
+  /* UA / platform-string fallback. */
+  const hay = `${ua} ${platformStr}`.toLowerCase();
+  if (/arm64|aarch64|armv8/.test(hay)) return { architecture: 'ARM64', bitness: '64' };
+  if (/x86_64|x64|win64|wow64|amd64/.test(hay)) return { architecture: 'x86_64', bitness: '64' };
+  if (/armv[3-7]|arm;/.test(hay)) return { architecture: 'ARM', bitness: '32' };
+  if (/i[3456]86|x86\b/.test(hay)) return { architecture: 'x86', bitness: '32' };
+  return { architecture: '', bitness: bit === '32' || bit === '64' ? bit : '' };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Post-normalization self-check                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Final invariant pass:
+ *   - if `os` contains digits, split a trailing version off into os_version
+ *     ('Windows 11' → os 'Windows', os_version '11'); unmappable → 'Unknown'.
+ *   - os_version must never equal os (reset to '' when it does, but only when
+ *     the equality is non-trivial, i.e. os is non-empty).
+ */
+function sanitizeOs(os: string, osVersion: string): { os: string; osVersion: string } {
+  let o = (os ?? '').trim();
+  let v = (osVersion ?? '').trim();
+  if (o && /\d/.test(o)) {
+    const m = /^([^\d]+?)\s*([\d][\d.]*)$/.exec(o);
+    if (m !== null && m[1].trim()) {
+      o = m[1].trim();
+      if (!v) v = m[2];
+    } else {
+      o = 'Unknown';
+    }
+  }
+  if (v && o && v === o) v = '';
+  return { os: o, osVersion: v };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Public API                                                                  */
+/* -------------------------------------------------------------------------- */
+
+const BLANK_IDENTITY: NormalizedIdentity = {
+  os: 'Unknown',
+  os_version: '',
+  browser_name: 'Unknown',
+  browser_major_version: '',
+  browser_full_version: '',
+  device: 'Unknown',
+  device_model: '',
+  architecture: '',
+  bitness: '',
+  platformFamily: 'unknown',
+};
+
+/**
+ * Normalizes UA / client hints into the shared identity shape. Never throws.
+ * Source priority: uaData.fullVersionList + platformVersion → secCh headers →
+ * UA regexes; brand priority: Edge → Opera → Brave → Samsung Internet →
+ * Headless Chrome → Google Chrome → Chromium → Firefox → Safari (plus the
+ * Cursor / Manus agent tokens in the UA fallback chain).
+ */
+export function normalizeIdentity(input: NormalizeIdentityInput): NormalizedIdentity {
+  try {
+    const ua = (input?.userAgent ?? '').toString();
+    const platformStr = (input?.platform ?? '').toString();
+    const rawTouch = input?.maxTouchPoints;
+    const touch = typeof rawTouch === 'number' && isFinite(rawTouch) ? rawTouch : 0;
+    const uad = input?.uaData ?? null;
+    const secCh = parseSecCh(input?.secCh);
+
+    const osRes = resolveOs(ua, platformStr, touch, uad, secCh);
+    const browser = resolveBrowser(ua, uad, secCh);
+    const archRes = resolveArchitecture(ua, platformStr, uad, secCh);
+
+    const identity: NormalizedIdentity = {
+      os: osRes.os,
+      os_version: osRes.os_version,
+      browser_name: browser.name,
+      browser_major_version: browser.major,
+      browser_full_version: browser.full,
+      device: osRes.device,
+      device_model: osRes.device_model,
+      architecture: archRes.architecture,
+      bitness: archRes.bitness,
+      platformFamily: osRes.platformFamily,
+    };
+
+    /* Self-check: a version source exists but the major came out empty — walk
+     * the fallback chain until a non-empty major is found. */
+    if (versionSourceExists(ua, uad, secCh) && !identity.browser_major_version) {
+      const fallback = fallbackMajorFromUa(identity.browser_name, ua);
+      if (fallback.major) {
+        identity.browser_full_version = fallback.full;
+        identity.browser_major_version = fallback.major;
+      }
+    }
+
+    const safe = sanitizeOs(identity.os, identity.os_version);
+    identity.os = safe.os;
+    identity.os_version = safe.osVersion;
+
+    return identity;
+  } catch {
+    return { ...BLANK_IDENTITY };
+  }
+}
