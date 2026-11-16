@@ -4,11 +4,11 @@
  * A signed request carries `Signature-Input`, `Signature` and `Signature-Agent` headers. The
  * public key is discovered from the signer's
  * `/.well-known/http-message-signatures-directory` and cached by RFC 7638 JWK thumbprint.
+ * All cryptography uses Web Crypto so the module runs unchanged in Cloudflare Workers.
  */
 
-import crypto from 'node:crypto';
 import { WEB_BOT_AUTH_SIGNER_MAP } from './registry.js';
-import type { AIBotDatabase } from './schema.js';
+import { runTransaction, type AIBotDatabase } from './schema.js';
 
 export type WebBotAuthReason =
   | 'signer.web-bot-auth.verified'
@@ -103,17 +103,35 @@ function parseSignatureInput(raw: string): SignatureInputParts | null {
 /** Returns the lower-cased signer host from a quoted `Signature-Agent` URL. */
 export function parseSignatureAgentHost(raw: string): string | null {
   let value = (raw ?? '').trim();
-  // RFC 9651 structured-field item wrappers: <"https://host">
   while (value.startsWith('<') && value.endsWith('>')) value = value.slice(1, -1).trim();
   if (!value.startsWith('"') || !value.endsWith('"') || value.length < 3) return null;
   const url = value.slice(1, -1);
   if (!/^https:\/\//i.test(url)) return null;
   try {
-    const host = new URL(url).hostname.toLowerCase();
-    return host || null;
+    return new URL(url).hostname.toLowerCase() || null;
   } catch {
     return null;
   }
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function base64ToBytes(value: string): Uint8Array {
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+  const binary = atob(`${normalized}${'='.repeat((4 - (normalized.length % 4)) % 4)}`);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(bytes.length);
+  copy.set(bytes);
+  return copy.buffer as ArrayBuffer;
 }
 
 function componentValue(
@@ -142,9 +160,7 @@ function componentValue(
     }
     default: {
       const value = readHeader(headers, name);
-      if (!value) return null;
-      // RFC 9421 canonicalises structured string headers by trimming and folding whitespace.
-      return value.replace(/\s+/g, ' ').trim();
+      return value ? value.replace(/\s+/g, ' ').trim() : null;
     }
   }
 }
@@ -178,26 +194,24 @@ function collectEd25519Keys(node: unknown, depth: number, output: Jwk[]): void {
 
 export class WebBotAuthVerifier {
   /** RFC 7638 thumbprint over the three required Ed25519 JWK members. */
-  static computeEd25519JwkThumbprint(jwk: Pick<Jwk, 'kty' | 'crv' | 'x'>): string {
+  static async computeEd25519JwkThumbprint(jwk: Pick<Jwk, 'kty' | 'crv' | 'x'>): Promise<string> {
     const canonical = JSON.stringify({
       crv: jwk.crv ?? 'Ed25519',
       kty: jwk.kty ?? 'OKP',
       x: jwk.x ?? '',
     });
-    return crypto.createHash('sha256').update(canonical, 'utf8').digest('base64url');
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+    return bytesToBase64Url(new Uint8Array(digest));
   }
 
   constructor(private readonly db: AIBotDatabase) {}
 
   private getCachedKeys(host: string, keyId: string): Jwk[] {
-    let rows: Array<Record<string, any>>;
-    if (keyId) {
-      rows = this.db
-        .prepare('SELECT jwk FROM ai_bot_jwk_cache WHERE host = ? AND kid = ?')
-        .all(host, keyId) as Array<Record<string, any>>;
-    } else {
-      rows = this.db.prepare('SELECT jwk FROM ai_bot_jwk_cache WHERE host = ?').all(host) as Array<Record<string, any>>;
-    }
+    const rows = keyId
+      ? (this.db
+          .prepare('SELECT jwk FROM ai_bot_jwk_cache WHERE host = ? AND kid = ?')
+          .all(host, keyId) as Array<Record<string, any>>)
+      : (this.db.prepare('SELECT jwk FROM ai_bot_jwk_cache WHERE host = ?').all(host) as Array<Record<string, any>>);
     const keys: Jwk[] = [];
     for (const row of rows) {
       try {
@@ -237,14 +251,22 @@ export class WebBotAuthVerifier {
            algorithm = excluded.algorithm,
            observed_at_utc = excluded.observed_at_utc`
       );
+      const thumbprints = await Promise.all(
+        keys.map((jwk) => WebBotAuthVerifier.computeEd25519JwkThumbprint(jwk))
+      );
       const now = new Date().toISOString();
-      const write = this.db.transaction(() => {
-        for (const jwk of keys) {
-          const thumbprint = WebBotAuthVerifier.computeEd25519JwkThumbprint(jwk);
-          upsert.run(thumbprint, normalizedHost, jwk.kid ?? null, JSON.stringify(jwk), jwk.alg ?? 'Ed25519', now);
-        }
+      runTransaction(this.db, () => {
+        keys.forEach((jwk, index) => {
+          upsert.run(
+            thumbprints[index],
+            normalizedHost,
+            jwk.kid ?? null,
+            JSON.stringify(jwk),
+            jwk.alg ?? 'Ed25519',
+            now
+          );
+        });
       });
-      write();
       return keys.length;
     } catch {
       return 0;
@@ -270,9 +292,7 @@ export class WebBotAuthVerifier {
     const signature = readHeader(request.headers, 'signature');
     const signatureAgent = readHeader(request.headers, 'signature-agent');
     const present = Boolean(signatureInput && signature && signatureAgent);
-    if (!present) {
-      return { present: false, verified: false, reason: 'none' };
-    }
+    if (!present) return { present: false, verified: false, reason: 'none' };
 
     const signerHost = parseSignatureAgentHost(signatureAgent);
     if (!signerHost) {
@@ -349,7 +369,7 @@ export class WebBotAuthVerifier {
       };
     }
 
-    const signatureMatch = new RegExp(`(?:^|,)\\s*${parsed.label}\\s*=\\s*:([A-Za-z0-9+/=]+):`).exec(signature);
+    const signatureMatch = new RegExp(`(?:^|,)\\s*${parsed.label}\\s*=\\s*:([A-Za-z0-9+/=_-]+):`).exec(signature);
     if (!signatureMatch) {
       return {
         present,
@@ -389,12 +409,27 @@ export class WebBotAuthVerifier {
       };
     }
 
-    const signatureBytes = Buffer.from(signatureMatch[1], 'base64');
+    const signatureBytes = base64ToBytes(signatureMatch[1]);
+    const dataBytes = new TextEncoder().encode(base);
     let verified = false;
     for (const jwk of keys) {
+      if (!jwk.x) continue;
       try {
-        const publicKey = crypto.createPublicKey({ key: jwk as crypto.JsonWebKey, format: 'jwk' });
-        if (crypto.verify(null, Buffer.from(base, 'utf8'), publicKey, signatureBytes)) {
+        const key = await globalThis.crypto.subtle.importKey(
+          'jwk',
+          { kty: 'OKP', crv: 'Ed25519', x: jwk.x } as JsonWebKey,
+          { name: 'Ed25519' },
+          false,
+          ['verify']
+        );
+        if (
+          await globalThis.crypto.subtle.verify(
+            'Ed25519',
+            key,
+            toArrayBuffer(signatureBytes),
+            toArrayBuffer(dataBytes)
+          )
+        ) {
           verified = true;
           break;
         }

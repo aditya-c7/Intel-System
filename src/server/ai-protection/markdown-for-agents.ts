@@ -168,9 +168,13 @@ function htmlToMarkdown(html: string): string {
 }
 
 /** Converts rendered HTML into Markdown suitable for `Accept: text/markdown` clients. */
+function utf8ByteLength(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
 export function convertHtmlToAgentMarkdown(htmlBuffer: Buffer | string): MarkdownConversionResult {
-  const source = typeof htmlBuffer === 'string' ? htmlBuffer : htmlBuffer.toString('utf8');
-  const inputBytes = Buffer.byteLength(source, 'utf8');
+  const source = typeof htmlBuffer === 'string' ? htmlBuffer : String(htmlBuffer);
+  const inputBytes = utf8ByteLength(source);
   if (inputBytes > MAX_MARKDOWN_HTML_BYTES) {
     return { converted: false, markdown: '', byteLength: inputBytes, reason: 'too_large' };
   }
@@ -195,7 +199,7 @@ export function convertHtmlToAgentMarkdown(htmlBuffer: Buffer | string): Markdow
     output += `\n\n\`\`\`json\n${JSON.stringify(nodes, null, 2)}\n\`\`\`\n`;
   }
   output = `${output.trim()}\n`;
-  return { converted: true, markdown: output, byteLength: Buffer.byteLength(output, 'utf8') };
+  return { converted: true, markdown: output, byteLength: utf8ByteLength(output) };
 }
 
 /** Applies the Markdown-for-Agents response headers without destroying existing metadata. */

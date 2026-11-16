@@ -7,7 +7,6 @@
  *   3. Forward-confirmed reverse DNS (FCrDNS) and soft PTR records
  */
 
-import dns from 'node:dns/promises';
 import {
   BOT_MAP_BY_ID,
   BOT_REGISTRY,
@@ -15,7 +14,7 @@ import {
   type BotDefinition,
   type BotFeedFormat,
 } from './registry.js';
-import type { AIBotDatabase } from './schema.js';
+import { runTransaction, type AIBotDatabase } from './schema.js';
 
 export interface ParsedCidr {
   cidr: string;
@@ -192,14 +191,13 @@ export class IpVerificationEngine {
       `INSERT OR IGNORE INTO ai_bot_cidr_ranges (bot_id, network, mask, cidr, source, created_at_utc)
        VALUES (?, ?, ?, ?, 'static', ?)`
     );
-    const run = this.db.transaction(() => {
+    runTransaction(this.db, () => {
       for (const subnet of BYTESPIDER_STATIC_SUBNETS) {
         const parsed = IpVerificationEngine.parseCidrBlock(subnet);
         if (!parsed) continue;
         insert.run('bytespider', parsed.networkHex, parsed.maskHex, parsed.cidr, now);
       }
     });
-    run();
     this.reloadMemoryRanges();
   }
 
@@ -495,13 +493,7 @@ export class IpVerificationEngine {
       expiresAtUtc,
     };
 
-    let hostname: string | null = null;
-    try {
-      const names = await withTimeout(dns.reverse(ip), DNS_TIMEOUT_MS);
-      hostname = names.find((name) => name.trim().endsWith('.'))?.replace(/\.$/, '').toLowerCase() ?? null;
-    } catch {
-      hostname = null;
-    }
+    const hostname = await reverseDnsViaDoh(ip);
     if (!hostname) {
       // Negative results expire quickly so a transient failure does not pin the IP forever.
       base.expiresAtUtc = new Date(now.getTime() + 60_000).toISOString();
@@ -528,7 +520,7 @@ export class IpVerificationEngine {
       const suffix = (bot.fcrdnsSuffixes ?? []).find((item) => hostname!.endsWith(item.toLowerCase()));
       if (!suffix) continue;
       try {
-        const addresses = await withTimeout(dns.resolve4(hostname), DNS_TIMEOUT_MS);
+        const addresses = await resolve4ViaDoh(hostname);
         if (addresses.includes(ip)) {
           this.saveDnsCache({
             ...base,
@@ -549,6 +541,44 @@ export class IpVerificationEngine {
     base.verificationMethod = 'ptr_unverified';
     base.expiresAtUtc = new Date(now.getTime() + 60_000).toISOString();
     this.saveDnsCache(base);
+  }
+}
+
+/** DNS-over-HTTPS helpers: work in Cloudflare Workers and need no Node-only modules. */
+interface DohAnswer {
+  type: number;
+  data: string;
+}
+
+async function dohQuery(name: string, type: number): Promise<DohAnswer[]> {
+  const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`;
+  const response = await withTimeout(
+    fetch(url, { headers: { accept: 'application/dns-json' } }),
+    DNS_TIMEOUT_MS
+  );
+  if (!response.ok) return [];
+  const payload = (await response.json()) as { Answer?: DohAnswer[] };
+  return Array.isArray(payload?.Answer) ? payload.Answer : [];
+}
+
+async function reverseDnsViaDoh(ip: string): Promise<string | null> {
+  try {
+    if (ip.includes(':')) return null; // IPv6 nibble PTR is intentionally skipped.
+    const reversed = ip.split('.').reverse().join('.');
+    const answers = await dohQuery(`${reversed}.in-addr.arpa`, 12);
+    const ptr = answers.find((answer) => answer.type === 12)?.data;
+    return ptr ? ptr.replace(/\.$/, '').toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolve4ViaDoh(hostname: string): Promise<string[]> {
+  try {
+    const answers = await dohQuery(hostname, 1);
+    return answers.filter((answer) => answer.type === 1).map((answer) => answer.data);
+  } catch {
+    return [];
   }
 }
 
