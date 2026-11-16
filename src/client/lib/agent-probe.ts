@@ -599,6 +599,42 @@ export function startIntelAgentProbe(
     600
   );
 
+  // ---- Probe 9b: Headless UA, H3 SwiftShader caveat and launch switches (F1/V1) ------------
+  setTimeout(
+    guard(() => {
+      if (/HeadlessChrome\//i.test(navigator.userAgent)) addReason('ua.headless-chrome', 'claude-cowork');
+      try {
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl', {
+          failIfMajorPerformanceCaveat: true,
+        }) as WebGLRenderingContext | null;
+        const debug = gl?.getExtension('WEBGL_debug_renderer_info');
+        const renderer = debug ? String(gl?.getParameter(debug.UNMASKED_RENDERER_WEBGL) ?? '') : '';
+        if (/SwiftShader/i.test(renderer)) addReason('headless.swiftshader.caveat');
+      } catch {
+        /* WebGL unavailable */
+      }
+
+      // F1: Chromium with --disable-ipc-flooding-protection accepts the 201st replaceState.
+      let ipcFloodAccepted = false;
+      try {
+        for (let i = 0; i <= 200; i += 1) history.replaceState(null, '', location.href);
+        ipcFloodAccepted = true;
+      } catch {
+        /* normal Blink blocks the flood */
+      }
+      if (ipcFloodAccepted) {
+        addReason('launch.ipc-flooding-switch');
+        safe(() => {
+          if (typeof speechSynthesis !== 'undefined' && speechSynthesis.getVoices().length === 0) {
+            addReason('launch.no-speech-voices');
+          }
+        });
+      }
+    }),
+    450
+  );
+
   // ---- Probe 10: Pointer kinematics (passive listeners) ----------------------------------
   safe(() => {
     let movesSinceLastClick = 0;
@@ -622,6 +658,8 @@ export function startIntelAgentProbe(
           zeroTrailHits += 1;
           if (zeroTrailHits >= 2) addReason('kinematics.zero_pointer_trail');
         }
+        // Playwright MCP dispatches synthetic pointerdown with pressure exactly 0.5.
+        if (event.pressure === 0.5) addReason('playwright.mcp.pressure');
         movesSinceLastClick = 0;
         checkHiddenFocus();
       }),
@@ -634,9 +672,16 @@ export function startIntelAgentProbe(
         const target = event.target as HTMLElement | null;
         if (!target || typeof target.getBoundingClientRect !== 'function') return;
         const rect = target.getBoundingClientRect();
-        if (rect.width > 300) {
-          const centerX = rect.left + rect.width / 2;
-          if (Math.abs(event.clientX - centerX) > 230) addReason('kinematics.screenshot_offset');
+        const centerX = rect.left + rect.width / 2;
+        const centerY = rect.top + rect.height / 2;
+        if (rect.width > 300 && Math.abs(event.clientX - centerX) > 230) {
+          addReason('kinematics.screenshot_offset');
+        }
+        // ChatGPT Work: 319px-wide window and clicks within 1px of the element centre with
+        // zero synthetic pressure. Reason ID kept distinct from the extension marker.
+        const offset = Math.hypot(event.clientX - centerX, event.clientY - centerY);
+        if ((window.innerWidth === 319 || offset <= 1) && (event as PointerEvent).pressure === 0) {
+          addReason('chatgpt.badge.overlay', 'chatgpt-work');
         }
       }),
       { passive: true }

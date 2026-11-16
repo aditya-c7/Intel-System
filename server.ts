@@ -41,7 +41,7 @@ import {
 } from './src/lib/geoFallbacks';
 import { buildProximityInfo } from './src/lib/geohash';
 import { detectAiBotFromServerSignals } from './src/lib/aiBotDirectory';
-import { createAIProtectionSystem } from './src/server/ai-protection/middleware';
+import { createAIProtectionSystem, refreshAIBotFeeds } from './src/server/ai-protection/middleware';
 import type { BotInfo } from './src/types/visitor';
 
 dotenv.config();
@@ -491,6 +491,16 @@ const db = initializeDatabase();
 // Native AI crawler / remote-agent protection engine. The same Express app is bundled into
 // the Cloudflare Worker; schema setup is deliberately deferred to request time there.
 const aiProtection = createAIProtectionSystem(db);
+
+// Hourly authoritative-feed refresh in the long-lived Express/VPS runtime. Cloudflare uses
+// the scheduled Worker handler in worker/index.js instead (Durable Object isolates are
+// ephemeral, so a setInterval here would not be reliable there).
+if (!IS_SERVERLESS_RUNTIME) {
+  const aiFeedTimer = setInterval(() => {
+    void refreshAIBotFeeds(db).catch(() => undefined);
+  }, 60 * 60 * 1000);
+  aiFeedTimer.unref?.();
+}
 
 function signVisitorId(visitorId: string): string {
   return crypto.createHmac('sha256', HMAC_SECRET).update(visitorId).digest('hex');

@@ -24,5 +24,8 @@
     { "tag": "v2", "new_sqlite_classes": ["SpeedTestStore"] },
     { "tag": "v3", "deleted_classes": ["SpeedTestStore"] }
   ],
+  "triggers": {
+    "crons": ["0 */1 * * *"]
+  },
   "observability": { "enabled": true }
 }

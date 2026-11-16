@@ -1116,6 +1116,43 @@ var BOT_REGISTRY = [
     fcrdnsSuffixes: [".fbsbx.com", ".facebook.com", ".tfbnw.net"],
     expectedAsns: [32934],
     followsRobotsTxt: false
+  },
+  {
+    id: "oai-adsbot",
+    displayName: "OAI-AdsBot",
+    operator: "OpenAI",
+    cfDetectionIds: ["90000107"],
+    legacyCategory: "AI Crawler",
+    behavior: "Search",
+    operatorLabel: "Direct",
+    uaTokens: [{ token: "OAI-AdsBot", matchMode: "bounded" }],
+    feedUrls: [{ url: "https://openai.com/adsbot.json", format: "json" }],
+    expectedAsns: [8075, 400645],
+    followsRobotsTxt: true
+  },
+  {
+    id: "ahrefsbot",
+    displayName: "AhrefsBot",
+    operator: "Ahrefs",
+    cfDetectionIds: ["90000108"],
+    legacyCategory: "Search Engine",
+    behavior: "Search",
+    operatorLabel: "Direct",
+    uaTokens: [{ token: "AhrefsBot", matchMode: "bounded" }],
+    feedUrls: [{ url: "https://api.ahrefs.com/v3/metadata/crawler-ip-ranges", format: "json" }],
+    followsRobotsTxt: true
+  },
+  {
+    id: "duckduckbot",
+    displayName: "DuckDuckBot",
+    operator: "DuckDuckGo",
+    cfDetectionIds: ["90000109"],
+    legacyCategory: "Search Engine",
+    behavior: "Search",
+    operatorLabel: "Direct",
+    uaTokens: [{ token: "DuckDuckBot", matchMode: "bounded" }],
+    feedUrls: [{ url: "https://duckduckgo.com/duckduckbot.json", format: "json" }],
+    followsRobotsTxt: true
   }
 ];
 var BOT_MAP_BY_ID = Object.freeze(
@@ -2607,6 +2644,17 @@ function applyMarkdownResponseHeaders(res, defaultContentSignal) {
 }
 
 // src/server/ai-protection/middleware.ts
+async function refreshAIBotFeeds(db2) {
+  initAIBotSchema(db2);
+  const ipEngine = new IpVerificationEngine(db2);
+  const webBotAuth = new WebBotAuthVerifier(db2);
+  const [feeds, keys] = await Promise.all([
+    ipEngine.syncAllOfficialFeeds(),
+    webBotAuth.refreshAllDirectories()
+  ]);
+  ipEngine.reloadMemoryRanges();
+  return { feeds, keys };
+}
 var ROBOTS_PATHS = /* @__PURE__ */ new Set(["/robots.txt", "/api/intel/ai-crawl-control/robots.txt"]);
 var LLMS_PATHS = /* @__PURE__ */ new Set(["/llms.txt", "/api/intel/ai-crawl-control/llms.txt"]);
 function computeCloudflareUriPattern(uri) {
@@ -2821,7 +2869,9 @@ function createAIProtectionSystem(db2) {
       }
       const accept = headerValue2(req, "accept");
       if (/text\/html/i.test(accept) || !reqPath.startsWith("/api") && req.method === "GET") {
-        res.setHeader("Server-Timing", `botscent;desc="${verdictFor(ctx).replace(/"/g, "'")}"`);
+        const wireVerdict = verdictFor(ctx).replace(/"/g, "'");
+        res.setHeader("Server-Timing", `botscent;desc="${wireVerdict}"`);
+        res.setHeader("Botscent-Report", wireVerdict);
       }
       const wantsMarkdown = config.markdownForAgentsEnabled && /\btext\/markdown\b/i.test(accept) && !reqPath.startsWith("/api") && !ROBOTS_PATHS.has(reqPath) && !LLMS_PATHS.has(reqPath);
       const originalWrite = res.write.bind(res);
@@ -3501,6 +3551,12 @@ function initializeDatabase() {
 }
 var db = initializeDatabase();
 var aiProtection = createAIProtectionSystem(db);
+if (!IS_SERVERLESS_RUNTIME) {
+  const aiFeedTimer = setInterval(() => {
+    void refreshAIBotFeeds(db).catch(() => void 0);
+  }, 60 * 60 * 1e3);
+  aiFeedTimer.unref?.();
+}
 function signVisitorId(visitorId) {
   return crypto.createHmac("sha256", HMAC_SECRET).update(visitorId).digest("hex");
 }

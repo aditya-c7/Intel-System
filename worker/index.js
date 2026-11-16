@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { handleAsNodeRequest } from 'cloudflare:node';
 import { DurableObject } from 'cloudflare:workers';
 import app, { initializeDatabaseSchema, withDatabase } from '../server.ts';
+import { refreshAIBotFeeds } from '../src/server/ai-protection/middleware.ts';
 
 // Workers' node:http adapter uses this as a routing key, not a public TCP port.
 const API_PORT = 3000;
@@ -45,6 +46,11 @@ export class VisitorStore extends DurableObject {
   fetch(request) {
     return withDatabase(this.database, () => handleAsNodeRequest(API_PORT, request));
   }
+
+  /** Cron-triggered refresh of official crawler CIDR feeds and Web Bot Auth JWKs. */
+  async refreshAIBotFeeds() {
+    return withDatabase(this.database, () => refreshAIBotFeeds(this.database));
+  }
 }
 
 export default {
@@ -85,5 +91,12 @@ export default {
       console.error('Worker API failure:', error);
       return apiResponse(Response.json({ error: 'Internal server error.' }, { status: 500 }));
     }
+  },
+
+  /** Runs hourly via the wrangler cron trigger to keep CIDR/JWK caches current. */
+  async scheduled(_controller, env, ctx) {
+    if (!env.VISITOR_STORE) return;
+    const store = env.VISITOR_STORE.get(env.VISITOR_STORE.idFromName('visitor-store-v1'));
+    ctx.waitUntil(store.refreshAIBotFeeds());
   },
 };

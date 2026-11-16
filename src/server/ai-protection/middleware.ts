@@ -18,6 +18,25 @@ import { WebBotAuthVerifier } from './web-bot-auth.js';
 import { BotPreferenceSyncEngine, type AccessEvaluation, type ZoneConfig } from './bot-preference-sync.js';
 import { applyMarkdownResponseHeaders, convertHtmlToAgentMarkdown } from './markdown-for-agents.js';
 
+/**
+ * Periodic feed/JWK refresh used by the Node timer and by the Cloudflare cron handler.
+ * Feed sync is idempotent and safe to run from a fresh Durable Object context.
+ */
+export async function refreshAIBotFeeds(db: AIBotDatabase): Promise<{
+  feeds: Awaited<ReturnType<IpVerificationEngine['syncAllOfficialFeeds']>>;
+  keys: number;
+}> {
+  initAIBotSchema(db);
+  const ipEngine = new IpVerificationEngine(db);
+  const webBotAuth = new WebBotAuthVerifier(db);
+  const [feeds, keys] = await Promise.all([
+    ipEngine.syncAllOfficialFeeds(),
+    webBotAuth.refreshAllDirectories(),
+  ]);
+  ipEngine.reloadMemoryRanges();
+  return { feeds, keys };
+}
+
 export interface AIProtectionSystem {
   middleware: (req: Request, res: Response, next: NextFunction) => Promise<void>;
   apiRouter: express.Router;
@@ -293,7 +312,11 @@ export function createAIProtectionSystem(db: AIBotDatabase): AIProtectionSystem 
       // Document navigations get a Server-Timing verdict without exposing the full decision tree.
       const accept = headerValue(req, 'accept');
       if (/text\/html/i.test(accept) || (!reqPath.startsWith('/api') && req.method === 'GET')) {
-        res.setHeader('Server-Timing', `botscent;desc="${verdictFor(ctx).replace(/"/g, "'")}"`);
+        const wireVerdict = verdictFor(ctx).replace(/"/g, "'");
+      res.setHeader('Server-Timing', `botscent;desc="${wireVerdict}"`);
+      // Botscent-Report is the second half of the client/server wire contract: the in-page
+      // probe can reconcile its local verdict with the server's navigation verdict.
+      res.setHeader('Botscent-Report', wireVerdict);
       }
 
       // Byte accounting + Markdown-for-Agents response interception.
