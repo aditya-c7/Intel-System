@@ -924,7 +924,7 @@ export default function App() {
    * recorded and the counters do not move.
    */
   const pollGeolocation = useCallback(async (visitorId: string, token: number) => {
-    const delaysMs = [800, 1500, 2500, 4000, 6000, 9000, 12000];
+    const delaysMs = [800, 1500, 2500, 4000, 6000, 9000, 12000, 15000, 20000, 30000, 30000];
     for (const delay of delaysMs) {
       await new Promise((resolve) => setTimeout(resolve, delay));
       if (geoPollToken.current !== token) return;
@@ -968,7 +968,9 @@ export default function App() {
 
         const token = geoPollToken.current + 1;
         geoPollToken.current = token;
-        if (!isLocationComplete(response.location)) {
+        // Only a request the server could tie to a public IP can ever resolve; on a
+        // private/LAN origin (local dev) polling would just repeat the same answer.
+        if (response.location.isIpVerified && !isLocationComplete(response.location)) {
           void pollGeolocation(response.visitorId, token);
         }
       } catch (err) {
