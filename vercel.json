@@ -48,6 +48,14 @@
       "destination": "/api/index?__ipath=$1"
     },
     {
+      "source": "/robots.txt",
+      "destination": "/api/index?__ipath=robots.txt"
+    },
+    {
+      "source": "/llms.txt",
+      "destination": "/api/index?__ipath=llms.txt"
+    },
+    {
       "source": "/((?!api/).*)",
       "destination": "/index.html"
     }

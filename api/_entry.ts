@@ -140,7 +140,14 @@ function restoreOriginalApiUrl(req: VercelRequest): void {
     }
 
     const cleanSubpath = cleanInjectedPath.replace(/^\/+/, '').replace(/^api\/+/i, '');
-    const restoredPath = cleanSubpath ? `${API_PREFIX}/${cleanSubpath}` : API_PREFIX;
+    // Root-level document routes (/robots.txt, /llms.txt) are routed through the same
+    // serverless function by vercel.json so Bot Preference Sync can answer dynamically.
+    const isRootDocument = /^(robots\.txt|llms\.txt)$/i.test(cleanSubpath);
+    const restoredPath = isRootDocument
+      ? `/${cleanSubpath}`
+      : cleanSubpath
+      ? `${API_PREFIX}/${cleanSubpath}`
+      : API_PREFIX;
     applyRestoredUrlAndQuery(req, restoredPath, searchParams);
     return;
   }
