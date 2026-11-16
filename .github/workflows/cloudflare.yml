@@ -23,3 +23,10 @@ jobs:
         env:
           WRANGLER_SEND_METRICS: 'false'
       - run: node scripts/test-worker.mjs
+      - name: Browser lifecycle checks
+        run: |
+          if command -v chromium >/dev/null || command -v chromium-browser >/dev/null || command -v google-chrome >/dev/null; then
+            node scripts/test-browser.mjs
+          else
+            echo "No system Chromium found; skipping optional browser lifecycle checks."
+          fi
