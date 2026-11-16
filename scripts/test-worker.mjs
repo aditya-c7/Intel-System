@@ -22,8 +22,10 @@ async function start() {
     '--inspector-port', '0', '--persist-to', state, '--var', `VISITOR_HMAC_SECRET:${secret}`,
   ];
   // Windows spawns npx.cmd; the bare "npx" name is not resolvable via spawn() there.
-child = spawn(process.platform === 'win32' ? 'npx.cmd' : 'npx', args, {
+const isWindows = process.platform === 'win32';
+child = spawn(isWindows ? 'npx.cmd' : 'npx', args, {
     detached: true,
+    shell: isWindows,
     env: { ...process.env, WRANGLER_SEND_METRICS: 'false' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
