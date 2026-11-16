@@ -1259,6 +1259,8 @@ export interface BotAutomationSignals {
   webdriver: boolean;
   cdpDetected: boolean;
   botSignals?: string[];
+  /** True when only ambiguous environment quirks were found. Never a bot verdict. */
+  botSuspicion?: boolean;
 }
 
 /**
@@ -1725,22 +1727,23 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
   // Run all 19 fingerprintjs/BotD detectors
   const botD19 = detectBotD19Signals(gpuRenderer);
 
-  // Weighted evidence gate. A single soft signal must never brand a real person
-  // as a bot: SwiftShader fires when hardware acceleration is disabled, empty
-  // languages happen on hardened profiles, minimized windows report zero outer
-  // geometry, and privacy extensions patch the webdriver getter. Hard signals
-  // (webdriver, CDP bindings, automation UAs, BotD hard detectors) prove
-  // automation on their own; soft signals only corroborate each other.
+  // Weighted evidence gate. A real person must never be branded as a bot from ambiguous
+  // environment quirks: SwiftShader appears whenever hardware acceleration is off (battery
+  // saver, blocklisted GPU, Linux), in-app browsers report zero outer geometry, empty
+  // languages happen on hardened profiles, and privacy extensions patch the webdriver
+  // getter. Only hard signals prove automation on their own: the WebDriver handshake, a
+  // CDP binding, an automation user-agent, or a BotD hard detector. Soft signals are
+  // recorded as corroboration only and can never flip `isBot`.
   const d19Hard =
     Boolean(botD19.signals.user_agent) ||
     Boolean(botD19.signals.webdriver) ||
-    Boolean(botD19.signals.distinctive_properties) ||
-    Boolean(botD19.signals.window_size);
+    Boolean(botD19.signals.distinctive_properties);
   const d19Soft =
     Boolean(botD19.signals.rtt) ||
     Boolean(botD19.signals.plugins_array) ||
     Boolean(botD19.signals.plugins_inconsistency) ||
     Boolean(botD19.signals.window_external) ||
+    Boolean(botD19.signals.window_size) ||
     Boolean(botD19.signals.product_sub) ||
     Boolean(botD19.signals.webgl) ||
     Boolean(botD19.signals.notification_permissions);
@@ -1751,8 +1754,10 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
     (webdriverGetterTampered ? 1 : 0) +
     (d19Soft ? 1 : 0);
 
-  const isBot =
-    webdriver || cdpDetected || headlessUa || d19Hard || softEvidenceCount >= 2;
+  // Soft evidence alone is suspicion, never a verdict: two coincidental quirks (an in-app
+  // browser with a disabled GPU) must not label a human as automated.
+  const isBot = webdriver || cdpDetected || headlessUa || d19Hard;
+  const botSuspicion = !isBot && softEvidenceCount >= 2;
   let botReason = 'Verified human runtime & native DOM prototypes';
   const allBotReasons: string[] = [];
 
@@ -1764,8 +1769,8 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
     botReason = 'Headless browser User-Agent signature detected';
   } else if (d19Hard) {
     botReason = botD19.reasons[0] || 'BotD hard automation signal detected';
-  } else if (isBot) {
-    botReason = `Corroborated soft automation evidence (${softEvidenceCount} independent signals)`;
+  } else if (botSuspicion) {
+    botReason = `Low-confidence environment quirks (${softEvidenceCount} soft signals)`;
   }
 
   if (botReason !== 'Verified human runtime & native DOM prototypes') {
@@ -1783,6 +1788,7 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
     webdriver: webdriver || botD19.signals.webdriver,
     cdpDetected: cdpDetected || botD19.signals.distinctive_properties,
     botSignals: allBotReasons,
+    botSuspicion,
   };
 }
 
