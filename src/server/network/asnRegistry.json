@@ -105,7 +105,7 @@
   },
   {
     "asn": 14061,
-    "asn_name": "DigitalOcean LLC",
+    "asn_name": "DigitalOcean, LLC",
     "handle": "DO-13",
     "asn_type": "datacenter",
     "datacenter_result": true,
@@ -241,7 +241,7 @@
   },
   {
     "asn": 400645,
-    "asn_name": "Axxess Networks LLC",
+    "asn_name": "OpenAI",
     "handle": "ANL-362",
     "asn_type": "datacenter",
     "datacenter_result": true,
@@ -257,7 +257,7 @@
   },
   {
     "asn": 396986,
-    "asn_name": "ByteDance Inc.",
+    "asn_name": "ByteDance",
     "handle": "BYTED",
     "asn_type": "ai_operator",
     "datacenter_result": true,

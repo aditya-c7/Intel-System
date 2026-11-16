@@ -4,14 +4,17 @@
  * Resolution order (first tier that answers wins):
  *   1. Edge headers — Cloudflare/Vercel already know the ASN + organization for free.
  *   2. Bundled Tier-2 registry (`asnRegistry.json`) — matched by ASN number and by
- *      longest-prefix IPv4 containment against curated sample prefixes.
- *   3. Team Cymru over DNS-over-HTTPS (`origin(.origin6).asn.cymru.com` TXT records) —
- *      pure `fetch`, no node:dns, safe in both Node 20 and Cloudflare Workers.
+ *      longest-prefix IPv4 containment against curated sample prefixes, backed by an
+ *      in-memory LRU (7-day TTL for ASN metadata).
+ *   3. Team Cymru over DNS TXT (`origin.asn.cymru.com`, `AS<asn>.asn.cymru.com`) via
+ *      `node:dns/promises` `resolveTxt` with a 1.5 s budget. When the runtime has no
+ *      DNS (Workers, restricted sandboxes) the same queries fall back to
+ *      DNS-over-HTTPS with the same budget.
  *   4. `cleanCymruAsName` normalisation of whatever Cymru returned.
  *
  * The resolver NEVER throws and NEVER fabricates a placeholder name such as
  * 'Standard Network' — when nothing is known it returns empty strings with
- * `source: 'none'` so callers can degrade silently.
+ * `source: 'none'` so callers can degrade to `AS<number>`.
  *
  * Caches (module-level LRU, max 500 entries): 7 days for ASN metadata, 24 hours for
  * prefix/IP lookups, 30 seconds for negative results. All expiry is lazy (checked on
@@ -134,7 +137,7 @@ export function registryEntryForIp(ip: string): { entry: AsnRegistryEntry; prefi
 /* LRU cache (max 500, lazy TTL)                                               */
 /* -------------------------------------------------------------------------- */
 
-type CachedValue = EnrichedNetwork | string | null;
+type CachedValue = EnrichedNetwork | AsnOrganization | string | null;
 
 interface CacheSlot {
   value: CachedValue;
@@ -393,11 +396,63 @@ function ipv6ReverseNibbles(ip: string): string[] {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Tier 3 — Team Cymru over DNS-over-HTTPS                                     */
+/* Tier 3 — Team Cymru over DNS TXT (node:dns, DoH fallback)                   */
 /* -------------------------------------------------------------------------- */
 
-const CYMRU_TIMEOUT_MS = 4000;
+const CYMRU_TIMEOUT_MS = 1500;
 const DOH_ENDPOINTS = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'];
+
+/** Races a promise against a fixed budget; the timeout resolves to the fallback. */
+function withBudget<T>(task: Promise<T>, fallback: T, ms: number): Promise<T> {
+  return new Promise<T>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(fallback);
+    }, ms);
+    task.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(fallback);
+      }
+    );
+  });
+}
+
+/**
+ * Team Cymru TXT lookup through the system resolver. `node:dns/promises` is imported
+ * lazily so the module stays importable in runtimes without it; a failure (no DNS,
+ * blocked UDP, NXDOMAIN) resolves to an empty list and the DoH tier takes over.
+ */
+async function dnsTxtRecords(name: string): Promise<string[]> {
+  try {
+    const dns = await import('node:dns/promises');
+    if (!dns || typeof dns.resolveTxt !== 'function') return [];
+    const lookup = dns.resolveTxt(name).then((records) =>
+      records.map((chunks) => chunks.join('')),
+    );
+    const records = await withBudget<string[]>(lookup, [], CYMRU_TIMEOUT_MS);
+    return records.filter((record) => typeof record === 'string' && record.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+/** Tier 3 transport: DNS first, DNS-over-HTTPS as the portable fallback. */
+async function cymruTextRecords(name: string): Promise<string[]> {
+  const fromDns = await dnsTxtRecords(name);
+  if (fromDns.length > 0) return fromDns;
+  return dohTextRecords(name);
+}
 
 interface DohAnswer {
   type?: number;
@@ -437,6 +492,27 @@ function firstCymruRecord(raw: string): string {
     .split(/"\s*"/)[0] ?? '';
 }
 
+const CYMRU_DATE_FIELD = /^\d{4}-\d{2}-\d{2}$/;
+const CYMRU_REGISTRY_FIELD = /^(?:apnic|arin|ripe|ripe-ncc|afrinic|lacnic|iana|arin-.*)$/i;
+
+/**
+ * Picks the AS-name field from a Cymru pipe-delimited record. The documented 5th
+ * field is preferred; real records often append the allocated date and the name after
+ * it, so a trailing field that contains letters and is not a date/registry token is
+ * accepted as well.
+ */
+function pickCymruAsName(fields: string[]): string {
+  const candidates = [fields[4], fields[5], fields[fields.length - 1]]
+    .map((value) => String(value ?? '').trim())
+    .filter((value) => value.length > 0);
+  for (const candidate of candidates) {
+    if (/[A-Za-z]/.test(candidate) && !CYMRU_DATE_FIELD.test(candidate) && !CYMRU_REGISTRY_FIELD.test(candidate)) {
+      return candidate;
+    }
+  }
+  return '';
+}
+
 function parseCymruOriginLine(raw: string): { asn: number; network: string; cc: string } | null {
   const fields = firstCymruRecord(raw)
     .split('|')
@@ -453,7 +529,7 @@ async function lookupCymruByIp(ip: string): Promise<{ asn: number; network: stri
     ? `${ipv6ReverseNibbles(text).join('.')}.origin6.asn.cymru.com`
     : `${ipv4ReverseOctets(text).join('.')}.origin.asn.cymru.com`;
   if (name.startsWith('.origin') || name.endsWith('.origin') || name.startsWith('.') || name.endsWith('.')) return null;
-  for (const record of await dohTextRecords(name)) {
+  for (const record of await cymruTextRecords(name)) {
     const parsed = parseCymruOriginLine(record);
     if (parsed) return parsed;
   }
@@ -464,14 +540,16 @@ async function lookupCymruAsName(asn: number): Promise<string | null> {
   const key = `asname:${asn}`;
   const cached = cacheGet(key);
   if (cached !== undefined) return typeof cached === 'string' ? cached : null;
-  for (const record of await dohTextRecords(`AS${asn}.asn.cymru.com`)) {
+  for (const record of await cymruTextRecords(`AS${asn}.asn.cymru.com`)) {
     const fields = firstCymruRecord(record)
       .split('|')
       .map((field) => field.trim());
-    // '<AS> | <prefixes> | <cc> | <registry> | <date> | <AS name>' — field 4 is the name.
-    if (fields.length >= 5 && fields[4]) {
-      cacheSet(key, fields[4], ASN_META_TTL_MS);
-      return fields[4];
+    // '<AS> | <prefixes> | <cc> | <registry> | <date> | <AS name>' — the name is the
+    // documented 5th field, with a trailing name accepted for real-world records.
+    const rawName = pickCymruAsName(fields);
+    if (rawName) {
+      cacheSet(key, rawName, ASN_META_TTL_MS);
+      return rawName;
     }
   }
   cacheSet(key, null, NEGATIVE_TTL_MS);
@@ -502,6 +580,79 @@ function toAsnNumber(value: unknown): number | null {
     if (Number.isInteger(parsed) && parsed > 0 && parsed <= 4294967295) return parsed;
   }
   return null;
+}
+
+export interface AsnOrganization {
+  /** Digits only ('55836') or '' when the input was not a number. */
+  asn: string;
+  asn_name: string;
+  asn_type: AsnType;
+  datacenter_result: boolean;
+  source: 'registry' | 'cymru' | 'none';
+}
+
+/**
+ * Resolves only the organisation behind an AS number. Used when the network path
+ * already knows the numeric ASN (edge header, provider cascade, client hint) but not
+ * the operator name. Registry first, Team Cymru second, empty result last — the
+ * caller decides how to label an unresolved network (`AS<number>`, never
+ * 'Standard Network').
+ */
+export async function resolveAsnOrganization(
+  asn: number | string | null | undefined
+): Promise<AsnOrganization> {
+  const number = toAsnNumber(asn);
+  const empty: AsnOrganization = {
+    asn: number === null ? '' : String(number),
+    asn_name: '',
+    asn_type: 'isp',
+    datacenter_result: false,
+    source: 'none',
+  };
+  if (number === null) return empty;
+
+  const cacheKey = `asnorg:${number}`;
+  const cached = cacheGet(cacheKey);
+  if (cached !== undefined && typeof cached === 'object' && cached !== null) {
+    return { ...(cached as AsnOrganization) };
+  }
+
+  const entry = registryEntryForAsn(number);
+  if (entry) {
+    const result: AsnOrganization = {
+      asn: String(number),
+      asn_name: entry.asn_name,
+      asn_type: entry.asn_type,
+      datacenter_result: entry.datacenter_result,
+      source: 'registry',
+    };
+    cacheSet(cacheKey, result, ASN_META_TTL_MS);
+    return result;
+  }
+
+  try {
+    const rawName = await lookupCymruAsName(number);
+    if (rawName) {
+      const name = cleanCymruAsName(rawName);
+      if (name) {
+        const heuristic = heuristicAsnType(name);
+        const result: AsnOrganization = {
+          asn: String(number),
+          asn_name: name,
+          asn_type: heuristic.type,
+          datacenter_result: heuristic.datacenter,
+          source: 'cymru',
+        };
+        cacheSet(cacheKey, result, ASN_META_TTL_MS);
+        return result;
+      }
+    }
+  } catch {
+    // Degrade to the numeric label below.
+  }
+
+  cacheSet(cacheKey, empty, NEGATIVE_TTL_MS);
+  return empty;
 }
 
 /**
@@ -564,6 +715,21 @@ export async function enrichNetwork(
           asn_type: entry.asn_type,
           datacenter_result: entry.datacenter_result,
           source: 'registry',
+        };
+        cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+        return result;
+      }
+
+      // ASN known, organisation unknown: ask Team Cymru for the AS name alone.
+      const byAsn = await resolveAsnOrganization(edgeAsn);
+      if (byAsn.source !== 'none') {
+        const result: EnrichedNetwork = {
+          asn: String(edgeAsn),
+          asn_name: byAsn.asn_name,
+          asn_network: registryEntryForIp(ipClean)?.prefix ?? '',
+          asn_type: byAsn.asn_type,
+          datacenter_result: byAsn.datacenter_result,
+          source: byAsn.source,
         };
         cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
         return result;

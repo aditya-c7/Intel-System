@@ -17,6 +17,8 @@
     "test:worker": "node scripts/test-worker.mjs",
     "test:browser": "node scripts/test-browser.mjs",
     "test:device": "tsx scripts/test-device-detection.ts",
+    "test:ua": "tsx scripts/test-ua-normalizer.ts",
+    "test:asn": "tsx scripts/test-asn-enricher.ts",
     "test:verify": "tsx scripts/test-verification.ts",
     "phones:generate": "node scripts/generate-phone-models.mjs"
   },
