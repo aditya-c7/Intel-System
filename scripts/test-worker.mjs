@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,14 +21,19 @@ async function start() {
     '--yes', 'wrangler@4.161.0', 'dev', '--ip', '127.0.0.1', '--port', String(port),
     '--inspector-port', '0', '--persist-to', state, '--var', `VISITOR_HMAC_SECRET:${secret}`,
   ];
-  // Windows spawns npx.cmd; the bare "npx" name is not resolvable via spawn() there.
-const isWindows = process.platform === 'win32';
-child = spawn(isWindows ? 'npx.cmd' : 'npx', args, {
+  const options = {
     detached: true,
-    shell: isWindows,
     env: { ...process.env, WRANGLER_SEND_METRICS: 'false' },
     stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  };
+  if (process.platform === 'win32') {
+    // Windows needs a shell to launch npx.cmd. Pass the whole command as one
+    // string (no separate args) so Node does not emit DEP0190, which warns
+    // when args are combined with shell:true. Linux keeps the plain spawn.
+    child = spawn(['npx.cmd', ...args].join(' '), { ...options, shell: true });
+  } else {
+    child = spawn('npx', args, options);
+  }
   child.stdout.on('data', chunk => { logs += chunk; });
   child.stderr.on('data', chunk => { logs += chunk; });
   let launchError;
@@ -48,6 +53,14 @@ async function stop() {
   if (!child) return;
   const processToStop = child;
   child = undefined;
+  if (process.platform === 'win32') {
+    // Negative-PID process-group signals are POSIX-only and are a no-op on
+    // Windows. Kill the whole process tree (cmd -> npx -> wrangler -> workerd)
+    // instead, otherwise stale workers keep port 18789 and its file handles.
+    try { spawnSync('taskkill', ['/PID', String(processToStop.pid), '/T', '/F'], { stdio: 'ignore' }); } catch {}
+    await delay(1000);
+    return;
+  }
   try { process.kill(-processToStop.pid, 'SIGTERM'); } catch {}
   await delay(1000);
   try { process.kill(-processToStop.pid, 'SIGKILL'); } catch {}
@@ -107,5 +120,26 @@ try {
   throw error;
 } finally {
   await stop();
-  await rm(state, { recursive: true, force: true });
+  // On Windows, Miniflare can briefly keep a handle open on its cache object
+  // (miniflare-CacheObject), so rm may fail with EBUSY/EPERM right after stop().
+  // Retry a few times, then make one final best-effort pass that never fails
+  // the test suite. CI runs on Linux and is unaffected.
+  const removeState = () => rm(state, { recursive: true, force: true });
+  let cleaned = false;
+  for (let attempt = 0; attempt < 5 && !cleaned; attempt++) {
+    try {
+      await removeState();
+      cleaned = true;
+    } catch (error) {
+      if (error?.code !== 'EBUSY' && error?.code !== 'EPERM') throw error;
+      await delay(500);
+    }
+  }
+  if (!cleaned) {
+    try {
+      await removeState();
+    } catch (error) {
+      console.warn(`Warning: could not fully clean up test state at ${state}: ${error?.message || error}`);
+    }
+  }
 }
