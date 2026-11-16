@@ -22,6 +22,7 @@ import {
   type MatchMode,
 } from '../src/shared/matching/compareFingerprints';
 import { scoreConfidence } from '../src/server/identity/confidenceScorer';
+import { normalizeGpuRenderer } from '../src/client/signals/webgl';
 
 let passed = 0;
 const failures: string[] = [];
@@ -122,6 +123,42 @@ check(
   'sub-1e-4 audio drift scores 0.90',
   Math.abs(audioResult.perFamily.audio.similarity - 0.9) < 1e-9,
   String(audioResult.perFamily.audio.similarity),
+);
+
+section('Kernels: GPU identity normalization');
+
+const gpuCases: Array<[string, string, string]> = [
+  [
+    'NVIDIA Direct3D ANGLE',
+    'ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Direct3D11 vs_5_0 ps_5_0, D3D11)',
+    'NVIDIA GeForce RTX 4090',
+  ],
+  [
+    'Apple Metal ANGLE',
+    'ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)',
+    'Apple M4',
+  ],
+  [
+    'Intel Direct3D ANGLE',
+    'ANGLE (Intel, Intel(R) UHD Graphics 630 (0x00003E9B) Direct3D11 vs_5_0 ps_5_0, D3D11)',
+    'Intel UHD Graphics 630',
+  ],
+  [
+    'nested SwiftShader ANGLE',
+    'ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)',
+    'SwiftShader',
+  ],
+  ['llvmpipe', 'llvmpipe (LLVM 17.0.6, 256 bits)', 'llvmpipe'],
+  ['bare GPU name', 'Apple M2', 'Apple M2'],
+];
+for (const [label, raw, expected] of gpuCases) {
+  const actual = normalizeGpuRenderer(raw);
+  check(`gpu normalization: ${label}`, actual === expected, `${actual}`);
+}
+check(
+  'nested parentheses never leak into the GPU identity',
+  !/[()]/.test(String(normalizeGpuRenderer(gpuCases[3][1]))),
+  String(normalizeGpuRenderer(gpuCases[3][1])),
 );
 
 /* -------------------------------------------------------------------------- */

@@ -365,6 +365,19 @@ export function getWebglExtensions(): WebglExtensions {
 // ---------------------------------------------------------------------------
 
 const ANGLE_SHAPE = /^angle\s*\((.*)\)\s*$/i;
+
+/**
+ * Software rasterizers are named inconsistently across drivers and browser
+ * builds ("SwiftShader Device (Subzero)", "Google SwiftShader", "SwiftShader
+ * driver"). Collapsing them to one canonical label keeps virtual machines
+ * fingerprinted consistently instead of by driver build detail.
+ */
+const SOFTWARE_RENDERERS: Array<[RegExp, string]> = [
+  [/swiftshader/i, 'SwiftShader'],
+  [/llvmpipe/i, 'llvmpipe'],
+  [/software\s+rasterizer/i, 'Software Rasterizer'],
+  [/basic\s+render\s+driver/i, 'Microsoft Basic Render Driver'],
+];
 const WRAPPER_TOKENS =
   /angle|direct3d\s*\d*|d3d\s*\d*|metal|vulkan|opengl(\s+es)?\s*[\d.]*|webgl\s*\d*|gles\s*[\d.]*|\bengine\b/gi;
 
@@ -376,30 +389,94 @@ const WRAPPER_TOKENS =
  *    17.0.6, 256 bits)" -> "llvmpipe"
  *  - plain renderer strings pass through: "Apple M4" -> "Apple M4"
  */
+/**
+ * Splits an ANGLE inner descriptor on the commas that separate its top-level
+ * fields. Commas nested inside parentheses belong to the model fragment.
+ */
+function splitTopLevel(value: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const char of value) {
+    if (char === '(') depth += 1;
+    else if (char === ')') depth = Math.max(0, depth - 1);
+    if (char === ',' && depth === 0) {
+      parts.push(current.trim());
+      current = '';
+      continue;
+    }
+    current += char;
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
+/**
+ * Removes parenthesized fragments from the inside out. Drivers nest them
+ * ("Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE))"), and a single
+ * pass leaves dangling brackets that corrupt the canonical GPU name.
+ */
+function stripNestedParens(value: string): string {
+  let out = value;
+  for (let pass = 0; pass < 8 && out.indexOf('(') !== -1; pass += 1) {
+    const next = out.replace(/\([^()]*\)/g, ' ');
+    if (next === out) break;
+    out = next;
+  }
+  return out.replace(/[()]/g, ' ');
+}
+
+/**
+ * Longest alphabetic fragment inside nested parentheses. ANGLE sometimes hides
+ * the real device there ("Vulkan 1.3.0 (SwiftShader Device ...)"), so it is the
+ * fallback whenever the outer fragment cleans down to a version string.
+ */
+function innerDeviceCandidate(value: string): string {
+  let best = '';
+  const pattern = /\(([^()]*)\)/g;
+  let match = pattern.exec(value);
+  while (match) {
+    const fragment = match[1]
+      .replace(/\b(?:unspecified version|swiftshader driver)\b/gi, ' ')
+      .trim();
+    if (/[a-z]{4,}/i.test(fragment) && fragment.length > best.length) best = fragment;
+    match = pattern.exec(value);
+  }
+  return best;
+}
+
 export function normalizeGpuRenderer(raw: string | null | undefined): string | null {
   if (typeof raw !== 'string') return null;
   const trimmed = raw.trim();
   if (!trimmed) return null;
   let value = trimmed;
   try {
+    for (const [pattern, label] of SOFTWARE_RENDERERS) {
+      if (pattern.test(trimmed)) return label;
+    }
     const angleMatch = value.match(ANGLE_SHAPE);
+    let innerCandidate = '';
     if (angleMatch) {
-      const parts = angleMatch[1].split(',').map((part) => part.trim());
+      const parts = splitTopLevel(angleMatch[1]);
+      innerCandidate = innerDeviceCandidate(angleMatch[1]);
       // ANGLE inner layout: "<vendor>, <model + wrapper suffix>, <backend>".
       value = parts.length >= 3 ? parts[1] : angleMatch[1];
     }
-    // Strip parenthesized fragments (device ids, LLVM versions, "(R)/(TM)").
-    value = value.replace(/\([^)]*\)/g, ' ');
-    value = value.replace(WRAPPER_TOKENS, ' ');
-    value = value
-      .replace(/renderer\s*:/gi, ' ')
-      .replace(/unspecified\s+version/gi, ' ')
-      .replace(/vs_\d+_\d+/gi, ' ')
-      .replace(/ps_\d+_\d+/gi, ' ')
-      .replace(/\d+\s*bits/gi, ' ')
-      .replace(/\s+/g, ' ')
-      .replace(/^[\s,\-]+|[\s,\-]+$/g, '')
-      .trim();
+    const clean = (input: string): string =>
+      stripNestedParens(input)
+        .replace(WRAPPER_TOKENS, ' ')
+        .replace(/renderer\s*:/gi, ' ')
+        .replace(/unspecified\s+version/gi, ' ')
+        .replace(/vs_\d+_\d+/gi, ' ')
+        .replace(/ps_\d+_\d+/gi, ' ')
+        .replace(/\d+\s*bits/gi, ' ')
+        .replace(/\b\d+\.\d+(?:\.\d+)*\b/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/^[\s,\-]+|[\s,\-]+$/g, '')
+        .trim();
+    value = clean(value);
+    // A fragment made of a bare version ("1.3.0") is not a device identity.
+    if (!/[a-z]{2,}/i.test(value) && innerCandidate) value = clean(innerCandidate);
   } catch {
     return trimmed;
   }
