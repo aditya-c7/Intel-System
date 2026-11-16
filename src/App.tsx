@@ -1360,9 +1360,11 @@ export default function App() {
                     ) : null}
                     {data.consistency ? (
                       <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-medium text-slate-600">
-                        {data.consistency.agent_verdict === 'human'
-                          ? 'Consistent human signals'
-                          : `Agent signals: ${data.consistency.agent_verdict}`}
+                        {data.bot === 'bad'
+                          ? `Agent signals: ${data.consistency.agent_verdict}`
+                          : data.bot === 'good'
+                          ? `Verified agent: ${data.consistency.agent_verdict}`
+                          : 'Consistent human signals'}
                       </span>
                     ) : null}
                   </div>
