@@ -207,6 +207,26 @@ function normalizeComparison(raw: unknown): { score: number; violations: string[
 const NEUTRAL_COMPARISON = { score: 0, violations: [] as string[], engineMode: null as string | null };
 
 /**
+ * Adapts a resolver profile to the engine's `ComparisonInput`. The concise `timezone`
+ * string is kept for the blocking index, while the engine-native `timezoneSignals`
+ * object is promoted into the `timezone` family slot for scoring.
+ */
+function engineInput(profile: BlockKeyProfile | ResolverProfile | null): ComparisonInput {
+  const source = (profile ?? {}) as Record<string, unknown>;
+  const adapted: Record<string, unknown> = { ...source };
+  const timezone = source['timezone'];
+  const timezoneSignals = source['timezoneSignals'];
+  if (
+    (timezone === null || timezone === undefined || typeof timezone === 'string') &&
+    timezoneSignals &&
+    typeof timezoneSignals === 'object'
+  ) {
+    adapted['timezone'] = timezoneSignals;
+  }
+  return adapted as unknown as ComparisonInput;
+}
+
+/**
  * Runs the fingerprint engine over (stored, incoming) — the engine's parameter
  * order is load-bearing: version monotonicity treats the FIRST argument as the
  * stored profile, so swapping it would invert downgrade detection.
@@ -222,8 +242,8 @@ async function runEngine(incoming: ResolverProfile, stored: BlockKeyProfile | nu
     | null;
   if (typeof engine !== 'function') return NEUTRAL_COMPARISON;
 
-  const storedInput = (stored ?? {}) as unknown as ComparisonInput;
-  const incomingInput = incoming as unknown as ComparisonInput;
+  const storedInput = engineInput(stored);
+  const incomingInput = engineInput(incoming);
 
   const pickMode = (): string => {
     try {

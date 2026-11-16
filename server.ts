@@ -6551,10 +6551,16 @@ app.post('/api/visitor/identify', async (req, res) => {
       typeof requestBody.hardwareFingerprint === 'string' &&
       requestBody.hardwareFingerprint.trim().length > 0
         ? requestBody.hardwareFingerprint.trim()
+        : typeof identityProfile.hardwareFingerprint === 'string' &&
+          identityProfile.hardwareFingerprint.trim().length > 0
+        ? identityProfile.hardwareFingerprint.trim()
         : hardwareId;
     const identityBrowserFingerprint =
-      typeof requestBody.browserFingerprint === 'string'
+      typeof requestBody.browserFingerprint === 'string' &&
+      requestBody.browserFingerprint.trim().length > 0
         ? requestBody.browserFingerprint.trim()
+        : typeof identityProfile.browserFingerprint === 'string'
+        ? identityProfile.browserFingerprint.trim()
         : '';
     const identitySessionId =
       typeof requestBody.sessionId === 'string' && requestBody.sessionId.trim().length > 0

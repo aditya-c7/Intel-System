@@ -13,6 +13,15 @@ import type {
 import { detectBrowserTampering } from './tamperingDetector';
 import { detectBotD19Signals } from './aiBotDirectory';
 import {
+  collectAllSignals,
+  computeBrowserFingerprint,
+  computeHardwareFingerprint,
+  hashStrings,
+  type CollectedSignals,
+} from '../client/signals';
+import { loadStoredIdentity, persistIdentity, getSessionId } from '../client/storage/identityStore';
+import { normalizeIdentity } from '../shared/normalization/uaNormalizer';
+import {
   classifyGenuineDevice,
   detectInAppBrowser,
   extractAndroidModelFromUA,
@@ -3790,6 +3799,146 @@ export function saveFirstPartyStorage(
 
 let inFlightRequest: Promise<IntelVisitorResponse> | null = null;
 
+/**
+ * Builds the tri-layer identity profile posted to `/api/visitor/identify`.
+ *
+ * The object is deliberately BOTH shapes at once: engine-native family objects
+ * (`gpu.normalizedGpu`, `screen.dpr`, `canvas.geometry`, …) feed the 6-mode matcher,
+ * while the concise fields (`hash`, `vendor`, `list`, `count`, …) feed the server's
+ * blocking index. Hashes are deterministic — no random, no clock.
+ */
+function buildIdentityProfile(
+  signals: CollectedSignals,
+  clientGeoHint: ClientGeoHint | null,
+  hardwareFingerprint: string,
+  browserFingerprint: string,
+  cpuArchitecture: string
+): Record<string, unknown> {
+  const ua = normalizeIdentity({
+    userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+    platform: typeof navigator !== 'undefined' ? navigator.platform : '',
+    maxTouchPoints: typeof navigator !== 'undefined' ? navigator.maxTouchPoints : 0,
+  });
+  const screen = signals.systemEntropy.screen;
+  const media = signals.systemEntropy.mediaDeviceCounts;
+  const gpu = signals.webglGpuIdentity;
+  const timezoneName = signals.systemEntropy.timezone ?? '';
+  const timezoneOffset = signals.systemEntropy.timezoneOffset ?? 0;
+  const gpuVendor = signals.webglBasics.vendorUnmasked ?? signals.webglBasics.vendor ?? '';
+  const gpuRenderer =
+    signals.webglBasics.rendererUnmasked ?? signals.webglBasics.renderer ?? '';
+  const canvasHash = hashStrings([signals.canvas.geometry, signals.canvas.text]);
+  const webglHash = hashStrings([
+    signals.webglExtensions.extensions ?? '',
+    signals.webglExtensions.parameters ?? '',
+    signals.webglExtensions.shaderPrecisions ?? '',
+  ]);
+  const audioHash = hashStrings([
+    String(signals.audio.sum ?? ''),
+    String(signals.audio.audioBaseLatency ?? ''),
+  ]);
+  const emojiRectHash = hashStrings([
+    String(signals.emoji.width ?? ''),
+    String(signals.emoji.height ?? ''),
+    String(signals.emoji.x ?? ''),
+    String(signals.emoji.y ?? ''),
+  ]);
+  const mediaKinds = [
+    (media.audioinput ?? 0) > 0 ? 'audioinput' : '',
+    (media.audiooutput ?? 0) > 0 ? 'audiooutput' : '',
+    (media.videoinput ?? 0) > 0 ? 'videoinput' : '',
+  ].filter(Boolean);
+  const languages =
+    typeof navigator !== 'undefined'
+      ? Array.from(new Set([navigator.language, ...(navigator.languages || [])]))
+          .filter((value): value is string => typeof value === 'string' && value.length > 0)
+          .slice(0, 10)
+      : [];
+  const browserMajor = Number.parseInt(ua.browser_major_version, 10);
+  const osVersionMajor = Number.parseInt(ua.os_version, 10);
+
+  return {
+    hardwareFingerprint,
+    browserFingerprint,
+    browser: { family: ua.browser_name, major: ua.browser_major_version },
+    os: { family: ua.os },
+    net: { asn: clientGeoHint?.asn ?? null },
+    languages,
+    screen: {
+      width: screen.width,
+      height: screen.height,
+      dpr: screen.pixelRatio ?? 1,
+      colorDepth: screen.colorDepth,
+      touch: screen.maxTouchPoints ?? 0,
+    },
+    timezone: timezoneName,
+    timezoneSignals: { name: timezoneName, offsetMinutes: timezoneOffset },
+    gpu: {
+      vendor: gpuVendor,
+      renderer: gpuRenderer,
+      normalizedGpu: gpu.normalizedGpu ?? '',
+      invariantLimitsHash: gpu.invariantLimits
+        ? hashStrings([JSON.stringify(gpu.invariantLimits)])
+        : '',
+    },
+    cpu: {
+      arch: cpuArchitecture,
+      architecture: cpuArchitecture,
+      cores: signals.systemEntropy.hardwareConcurrency,
+      memoryGb: signals.systemEntropy.deviceMemory,
+      osFamily: ua.os,
+    },
+    fonts: {
+      count: signals.fonts.installed.length,
+      list: signals.fonts.installed,
+      hash: signals.fonts.fontHash,
+      platformClass: signals.fonts.platformClassGuess,
+    },
+    mediaDevices: {
+      audioIn: media.audioinput,
+      audioOut: media.audiooutput,
+      video: media.videoinput,
+      count: (media.audioinput ?? 0) + (media.audiooutput ?? 0) + (media.videoinput ?? 0),
+      kinds: mediaKinds,
+    },
+    canvas: {
+      geometry: signals.canvas.geometry,
+      text: signals.canvas.text,
+      stabilized: signals.canvasNoise.stabilizedGeometryHash ?? '',
+      hash: canvasHash,
+    },
+    webgl: {
+      extensionsHash: signals.webglExtensions.extensions ?? '',
+      paramsHash: signals.webglExtensions.parameters ?? '',
+      shaderPrecisionHash: signals.webglExtensions.shaderPrecisions ?? '',
+      extensionsList: signals.webglExtensions.supportedExtensions,
+      hash: webglHash,
+      vendor: gpuVendor,
+      renderer: gpuRenderer,
+    },
+    audio: {
+      sum: signals.audio.sum,
+      baseLatency: signals.audio.audioBaseLatency,
+      hash: audioHash,
+    },
+    fontPrefs: {
+      widths: signals.fontPreferences.widths,
+      emojiRectHash,
+      hash: hashStrings([JSON.stringify(signals.fontPreferences.widths), emojiRectHash]),
+      families: [],
+    },
+    misc: {
+      mathHash: signals.math.mathHash,
+      errorStackHash: signals.math.errorStackHash,
+    },
+    versions: {
+      browserFamily: ua.browser_name,
+      browserMajor: Number.isFinite(browserMajor) ? browserMajor : 0,
+      osVersionMajor: Number.isFinite(osVersionMajor) ? osVersionMajor : 0,
+    },
+  };
+}
+
 export async function identifyCurrentVisitor(options?: {
   manualRefresh?: boolean;
 }): Promise<IntelVisitorResponse> {
@@ -3803,7 +3952,14 @@ export async function identifyCurrentVisitor(options?: {
       collectClientGeoHint(),
     ]);
     const stored = getFirstPartyStorage();
-    const hardwareSignals = await collectHardwareSignals(browserDevice);
+    // The legacy hardware probe and the new tri-layer collectors run concurrently, so the
+    // added wall-clock cost is the slower of the two — never the sum. Both are total.
+    const [hardwareSignals, collectedSignals, storedIdentity] = await Promise.all([
+      collectHardwareSignals(browserDevice),
+      collectAllSignals({ timeouts: 1200 }).catch(() => null),
+      loadStoredIdentity().catch(() => ({ identity: null, sources: [], storage_healed: false })),
+    ]);
+    const identitySessionId = getSessionId().sessionId;
     const securitySignals = await evaluateSecuritySignals(
       browserDevice,
       hardwareSignals,
@@ -3840,6 +3996,25 @@ export async function identifyCurrentVisitor(options?: {
       protocol: 'INTEL_ENVELOPE_V1',
     };
 
+    // Tri-layer fingerprints: deterministic hashes over the hardware-only and browser-only
+    // signal families. The server resolver indexes on these; the canonical visitorId /
+    // hardwareId above are untouched.
+    const identityHardwareFingerprint = collectedSignals
+      ? computeHardwareFingerprint(collectedSignals)
+      : hardwareSignals.hardwareId;
+    const identityBrowserFingerprint = collectedSignals
+      ? computeBrowserFingerprint(collectedSignals)
+      : hardwareSignals.canvasHash;
+    const identityProfile = collectedSignals
+      ? buildIdentityProfile(
+          collectedSignals,
+          clientGeoHint,
+          identityHardwareFingerprint,
+          identityBrowserFingerprint,
+          hardwareSignals.architecture
+        )
+      : null;
+
     const response = await fetch('/api/visitor/identify', {
       method: 'POST',
       headers: {
@@ -3858,6 +4033,11 @@ export async function identifyCurrentVisitor(options?: {
         browserDevice,
         hardwareSignals,
         securitySignals,
+        identityProfile,
+        hardwareFingerprint: identityHardwareFingerprint,
+        browserFingerprint: identityBrowserFingerprint,
+        sessionId: identitySessionId,
+        storageHealed: storedIdentity.storage_healed,
         clientGeoHint,
         securityEnvelope,
         // Top-level mirrors so no server-side spelling path can miss the verdict.
@@ -3882,6 +4062,14 @@ export async function identifyCurrentVisitor(options?: {
       data.statistics.currentSessionId,
       data.historyBackup
     );
+    // Waterfall heal: mirror the server-issued canonical identity into IndexedDB + the
+    // non-HttpOnly client cookie, so an evicted localStorage still recovers it next visit.
+    await persistIdentity({
+      visitor_id: data.visitorId,
+      hardware_fingerprint: identityHardwareFingerprint,
+      browser_fingerprint: identityBrowserFingerprint,
+      created_at: new Date().toISOString(),
+    }).catch(() => false);
     return data;
   };
 

@@ -1067,8 +1067,8 @@ export default function App() {
       identification: {
         visitor_id: data.visitorId,
         hardware_id: data.hardwareId,
-        confidence: { score: 1, version: 'v2.1' },
-        visitor_found: data.isReturning,
+        confidence: data.identification?.confidence ?? { score: 1, version: '2.1' },
+        visitor_found: data.identification?.visitor_found ?? data.isReturning,
         recognition_mode: data.recognitionSource,
         first_seen_at: Date.parse(data.statistics.firstVisitUtc) || null,
         last_seen_at: Date.parse(data.statistics.lastVisitUtc) || null,
@@ -1159,6 +1159,9 @@ export default function App() {
         rawAttributes && typeof rawAttributes === 'object'
           ? { ...(rawAttributes as Record<string, unknown>), ...phoneDetails }
           : rawAttributes,
+      // Tri-layer identity evidence from the server resolver + calibrated confidence v2.0.
+      identity_layers: data.identity_layers ?? null,
+      consistency: data.consistency ?? null,
     };
   }, [data, displayedSuspectScore]);
 
