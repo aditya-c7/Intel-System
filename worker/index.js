@@ -89,6 +89,7 @@ export default {
       const persistent =
         pathname === '/api/health' ||
         pathname.startsWith('/api/visitor/') ||
+        pathname === '/api/intel/geolocation' ||
         pathname.startsWith('/api/intel/ai-crawl-control/') ||
         isPolicyDocument;
       const response = persistent

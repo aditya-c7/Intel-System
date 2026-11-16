@@ -184,14 +184,16 @@ function mergeLocationIntoResponse(
   const refreshedIp =
     location.publicIp && location.publicIp !== 'Unavailable' ? location.publicIp : '';
   const visitHistory = response.visitHistory.map((visit, index) => {
-    const sameNetwork = refreshedIp
-      ? visit.publicIp === refreshedIp
-      : index === 0;
+    const sameNetwork = refreshedIp ? visit.publicIp === refreshedIp : false;
     const visitIsIncomplete =
       !hasUsableGeoValue(visit.city) ||
       !hasUsableGeoValue(visit.country) ||
       !hasUsableGeoValue(visit.isp);
-    if (!sameNetwork || (!visitIsIncomplete && index !== 0)) return visit;
+    // The first row is the visit this page load just recorded, which is what the map and
+    // tiles render. Update it even when the Tor circuit rotated to a new exit IP between
+    // the identify call and the geo retry, plus every older row on the same exit.
+    const isCurrentVisit = index === 0;
+    if (!isCurrentVisit && !(sameNetwork && visitIsIncomplete)) return visit;
     return {
       ...visit,
       publicIp: refreshedIp || visit.publicIp,
@@ -1780,7 +1782,9 @@ export default function App() {
                               {data.browserDevice.phoneDisplayLabel}
                             </span>
                             <span className="block text-[10px] sm:text-[11px] text-slate-500 leading-snug">
-                              {data.browserDevice.os} • {data.browserDevice.deviceType}
+                              {torBrowserClient && !data.browserDevice.reportedModel
+                                ? 'Model hidden by Tor Browser'
+                                : `${data.browserDevice.os} • ${data.browserDevice.deviceType}`}
                             </span>
                           </>
                         ) : (

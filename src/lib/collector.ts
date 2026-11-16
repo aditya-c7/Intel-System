@@ -1061,8 +1061,11 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
         phoneDisplayLabel = reportedModel;
       }
     } else {
-      phoneModel = 'Android Smartphone';
-      phoneDisplayLabel = 'Android Smartphone';
+      // No model is exposed at all (Tor Browser strips it from the reduced UA and
+      // Firefox has no UA-CH). Show the honest OS-level label instead of inventing
+      // a handset name: "Android 14 Smartphone" is still more useful than "Mobile".
+      phoneModel = `${os} Smartphone`;
+      phoneDisplayLabel = `${os} Smartphone`;
     }
   }
 

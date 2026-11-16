@@ -3949,22 +3949,25 @@ function computeSuspectScore100(input: {
   return Math.max(0, Math.min(100, Math.round(score)));
 }
 
-async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): Promise<LocationInfo> {  if (!isPublic || !visitorIp || visitorIp === 'Unavailable') {
-    return {
-      publicIp: 'Unavailable',
-      city: 'Unavailable',
-      region: 'Unavailable',
-      country: 'Unavailable',
-      countryCode: '',
-      latitude: null,
-      longitude: null,
-      isp: 'Unknown',
-      org: 'Unknown',
-      asn: 'Unknown',
-      isVpnOrHosting: false,
-      isIpVerified: false,
-      isLocationVerified: false,
-    };
+async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): Promise<LocationInfo> {
+  const empty = (verified: boolean): LocationInfo => ({
+    publicIp: verified ? visitorIp : 'Unavailable',
+    city: 'Unavailable',
+    region: 'Unavailable',
+    country: 'Unavailable',
+    countryCode: '',
+    latitude: null,
+    longitude: null,
+    isp: 'Unknown',
+    org: 'Unknown',
+    asn: 'Unknown',
+    isVpnOrHosting: false,
+    isIpVerified: verified,
+    isLocationVerified: false,
+  });
+
+  if (!isPublic || !visitorIp || visitorIp === 'Unavailable') {
+    return empty(false);
   }
 
   const nowMs = Date.now();
@@ -4030,285 +4033,203 @@ async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): 
     const trimmed = val.trim();
     return trimmed.length > 0 ? trimmed : 'Unknown';
   };
+  const cleanText = (val: unknown): string => (typeof val === 'string' ? val.trim() : '');
+  const finiteNumber = (val: unknown): number | null =>
+    typeof val === 'number' && Number.isFinite(val) ? val : null;
+  const network = (
+    isp: unknown,
+    org: unknown,
+    asn: unknown,
+    hostile = false
+  ): ReturnType<typeof normalizeIspAndOrg> =>
+    normalizeIspAndOrg(isp, org, asn, hostile);
 
-  // Provider 1: ipwho.is/{visitorIp}
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3000);
-    const resp = await fetch(`https://ipwho.is/${encodeURIComponent(visitorIp)}`, {
-      signal: controller.signal,
-      headers: { Accept: 'application/json', 'User-Agent': 'IntelSystem/1.0' },
-    });
-    clearTimeout(timer);
+  const build = (input: {
+    city: string;
+    region: string;
+    country: string;
+    countryCode: string;
+    latitude: number | null;
+    longitude: number | null;
+    isp: string;
+    org: string;
+    asn: string;
+    isVpnOrHosting: boolean;
+  }): LocationInfo => ({
+    publicIp: visitorIp,
+    ...input,
+    isIpVerified: true,
+    isLocationVerified: !isMissingGeoValue(input.city) || !isMissingGeoValue(input.country),
+  });
 
-    if (resp.ok) {
-      const data = (await resp.json()) as Record<string, unknown>;
-      const providerIp = normalizeIpCandidate(typeof data.ip === 'string' ? data.ip : '');
-      if (
-        data.success !== false &&
-        providerIp &&
-        providerIp.toLowerCase() === visitorIp.toLowerCase()
-      ) {
-        const city = cleanField(data.city);
-        const region = cleanField(data.region);
-        const country = cleanField(data.country);
-        const countryCode = typeof data.country_code === 'string' ? data.country_code.trim() : '';
-        const latitude = typeof data.latitude === 'number' && Number.isFinite(data.latitude) ? data.latitude : null;
-        const longitude = typeof data.longitude === 'number' && Number.isFinite(data.longitude) ? data.longitude : null;
-        const conn = (data.connection as Record<string, unknown>) || {};
-        const sec = (data.security as Record<string, unknown>) || {};
-        const explicitVpn = Boolean(sec.vpn || sec.proxy || sec.tor || sec.hosting);
-
-        const netDetails = normalizeIspAndOrg(conn.isp, conn.org, conn.asn, explicitVpn);
-
-        if (city !== 'Unknown' || country !== 'Unknown' || netDetails.isp !== 'Unknown') {
-          db.prepare(
-            `INSERT OR REPLACE INTO verified_geo_cache_v3 (
-              ip_address, city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          ).run(
-            visitorIp,
-            city,
-            region,
-            country,
-            countryCode,
-            latitude,
-            longitude,
-            netDetails.isp,
-            netDetails.org,
-            netDetails.asn,
-            netDetails.isVpnOrHosting ? 1 : 0,
-            nowMs
-          );
-
-          return {
-            publicIp: visitorIp,
-            city,
-            region,
-            country,
-            countryCode,
-            latitude,
-            longitude,
-            isp: netDetails.isp,
-            org: netDetails.org,
-            asn: netDetails.asn,
-            isVpnOrHosting: netDetails.isVpnOrHosting,
-            isIpVerified: true,
-            isLocationVerified: city !== 'Unknown' || country !== 'Unknown',
-          };
-        }
-      }
+  /** Cache write shared by every provider; a failed write never loses the answer. */
+  const persist = (location: LocationInfo): void => {
+    try {
+      db.prepare(
+        `INSERT OR REPLACE INTO verified_geo_cache_v3 (
+          ip_address, city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        visitorIp,
+        location.city,
+        location.region,
+        location.country,
+        location.countryCode,
+        location.latitude,
+        location.longitude,
+        location.isp,
+        location.org,
+        location.asn,
+        location.isVpnOrHosting ? 1 : 0,
+        nowMs
+      );
+    } catch {
+      // Cache failure is non-fatal: the resolved answer is still returned.
     }
-  } catch {
-    // Proceed to fallback provider
-  }
+  };
 
-  // Provider 2: ipapi.co/{visitorIp}/json/
-  try {
+  /**
+   * Providers run in PARALLEL with a shared 6 s budget instead of five sequential 3 s
+   * calls. On a high-latency Tor circuit a sequential cascade used to exhaust the budget
+   * on the first two providers, leaving only RIPE's ASN — i.e. an ISP with no location.
+   * Parallel probes make a usable answer far more likely and cap the whole lookup at 6 s.
+   */
+  const PROVIDER_TIMEOUT_MS = 6000;
+  const probe = async (url: string, parse: (data: Record<string, unknown>) => LocationInfo | null): Promise<LocationInfo | null> => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3000);
-    const resp = await fetch(`https://ipapi.co/${encodeURIComponent(visitorIp)}/json/`, {
-      signal: controller.signal,
-      headers: { Accept: 'application/json', 'User-Agent': 'IntelSystem/1.0' },
-    });
-    clearTimeout(timer);
-
-    if (resp.ok) {
+    const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
+    try {
+      const resp = await fetch(url, {
+        signal: controller.signal,
+        headers: { Accept: 'application/json', 'User-Agent': 'IntelSystem/1.0' },
+      });
+      if (!resp.ok) return null;
       const data = (await resp.json()) as Record<string, unknown>;
-      const providerIp = normalizeIpCandidate(typeof data.ip === 'string' ? data.ip : '');
-      if (
-        !data.error &&
-        providerIp &&
-        providerIp.toLowerCase() === visitorIp.toLowerCase()
-      ) {
-        const city = cleanField(data.city);
-        const region = cleanField(data.region);
-        const country = cleanField(data.country_name || data.country);
-        const countryCode = typeof data.country_code === 'string' ? data.country_code.trim() : '';
-        const latitude = typeof data.latitude === 'number' && Number.isFinite(data.latitude) ? data.latitude : null;
-        const longitude = typeof data.longitude === 'number' && Number.isFinite(data.longitude) ? data.longitude : null;
-        const netDetails = normalizeIspAndOrg(data.org, data.org, data.asn, false);
-
-        if (city !== 'Unknown' || country !== 'Unknown' || netDetails.isp !== 'Unknown') {
-          db.prepare(
-            `INSERT OR REPLACE INTO verified_geo_cache_v3 (
-              ip_address, city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          ).run(
-            visitorIp,
-            city,
-            region,
-            country,
-            countryCode,
-            latitude,
-            longitude,
-            netDetails.isp,
-            netDetails.org,
-            netDetails.asn,
-            netDetails.isVpnOrHosting ? 1 : 0,
-            nowMs
-          );
-
-          return {
-            publicIp: visitorIp,
-            city,
-            region,
-            country,
-            countryCode,
-            latitude,
-            longitude,
-            isp: netDetails.isp,
-            org: netDetails.org,
-            asn: netDetails.asn,
-            isVpnOrHosting: netDetails.isVpnOrHosting,
-            isIpVerified: true,
-            isLocationVerified: city !== 'Unknown' || country !== 'Unknown',
-          };
-        }
-      }
+      const parsed = parse(data);
+      return parsed && scoreGeoLocation(parsed) > 0 ? parsed : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
     }
-  } catch {
-    // Proceed to tertiary fallback
-  }
+  };
 
-  // Provider 3: freeipapi.com/api/json/{visitorIp}
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3000);
-    const resp = await fetch(`https://freeipapi.com/api/json/${encodeURIComponent(visitorIp)}`, {
-      signal: controller.signal,
-      headers: { Accept: 'application/json', 'User-Agent': 'IntelSystem/1.0' },
+  // Provider 1: ipwho.is
+  const probeIpWho = () =>
+    probe(`https://ipwho.is/${encodeURIComponent(visitorIp)}`, (data) => {
+      if (data.success === false) return null;
+      const providerIp = normalizeIpCandidate(typeof data.ip === 'string' ? data.ip : '');
+      if (!providerIp || providerIp.toLowerCase() !== visitorIp.toLowerCase()) return null;
+      const conn = (data.connection as Record<string, unknown>) || {};
+      const sec = (data.security as Record<string, unknown>) || {};
+      const net = network(conn.isp, conn.org, conn.asn, Boolean(sec.vpn || sec.proxy || sec.tor || sec.hosting));
+      const location = build({
+        city: cleanField(data.city),
+        region: cleanField(data.region),
+        country: cleanField(data.country),
+        countryCode: cleanText(data.country_code).toUpperCase(),
+        latitude: finiteNumber(data.latitude),
+        longitude: finiteNumber(data.longitude),
+        isp: net.isp,
+        org: net.org,
+        asn: net.asn,
+        isVpnOrHosting: net.isVpnOrHosting,
+      });
+      return location;
     });
-    clearTimeout(timer);
 
-    if (resp.ok) {
-      const data = (await resp.json()) as Record<string, unknown>;
+  // Provider 2: ipapi.co
+  const probeIpApi = () =>
+    probe(`https://ipapi.co/${encodeURIComponent(visitorIp)}/json/`, (data) => {
+      if (data.error) return null;
+      const providerIp = normalizeIpCandidate(typeof data.ip === 'string' ? data.ip : '');
+      if (providerIp && providerIp.toLowerCase() !== visitorIp.toLowerCase()) return null;
+      const net = network(data.org, data.org, data.asn);
+      return build({
+        city: cleanField(data.city),
+        region: cleanField(data.region),
+        country: cleanField(data.country_name || data.country),
+        countryCode: cleanText(data.country_code).toUpperCase(),
+        latitude: finiteNumber(data.latitude),
+        longitude: finiteNumber(data.longitude),
+        isp: net.isp,
+        org: net.org,
+        asn: net.asn,
+        isVpnOrHosting: net.isVpnOrHosting,
+      });
+    });
+
+  // Provider 3: freeipapi.com
+  const probeFreeIpApi = () =>
+    probe(`https://freeipapi.com/api/json/${encodeURIComponent(visitorIp)}`, (data) => {
       const providerIp = normalizeIpCandidate(typeof data.ipAddress === 'string' ? data.ipAddress : '');
-      if (providerIp && providerIp.toLowerCase() === visitorIp.toLowerCase()) {
-        const city = cleanField(data.cityName);
-        const region = cleanField(data.regionName);
-        const country = cleanField(data.countryName);
-        const countryCode = typeof data.countryCode === 'string' ? data.countryCode.trim() : '';
-        const latitude = typeof data.latitude === 'number' && Number.isFinite(data.latitude) ? data.latitude : null;
-        const longitude = typeof data.longitude === 'number' && Number.isFinite(data.longitude) ? data.longitude : null;
-        const netDetails = normalizeIspAndOrg(
-          data.asnOrganization,
-          data.asnOrganization,
-          data.asn,
-          Boolean(data.isProxy)
-        );
-
-        if (city !== 'Unknown' || country !== 'Unknown' || netDetails.isp !== 'Unknown') {
-          db.prepare(
-            `INSERT OR REPLACE INTO verified_geo_cache_v3 (
-              ip_address, city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          ).run(
-            visitorIp,
-            city,
-            region,
-            country,
-            countryCode,
-            latitude,
-            longitude,
-            netDetails.isp,
-            netDetails.org,
-            netDetails.asn,
-            netDetails.isVpnOrHosting ? 1 : 0,
-            nowMs
-          );
-
-          return {
-            publicIp: visitorIp,
-            city,
-            region,
-            country,
-            countryCode,
-            latitude,
-            longitude,
-            isp: netDetails.isp,
-            org: netDetails.org,
-            asn: netDetails.asn,
-            isVpnOrHosting: netDetails.isVpnOrHosting,
-            isIpVerified: true,
-            isLocationVerified: city !== 'Unknown' || country !== 'Unknown',
-          };
-        }
-      }
-    }
-  } catch {
-    // Ignore
-  }
-
-  // Provider 4: ipinfo.io/{visitorIp}/json — organisation string carries `AS15169 Google LLC`.
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3000);
-    const resp = await fetch(`https://ipinfo.io/${encodeURIComponent(visitorIp)}/json`, {
-      signal: controller.signal,
-      headers: { Accept: 'application/json', 'User-Agent': 'IntelSystem/1.0' },
+      if (!providerIp || providerIp.toLowerCase() !== visitorIp.toLowerCase()) return null;
+      const net = network(data.asnOrganization, data.asnOrganization, data.asn, Boolean(data.isProxy));
+      return build({
+        city: cleanField(data.cityName),
+        region: cleanField(data.regionName),
+        country: cleanField(data.countryName),
+        countryCode: cleanText(data.countryCode).toUpperCase(),
+        latitude: finiteNumber(data.latitude),
+        longitude: finiteNumber(data.longitude),
+        isp: net.isp,
+        org: net.org,
+        asn: net.asn,
+        isVpnOrHosting: net.isVpnOrHosting,
+      });
     });
-    clearTimeout(timer);
 
-    if (resp.ok) {
-      const data = (await resp.json()) as Record<string, unknown>;
-      const countryCodeRaw = typeof data.country === 'string' ? data.country.trim() : '';
+  // Provider 4: ipinfo.io — the org string carries `AS15169 Google LLC`.
+  const probeIpInfo = () =>
+    probe(`https://ipinfo.io/${encodeURIComponent(visitorIp)}/json`, (data) => {
+      const providerIp = normalizeIpCandidate(typeof data.ip === 'string' ? data.ip : '');
+      if (providerIp && providerIp.toLowerCase() !== visitorIp.toLowerCase()) return null;
+      const countryCodeRaw = cleanText(data.country).toUpperCase();
       const country = countryNameFromCode(countryCodeRaw) || cleanField(data.country);
       const locParts = typeof data.loc === 'string' ? data.loc.split(',') : [];
       const latitude = locParts[0] ? Number.parseFloat(locParts[0]) : null;
       const longitude = locParts[1] ? Number.parseFloat(locParts[1]) : null;
-      const orgRaw = typeof data.org === 'string' ? data.org.trim() : '';
+      const orgRaw = cleanText(data.org);
       const asnMatch = /^(AS\d+)\s+(.+)$/i.exec(orgRaw);
       const orgName = asnMatch?.[2] || orgRaw;
-      const netDetails = normalizeIspAndOrg(orgName, orgName, asnMatch?.[1] || '', false);
-      const city = cleanField(data.city);
-      const region = cleanField(data.region);
+      const net = network(orgName, orgName, asnMatch?.[1] || '');
+      return build({
+        city: cleanField(data.city),
+        region: cleanField(data.region),
+        country,
+        countryCode: countryCodeRaw,
+        latitude: Number.isFinite(latitude) ? latitude : null,
+        longitude: Number.isFinite(longitude) ? longitude : null,
+        isp: net.isp,
+        org: net.org,
+        asn: net.asn,
+        isVpnOrHosting: net.isVpnOrHosting,
+      });
+    });
 
-      if (city !== 'Unknown' || country !== 'Unknown' || netDetails.isp !== 'Unknown') {
-        db.prepare(
-          `INSERT OR REPLACE INTO verified_geo_cache_v3 (
-            ip_address, city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(
-          visitorIp,
-          city,
-          region,
-          country,
-          countryCodeRaw.toUpperCase(),
-          latitude,
-          longitude,
-          netDetails.isp,
-          netDetails.org,
-          netDetails.asn,
-          netDetails.isVpnOrHosting ? 1 : 0,
-          nowMs
-        );
+  const settled = await Promise.allSettled([
+    probeIpWho(),
+    probeIpApi(),
+    probeFreeIpApi(),
+    probeIpInfo(),
+  ]);
+  const candidates = settled
+    .filter((entry): entry is PromiseFulfilledResult<LocationInfo | null> => entry.status === 'fulfilled')
+    .map((entry) => entry.value)
+    .filter((entry): entry is LocationInfo => entry !== null)
+    // Best answer wins: city > country > ISP > coordinates. Ties keep provider order.
+    .sort((a, b) => scoreGeoLocation(b) - scoreGeoLocation(a));
 
-        return {
-          publicIp: visitorIp,
-          city,
-          region,
-          country,
-          countryCode: countryCodeRaw.toUpperCase(),
-          latitude,
-          longitude,
-          isp: netDetails.isp,
-          org: netDetails.org,
-          asn: netDetails.asn,
-          isVpnOrHosting: netDetails.isVpnOrHosting,
-          isIpVerified: true,
-          isLocationVerified: city !== 'Unknown' || country !== 'Unknown',
-        };
-      }
-    }
-  } catch {
-    // Ignore
+  const best = candidates[0];
+  if (best) {
+    persist(best);
+    return best;
   }
 
   // Provider 5: RIPE Stat prefix overview — ASN attribution when no provider returned geo.
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3000);
+    const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
     const resp = await fetch(
       `https://stat.ripe.net/data/prefix-overview/data.json?resource=${encodeURIComponent(visitorIp)}`,
       {
@@ -4328,27 +4249,7 @@ async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): 
         // Never label a numeric ASN "Standard Network": the AS label is honest.
         const org = cloudProviderOrgForAsn(asn) || asn;
         const netDetails = normalizeIspAndOrg(org, org, asn, false);
-        db.prepare(
-          `INSERT OR REPLACE INTO verified_geo_cache_v3 (
-            ip_address, city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-        ).run(
-          visitorIp,
-          'Unavailable',
-          'Unavailable',
-          'Unavailable',
-          '',
-          null,
-          null,
-          netDetails.isp,
-          netDetails.org,
-          netDetails.asn,
-          0,
-          nowMs
-        );
-
-        return {
-          publicIp: visitorIp,
+        const location = build({
           city: 'Unavailable',
           region: 'Unavailable',
           country: 'Unavailable',
@@ -4359,32 +4260,81 @@ async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): 
           org: netDetails.org,
           asn: netDetails.asn,
           isVpnOrHosting: false,
-          isIpVerified: true,
-          isLocationVerified: false,
-        };
+        });
+        persist(location);
+        return location;
       }
     }
   } catch {
     // Ignore
   }
 
+  return empty(true);
+}
+
+/** Preference score for competing provider payloads (higher is better). */
+function scoreGeoLocation(location: LocationInfo): number {
+  let score = 0;
+  if (!isMissingGeoValue(location.city)) score += 8;
+  if (!isMissingGeoValue(location.country)) score += 4;
+  if (
+    !isMissingGeoValue(location.isp) &&
+    !/^autonomous system\b/i.test(location.isp) &&
+    location.isp !== 'Standard Network'
+  ) {
+    score += 2;
+  }
+  if (typeof location.latitude === 'number' && typeof location.longitude === 'number') {
+    score += 1;
+  }
+  return score;
+}
+
+/**
+ * Tor exit relays: Onionoo carries the relay's country and operator even when every
+ * IP-geolocation provider is rate-limited or only returns an ASN. Without this, a Tor
+ * visitor could see an ISP but "Unavailable" for location. Country is the honest floor:
+ * the exit relay's country, never the user's claimed city.
+ */
+function applyTorRelayFallback(location: LocationInfo, visitorIp: string): LocationInfo {
+  const hasCity = !isMissingGeoValue(location.city);
+  const hasCountry = !isMissingGeoValue(location.country);
+  if (hasCity && hasCountry) return location;
+
+  const relay = lookupTorRelayMetadata(visitorIp);
+  if (!relay) return location;
+
+  const countryCode = (relay.country ?? '').trim().toUpperCase();
+  const countryName = countryCode ? countryNameFromCode(countryCode) || countryCode : '';
+  const relayAsn = normalizeAsnLabel(relay.as) || '';
+  const relayIsp = (relay.asName ?? '').trim();
+  const existingIspIsReal =
+    !isMissingGeoValue(location.isp) &&
+    !/^autonomous system\b/i.test(location.isp) &&
+    location.isp !== 'Standard Network';
+  const isp = existingIspIsReal ? location.isp : relayIsp || relayAsn || location.isp;
+
+  if (!countryName && !relayAsn && !relayIsp) return location;
+
   return {
-    publicIp: visitorIp,
-    city: 'Unavailable',
-    region: 'Unavailable',
-    country: 'Unavailable',
-    countryCode: '',
-    latitude: null,
-    longitude: null,
-    isp: 'Unknown',
-    org: 'Unknown',
-    asn: 'Unknown',
-    isVpnOrHosting: false,
-    isIpVerified: true,
-    isLocationVerified: false,
+    ...location,
+    country: hasCountry ? location.country : countryName || location.country,
+    countryCode: location.countryCode || countryCode,
+    isp,
+    org: !isMissingGeoValue(location.org) ? location.org : isp,
+    asn: normalizeAsnLabel(location.asn) || relayAsn || location.asn,
+    isVpnOrHosting: true,
+    isLocationVerified: hasCity || Boolean(countryName),
   };
 }
 
+async function resolveLocationWithTorFallback(
+  visitorIp: string,
+  isPublic: boolean
+): Promise<LocationInfo> {
+  const location = await lookupVerifiedGeolocation(visitorIp, isPublic);
+  return applyTorRelayFallback(location, visitorIp);
+}
 function sanitizeBrowserDevice(input: Partial<BrowserDeviceInfo> | undefined): BrowserDeviceInfo {
   const safeStr = (val: unknown, fallback: string): string => {
     if (typeof val !== 'string') return fallback;
@@ -4568,7 +4518,7 @@ app.get('/api/intel/geolocation', async (req, res) => {
     const edgeGeo = extractEdgeGeo(req);
 
     let location = mergeLocationWithEdge(
-      await lookupVerifiedGeolocation(visitorIp, isPublic),
+      await resolveLocationWithTorFallback(visitorIp, isPublic),
       edgeGeo
     );
 
@@ -5769,7 +5719,7 @@ app.post('/api/visitor/identify', async (req, res) => {
     // the location: city / region / country / lat / lon / timezone survive from the edge.
     const edgeGeo = extractEdgeGeo(req);
     let location = mergeLocationWithEdge(
-      await lookupVerifiedGeolocation(extractedIp, isPublic),
+      await resolveLocationWithTorFallback(extractedIp, isPublic),
       edgeGeo
     );
 
