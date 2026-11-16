@@ -7042,7 +7042,9 @@ function classifyBotTraffic(headers, network, client) {
   const isDesktopChromeOrSafari = /chrome\/|crios\/|safari\//i.test(ua) && !/mobile|android|iphone|ipad/i.test(ua);
   const missingFetchMetadata = !secFetchSite && !secFetchMode && !secFetchDest;
   const headerAnomaly = isDesktopChromeOrSafari && missingFetchMetadata && !acceptLanguage;
-  if (client.isBot || client.webdriver || client.cdpDetected || AUTOMATION_UA_PATTERN.test(ua) || headerAnomaly) {
+  const headlessUa = /headlesschrome|phantomjs|slimerjs/i.test(ua);
+  const corroboratedClientBot = Boolean(client.isBot) && Boolean(client.webdriver || client.cdpDetected || headlessUa);
+  if (corroboratedClientBot || client.webdriver || client.cdpDetected || AUTOMATION_UA_PATTERN.test(ua) || headerAnomaly) {
     const reasons = [];
     if (client.isBot) reasons.push("Client reported an automated runtime");
     if (client.webdriver) reasons.push("WebDriver handshake detected");
@@ -7379,7 +7381,7 @@ async function resolveAiAgentIdentity(input) {
   const maskedGpu = !gpuRenderer || gpuRenderer === "unavailable" || /swiftshader|llvmpipe|mesa|software|generic|^standard/.test(gpuRenderer);
   const idbRatio = typeof input.client.idbDurabilityRatio === "number" ? input.client.idbDurabilityRatio : null;
   const clientAutomation = Boolean(
-    input.client.isBot || input.client.webdriver || input.client.cdpDetected || input.client.isHeadless
+    input.client.webdriver || input.client.cdpDetected || input.client.isBot && input.client.isHeadless
   );
   const desktopChrome = /chrome\//i.test(ua) && !/mobile|android|iphone|ipad/i.test(ua);
   const screen = (input.client.screenResolution || "").toLowerCase();

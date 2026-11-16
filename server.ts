@@ -1549,8 +1549,14 @@ function classifyBotTraffic(
   // predate Sec-Fetch support) and language-stripping privacy setups out of the bot verdict.
   const headerAnomaly = isDesktopChromeOrSafari && missingFetchMetadata && !acceptLanguage;
 
+  // A bare client `isBot` flag is not enough: old bundles could set it from a patched
+  // Navigator getter. Require the flag to be corroborated by a runtime binding or a
+  // headless user-agent before the server upgrades it to a bad-bot verdict.
+  const headlessUa = /headlesschrome|phantomjs|slimerjs/i.test(ua);
+  const corroboratedClientBot =
+    Boolean(client.isBot) && Boolean(client.webdriver || client.cdpDetected || headlessUa);
   if (
-    client.isBot ||
+    corroboratedClientBot ||
     client.webdriver ||
     client.cdpDetected ||
     AUTOMATION_UA_PATTERN.test(ua) ||
@@ -2025,11 +2031,12 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
     /swiftshader|llvmpipe|mesa|software|generic|^standard/.test(gpuRenderer);
   const idbRatio =
     typeof input.client.idbDurabilityRatio === 'number' ? input.client.idbDurabilityRatio : null;
+  // Corroborated automation only: a lone `isBot` bit (or a headless layout hint from an
+  // in-app browser) must not feed the cloud-VM / agent attribution rules.
   const clientAutomation = Boolean(
-    input.client.isBot ||
-      input.client.webdriver ||
+    input.client.webdriver ||
       input.client.cdpDetected ||
-      input.client.isHeadless
+      (input.client.isBot && input.client.isHeadless)
   );
   const desktopChrome =
     /chrome\//i.test(ua) && !/mobile|android|iphone|ipad/i.test(ua);
