@@ -15,6 +15,7 @@ import { LocationMap } from './components/LocationMap';
 import { NetworkStabilityPanel } from './components/NetworkStabilityPanel';
 import { CpuActivityPanel } from './components/CpuActivityPanel';
 import { isMobileDevice } from './lib/deviceClass';
+import { normalizeIdentity } from './shared/normalization/uaNormalizer';
 import { SmartSignalsGrid } from './components/SmartSignalsGrid';
 import {
   CursorAttributionOverlay,
@@ -1020,12 +1021,23 @@ export default function App() {
 
   // API v4 event payload rendered by the bottom inspector. Built exclusively from live
   // first-party values: no invented signals, no third-party fraud labels.
+  // Browser/OS fields come from the shared UA-CH normalizer so `os` is always the
+  // family ('Windows'), `os_version` the version ('11'), and `browser_major_version`
+  // never empty — the previous assembly wrote the display string into `os`,
+  // navigator.platform into `os_version`, and regexed the browser name into an
+  // empty major version.
   const eventJson = useMemo(() => {
     if (!data) return null;
     const s = data.securitySignals;
     const firstVisitMs = Date.parse(data.visitHistory[0]?.visitedAtUtc || '') || Date.now();
     const deviceType = data.browserDevice.deviceType;
-    const osName = data.browserDevice.os;
+    const uaIdentity = normalizeIdentity({
+      userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+      platform: typeof navigator !== 'undefined' ? navigator.platform : '',
+      maxTouchPoints: typeof navigator !== 'undefined' ? navigator.maxTouchPoints : 0,
+    });
+    const osName = uaIdentity.os;
+    const osVersion = uaIdentity.os_version;
     const rawAttributes =
       data.rawDeviceAttributes ?? (s as { rawDeviceAttributes?: unknown }).rawDeviceAttributes ?? null;
     const phoneDetails =
@@ -1066,13 +1078,13 @@ export default function App() {
       user_agent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
       device: deviceType,
       os: osName,
-      os_version: data.browserDevice.platform,
+      os_version: osVersion,
       browser_details: {
-        browser_name: data.browserDevice.browser,
-        browser_major_version: String(data.browserDevice.browser || '').replace(/\D.*$/, ''),
-        browser_full_version: data.browserDevice.browser,
+        browser_name: uaIdentity.browser_name || data.browserDevice.browser,
+        browser_major_version: uaIdentity.browser_major_version,
+        browser_full_version: uaIdentity.browser_full_version || data.browserDevice.browser,
         os: osName,
-        os_version: data.browserDevice.platform,
+        os_version: osVersion,
         device: deviceType,
         ...phoneDetails,
       },
