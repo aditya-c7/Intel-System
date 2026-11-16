@@ -29,6 +29,10 @@ Every analysis is performed through a signed first-party API request, scored acr
 - **Persistent visitor history:** recognizes returning visitors and preserves session, IP, location, and device context across visits.
 - **Serverless-ready:** designed for Cloudflare Workers with SQLite-backed Durable Objects, while remaining deployable with Express.
 
+### AI Crawl Control
+
+Native bot and agent defense runs at the edge: Web Bot Auth (Ed25519) verification, published operator CIDR feeds, FCrDNS / soft-PTR attribution, and a client-side agent probe, with dynamic `robots.txt` / `llms.txt`, Content-Signal negotiation, and Markdown-for-Agents responses. The `/api/intel/ai-crawl-control/*` endpoints power the dashboard's analytics and policy controls; see [CLOUDFLARE.md](./CLOUDFLARE.md#ai-crawl-control-native-bot--agent-defense) for the endpoint list and Cloudflare `run_worker_first` routing. Verify the Worker locally with `node scripts/test-worker.mjs`, and build it with `npm run build` and `node scripts/build-worker.mjs`.
+
 ## What it detects
 
 | Area | What Intel System checks |
