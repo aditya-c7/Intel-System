@@ -3930,6 +3930,10 @@ function buildIdentityProfile(
     misc: {
       mathHash: signals.math.mathHash,
       errorStackHash: signals.math.errorStackHash,
+      // Preserved as resolver evidence only — never used to set the automation verdict.
+      canvasNoise: signals.canvasNoise.classification,
+      canvasNoiseFlags: signals.canvasNoise.flags,
+      automationReasonIds: signals.automation.reasonIds,
     },
     versions: {
       browserFamily: ua.browser_name,
@@ -4036,7 +4040,7 @@ export async function identifyCurrentVisitor(options?: {
         identityProfile,
         hardwareFingerprint: identityHardwareFingerprint,
         browserFingerprint: identityBrowserFingerprint,
-        sessionId: identitySessionId,
+        sessionId: stored.sessionId || identitySessionId,
         storageHealed: storedIdentity.storage_healed,
         clientGeoHint,
         securityEnvelope,
