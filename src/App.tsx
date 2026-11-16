@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { identifyCurrentVisitor, detectIncognitoMode, detectEmulatorEvidence } from './lib/collector';
 import type { EmulatorEvidence } from './lib/collector';
 import type {
   BotSubtype,
   IntelVisitorResponse,
+  LocationInfo,
   NetworkType,
   RiskLevel,
   SecuritySignals,
@@ -147,6 +148,69 @@ function formatShortLocation(city: string, country: string): string {
 function formatValidNetworkField(value: string | null | undefined): string {
   if (!value || value === 'Unavailable' || value === 'Unknown') return 'Unknown';
   return value;
+}
+
+/** A geo/network field that carries a real value rather than a placeholder token. */
+function hasUsableGeoValue(value: string | null | undefined): boolean {
+  if (!value) return false;
+  const normalized = value.trim().toLowerCase();
+  return (
+    normalized !== '' &&
+    normalized !== 'unknown' &&
+    normalized !== 'unavailable' &&
+    normalized !== 'n/a' &&
+    normalized !== 'standard network'
+  );
+}
+
+/**
+ * True once both halves of the network identity are real: a city or country, and a
+ * named ISP (a bare `Autonomous System AS…` placeholder does not count). The dashboard
+ * keeps polling `/api/intel/geolocation` until this is true.
+ */
+function isLocationComplete(location: LocationInfo | null | undefined): boolean {
+  if (!location) return false;
+  const hasPlace = hasUsableGeoValue(location.city) || hasUsableGeoValue(location.country);
+  const isp = (location.isp ?? '').trim();
+  const hasNetwork = hasUsableGeoValue(isp) && !/^autonomous system\b/i.test(isp);
+  return hasPlace && hasNetwork;
+}
+
+/** Field-level merge of a refreshed location onto the loaded response + its history. */
+function mergeLocationIntoResponse(
+  response: IntelVisitorResponse,
+  location: LocationInfo
+): IntelVisitorResponse {
+  const refreshedIp =
+    location.publicIp && location.publicIp !== 'Unavailable' ? location.publicIp : '';
+  const visitHistory = response.visitHistory.map((visit, index) => {
+    const sameNetwork = refreshedIp
+      ? visit.publicIp === refreshedIp
+      : index === 0;
+    const visitIsIncomplete =
+      !hasUsableGeoValue(visit.city) ||
+      !hasUsableGeoValue(visit.country) ||
+      !hasUsableGeoValue(visit.isp);
+    if (!sameNetwork || (!visitIsIncomplete && index !== 0)) return visit;
+    return {
+      ...visit,
+      publicIp: refreshedIp || visit.publicIp,
+      city: hasUsableGeoValue(location.city) ? location.city : visit.city,
+      region: hasUsableGeoValue(location.region) ? location.region : visit.region,
+      country: hasUsableGeoValue(location.country) ? location.country : visit.country,
+      latitude: location.latitude !== null ? location.latitude : visit.latitude,
+      longitude: location.longitude !== null ? location.longitude : visit.longitude,
+      isp: hasUsableGeoValue(location.isp) ? location.isp : visit.isp,
+      org: hasUsableGeoValue(location.org) ? location.org : visit.org,
+      asn: hasUsableGeoValue(location.asn) ? location.asn : visit.asn,
+    };
+  });
+
+  return {
+    ...response,
+    location: { ...response.location, ...location },
+    visitHistory,
+  };
 }
 
 /**
@@ -836,6 +900,8 @@ export default function App() {
   const [selectedVisitIndex, setSelectedVisitIndex] = useState<number>(0);
   const [visibleVisitsCount, setVisibleVisitsCount] = useState<number>(5);
   const [copiedJson, setCopiedJson] = useState<boolean>(false);
+  // Monotonic token: a newer load (or unmount) cancels any in-flight geo retry loop.
+  const geoPollToken = useRef(0);
 
   // Swiss light mode is the only theme: strip any legacy class left by a previous session.
   useEffect(() => {
@@ -848,24 +914,78 @@ export default function App() {
     }
   }, []);
 
-  const loadVisitorData = useCallback(async (manualRefresh = false) => {
-    try {
-      if (manualRefresh) {
-        setRefreshing(true);
-      } else {
-        setLoading(true);
+  /**
+   * Retries ISP + location until the server has an exact answer.
+   *
+   * The first identify can land before a rate-limited provider answers, so the tiles
+   * briefly show "Unavailable"/"Standard Network". This loop asks the dedicated
+   * `/api/intel/geolocation` endpoint (which never replays an incomplete cache entry)
+   * with backoff and merges every improvement into the existing view — no new visit is
+   * recorded and the counters do not move.
+   */
+  const pollGeolocation = useCallback(async (visitorId: string, token: number) => {
+    const delaysMs = [800, 1500, 2500, 4000, 6000, 9000, 12000];
+    for (const delay of delaysMs) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      if (geoPollToken.current !== token) return;
+      try {
+        const response = await fetch('/api/intel/geolocation', {
+          method: 'GET',
+          cache: 'no-store',
+          credentials: 'same-origin',
+          headers: { Accept: 'application/json' },
+        });
+        if (!response.ok) continue;
+        const payload = (await response.json()) as {
+          location?: LocationInfo;
+          resolved?: boolean;
+        };
+        if (!payload?.location || geoPollToken.current !== token) continue;
+        setData((previous) => {
+          if (!previous || previous.visitorId !== visitorId) return previous;
+          return mergeLocationIntoResponse(previous, payload.location as LocationInfo);
+        });
+        if (payload.resolved) return;
+      } catch {
+        // Offline / server hiccup: the next backoff step retries.
       }
-      setError(null);
-
-      const response = await identifyCurrentVisitor({ manualRefresh });
-      setData(response);
-      setSelectedVisitIndex(0);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to load visitor intelligence data.');
-    } finally {
-      setLoading(false);
-      setRefreshing(false);
     }
+  }, []);
+
+  const loadVisitorData = useCallback(
+    async (manualRefresh = false) => {
+      try {
+        if (manualRefresh) {
+          setRefreshing(true);
+        } else {
+          setLoading(true);
+        }
+        setError(null);
+
+        const response = await identifyCurrentVisitor({ manualRefresh });
+        setData(response);
+        setSelectedVisitIndex(0);
+
+        const token = geoPollToken.current + 1;
+        geoPollToken.current = token;
+        if (!isLocationComplete(response.location)) {
+          void pollGeolocation(response.visitorId, token);
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Unable to load visitor intelligence data.');
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    },
+    [pollGeolocation]
+  );
+
+  useEffect(() => {
+    return () => {
+      // Invalidate any retry loop still waiting on its backoff timer.
+      geoPollToken.current += 1;
+    };
   }, []);
 
   useEffect(() => {

@@ -130,6 +130,24 @@ export function classifyGenuineDevice(input: DeviceGateInput): DeviceGateResult 
 
   const reasons: string[] = [];
 
+  // Layer 0 — Firefox on Android, including Tor Browser.
+  // Tor Browser ships a reduced Firefox/Android user-agent and, under RFP, spoofs
+  // `navigator.platform` / UA-CH architecture to desktop x86 values. The desktop
+  // platform and x86 vetoes below would then flag a real handset as DevTools emulation.
+  // This must also run before the persistent PC lock: an older build could have saved
+  // a poisoned desktop lock on this very handset, and a finger-driven phone with no
+  // desktop GPU is stronger evidence than that stale bit. A desktop Tor UA never
+  // carries `Android; Mobile`, so this cannot turn a real PC into a phone.
+  const isFirefoxAndroidUA = claimsAndroid && /Firefox\//i.test(ua) && !/Chrome\//i.test(ua);
+  if (
+    isFirefoxAndroidUA &&
+    !hasDesktopGpu &&
+    (fingerDriven || hasTouch || /Mobile/i.test(ua))
+  ) {
+    reasons.push('Firefox/Android touch hardware (Tor Browser / RFP-safe)');
+    return { kind: 'mobile', genuineMobile: true, devtoolsDeviceEmulation: false, reasons };
+  }
+
   // Layer 1 — persistent PC hardware lock. Opening DevTools cannot erase it.
   if (input.pcLocked) {
     reasons.push('Persistent desktop hardware lock');

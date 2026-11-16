@@ -8741,7 +8741,10 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic) {
   const cached = db.prepare(
     "SELECT city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms FROM verified_geo_cache_v3 WHERE ip_address = ?"
   ).get(visitorIp);
-  if (cached && nowMs - cached.verified_at_ms < 6 * 3600 * 1e3 && cached.isp !== "Unknown" && typeof cached.latitude === "number" && typeof cached.longitude === "number") {
+  const cachedHasLocation = Boolean(cached) && (!isMissingGeoValue(cached?.city) || !isMissingGeoValue(cached?.country));
+  const cachedHasNetwork = Boolean(cached) && !isMissingGeoValue(cached?.isp) && !/^autonomous system\b/i.test(cached?.isp ?? "") && cached?.isp !== "Standard Network";
+  const cachedIsComplete = cachedHasLocation && cachedHasNetwork && typeof cached?.latitude === "number" && typeof cached?.longitude === "number";
+  if (cached && nowMs - cached.verified_at_ms < 6 * 3600 * 1e3 && cachedIsComplete) {
     return {
       publicIp: visitorIp,
       city: cached.city,
@@ -8755,7 +8758,7 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic) {
       asn: cached.asn,
       isVpnOrHosting: Boolean(cached.is_vpn_or_hosting),
       isIpVerified: true,
-      isLocationVerified: cached.city !== "Unavailable" || cached.country !== "Unavailable"
+      isLocationVerified: !isMissingGeoValue(cached.city) || !isMissingGeoValue(cached.country)
     };
   }
   const cleanField = (val) => {
@@ -9192,6 +9195,58 @@ var handleNetworkPing = (_req, res) => {
 };
 app.head("/api/network/ping", handleNetworkHeadPing);
 app.get("/api/network/ping", handleNetworkPing);
+app.get("/api/intel/geolocation", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  try {
+    const { ip: visitorIp, isPublic } = extractVisitorIp(req);
+    const edgeGeo = extractEdgeGeo(req);
+    let location = mergeLocationWithEdge(
+      await lookupVerifiedGeolocation(visitorIp, isPublic),
+      edgeGeo
+    );
+    const edgeAsnNumber = Number.parseInt(edgeGeo.asn.replace(/^AS/i, ""), 10);
+    const enrichedNetwork = await enrichNetwork(visitorIp, {
+      asn: Number.isInteger(edgeAsnNumber) && edgeAsnNumber > 0 ? edgeAsnNumber : void 0,
+      country: edgeGeo.countryCode || void 0
+    });
+    const placeholderIspBefore = isMissingGeoValue(location.isp) || /^autonomous system\b/i.test(location.isp) || location.isp === "Standard Network";
+    const placeholderOrgBefore = isMissingGeoValue(location.org) || location.org === "Standard Network";
+    if (enrichedNetwork.source !== "none") {
+      location = {
+        ...location,
+        asn: normalizeAsnLabel(location.asn) || normalizeAsnLabel(enrichedNetwork.asn) || location.asn,
+        isp: placeholderIspBefore && enrichedNetwork.asn_name ? enrichedNetwork.asn_name : location.isp,
+        org: placeholderOrgBefore && enrichedNetwork.asn_name ? enrichedNetwork.asn_name : location.org,
+        isVpnOrHosting: location.isVpnOrHosting || enrichedNetwork.datacenter_result
+      };
+    }
+    const knownAsnLabel = normalizeAsnLabel(location.asn) || normalizeAsnLabel(edgeGeo.asn) || "";
+    const stillPlaceholder = isMissingGeoValue(location.isp) || /^autonomous system\b/i.test(location.isp) || location.isp === "Standard Network";
+    if (knownAsnLabel && stillPlaceholder) {
+      const byAsn = await resolveAsnOrganization(knownAsnLabel);
+      location = {
+        ...location,
+        asn: knownAsnLabel,
+        isp: byAsn.asn_name || knownAsnLabel,
+        org: isMissingGeoValue(location.org) || location.org === "Standard Network" ? byAsn.asn_name || knownAsnLabel : location.org,
+        isVpnOrHosting: location.isVpnOrHosting || byAsn.datacenter_result
+      };
+    }
+    const hasLocation = !isMissingGeoValue(location.city) || !isMissingGeoValue(location.country);
+    const hasNetwork = !isMissingGeoValue(location.isp) && !/^autonomous system\b/i.test(location.isp) && location.isp !== "Standard Network";
+    const resolved = location.isIpVerified && hasLocation && hasNetwork;
+    res.json({
+      location: {
+        ...location,
+        isLocationVerified: hasLocation
+      },
+      resolved,
+      checkedAt: (/* @__PURE__ */ new Date()).toISOString()
+    });
+  } catch {
+    res.status(500).json({ error: "Geolocation lookup failed." });
+  }
+});
 app.use(express2.json({ limit: "512kb" }));
 app.use(aiProtection.middleware);
 app.get("/api/health", async (req, res) => {

@@ -3988,13 +3988,25 @@ async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): 
       }
     | undefined;
 
-  if (
-    cached &&
-    nowMs - cached.verified_at_ms < 6 * 3600 * 1000 &&
-    cached.isp !== 'Unknown' &&
-    typeof cached.latitude === 'number' &&
-    typeof cached.longitude === 'number'
-  ) {
+  // Only a COMPLETE cache entry may short-circuit the provider cascade. A miss that
+  // recorded "Unavailable" city/country (provider rate-limit, cold start, ISP-only RIPE
+  // answer) is deliberately treated as absent, so the next request — the client retry
+  // loop — queries the providers again instead of replaying the miss for six hours.
+  const cachedHasLocation =
+    Boolean(cached) &&
+    (!isMissingGeoValue(cached?.city) || !isMissingGeoValue(cached?.country));
+  const cachedHasNetwork =
+    Boolean(cached) &&
+    !isMissingGeoValue(cached?.isp) &&
+    !/^autonomous system\b/i.test(cached?.isp ?? '') &&
+    cached?.isp !== 'Standard Network';
+  const cachedIsComplete =
+    cachedHasLocation &&
+    cachedHasNetwork &&
+    typeof cached?.latitude === 'number' &&
+    typeof cached?.longitude === 'number';
+
+  if (cached && nowMs - cached.verified_at_ms < 6 * 3600 * 1000 && cachedIsComplete) {
     return {
       publicIp: visitorIp,
       city: cached.city,
@@ -4008,7 +4020,8 @@ async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): 
       asn: cached.asn,
       isVpnOrHosting: Boolean(cached.is_vpn_or_hosting),
       isIpVerified: true,
-      isLocationVerified: cached.city !== 'Unavailable' || cached.country !== 'Unavailable',
+      isLocationVerified:
+        !isMissingGeoValue(cached.city) || !isMissingGeoValue(cached.country),
     };
   }
 
@@ -4539,6 +4552,95 @@ const handleNetworkPing = (_req: express.Request, res: express.Response) => {
 
 app.head('/api/network/ping', handleNetworkHeadPing);
 app.get('/api/network/ping', handleNetworkPing);
+
+/**
+ * ISP + location retry endpoint.
+ *
+ * The identify response can legitimately arrive before a rate-limited provider answers,
+ * leaving `city`/`country` as "Unavailable" and the ISP as "Unknown". The dashboard then
+ * polls this endpoint with backoff until both resolve. It never creates a visit and never
+ * serves an incomplete cache entry (see `lookupVerifiedGeolocation`).
+ */
+app.get('/api/intel/geolocation', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  try {
+    const { ip: visitorIp, isPublic } = extractVisitorIp(req);
+    const edgeGeo = extractEdgeGeo(req);
+
+    let location = mergeLocationWithEdge(
+      await lookupVerifiedGeolocation(visitorIp, isPublic),
+      edgeGeo
+    );
+
+    // Same four-tier ASN enrichment as the identify handler: edge headers → bundled
+    // registry → Team Cymru. A placeholder ISP is replaced by the resolved operator.
+    const edgeAsnNumber = Number.parseInt(edgeGeo.asn.replace(/^AS/i, ''), 10);
+    const enrichedNetwork = await enrichNetwork(visitorIp, {
+      asn: Number.isInteger(edgeAsnNumber) && edgeAsnNumber > 0 ? edgeAsnNumber : undefined,
+      country: edgeGeo.countryCode || undefined,
+    });
+    const placeholderIspBefore =
+      isMissingGeoValue(location.isp) ||
+      /^autonomous system\b/i.test(location.isp) ||
+      location.isp === 'Standard Network';
+    const placeholderOrgBefore =
+      isMissingGeoValue(location.org) || location.org === 'Standard Network';
+    if (enrichedNetwork.source !== 'none') {
+      location = {
+        ...location,
+        asn: normalizeAsnLabel(location.asn) || normalizeAsnLabel(enrichedNetwork.asn) || location.asn,
+        isp:
+          placeholderIspBefore && enrichedNetwork.asn_name
+            ? enrichedNetwork.asn_name
+            : location.isp,
+        org:
+          placeholderOrgBefore && enrichedNetwork.asn_name
+            ? enrichedNetwork.asn_name
+            : location.org,
+        isVpnOrHosting: location.isVpnOrHosting || enrichedNetwork.datacenter_result,
+      };
+    }
+
+    const knownAsnLabel =
+      normalizeAsnLabel(location.asn) || normalizeAsnLabel(edgeGeo.asn) || '';
+    const stillPlaceholder =
+      isMissingGeoValue(location.isp) ||
+      /^autonomous system\b/i.test(location.isp) ||
+      location.isp === 'Standard Network';
+    if (knownAsnLabel && stillPlaceholder) {
+      const byAsn = await resolveAsnOrganization(knownAsnLabel);
+      location = {
+        ...location,
+        asn: knownAsnLabel,
+        isp: byAsn.asn_name || knownAsnLabel,
+        org:
+          isMissingGeoValue(location.org) || location.org === 'Standard Network'
+            ? byAsn.asn_name || knownAsnLabel
+            : location.org,
+        isVpnOrHosting: location.isVpnOrHosting || byAsn.datacenter_result,
+      };
+    }
+
+    const hasLocation =
+      !isMissingGeoValue(location.city) || !isMissingGeoValue(location.country);
+    const hasNetwork =
+      !isMissingGeoValue(location.isp) &&
+      !/^autonomous system\b/i.test(location.isp) &&
+      location.isp !== 'Standard Network';
+    const resolved = location.isIpVerified && hasLocation && hasNetwork;
+
+    res.json({
+      location: {
+        ...location,
+        isLocationVerified: hasLocation,
+      },
+      resolved,
+      checkedAt: new Date().toISOString(),
+    });
+  } catch {
+    res.status(500).json({ error: 'Geolocation lookup failed.' });
+  }
+});
 
 app.use(express.json({ limit: '512kb' }));
 

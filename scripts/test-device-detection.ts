@@ -584,6 +584,32 @@ const cases: Case[] = [
     expectKind: 'pc',
     expectDevtools: true,
   },
+  // Tor Browser on Android ships a reduced Firefox UA and RFP spoofs
+  // `navigator.platform` / UA-CH architecture to desktop x86. A finger-driven
+  // handset with no desktop GPU must still be recognised as a phone.
+  {
+    name: 'Tor Browser on Android (RFP desktop platform)',
+    input: phoneHw('Mozilla/5.0 (Android 14; Mobile; rv:128.0) Gecko/128.0 Firefox/128.0', {
+      platform: 'Linux x86_64',
+      architecture: 'x86',
+      gpuVendor: 'Mozilla',
+      gpuRenderer: 'Mozilla',
+    }),
+    expectKind: 'mobile',
+    expectDevtools: false,
+  },
+  {
+    name: 'Tor Browser Android beats poisoned PC lock',
+    input: phoneHw('Mozilla/5.0 (Android 14; Mobile; rv:128.0) Gecko/128.0 Firefox/128.0', {
+      platform: 'Linux x86_64',
+      architecture: 'x86',
+      gpuVendor: 'Mozilla',
+      gpuRenderer: 'Mozilla',
+      pcLocked: true,
+    }),
+    expectKind: 'mobile',
+    expectDevtools: false,
+  },
 ];
 
 let failures = 0;
