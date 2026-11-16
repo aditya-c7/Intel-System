@@ -10,6 +10,8 @@
  *   { agent_name: string | null, reasons: string[], path: string }
  */
 
+import { gateAutomationEvidence } from '../../lib/verdict';
+
 export interface AgentVerdict {
   type: 'agent' | 'human';
   agent_name?: string;
@@ -298,6 +300,14 @@ export function startIntelAgentProbe(
 
   function getVerdict(): AgentVerdict {
     if (reasons.length === 0) return { type: 'human', reasons: [] };
+    // Weighted gate: a single weak reason (SwiftShader with hardware acceleration
+    // off, extension shadow roots, stale pointer trails) must never brand a real
+    // person as an agent. Hard reasons alone, two medium reasons, or one medium
+    // plus weak corroboration are required for an agent verdict.
+    const gated = gateAutomationEvidence(reasons);
+    if (gated.verdict !== 'automated') {
+      return { type: 'human', reasons: reasons.slice() };
+    }
     const verdict: AgentVerdict = { type: 'agent', reasons: reasons.slice() };
     const name = pickAgentName();
     if (name) verdict.agent_name = name;
@@ -492,9 +502,12 @@ export function startIntelAgentProbe(
   // ---- Probe 8: CDP / headless probes at 400ms ------------------------------------------
   setTimeout(
     guard(() => {
-      // S1 — chrome-extension URL with an explicit port is a shell-only URL quirk.
+      // S1 — chrome-headless-shell DROPS the explicit `:0` port on the
+      // non-special chrome-extension scheme, while regular Chrome retains it.
+      // Flag only the drop: the old "port === '0'" check fired for every
+      // ordinary Chrome user and was the main "person shown as automated" bug.
       safe(() => {
-        if (new URL('chrome-extension://x:0').port === '0') {
+        if (new URL('chrome-extension://x:0').port === '') {
           addReason('headless.shell.url_scheme_port');
         }
       });
@@ -654,12 +667,17 @@ export function startIntelAgentProbe(
       'pointerdown',
       guard((event: PointerEvent) => {
         if (!event.isTrusted || event.pointerType !== 'mouse') return;
-        if (movesSinceLastClick <= 2 && (event.pressure === 0 || event.pressure === 0.5)) {
-          zeroTrailHits += 1;
-          if (zeroTrailHits >= 2) addReason('kinematics.zero_pointer_trail');
+        // A real mouse reports pressure 0.5 whenever a button is active (Pointer
+        // Events spec), so pressure alone proves nothing. It only counts as a
+        // Playwright-MCP-style signature when the pointer trail is also stale.
+        const staleTrail = movesSinceLastClick <= 1;
+        if (event.pressure === 0.5 && staleTrail) {
+          addReason('playwright.mcp.pressure');
         }
-        // Playwright MCP dispatches synthetic pointerdown with pressure exactly 0.5.
-        if (event.pressure === 0.5) addReason('playwright.mcp.pressure');
+        if (staleTrail && (event.pressure === 0 || event.pressure === 0.5)) {
+          zeroTrailHits += 1;
+          if (zeroTrailHits >= 3) addReason('kinematics.zero_pointer_trail');
+        }
         movesSinceLastClick = 0;
         checkHiddenFocus();
       }),
@@ -677,10 +695,11 @@ export function startIntelAgentProbe(
         if (rect.width > 300 && Math.abs(event.clientX - centerX) > 230) {
           addReason('kinematics.screenshot_offset');
         }
-        // ChatGPT Work: 319px-wide window and clicks within 1px of the element centre with
-        // zero synthetic pressure. Reason ID kept distinct from the extension marker.
+        // ChatGPT Work: 319px-wide window and clicks within 1px of the element
+        // centre with zero synthetic pressure. The 319px gate is mandatory — a
+        // human trackpad tap also lands dead-centre with zero pressure.
         const offset = Math.hypot(event.clientX - centerX, event.clientY - centerY);
-        if ((window.innerWidth === 319 || offset <= 1) && (event as PointerEvent).pressure === 0) {
+        if (window.innerWidth === 319 && offset <= 1 && (event as PointerEvent).pressure === 0) {
           addReason('chatgpt.badge.overlay', 'chatgpt-work');
         }
       }),

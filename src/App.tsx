@@ -14,7 +14,6 @@ import type {
 import { LocationMap } from './components/LocationMap';
 import { NetworkStabilityPanel } from './components/NetworkStabilityPanel';
 import { CpuActivityPanel } from './components/CpuActivityPanel';
-import { AICrawlControlDashboard } from './client/components/AICrawlControlDashboard';
 import { isMobileDevice } from './lib/deviceClass';
 import { SmartSignalsGrid } from './components/SmartSignalsGrid';
 import {
@@ -1185,9 +1184,6 @@ export default function App() {
             <a href="#history" className="hover:text-slate-900 whitespace-nowrap shrink-0">
               Visit History
             </a>
-            <a href="#ai-crawl-control" className="hover:text-slate-900 whitespace-nowrap shrink-0">
-              AI Crawl Control
-            </a>
           </nav>
 
           <div className="flex items-center gap-2 shrink-0">
@@ -2208,11 +2204,6 @@ export default function App() {
           <div className="mt-3 max-h-[420px] overflow-auto rounded-xl bg-[#F8FAFC] border border-[#E5E7EB] p-3 text-[11px] leading-relaxed font-mono">
             {eventJson ? <JsonPreview value={eventJson} /> : 'Collecting event payload...'}
           </div>
-        </section>
-
-        {/* Native AI Crawler / Agent Defense console (Cloudflare Worker API-backed) */}
-        <section id="ai-crawl-control" className="scroll-mt-20">
-          <AICrawlControlDashboard />
         </section>
       </main>
 

@@ -1711,49 +1711,70 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
   } catch {
     // Ignore hostile window proxies.
   }
-  const isHeadless = headlessUa || softwareGpu || zeroGeometry;
-
-  let isBot = false;
-  let botReason = 'Verified human runtime & native DOM prototypes';
-  const allBotReasons: string[] = [];
+  const isHeadless = headlessUa || zeroGeometry;
 
   // Run all 19 fingerprintjs/BotD detectors
   const botD19 = detectBotD19Signals(gpuRenderer);
-  if (botD19.detected) {
-    isBot = true;
-    allBotReasons.push(...botD19.reasons);
-  }
+
+  // Weighted evidence gate. A single soft signal must never brand a real person
+  // as a bot: SwiftShader fires when hardware acceleration is disabled, empty
+  // languages happen on hardened profiles, minimized windows report zero outer
+  // geometry, and privacy extensions patch the webdriver getter. Hard signals
+  // (webdriver, CDP bindings, automation UAs, BotD hard detectors) prove
+  // automation on their own; soft signals only corroborate each other.
+  const d19Hard =
+    Boolean(botD19.signals.user_agent) ||
+    Boolean(botD19.signals.webdriver) ||
+    Boolean(botD19.signals.distinctive_properties) ||
+    Boolean(botD19.signals.window_size);
+  const d19Soft =
+    Boolean(botD19.signals.rtt) ||
+    Boolean(botD19.signals.plugins_array) ||
+    Boolean(botD19.signals.plugins_inconsistency) ||
+    Boolean(botD19.signals.window_external) ||
+    Boolean(botD19.signals.product_sub) ||
+    Boolean(botD19.signals.webgl) ||
+    Boolean(botD19.signals.notification_permissions);
+  const softEvidenceCount =
+    (softwareGpu ? 1 : 0) +
+    (zeroGeometry ? 1 : 0) +
+    (emptyLanguages ? 1 : 0) +
+    (webdriverGetterTampered ? 1 : 0) +
+    (d19Soft ? 1 : 0);
+
+  const isBot =
+    webdriver || cdpDetected || headlessUa || d19Hard || softEvidenceCount >= 2;
+  let botReason = 'Verified human runtime & native DOM prototypes';
+  const allBotReasons: string[] = [];
 
   if (webdriver) {
-    isBot = true;
     botReason = 'navigator.webdriver flag is enabled (WebDriver controlled session)';
   } else if (cdpDetected) {
-    isBot = true;
     botReason = 'Chrome DevTools Protocol binding exposed on window/document';
-  } else if (webdriverGetterTampered) {
-    isBot = true;
-    botReason = 'Navigator.prototype.webdriver getter overridden (anti-detect automation patch)';
   } else if (headlessUa) {
-    isBot = true;
     botReason = 'Headless browser User-Agent signature detected';
-  } else if (softwareGpu) {
-    isBot = true;
-    botReason = `Software GPU renderer (${gpuRenderer || 'unknown'})`;
-  } else if (zeroGeometry) {
-    isBot = true;
-    botReason = 'Zero outer window geometry (headless viewport)';
-  } else if (emptyLanguages) {
-    isBot = true;
-    botReason = 'navigator.languages array is empty';
-  } else if (botD19.detected && botD19.reasons.length > 0) {
-    botReason = botD19.reasons[0];
+  } else if (d19Hard) {
+    botReason = botD19.reasons[0] || 'BotD hard automation signal detected';
+  } else if (isBot) {
+    botReason = `Corroborated soft automation evidence (${softEvidenceCount} independent signals)`;
   }
 
-  if (botReason !== 'Verified human runtime & native DOM prototypes' && !allBotReasons.includes(botReason)) {
-    allBotReasons.unshift(botReason);
+  if (botReason !== 'Verified human runtime & native DOM prototypes') {
+    allBotReasons.push(botReason);
+  }
+  if (isBot && botD19.detected) {
+    allBotReasons.push(...botD19.reasons.filter((reason) => reason !== botReason));
   }
 
-  return { isBot, isHeadless: isHeadless || botD19.signals.window_size || botD19.signals.webgl || botD19.signals.user_agent, botReason, webdriver: webdriver || botD19.signals.webdriver, cdpDetected: cdpDetected || botD19.signals.distinctive_properties, botSignals: allBotReasons };
+  return {
+    isBot,
+    isHeadless:
+      isHeadless || botD19.signals.window_size || botD19.signals.user_agent,
+    botReason,
+    webdriver: webdriver || botD19.signals.webdriver,
+    cdpDetected: cdpDetected || botD19.signals.distinctive_properties,
+    botSignals: allBotReasons,
+  };
 }
 
 /**
