@@ -50,7 +50,10 @@ export class VisitorStore extends DurableObject {
 export default {
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
-    if (pathname !== '/api' && !pathname.startsWith('/api/')) {
+    // Dynamic crawler-policy documents are Worker-first (see wrangler.jsonc) and must be
+    // answered by the Express app, not by static assets.
+    const isPolicyDocument = pathname === '/robots.txt' || pathname === '/llms.txt';
+    if (pathname !== '/api' && !pathname.startsWith('/api/') && !isPolicyDocument) {
       const asset = await env.ASSETS.fetch(request);
       const result = new Response(asset.body, asset);
       result.headers.set(
@@ -67,7 +70,13 @@ export default {
       return apiResponse(Response.json({ error: 'Configure VISITOR_HMAC_SECRET with at least 32 characters.' }, { status: 503 }));
     }
     try {
-      const persistent = pathname === '/api/health' || pathname.startsWith('/api/visitor/');
+      // Every AI protection route needs request-scoped Durable-Object SQLite access: the
+      // analytics/telemetry/policy APIs, plus the two dynamic crawler-policy documents.
+      const persistent =
+        pathname === '/api/health' ||
+        pathname.startsWith('/api/visitor/') ||
+        pathname.startsWith('/api/intel/ai-crawl-control/') ||
+        isPolicyDocument;
       const response = persistent
         ? await env.VISITOR_STORE.get(env.VISITOR_STORE.idFromName('visitor-store-v1')).fetch(request)
         : await handleAsNodeRequest(API_PORT, request);
