@@ -1328,6 +1328,46 @@ export default function App() {
                 <p className="text-xs sm:text-[13px] text-slate-500 mt-1">
                   Real-time browser identity, hardware fingerprint, and live connection telemetry.
                 </p>
+                {data.identification ? (
+                  <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+                    <span
+                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+                        data.identification.confidence.score >= 0.9
+                          ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                          : data.identification.confidence.score >= 0.7
+                          ? 'border-amber-200 bg-amber-50 text-amber-700'
+                          : 'border-rose-200 bg-rose-50 text-rose-700'
+                      }`}
+                      title="Calibrated identification confidence (v2.0)"
+                    >
+                      Confidence {(data.identification.confidence.score * 100).toFixed(1)}% · v
+                      {data.identification.confidence.version}
+                    </span>
+                    {data.identity_layers ? (
+                      <span
+                        className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-600"
+                        title={`Match score ${data.identity_layers.match_score}/100`}
+                      >
+                        {data.identity_layers.match_mode === 'exact'
+                          ? 'Exact match'
+                          : data.identity_layers.match_mode === 'cross_browser'
+                          ? 'Cross-browser match'
+                          : data.identity_layers.match_mode === 'hardware'
+                          ? 'Hardware match'
+                          : data.identity_layers.match_mode === 'lenient'
+                          ? 'Lenient match'
+                          : 'New identity'}
+                      </span>
+                    ) : null}
+                    {data.consistency ? (
+                      <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-medium text-slate-600">
+                        {data.consistency.agent_verdict === 'human'
+                          ? 'Consistent human signals'
+                          : `Agent signals: ${data.consistency.agent_verdict}`}
+                      </span>
+                    ) : null}
+                  </div>
+                ) : null}
                 {data.browserDevice.genuineMobile ? (
                   <div className="mt-2 flex justify-center">
                     {data.browserDevice.phoneModel ? (

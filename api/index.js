@@ -3220,6 +3220,2071 @@ function createAIProtectionSystem(db2) {
   return { middleware, apiRouter, ipEngine, webBotAuth, preferenceSync };
 }
 
+// src/server/middleware/clientHints.ts
+var CLIENT_HINT_ACCEPT_CH = "Sec-CH-UA, Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Model, Sec-CH-UA-Mobile";
+var CLIENT_HINT_CRITICAL_CH = "Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List";
+var EMPTY_HINTS = {
+  brands: [],
+  platform: "",
+  platformVersion: "",
+  architecture: "",
+  bitness: "",
+  model: "",
+  mobile: "",
+  fullVersionList: []
+};
+function readHeaderValue(headers, name) {
+  const raw = headers[name] ?? headers[name.toLowerCase()] ?? headers[name.toUpperCase()];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return typeof value === "string" ? value : "";
+}
+function unquote(value) {
+  let text = value.trim();
+  if (text.length >= 2) {
+    const first = text[0];
+    const last = text[text.length - 1];
+    if (first === '"' && last === '"' || first === "'" && last === "'") text = text.slice(1, -1);
+  }
+  return text.trim();
+}
+function unescapeToken(value) {
+  return value.replace(/\\(.)/g, "$1").trim();
+}
+function parseBrandList(raw) {
+  const brands = [];
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (!text) return brands;
+  for (const part of text.split(",")) {
+    const entry = part.trim();
+    if (!entry) continue;
+    const match = /^(?:"((?:[^"\\]|\\.)*)"|([^";]*))\s*;\s*v\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^";]*))\s*$/.exec(entry);
+    if (!match) continue;
+    const brand = match[1] !== void 0 ? unescapeToken(match[1]) : match[2].trim();
+    const version = match[3] !== void 0 ? unescapeToken(match[3]) : (match[4] ?? "").trim();
+    if (!brand) continue;
+    brands.push({ brand, version });
+  }
+  return brands;
+}
+function parseMobile(raw) {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (!text) return "";
+  const token = text.replace(/^\?/, "").trim();
+  if (token === "1") return "true";
+  if (token === "0") return "false";
+  return token;
+}
+function parseClientHintHeaders(headers) {
+  try {
+    const bag = headers ?? {};
+    const brands = parseBrandList(readHeaderValue(bag, "sec-ch-ua"));
+    const fullVersionList = parseBrandList(readHeaderValue(bag, "sec-ch-ua-full-version-list"));
+    return {
+      brands,
+      platform: unquote(readHeaderValue(bag, "sec-ch-ua-platform")),
+      platformVersion: unquote(readHeaderValue(bag, "sec-ch-ua-platform-version")),
+      architecture: unquote(readHeaderValue(bag, "sec-ch-ua-arch")),
+      bitness: unquote(readHeaderValue(bag, "sec-ch-ua-bitness")),
+      model: unquote(readHeaderValue(bag, "sec-ch-ua-model")),
+      mobile: parseMobile(readHeaderValue(bag, "sec-ch-ua-mobile")),
+      fullVersionList
+    };
+  } catch {
+    return { ...EMPTY_HINTS, brands: [], fullVersionList: [] };
+  }
+}
+function clientHintsMiddleware(req, res, next) {
+  try {
+    if (!res.getHeader("Accept-CH")) res.setHeader("Accept-CH", CLIENT_HINT_ACCEPT_CH);
+    if (!res.getHeader("Critical-CH")) res.setHeader("Critical-CH", CLIENT_HINT_CRITICAL_CH);
+    req.intelClientHints = parseClientHintHeaders(req.headers);
+  } catch {
+  }
+  next();
+}
+
+// src/server/network/asnRegistry.json
+var asnRegistry_default = [
+  {
+    asn: 55836,
+    asn_name: "Reliance Jio Infocomm Limited",
+    handle: "RELIANCEJIO-IN",
+    asn_type: "isp",
+    datacenter_result: false,
+    sample_prefixes: ["49.44.63.0/24", "49.44.88.0/22"]
+  },
+  {
+    asn: 24560,
+    asn_name: "Bharti Airtel Ltd., Telemedia Services",
+    handle: "ORG-BAL1-AP",
+    asn_type: "isp",
+    datacenter_result: false,
+    sample_prefixes: []
+  },
+  {
+    asn: 9498,
+    asn_name: "Bharti Airtel Ltd.",
+    handle: "ORG-BAL1-AP",
+    asn_type: "mobile",
+    datacenter_result: false,
+    sample_prefixes: []
+  },
+  {
+    asn: 9829,
+    asn_name: "Bharat Sanchar Nigam Ltd.",
+    handle: "ORG-BSNL1-AP",
+    asn_type: "isp",
+    datacenter_result: false,
+    sample_prefixes: ["117.192.0.0/13"]
+  },
+  {
+    asn: 714,
+    asn_name: "Apple Inc.",
+    handle: "APPLEC-1-Z",
+    asn_type: "isp",
+    datacenter_result: false,
+    sample_prefixes: ["17.0.0.0/8"]
+  },
+  {
+    asn: 6185,
+    asn_name: "Apple Inc.",
+    handle: "APPLEC-1-Z",
+    asn_type: "isp",
+    datacenter_result: false,
+    sample_prefixes: []
+  },
+  {
+    asn: 32934,
+    asn_name: "Meta Platforms, Inc.",
+    handle: "THEFA-3",
+    asn_type: "datacenter",
+    datacenter_result: false,
+    sample_prefixes: ["31.13.64.0/18", "157.240.0.0/16", "179.60.192.0/22", "69.171.240.0/20", "173.252.64.0/18", "185.89.216.0/22"]
+  },
+  {
+    asn: 13335,
+    asn_name: "Cloudflare, Inc.",
+    handle: "CLOUDFLARENET",
+    asn_type: "cdn",
+    datacenter_result: true,
+    sample_prefixes: ["1.1.1.0/24", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/12", "141.101.0.0/16", "162.158.0.0/16", "172.64.0.0/13", "198.41.128.0/17"]
+  },
+  {
+    asn: 15169,
+    asn_name: "Google LLC",
+    handle: "GOGL",
+    asn_type: "cloud",
+    datacenter_result: true,
+    sample_prefixes: ["8.8.4.0/24", "8.8.8.0/24", "34.64.0.0/10", "35.184.0.0/13", "35.192.0.0/12", "74.125.0.0/16", "104.196.0.0/16", "130.211.0.0/16", "142.250.0.0/15", "172.217.0.0/16", "216.58.192.0/19"]
+  },
+  {
+    asn: 16509,
+    asn_name: "Amazon.com, Inc.",
+    handle: "AMAZON-4",
+    asn_type: "datacenter",
+    datacenter_result: true,
+    sample_prefixes: ["52.0.0.0/8", "54.0.0.0/8"]
+  },
+  {
+    asn: 14618,
+    asn_name: "Amazon.com, Inc.",
+    handle: "AMAZO-4",
+    asn_type: "datacenter",
+    datacenter_result: true,
+    sample_prefixes: []
+  },
+  {
+    asn: 8075,
+    asn_name: "Microsoft Corporation",
+    handle: "MSFT",
+    asn_type: "datacenter",
+    datacenter_result: true,
+    sample_prefixes: ["13.64.0.0/11", "20.0.0.0/8", "40.64.0.0/10", "52.136.0.0/13", "104.40.0.0/13", "168.61.0.0/16"]
+  },
+  {
+    asn: 12076,
+    asn_name: "Microsoft Corporation",
+    handle: "MSFT",
+    asn_type: "datacenter",
+    datacenter_result: true,
+    sample_prefixes: ["13.107.0.0/16"]
+  },
+  {
+    asn: 14061,
+    asn_name: "DigitalOcean LLC",
+    handle: "DO-13",
+    asn_type: "datacenter",
+    datacenter_result: true,
+    sample_prefixes: [
+      "46.101.0.0/16",
+      "68.183.0.0/16",
+      "104.131.0.0/16",
+      "104.236.0.0/16",
+      "128.199.0.0/16",
+      "134.209.0.0/16",
+      "138.68.0.0/16",
+      "139.59.0.0/16",
+      "143.198.0.0/16",
+      "157.245.0.0/16",
+      "159.65.0.0/16",
+      "159.89.0.0/16",
+      "161.35.0.0/16",
+      "165.22.0.0/16",
+      "167.71.0.0/16",
+      "167.99.0.0/16",
+      "174.138.0.0/16",
+      "178.128.0.0/16"
+    ]
+  },
+  {
+    asn: 16276,
+    asn_name: "OVH SAS",
+    handle: "ORG-OS3-RIPE",
+    asn_type: "datacenter",
+    datacenter_result: true,
+    sample_prefixes: ["5.196.0.0/16", "51.68.0.0/16", "51.75.0.0/16", "51.77.0.0/16", "51.83.0.0/16", "51.89.0.0/16", "54.36.0.0/16", "54.37.0.0/16", "54.38.0.0/16"]
+  },
+  {
+    asn: 24940,
+    asn_name: "Hetzner Online GmbH",
+    handle: "ORG-HOA1-RIPE",
+    asn_type: "datacenter",
+    datacenter_result: true,
+    sample_prefixes: [
+      "5.9.0.0/16",
+      "46.4.0.0/16",
+      "49.12.0.0/16",
+      "49.13.0.0/16",
+      "65.21.0.0/16",
+      "65.108.0.0/15",
+      "78.46.0.0/15",
+      "88.198.0.0/16",
+      "88.99.0.0/16",
+      "94.130.0.0/16",
+      "95.216.0.0/15",
+      "116.202.0.0/15",
+      "135.181.0.0/16",
+      "144.76.0.0/16",
+      "148.251.0.0/16",
+      "157.90.0.0/16",
+      "159.69.0.0/16",
+      "162.55.0.0/16",
+      "167.235.0.0/16",
+      "168.119.0.0/16"
+    ]
+  },
+  {
+    asn: 9009,
+    asn_name: "M247 Ltd",
+    handle: "ORG-MES6-RIPE",
+    asn_type: "datacenter",
+    datacenter_result: true,
+    sample_prefixes: ["37.19.208.0/20", "146.70.0.0/16"]
+  },
+  {
+    asn: 51167,
+    asn_name: "Contabo GmbH",
+    handle: "ORG-GG22-RIPE",
+    asn_type: "datacenter",
+    datacenter_result: true,
+    sample_prefixes: ["5.189.128.0/19", "62.171.128.0/17", "173.212.192.0/18"]
+  },
+  {
+    asn: 20473,
+    asn_name: "The Constant Company, LLC",
+    handle: "CHOOP-1",
+    asn_type: "datacenter",
+    datacenter_result: true,
+    sample_prefixes: [
+      "45.32.0.0/16",
+      "45.63.0.0/16",
+      "45.76.0.0/16",
+      "45.77.0.0/16",
+      "64.176.0.0/17",
+      "66.42.0.0/16",
+      "78.141.192.0/18",
+      "95.179.128.0/17",
+      "108.61.0.0/16",
+      "139.180.128.0/17",
+      "144.202.0.0/16",
+      "149.28.0.0/16",
+      "167.179.0.0/16",
+      "207.148.0.0/16",
+      "209.250.224.0/19"
+    ]
+  },
+  {
+    asn: 63949,
+    asn_name: "Akamai Technologies, Inc.",
+    handle: "ORG-ATI1-AP",
+    asn_type: "datacenter",
+    datacenter_result: true,
+    sample_prefixes: ["45.79.0.0/16", "139.162.0.0/16", "172.104.0.0/15", "172.105.0.0/16"]
+  },
+  {
+    asn: 399358,
+    asn_name: "Anthropic, PBC",
+    handle: "AP-2440",
+    asn_type: "ai_operator",
+    datacenter_result: true,
+    sample_prefixes: []
+  },
+  {
+    asn: 401518,
+    asn_name: "OpenAI OpCo, LLC",
+    handle: "OOL-15",
+    asn_type: "ai_operator",
+    datacenter_result: true,
+    sample_prefixes: []
+  },
+  {
+    asn: 401864,
+    asn_name: "OpenAI OpCo, LLC",
+    handle: "OOL-15",
+    asn_type: "ai_operator",
+    datacenter_result: true,
+    sample_prefixes: []
+  },
+  {
+    asn: 400645,
+    asn_name: "Axxess Networks LLC",
+    handle: "ANL-362",
+    asn_type: "datacenter",
+    datacenter_result: true,
+    sample_prefixes: ["130.250.218.0/24"]
+  },
+  {
+    asn: 212949,
+    asn_name: "Mistral AI",
+    handle: "ORG-KS338-RIPE",
+    asn_type: "ai_operator",
+    datacenter_result: true,
+    sample_prefixes: []
+  },
+  {
+    asn: 396986,
+    asn_name: "ByteDance Inc.",
+    handle: "BYTED",
+    asn_type: "ai_operator",
+    datacenter_result: true,
+    sample_prefixes: []
+  }
+];
+
+// src/server/network/asnEnricher.ts
+var REGISTRY = asnRegistry_default;
+var REGISTRY_BY_ASN = /* @__PURE__ */ new Map();
+for (const entry of REGISTRY) REGISTRY_BY_ASN.set(entry.asn, entry);
+var REGISTRY_PREFIXES = (() => {
+  const ranges = [];
+  for (const entry of REGISTRY) {
+    for (const prefix of entry.sample_prefixes ?? []) {
+      const parsed = parseIpv4Prefix(prefix);
+      if (parsed) ranges.push({ ...parsed, prefix, entry });
+    }
+  }
+  ranges.sort((a, b) => b.prefixLength - a.prefixLength);
+  return ranges;
+})();
+function parseIpv4(text) {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text.trim());
+  if (!match) return null;
+  const octets = [match[1], match[2], match[3], match[4]].map((part) => Number.parseInt(part, 10));
+  if (octets.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) return null;
+  return (octets[0] << 24 | octets[1] << 16 | octets[2] << 8 | octets[3]) >>> 0;
+}
+function parseIpv4Prefix(prefix) {
+  const [addressPart, lengthPart] = prefix.split("/");
+  const base = parseIpv4(addressPart ?? "");
+  const prefixLength = Number.parseInt(lengthPart ?? "", 10);
+  if (base === null || !Number.isInteger(prefixLength) || prefixLength < 0 || prefixLength > 32) return null;
+  const mask = prefixLength === 0 ? 0 : 4294967295 << 32 - prefixLength >>> 0;
+  const first = (base & mask) >>> 0;
+  const last = (first | mask ^ 4294967295) >>> 0;
+  return { first, last, prefixLength };
+}
+function ipv4InRanges(ip) {
+  const value = parseIpv4(ip);
+  if (value === null) return null;
+  for (const range of REGISTRY_PREFIXES) {
+    if (value >= range.first && value <= range.last) return range;
+  }
+  return null;
+}
+function registryEntryForAsn(asn) {
+  const value = typeof asn === "number" ? asn : Number.parseInt(String(asn ?? "").replace(/^\s*as/i, ""), 10);
+  if (!Number.isInteger(value) || value <= 0) return null;
+  return REGISTRY_BY_ASN.get(value) ?? null;
+}
+function registryEntryForIp(ip) {
+  const match = ipv4InRanges(ip);
+  return match ? { entry: match.entry, prefix: match.prefix } : null;
+}
+var CACHE_LIMIT = 500;
+var ASN_META_TTL_MS = 7 * 24 * 60 * 60 * 1e3;
+var IP_LOOKUP_TTL_MS = 24 * 60 * 60 * 1e3;
+var NEGATIVE_TTL_MS = 30 * 1e3;
+var CACHE = /* @__PURE__ */ new Map();
+function cacheGet(key) {
+  const slot = CACHE.get(key);
+  if (!slot) return void 0;
+  if (slot.expiresAt <= Date.now()) {
+    CACHE.delete(key);
+    return void 0;
+  }
+  CACHE.delete(key);
+  CACHE.set(key, slot);
+  return slot.value;
+}
+function cacheSet(key, value, ttlMs) {
+  CACHE.delete(key);
+  CACHE.set(key, { value, expiresAt: Date.now() + ttlMs });
+  while (CACHE.size > CACHE_LIMIT) {
+    const oldest = CACHE.keys().next();
+    if (oldest.done) break;
+    CACHE.delete(oldest.value);
+  }
+}
+function cleanCymruAsName(raw) {
+  let name = String(raw ?? "");
+  name = name.replace(/^"+|"+$/g, "").trim();
+  name = name.replace(/,\s*[A-Za-z]{2}\s*$/, "");
+  name = name.replace(/^[A-Z0-9][A-Z0-9-]{0,40}\s+-\s+/, (match, offset, text) => {
+    const remainder = text.slice(offset + match.length);
+    return remainder.trim() ? "" : match;
+  });
+  if (!name.trim()) name = String(raw ?? "").replace(/^"+|"+$/g, "").trim();
+  return name.replace(/\s+/g, " ").trim();
+}
+function cleanEdgeAsOrg(raw) {
+  return String(raw ?? "").replace(/^[Aa][Ss]\d+\s+/, "").replace(/\s+/g, " ").trim();
+}
+var HOSTING_NAME_HINTS = [
+  "amazon web services",
+  "aws",
+  "azure",
+  "google cloud",
+  "oracle cloud",
+  "alibaba cloud",
+  "tencent cloud",
+  "digitalocean",
+  "linode",
+  "vultr",
+  "hetzner",
+  "ovh",
+  "contabo",
+  "m247",
+  "leaseweb",
+  "scaleway",
+  "cloudflare",
+  "akamai",
+  "fastly",
+  "datacenter",
+  "data center",
+  "hosting",
+  "colocation",
+  "vps",
+  "anthropic",
+  "openai",
+  "mistral",
+  "bytedance"
+];
+var MOBILE_NAME_HINTS = [
+  "airtel",
+  "jio",
+  "vodafone",
+  "idea cellular",
+  "verizon",
+  "t-mobile",
+  "tmobile",
+  "at&t",
+  "sprint",
+  "boost mobile",
+  "metro",
+  "mint mobile",
+  "google fi",
+  "o2 uk",
+  "orange",
+  "movistar",
+  "telcel",
+  "safaricom",
+  "docomo",
+  "softbank",
+  "kddi",
+  "sk telecom",
+  "cellular",
+  "mobile"
+];
+function heuristicAsnType(name) {
+  const text = String(name ?? "").toLowerCase();
+  if (!text) return { type: "isp", datacenter: false };
+  if (HOSTING_NAME_HINTS.some((hint) => text.includes(hint))) return { type: "datacenter", datacenter: true };
+  if (MOBILE_NAME_HINTS.some((hint) => text.includes(hint))) return { type: "mobile", datacenter: false };
+  return { type: "isp", datacenter: false };
+}
+function ipv4ReverseOctets(ip) {
+  const value = parseIpv4(ip);
+  if (value === null) return [];
+  return [
+    String(value >>> 24 & 255),
+    String(value >>> 16 & 255),
+    String(value >>> 8 & 255),
+    String(value & 255)
+  ].reverse();
+}
+function expandIpv6Groups(ip) {
+  const text = String(ip ?? "").trim().toLowerCase();
+  if (!text || !text.includes(":") || !/^[0-9a-f:.]+$/.test(text)) return null;
+  if (text.includes("%")) return null;
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+  let head = halves[0] ? halves[0].split(":") : [];
+  let tail = halves[1] ? halves[1].split(":") : [];
+  const unfoldIpv4Tail = (tokens) => {
+    const last = tokens[tokens.length - 1] ?? "";
+    if (!last.includes(".")) return tokens;
+    const parts = last.split(".");
+    if (parts.length !== 4) return [];
+    const values2 = parts.map((part) => Number.parseInt(part, 10));
+    if (values2.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) return [];
+    return tokens.slice(0, -1).concat([values2[0] << 8 | values2[1], values2[2] << 8 | values2[3]].map((v) => v.toString(16)));
+  };
+  head = unfoldIpv4Tail(head);
+  tail = unfoldIpv4Tail(tail);
+  if (head.length === 0 && halves[0]) return null;
+  if (tail.length === 0 && halves[1]) return null;
+  const fill = 8 - head.length - tail.length;
+  if (fill < 0) return null;
+  if (halves.length === 1 && fill !== 0) return null;
+  const groups = halves.length === 2 ? [...head, ...new Array(fill).fill("0"), ...tail] : [...head, ...tail];
+  if (groups.length !== 8) return null;
+  const values = [];
+  for (const group of groups) {
+    if (!/^[0-9a-f]{1,4}$/.test(group)) return null;
+    values.push(Number.parseInt(group, 16));
+  }
+  return values;
+}
+function ipv6ReverseNibbles(ip) {
+  const groups = expandIpv6Groups(ip);
+  if (!groups) return [];
+  const nibbles = [];
+  for (const value of groups) {
+    for (const shift of [12, 8, 4, 0]) nibbles.push((value >> shift & 15).toString(16));
+  }
+  return nibbles.reverse();
+}
+var CYMRU_TIMEOUT_MS = 4e3;
+var DOH_ENDPOINTS = ["https://cloudflare-dns.com/dns-query", "https://dns.google/resolve"];
+async function dohTextRecords(name) {
+  if (typeof fetch !== "function") return [];
+  const signal = typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function" ? AbortSignal.timeout(CYMRU_TIMEOUT_MS) : void 0;
+  for (const endpoint of DOH_ENDPOINTS) {
+    try {
+      const response = await fetch(`${endpoint}?name=${encodeURIComponent(name)}&type=TXT`, {
+        headers: { accept: "application/dns-json" },
+        signal
+      });
+      if (!response.ok) continue;
+      const payload = await response.json();
+      const answers = Array.isArray(payload?.Answer) ? payload.Answer : [];
+      const records = answers.filter((answer) => typeof answer?.data === "string" && answer.data.length > 0).map((answer) => answer.data);
+      if (records.length) return records;
+    } catch {
+    }
+  }
+  return [];
+}
+function firstCymruRecord(raw) {
+  return String(raw ?? "").replace(/^"+|"+$/g, "").split(/"\s*"/)[0] ?? "";
+}
+function parseCymruOriginLine(raw) {
+  const fields = firstCymruRecord(raw).split("|").map((field) => field.trim());
+  const asn = Number.parseInt(fields[0] ?? "", 10);
+  if (!Number.isInteger(asn) || asn <= 0 || asn > 4294967295) return null;
+  return { asn, network: fields[1] ?? "", cc: (fields[2] ?? "").toUpperCase().slice(0, 2) };
+}
+async function lookupCymruByIp(ip) {
+  const text = String(ip ?? "").trim();
+  if (!text) return null;
+  const name = text.includes(":") ? `${ipv6ReverseNibbles(text).join(".")}.origin6.asn.cymru.com` : `${ipv4ReverseOctets(text).join(".")}.origin.asn.cymru.com`;
+  if (name.startsWith(".origin") || name.endsWith(".origin") || name.startsWith(".") || name.endsWith(".")) return null;
+  for (const record of await dohTextRecords(name)) {
+    const parsed = parseCymruOriginLine(record);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+async function lookupCymruAsName(asn) {
+  const key = `asname:${asn}`;
+  const cached = cacheGet(key);
+  if (cached !== void 0) return typeof cached === "string" ? cached : null;
+  for (const record of await dohTextRecords(`AS${asn}.asn.cymru.com`)) {
+    const fields = firstCymruRecord(record).split("|").map((field) => field.trim());
+    if (fields.length >= 5 && fields[4]) {
+      cacheSet(key, fields[4], ASN_META_TTL_MS);
+      return fields[4];
+    }
+  }
+  cacheSet(key, null, NEGATIVE_TTL_MS);
+  return null;
+}
+var EMPTY_NETWORK = () => ({
+  asn: "",
+  asn_name: "",
+  asn_network: "",
+  asn_type: "isp",
+  datacenter_result: false,
+  source: "none"
+});
+function cloneResult(result) {
+  return { ...result };
+}
+function toAsnNumber(value) {
+  if (typeof value === "number" && Number.isInteger(value) && value > 0 && value <= 4294967295) return value;
+  if (typeof value === "string") {
+    const parsed = Number.parseInt(value.replace(/^\s*[Aa][Ss]/, "").trim(), 10);
+    if (Number.isInteger(parsed) && parsed > 0 && parsed <= 4294967295) return parsed;
+  }
+  return null;
+}
+async function enrichNetwork(ip, edge = {}) {
+  try {
+    const ipClean = String(ip ?? "").trim();
+    const cacheKey = `ip:${ipClean}`;
+    const cached = cacheGet(cacheKey);
+    if (cached !== void 0 && typeof cached === "object" && cached !== null) {
+      return cloneResult(cached);
+    }
+    const edgeAsn = toAsnNumber(edge?.asn);
+    const edgeOrg = String(edge?.asOrganization ?? "").trim();
+    if (edgeAsn && edgeOrg) {
+      const entry = registryEntryForAsn(edgeAsn);
+      const heuristic = entry ? null : heuristicAsnType(cleanEdgeAsOrg(edgeOrg));
+      const result = {
+        asn: String(edgeAsn),
+        asn_name: cleanEdgeAsOrg(edgeOrg),
+        asn_network: registryEntryForIp(ipClean)?.prefix ?? "",
+        asn_type: entry?.asn_type ?? heuristic?.type ?? "isp",
+        datacenter_result: entry ? entry.datacenter_result : heuristic?.datacenter ?? false,
+        source: "edge"
+      };
+      cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+      return result;
+    }
+    const prefixMatch = registryEntryForIp(ipClean);
+    if (prefixMatch) {
+      const result = {
+        asn: String(prefixMatch.entry.asn),
+        asn_name: prefixMatch.entry.asn_name,
+        asn_network: prefixMatch.prefix,
+        asn_type: prefixMatch.entry.asn_type,
+        datacenter_result: prefixMatch.entry.datacenter_result,
+        source: "registry"
+      };
+      cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+      return result;
+    }
+    if (edgeAsn) {
+      const entry = registryEntryForAsn(edgeAsn);
+      if (entry) {
+        const result = {
+          asn: String(edgeAsn),
+          asn_name: entry.asn_name,
+          asn_network: "",
+          asn_type: entry.asn_type,
+          datacenter_result: entry.datacenter_result,
+          source: "registry"
+        };
+        cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+        return result;
+      }
+    }
+    if (edgeOrg) {
+      const heuristic = heuristicAsnType(edgeOrg);
+      const result = {
+        asn: "",
+        asn_name: cleanEdgeAsOrg(edgeOrg),
+        asn_network: "",
+        asn_type: heuristic.type,
+        datacenter_result: heuristic.datacenter,
+        source: "edge"
+      };
+      cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+      return result;
+    }
+    const cymru = await lookupCymruByIp(ipClean);
+    if (cymru) {
+      const entry = registryEntryForAsn(cymru.asn);
+      let asnName = entry?.asn_name ?? "";
+      let asnType = entry?.asn_type;
+      let datacenter = entry?.datacenter_result;
+      if (!asnName) {
+        const rawName = await lookupCymruAsName(cymru.asn);
+        if (rawName) {
+          asnName = cleanCymruAsName(rawName);
+          const heuristic = heuristicAsnType(asnName);
+          asnType = heuristic.type;
+          datacenter = heuristic.datacenter;
+        }
+      }
+      const result = {
+        asn: String(cymru.asn),
+        asn_name: asnName,
+        asn_network: cymru.network || "",
+        asn_type: asnType ?? "isp",
+        datacenter_result: datacenter ?? false,
+        source: "cymru"
+      };
+      cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+      return result;
+    }
+    const empty = EMPTY_NETWORK();
+    cacheSet(cacheKey, empty, NEGATIVE_TTL_MS);
+    return empty;
+  } catch {
+    return EMPTY_NETWORK();
+  }
+}
+
+// src/server/identity/identityIndex.ts
+var IDENTITY_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS visitor_profiles (
+  visitor_id TEXT PRIMARY KEY,
+  profile_json TEXT,
+  hardware_fingerprint TEXT,
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_visitor_profiles_hw ON visitor_profiles(hardware_fingerprint);
+CREATE INDEX IF NOT EXISTS idx_visitor_profiles_updated ON visitor_profiles(updated_at_utc);
+
+CREATE TABLE IF NOT EXISTS identity_blocks (
+  bucket_key TEXT NOT NULL,
+  visitor_id TEXT NOT NULL,
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL,
+  PRIMARY KEY (bucket_key, visitor_id)
+);
+CREATE INDEX IF NOT EXISTS idx_identity_blocks_key ON identity_blocks(bucket_key);
+CREATE INDEX IF NOT EXISTS idx_identity_blocks_visitor ON identity_blocks(visitor_id);
+
+CREATE TABLE IF NOT EXISTS visitor_links (
+  visitor_id TEXT NOT NULL,
+  hardware_fingerprint TEXT NOT NULL,
+  link_mode TEXT,
+  link_score REAL,
+  created_at_utc TEXT NOT NULL,
+  last_seen_utc TEXT NOT NULL,
+  PRIMARY KEY (visitor_id, hardware_fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_visitor_links_hw ON visitor_links(hardware_fingerprint);
+`;
+function ensureIdentitySchema(db2) {
+  db2.exec(IDENTITY_SCHEMA_SQL);
+}
+function normalizeText(value) {
+  if (typeof value !== "string") return "";
+  return value.trim().toLowerCase();
+}
+function normalizeInt(value) {
+  const num = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(num) ? Math.floor(num) : null;
+}
+function hexHash(text) {
+  return fnv1a64(text).toString(16).padStart(16, "0");
+}
+function networkBucket(net2) {
+  const ip = normalizeText(net2?.ip);
+  const asn = normalizeText(net2?.asn);
+  if (ip) {
+    const octets = ip.split(".");
+    if (octets.length === 4 && octets.every((o) => /^\d{1,3}$/.test(o))) {
+      return octets.slice(0, 3).join(".");
+    }
+  }
+  return asn || "unknown";
+}
+function screenBucket(screen) {
+  const width = normalizeInt(screen?.width);
+  const height = normalizeInt(screen?.height);
+  return width !== null && height !== null ? `${width}x${height}` : "unknown";
+}
+var FNV_OFFSET_64 = 0xcbf29ce484222325n;
+var FNV_PRIME_64 = 0x00000100000001b3n;
+var MASK_64 = 0xffffffffffffffffn;
+function fnv1a64(input) {
+  let hash = FNV_OFFSET_64;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= BigInt(input.charCodeAt(i) & 255);
+    hash = hash * FNV_PRIME_64 & MASK_64;
+  }
+  return hash;
+}
+function simhash64(tokens) {
+  const votes = new Array(64).fill(0);
+  for (const token of tokens) {
+    const hash = fnv1a64(normalizeText(token));
+    for (let bit = 0; bit < 64; bit += 1) {
+      votes[bit] += hash >> BigInt(bit) & 1n ? 1 : -1;
+    }
+  }
+  let out = 0n;
+  for (let bit = 0; bit < 64; bit += 1) {
+    if (votes[bit] > 0) out |= 1n << BigInt(bit);
+  }
+  return out;
+}
+function bandHex(simhash, band) {
+  const slice = simhash >> BigInt(band * 16) & 0xffffn;
+  return slice.toString(16).padStart(4, "0");
+}
+function canonicalIdentityFeatures(profile) {
+  const tokens = [];
+  const push = (prefix, value) => {
+    const text = normalizeText(value);
+    if (text) tokens.push(`${prefix}:${text}`);
+  };
+  push("hw", profile.hardwareFingerprint);
+  const gpu = [normalizeText(profile.gpu?.vendor), normalizeText(profile.gpu?.renderer)].filter(Boolean).join("|");
+  if (gpu) tokens.push(`gpu:${gpu}`);
+  push("os", profile.os?.family);
+  push("tz", profile.timezone);
+  const screen = screenBucket(profile.screen);
+  if (screen !== "unknown") tokens.push(`screen:${screen}`);
+  const fontsCount = normalizeInt(profile.fonts?.count);
+  if (fontsCount !== null && fontsCount > 0) tokens.push(`fonts:${fontsCount}`);
+  const cores = normalizeInt(profile.cpu?.cores);
+  if (cores !== null && cores > 0) tokens.push(`cpu:${cores}`);
+  push("cpuarch", profile.cpu?.architecture);
+  push("canvas", profile.canvas?.hash);
+  push("webgl", profile.webgl?.hash);
+  push("audio", profile.audio?.hash);
+  push("browser", profile.browser?.family);
+  const langs = (profile.languages ?? []).map((lang) => normalizeText(lang)).filter(Boolean).slice(0, 6).join(",");
+  if (langs) tokens.push(`langs:${langs}`);
+  return tokens;
+}
+var MIN_TOKENS_FOR_BANDS = 3;
+function blockKeysFor(profile) {
+  const keys = /* @__PURE__ */ new Set();
+  const hardware = normalizeText(profile.hardwareFingerprint);
+  if (hardware) keys.add(`hw_hash:${hexHash(hardware)}`);
+  const gpuText = [normalizeText(profile.gpu?.vendor), normalizeText(profile.gpu?.renderer)].filter(Boolean).join("|");
+  const osFamily = normalizeText(profile.os?.family);
+  const timezone = normalizeText(profile.timezone);
+  if (gpuText && (osFamily || timezone)) {
+    keys.add(`block_gpu:${hexHash(gpuText)}:${osFamily}:${timezone}`);
+  }
+  const net2 = networkBucket(profile.net);
+  const screen = screenBucket(profile.screen);
+  if (net2 !== "unknown" || screen !== "unknown") {
+    keys.add(`block_net:${net2}:${screen}`);
+  }
+  const tokens = canonicalIdentityFeatures(profile);
+  if (tokens.length >= MIN_TOKENS_FOR_BANDS) {
+    const simhash = simhash64(tokens);
+    for (let band = 0; band < 4; band += 1) keys.add(`band_${band}:${bandHex(simhash, band)}`);
+  }
+  return [...keys];
+}
+function upsertBlocks(db2, visitorId, keys, nowUtc) {
+  const statement = db2.prepare(
+    `INSERT INTO identity_blocks (bucket_key, visitor_id, created_at_utc, updated_at_utc)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(bucket_key, visitor_id) DO UPDATE SET updated_at_utc = excluded.updated_at_utc`
+  );
+  for (const key of keys) {
+    if (typeof key !== "string" || key.length === 0) continue;
+    try {
+      statement.run(key, visitorId, nowUtc, nowUtc);
+    } catch {
+    }
+  }
+}
+function sanitizeLimit(limit) {
+  const num = Math.floor(limit);
+  return Number.isFinite(num) && num > 0 ? Math.min(num, 500) : 200;
+}
+function findCandidates(db2, keys, limit = 200) {
+  const capped = sanitizeLimit(limit);
+  const perKey = Math.max(10, Math.ceil(capped / 2));
+  const seen = /* @__PURE__ */ new Map();
+  const statement = db2.prepare(
+    `SELECT visitor_id FROM identity_blocks WHERE bucket_key = ? ORDER BY updated_at_utc DESC LIMIT ${perKey}`
+  );
+  for (const key of keys) {
+    if (typeof key !== "string" || key.length === 0) continue;
+    let rows = [];
+    try {
+      rows = statement.all(key);
+    } catch {
+      continue;
+    }
+    for (const row of rows) {
+      const candidateId = typeof row?.visitor_id === "string" ? row.visitor_id : "";
+      if (!candidateId) continue;
+      if (!seen.has(candidateId)) seen.set(candidateId, candidateId);
+    }
+  }
+  return [...seen.keys()].slice(0, capped);
+}
+function loadVisitorProfile(db2, visitorId) {
+  if (typeof visitorId !== "string" || visitorId.length === 0) return null;
+  try {
+    const row = db2.prepare("SELECT * FROM visitor_profiles WHERE visitor_id = ?").get(visitorId);
+    if (!row || typeof row.visitor_id !== "string") return null;
+    let profile = null;
+    if (typeof row.profile_json === "string" && row.profile_json.length > 0) {
+      try {
+        profile = JSON.parse(row.profile_json);
+      } catch {
+        profile = null;
+      }
+    }
+    return {
+      visitor_id: row.visitor_id,
+      hardware_fingerprint: typeof row.hardware_fingerprint === "string" ? row.hardware_fingerprint : null,
+      profile,
+      profile_json: typeof row.profile_json === "string" ? row.profile_json : null,
+      created_at_utc: typeof row.created_at_utc === "string" ? row.created_at_utc : "",
+      updated_at_utc: typeof row.updated_at_utc === "string" ? row.updated_at_utc : ""
+    };
+  } catch {
+    return null;
+  }
+}
+
+// src/shared/matching/compareFingerprints.ts
+var FAMILY_ORDER = [
+  "gpu",
+  "cpu",
+  "screen",
+  "timezone",
+  "fonts",
+  "mediaDevices",
+  "canvas",
+  "webgl",
+  "audio",
+  "fontPrefs",
+  "misc"
+];
+var WEIGHT_MATRIX = {
+  exact: {
+    gpu: 15,
+    cpu: 10,
+    screen: 8,
+    timezone: 5,
+    fonts: 10,
+    mediaDevices: 2,
+    canvas: 15,
+    webgl: 10,
+    audio: 10,
+    fontPrefs: 7,
+    misc: 8
+  },
+  strict: {
+    gpu: 18,
+    cpu: 12,
+    screen: 10,
+    timezone: 6,
+    fonts: 12,
+    mediaDevices: 2,
+    canvas: 14,
+    webgl: 8,
+    audio: 8,
+    fontPrefs: 5,
+    misc: 5
+  },
+  lenient: {
+    gpu: 22,
+    cpu: 15,
+    screen: 12,
+    timezone: 8,
+    fonts: 13,
+    mediaDevices: 4,
+    canvas: 8,
+    webgl: 6,
+    audio: 5,
+    fontPrefs: 4,
+    misc: 3
+  },
+  "cross-browser": {
+    gpu: 30,
+    cpu: 20,
+    screen: 16,
+    timezone: 12,
+    fonts: 16,
+    mediaDevices: 6,
+    canvas: 0,
+    webgl: 0,
+    audio: 0,
+    fontPrefs: 0,
+    misc: 0
+  },
+  "hardware-only": {
+    gpu: 32,
+    cpu: 22,
+    screen: 18,
+    timezone: 12,
+    fonts: 10,
+    mediaDevices: 6,
+    canvas: 0,
+    webgl: 0,
+    audio: 0,
+    fontPrefs: 0,
+    misc: 0
+  },
+  "engine-only": {
+    gpu: 0,
+    cpu: 0,
+    screen: 0,
+    timezone: 0,
+    fonts: 10,
+    mediaDevices: 0,
+    canvas: 25,
+    webgl: 20,
+    audio: 18,
+    fontPrefs: 12,
+    misc: 15
+  }
+};
+var MODE_THRESHOLDS = {
+  exact: 100,
+  strict: 92,
+  lenient: 82,
+  "cross-browser": 85,
+  "hardware-only": 88,
+  "engine-only": 85
+};
+function jaccardSet(a, b) {
+  const norm = (list) => (list ?? []).filter((x) => typeof x === "string" && x.trim().length > 0).map((x) => x.trim().toLowerCase());
+  const setA = new Set(norm(a));
+  const setB = new Set(norm(b));
+  if (setA.size === 0 && setB.size === 0) return 1;
+  if (setA.size === 0 || setB.size === 0) return 0;
+  let intersection = 0;
+  for (const item of setA) if (setB.has(item)) intersection += 1;
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+var FNV_OFFSET_B = 2166136261 ^ 3735928559;
+var OS_FONT_TABLE = {
+  windows: [
+    "arial",
+    "calibri",
+    "cambria",
+    "candara",
+    "comic sans ms",
+    "consolas",
+    "constantia",
+    "corbel",
+    "courier new",
+    "georgia",
+    "impact",
+    "lucida console",
+    "lucida sans unicode",
+    "microsoft sans serif",
+    "palatino linotype",
+    "segoe ui",
+    "tahoma",
+    "times new roman",
+    "trebuchet ms",
+    "verdana"
+  ],
+  mac: [
+    "american typewriter",
+    "andale mono",
+    "arial",
+    "arial black",
+    "arial narrow",
+    "avenir next",
+    "baskerville",
+    "big caslon",
+    "chalkboard",
+    "chalkduster",
+    "cochin",
+    "comic sans ms",
+    "courier",
+    "courier new",
+    "didot",
+    "futura",
+    "geneva",
+    "georgia",
+    "gill sans",
+    "helvetica",
+    "helvetica neue",
+    "impact",
+    "lucida grande",
+    "menlo",
+    "monaco",
+    "optima",
+    "palatino",
+    "tahoma",
+    "times",
+    "times new roman",
+    "trebuchet ms",
+    "verdana"
+  ],
+  linux: [
+    "dejavu sans",
+    "dejavu sans mono",
+    "dejavu serif",
+    "liberation mono",
+    "liberation sans",
+    "liberation serif",
+    "noto sans",
+    "noto serif",
+    "ubuntu"
+  ],
+  android: ["roboto", "noto sans", "noto serif", "droid sans", "droid serif"],
+  ios: [
+    "american typewriter",
+    "andale mono",
+    "arial",
+    "arial black",
+    "arial narrow",
+    "baskerville",
+    "cochin",
+    "comic sans ms",
+    "courier",
+    "courier new",
+    "georgia",
+    "helvetica",
+    "helvetica neue",
+    "impact",
+    "menlo",
+    "palatino",
+    "tahoma",
+    "times new roman",
+    "trebuchet ms",
+    "verdana",
+    "snell roundhand"
+  ]
+};
+function isOsShippedOn(font, platformClass) {
+  const list = OS_FONT_TABLE[platformClass.toLowerCase()];
+  if (!list) return true;
+  return list.indexOf(font) !== -1;
+}
+function str(v) {
+  return typeof v === "string" ? v.trim() : "";
+}
+function gpuSim(s, i) {
+  const a = s.gpu;
+  const b = i.gpu;
+  if (!a && !b) return null;
+  if (!a || !b) return 0;
+  const ga = str(a.normalizedGpu).toLowerCase();
+  const gb = str(b.normalizedGpu).toLowerCase();
+  if (ga && gb) return ga === gb ? 1 : 0;
+  const ha = str(a.invariantLimitsHash).toLowerCase();
+  const hb = str(b.invariantLimitsHash).toLowerCase();
+  if (ha && hb) return ha === hb ? 0.6 : 0;
+  return null;
+}
+function cpuSim(s, i) {
+  const a = s.cpu;
+  const b = i.cpu;
+  if (!a && !b) return null;
+  if (!a || !b) return 0;
+  let comparable = 0;
+  let matched = 0;
+  const archA = str(a.arch).toLowerCase();
+  const archB = str(b.arch).toLowerCase();
+  if (archA && archB) {
+    comparable += 1;
+    if (archA !== archB) return 0;
+    matched += 1;
+  }
+  if (a.cores !== null && a.cores !== void 0 && b.cores !== null && b.cores !== void 0) {
+    comparable += 1;
+    if (a.cores === b.cores) matched += 1;
+  }
+  if (a.memoryGb !== null && a.memoryGb !== void 0 && b.memoryGb !== null && b.memoryGb !== void 0) {
+    comparable += 1;
+    if (a.memoryGb === b.memoryGb) matched += 1;
+  }
+  return comparable === 0 ? null : matched / comparable;
+}
+function screenSim(s, i) {
+  const a = s.screen;
+  const b = i.screen;
+  if (!a && !b) return null;
+  if (!a || !b) return 0;
+  const w1 = typeof a.width === "number" ? a.width : 0;
+  const h1 = typeof a.height === "number" ? a.height : 0;
+  const w2 = typeof b.width === "number" ? b.width : 0;
+  const h2 = typeof b.height === "number" ? b.height : 0;
+  if (!w1 || !h1 || !w2 || !h2) return 0;
+  if (w1 === w2 && h1 === h2) return 1;
+  const dpr1 = typeof a.dpr === "number" && a.dpr > 0 ? a.dpr : 1;
+  const dpr2 = typeof b.dpr === "number" && b.dpr > 0 ? b.dpr : 1;
+  const r1 = w1 / h1;
+  const r2 = w2 / h2;
+  if (Math.abs(r1 - r2) > 0.02) return 0;
+  const nearMultiplier = (x) => ZOOM_MULTIPLIERS.some((m) => Math.abs(x - m) <= 0.02 * m);
+  const raw = w2 / w1;
+  const dprScaled = w2 * dpr2 / (w1 * dpr1);
+  if (nearMultiplier(raw) || nearMultiplier(1 / raw) || nearMultiplier(dprScaled) || nearMultiplier(1 / dprScaled)) {
+    return 0.85;
+  }
+  return 0;
+}
+var ZOOM_MULTIPLIERS = [0.75, 0.8, 0.9, 1.1, 1.25, 1.5];
+function timezoneSim(s, i) {
+  const a = s.timezone;
+  const b = i.timezone;
+  if (!a && !b) return null;
+  if (!a || !b) return 0;
+  const nameA = str(a.name).toLowerCase();
+  const nameB = str(b.name).toLowerCase();
+  if (nameA && nameB) return nameA === nameB ? 1 : 0;
+  const oA = typeof a.offsetMinutes === "number" ? a.offsetMinutes : null;
+  const oB = typeof b.offsetMinutes === "number" ? b.offsetMinutes : null;
+  if (oA !== null && oB !== null) return Math.abs(oA - oB) <= 1 ? 0.7 : 0;
+  return null;
+}
+function fontsSim(s, i, mode) {
+  const a = s.fonts;
+  const b = i.fonts;
+  if (!a && !b) return null;
+  if (!a || !b) return 0;
+  const listA = Array.isArray(a.list) ? a.list : [];
+  const listB = Array.isArray(b.list) ? b.list : [];
+  if (mode === "cross-browser") {
+    const pcA = str(a.platformClass).toLowerCase();
+    const pcB = str(b.platformClass).toLowerCase();
+    const filteredA = listA.filter(
+      (f) => isOsShippedOn(f.toLowerCase(), pcA) && isOsShippedOn(f.toLowerCase(), pcB)
+    );
+    const filteredB = listB.filter(
+      (f) => isOsShippedOn(f.toLowerCase(), pcA) && isOsShippedOn(f.toLowerCase(), pcB)
+    );
+    const useA = filteredA.length > 0 ? filteredA : listA;
+    const useB = filteredB.length > 0 ? filteredB : listB;
+    const j = jaccardSet(useA, useB);
+    return j >= 0.85 ? 1 : j * 0.5;
+  }
+  return jaccardSet(listA, listB);
+}
+function mediaDeviceBit(v) {
+  if (v === null || v === void 0) return null;
+  if (typeof v === "boolean") return v ? "1" : "0";
+  if (typeof v === "number" && isFinite(v)) return v > 0 ? "1" : "0";
+  return null;
+}
+function mediaDevicesSim(s, i) {
+  const a = s.mediaDevices;
+  const b = i.mediaDevices;
+  if (!a && !b) return null;
+  if (!a || !b) return 0;
+  const pairs = [
+    [a.audioIn, b.audioIn],
+    [a.audioOut, b.audioOut],
+    [a.video, b.video]
+  ];
+  let comparable = 0;
+  let matched = 0;
+  for (const [x, y] of pairs) {
+    const vx = mediaDeviceBit(x);
+    const vy = mediaDeviceBit(y);
+    if (vx === null || vy === null) continue;
+    comparable += 1;
+    if (vx === vy) matched += 1;
+  }
+  return comparable === 0 ? null : matched / comparable;
+}
+function canvasSim(s, i, mode) {
+  const a = s.canvas;
+  const b = i.canvas;
+  if (!a && !b) return null;
+  if (!a || !b) return 0;
+  const geoWeight = mode === "lenient" ? 2 : 1;
+  let total = 0;
+  let matched = 0;
+  const geoA = str(a.geometry);
+  const geoB = str(b.geometry);
+  if (geoA && geoB) {
+    total += geoWeight;
+    if (geoA === geoB) matched += geoWeight;
+  }
+  const textA = str(a.text);
+  const textB = str(b.text);
+  if (textA && textB) {
+    total += 1;
+    if (textA === textB) matched += 1;
+  }
+  const stA = str(a.stabilized);
+  const stB = str(b.stabilized);
+  if (stA && stB) {
+    total += 1;
+    if (stA === stB) matched += 1;
+  }
+  return total === 0 ? null : matched / total;
+}
+function webglSim(s, i) {
+  const a = s.webgl;
+  const b = i.webgl;
+  if (!a && !b) return null;
+  if (!a || !b) return 0;
+  const pairs = [
+    [a.extensionsHash, b.extensionsHash],
+    [a.paramsHash, b.paramsHash],
+    [a.shaderPrecisionHash, b.shaderPrecisionHash]
+  ];
+  let comparable = 0;
+  let matched = 0;
+  for (const [x, y] of pairs) {
+    const vx = str(x);
+    const vy = str(y);
+    if (!vx || !vy) continue;
+    comparable += 1;
+    if (vx.toLowerCase() === vy.toLowerCase()) matched += 1;
+  }
+  return comparable === 0 ? null : matched / comparable;
+}
+function audioSim(s, i) {
+  const a = s.audio;
+  const b = i.audio;
+  if (a !== null && a !== void 0 && a.braveFlag === true || b !== null && b !== void 0 && b.braveFlag === true) {
+    return null;
+  }
+  if (!a && !b) return null;
+  if (!a || !b) return 0;
+  const sumA = a.sum;
+  const sumB = b.sum;
+  const hasA = typeof sumA === "number" && isFinite(sumA);
+  const hasB = typeof sumB === "number" && isFinite(sumB);
+  if (!hasA && !hasB) return null;
+  if (!hasA || !hasB) return 0;
+  const delta = Math.abs(sumA - sumB);
+  const scale = Math.max(Math.abs(sumA), Math.abs(sumB), 1e-12);
+  const relative = delta / scale;
+  let score;
+  if (relative < 1e-9) score = 1;
+  else if (relative < 1e-4) score = 0.9;
+  else score = 0;
+  const blA = a.baseLatency;
+  const blB = b.baseLatency;
+  if (typeof blA === "number" && isFinite(blA) && blA > 0 && typeof blB === "number" && isFinite(blB) && blB > 0) {
+    const rel = Math.abs(blA - blB) / Math.max(blA, blB);
+    if (rel >= 1e-4) score = Math.min(score, 0.5);
+  }
+  return score;
+}
+function fontPrefsSim(s, i) {
+  const a = s.fontPrefs;
+  const b = i.fontPrefs;
+  if (!a && !b) return null;
+  if (!a || !b) return 0;
+  const widthsA = a.widths && typeof a.widths === "object" ? a.widths : {};
+  const widthsB = b.widths && typeof b.widths === "object" ? b.widths : {};
+  const keys = Object.keys(widthsA).filter((k) => Object.prototype.hasOwnProperty.call(widthsB, k));
+  let widthComparable = 0;
+  let widthMatched = 0;
+  for (const k of keys) {
+    const x = widthsA[k];
+    const y = widthsB[k];
+    if (x === null || x === void 0 || y === null || y === void 0) continue;
+    if (typeof x !== "number" || typeof y !== "number") continue;
+    widthComparable += 1;
+    if (Math.abs(x - y) < 1e-9) widthMatched += 1;
+  }
+  const widthRatio = widthComparable === 0 ? null : widthMatched / widthComparable;
+  const emojiA = str(a.emojiRectHash);
+  const emojiB = str(b.emojiRectHash);
+  const emojiEq = emojiA && emojiB ? emojiA.toLowerCase() === emojiB.toLowerCase() ? 1 : 0 : null;
+  if (widthRatio === null && emojiEq === null) return null;
+  if (widthRatio === null) return emojiEq;
+  if (emojiEq === null) return widthRatio;
+  return 0.5 * widthRatio + 0.5 * emojiEq;
+}
+function miscSim(s, i) {
+  const a = s.misc;
+  const b = i.misc;
+  if (!a && !b) return null;
+  if (!a || !b) return 0;
+  let comparable = 0;
+  let matched = 0;
+  const mA = str(a.mathHash);
+  const mB = str(b.mathHash);
+  if (mA && mB) {
+    comparable += 1;
+    if (mA.toLowerCase() === mB.toLowerCase()) matched += 1;
+  }
+  const eA = str(a.errorStackHash);
+  const eB = str(b.errorStackHash);
+  if (eA && eB) {
+    comparable += 1;
+    if (eA.toLowerCase() === eB.toLowerCase()) matched += 1;
+  }
+  return comparable === 0 ? null : matched / comparable;
+}
+var FAMILY_KERNELS = {
+  gpu: (s, i) => gpuSim(s, i),
+  cpu: (s, i) => cpuSim(s, i),
+  screen: (s, i) => screenSim(s, i),
+  timezone: (s, i) => timezoneSim(s, i),
+  fonts: (s, i, mode) => fontsSim(s, i, mode),
+  mediaDevices: (s, i) => mediaDevicesSim(s, i),
+  canvas: (s, i, mode) => canvasSim(s, i, mode),
+  webgl: (s, i) => webglSim(s, i),
+  audio: (s, i) => audioSim(s, i),
+  fontPrefs: (s, i) => fontPrefsSim(s, i),
+  misc: (s, i) => miscSim(s, i)
+};
+var HARD_VIOLATION_OS = "os_family_mismatch";
+var HARD_VIOLATION_ARCH = "cpu_arch_mismatch";
+var VIOLATION_DOWNGRADE = "version_downgrade_anomaly";
+var NOTE_DRIFT = "version_upgrade_drift_allowed";
+function normalizeArch(arch) {
+  const a = (arch ?? "").trim().toLowerCase();
+  if (a === "amd64" || a === "x64" || a === "x86-64" || a === "x86_64" || a === "wow64") return "x86_64";
+  if (a === "arm64" || a === "aarch64") return "arm64";
+  if (a === "i386" || a === "i486" || a === "i586" || a === "i686" || a === "x86") return "x86";
+  if (a.indexOf("arm") !== -1) return "arm";
+  return a;
+}
+function hardwareSignalsMatch(raws) {
+  const checks = [];
+  const gpu = raws.gpu;
+  if (gpu !== null) checks.push(gpu >= 0.6);
+  const screen = raws.screen;
+  if (screen !== null) checks.push(screen >= 0.85);
+  const cpu = raws.cpu;
+  if (cpu !== null) checks.push(cpu > 0);
+  if (checks.length === 0) return false;
+  return checks.every(Boolean);
+}
+function audioDrifted(s, i) {
+  const a = s.audio;
+  const b = i.audio;
+  if (!a || !b) return false;
+  const sumA = a.sum;
+  const sumB = b.sum;
+  if (typeof sumA !== "number" || !isFinite(sumA) || typeof sumB !== "number" || !isFinite(sumB)) return false;
+  const scale = Math.max(Math.abs(sumA), Math.abs(sumB), 1e-12);
+  return Math.abs(sumA - sumB) / scale >= 1e-4;
+}
+function round3(x) {
+  return Math.round(x * 1e3) / 1e3;
+}
+function blankPerFamily(weights) {
+  const out = {};
+  for (const family of FAMILY_ORDER) {
+    out[family] = { similarity: -1, weight: weights[family], contribution: 0 };
+  }
+  return out;
+}
+function compareFingerprints(stored, incoming, mode) {
+  const safeMode = WEIGHT_MATRIX[mode] ? mode : "exact";
+  const weights = WEIGHT_MATRIX[safeMode];
+  const s = stored && typeof stored === "object" ? stored : {};
+  const i = incoming && typeof incoming === "object" ? incoming : {};
+  const raws = {};
+  for (const family of FAMILY_ORDER) {
+    let sim = null;
+    try {
+      sim = FAMILY_KERNELS[family](s, i, safeMode);
+    } catch {
+      sim = null;
+    }
+    raws[family] = sim === null || !isFinite(sim) ? null : Math.max(0, Math.min(1, sim));
+  }
+  const violations = [];
+  const vs = s.versions;
+  const vi = i.versions;
+  const famA = str(vs?.browserFamily).toLowerCase();
+  const famB = str(vi?.browserFamily).toLowerCase();
+  const sameFamily = Boolean(famA && famB && famA === famB);
+  const majorA = vs && typeof vs.browserMajor === "number" && isFinite(vs.browserMajor) ? vs.browserMajor : null;
+  const majorB = vi && typeof vi.browserMajor === "number" && isFinite(vi.browserMajor) ? vi.browserMajor : null;
+  let driftAllowed = false;
+  if (sameFamily && majorA !== null && majorB !== null) {
+    const delta = majorB - majorA;
+    if (delta < 0) {
+      violations.push(VIOLATION_DOWNGRADE);
+    } else if (delta <= 3 && hardwareSignalsMatch(raws)) {
+      driftAllowed = true;
+    }
+  }
+  if (driftAllowed) {
+    const canvasBoth = Boolean(s.canvas && i.canvas);
+    const canvasDrift = canvasBoth && str(s.canvas.geometry) && str(s.canvas.geometry) === str(i.canvas.geometry) && str(s.canvas.text) && str(i.canvas.text) && str(s.canvas.text) !== str(i.canvas.text);
+    const audioDrift = audioDrifted(s, i);
+    if (canvasDrift) {
+      raws.canvas = 1;
+      violations.push(NOTE_DRIFT);
+    } else if (audioDrift) {
+      raws.audio = 1;
+      violations.push(NOTE_DRIFT);
+    }
+  }
+  const osA = str(s.cpu?.osFamily).toLowerCase();
+  const osB = str(i.cpu?.osFamily).toLowerCase();
+  const archA = normalizeArch(str(s.cpu?.arch));
+  const archB = normalizeArch(str(i.cpu?.arch));
+  const osMismatch = Boolean(osA && osB && osA !== osB);
+  const archMismatch = Boolean(archA && archB && archA !== archB);
+  if (osMismatch) violations.push(HARD_VIOLATION_OS);
+  if (archMismatch) violations.push(HARD_VIOLATION_ARCH);
+  const perFamily = blankPerFamily(weights);
+  let weighted = 0;
+  let weightSum = 0;
+  const diffVector = [];
+  for (const family of FAMILY_ORDER) {
+    const sim = raws[family];
+    const weight = weights[family];
+    if (sim === null) {
+      diffVector.push(-1);
+      continue;
+    }
+    diffVector.push(round3(sim));
+    perFamily[family].similarity = round3(sim);
+    perFamily[family].contribution = weight * sim;
+    weighted += weight * sim;
+    weightSum += weight;
+  }
+  const matchScore = weightSum > 0 ? round3(weighted / weightSum * 100) : 0;
+  let veto = false;
+  if (safeMode !== "engine-only" && (osMismatch || archMismatch)) veto = true;
+  if (safeMode !== "engine-only" && violations.indexOf(VIOLATION_DOWNGRADE) !== -1) veto = true;
+  const threshold = MODE_THRESHOLDS[safeMode];
+  let match = !veto && matchScore >= threshold;
+  if (safeMode === "exact" && weightSum < 100) match = false;
+  const hwFamilies = ["gpu", "cpu", "screen"];
+  let hwWeighted = 0;
+  let hwWeightSum = 0;
+  for (const family of hwFamilies) {
+    const sim = raws[family];
+    if (sim === null) continue;
+    hwWeighted += weights[family] * sim;
+    hwWeightSum += weights[family];
+  }
+  let hardwareMatch = hwWeightSum > 0 ? hwWeighted / hwWeightSum >= 0.85 : false;
+  if (safeMode === "cross-browser" && (raws.fonts ?? 0) >= 0.85) hardwareMatch = true;
+  return {
+    matchScore,
+    match,
+    hardwareMatch,
+    mode: safeMode,
+    constraintViolations: violations,
+    diffVector,
+    perFamily
+  };
+}
+function bestMode(stored, incoming) {
+  const order = ["lenient", "cross-browser", "hardware-only"];
+  let best = null;
+  for (const mode of order) {
+    try {
+      const result = compareFingerprints(stored, incoming, mode);
+      if (result.match) return mode;
+      if (best === null || result.matchScore > best.score) {
+        best = { mode, score: result.matchScore };
+      }
+    } catch {
+    }
+  }
+  return best === null ? "lenient" : best.mode;
+}
+
+// src/server/identity/confidenceScorer.ts
+var SCORE_VERSION = "2.0";
+var MIN_SCORE = 0.1;
+var MAX_SCORE = 0.999;
+var MAX_ENTROPY_BONUS = 0.014;
+var HARDWARE_FLAG_HINTS = [
+  "gpu",
+  "canvas",
+  "webgl",
+  "font",
+  "screen",
+  "audio",
+  "hardware",
+  "core",
+  "memory",
+  "texture",
+  "resolution",
+  "color_depth",
+  "device_memory",
+  "cpu"
+];
+function round4(value) {
+  return Math.round(value * 1e4) / 1e4;
+}
+function clamp(value, min, max) {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, value));
+}
+function isHardwareContradiction(flag) {
+  const text = String(flag ?? "").toLowerCase();
+  if (!text) return false;
+  return HARDWARE_FLAG_HINTS.some((hint) => text.includes(hint));
+}
+function baseTierForMatch(input, reasons) {
+  const mode = String(input.match_mode ?? "none");
+  const matchScore = clamp(Number(input.match_score ?? 0), 0, 100);
+  const entropy = input.entropy ?? {};
+  const deterministicHardware = Boolean(entropy.deterministicCanvas) && Boolean(entropy.unmaskedWebgl);
+  if (mode === "exact") {
+    if (input.storage_healed) {
+      reasons.push("exact_match_storage_confirmed");
+      return 0.985;
+    }
+    reasons.push(
+      input.incognito ? deterministicHardware ? "exact_match_incognito_deterministic_hardware" : "exact_match_incognito_storage_missing" : "exact_match_storage_missing"
+    );
+    return 0.96;
+  }
+  if (mode === "lenient") {
+    const base = 0.91 + 0.05 * (matchScore - 82) / 18;
+    reasons.push(`lenient_upgrade_match_score_${Math.round(matchScore)}`);
+    return base;
+  }
+  if (mode === "cross_browser" || mode === "hardware") {
+    const base = 0.85 + 0.06 * (matchScore - 85) / 15;
+    reasons.push(`${mode === "hardware" ? "hardware_only" : "cross_browser"}_match_score_${Math.round(matchScore)}`);
+    return base;
+  }
+  if (input.isMobileIos) {
+    reasons.push("first_visit_ios_safari");
+    return 0.8;
+  }
+  reasons.push(input.firstSeenDesktop ? "first_visit_clean_desktop" : "first_visit");
+  return 0.9;
+}
+function entropyBonusFor(input, reasons) {
+  const entropy = input.entropy ?? {};
+  let bonus = 0;
+  if (entropy.deterministicCanvas === true) {
+    bonus += 4e-3;
+    reasons.push("entropy_deterministic_canvas");
+  }
+  if (entropy.unmaskedWebgl === true) {
+    bonus += 4e-3;
+    reasons.push("entropy_unmasked_webgl");
+  }
+  const fontsCount = Number(entropy.fontsCount ?? 0);
+  if (Number.isFinite(fontsCount) && fontsCount >= 12) {
+    bonus += 3e-3;
+    reasons.push(`entropy_fonts_count_${Math.round(fontsCount)}`);
+  }
+  if (entropy.deterministicAudio === true) {
+    bonus += 3e-3;
+    reasons.push("entropy_deterministic_audio");
+  }
+  return clamp(bonus, 0, MAX_ENTROPY_BONUS);
+}
+function consistencyPenaltyFor(input, reasons) {
+  const flags = (Array.isArray(input.consistencyFlags) ? input.consistencyFlags : []).filter((flag) => typeof flag === "string" && flag.trim().length > 0);
+  const hardwareFlags = flags.filter(isHardwareContradiction);
+  const benignFlags = flags.filter((flag) => !isHardwareContradiction(flag));
+  if (input.genuineSpoof === true) {
+    reasons.push("consistency_genuine_spoof");
+    for (const flag of flags) reasons.push(`consistency_flag:${flag}`);
+    return { penalty: 0.35, tampering: true, tamperingMlScore: 0.9, spoofLikelihood: "high" };
+  }
+  if (input.rfpOrTor === true) {
+    reasons.push("consistency_rfp_or_tor_uniformity");
+    return { penalty: 0.25, tampering: false, tamperingMlScore: 0, spoofLikelihood: "medium" };
+  }
+  if (input.braveShields === true && hardwareFlags.length === 0) {
+    reasons.push("consistency_brave_shields_no_hardware_contradiction");
+    return { penalty: 0.03, tampering: false, tamperingMlScore: 0, spoofLikelihood: "low" };
+  }
+  for (const flag of benignFlags) reasons.push(`consistency_flag:${flag}`);
+  if (hardwareFlags.length > 0) {
+    for (const flag of hardwareFlags) reasons.push(`consistency_hardware_flag:${flag}`);
+  }
+  return { penalty: 0, tampering: false, tamperingMlScore: 0, spoofLikelihood: "low" };
+}
+function scoreConfidence(input) {
+  try {
+    const reasons = [];
+    const baseTier = clamp(baseTierForMatch(input ?? {}, reasons), MIN_SCORE, MAX_SCORE);
+    const entropyBonus = entropyBonusFor(input ?? {}, reasons);
+    const consistency = consistencyPenaltyFor(input ?? {}, reasons);
+    const score = clamp(baseTier + entropyBonus - consistency.penalty, MIN_SCORE, MAX_SCORE);
+    return {
+      score: round4(score),
+      version: SCORE_VERSION,
+      breakdown: {
+        base_tier: round4(baseTier),
+        entropy_bonus: round4(entropyBonus),
+        penalty: round4(consistency.penalty),
+        reasons
+      },
+      tampering: consistency.tampering,
+      tampering_ml_score: consistency.tamperingMlScore,
+      spoof_likelihood: consistency.spoofLikelihood
+    };
+  } catch {
+    return {
+      score: MIN_SCORE,
+      version: SCORE_VERSION,
+      breakdown: { base_tier: MIN_SCORE, entropy_bonus: 0, penalty: 0, reasons: ["scorer_fallback"] },
+      tampering: false,
+      tampering_ml_score: 0,
+      spoof_likelihood: "low"
+    };
+  }
+}
+
+// src/server/identity/resolver.ts
+function normalizeText2(value) {
+  if (typeof value !== "string") return "";
+  return value.trim().toLowerCase();
+}
+function parseMajor(value) {
+  const text = normalizeText2(value);
+  const match = /^(\d{1,5})/.exec(text);
+  return match ? Number.parseInt(match[1], 10) : null;
+}
+function clampScore(score) {
+  const num = typeof score === "number" ? score : Number(score);
+  if (!Number.isFinite(num)) return 0;
+  return Math.min(100, Math.max(0, Math.round(num * 100) / 100));
+}
+function confidenceHint(mode, score, isMobileIos) {
+  return scoreConfidence({ match_mode: mode, match_score: score, isMobileIos }).score;
+}
+var LADDER_TIERS = [
+  { mode: "hardware", min: 88, priority: 3 },
+  { mode: "cross_browser", min: 85, priority: 2 },
+  { mode: "lenient", min: 82, priority: 1 }
+];
+var EXACT_PRIORITY = 4;
+var ENGINE_MODE_TIERS = {
+  exact: { mode: "exact", min: 100, priority: EXACT_PRIORITY },
+  strict: { mode: "lenient", min: 82, priority: 1 },
+  lenient: { mode: "lenient", min: 82, priority: 1 },
+  "cross-browser": { mode: "cross_browser", min: 85, priority: 2 },
+  "hardware-only": { mode: "hardware", min: 88, priority: 3 },
+  "engine-only": { mode: "cross_browser", min: 85, priority: 2 }
+};
+function tierForScore(score) {
+  for (const tier of LADDER_TIERS) {
+    if (score >= tier.min) return tier;
+  }
+  return null;
+}
+function normalizeComparison(raw) {
+  const obj = raw && typeof raw === "object" ? raw : {};
+  const score = clampScore(obj["match_score"] ?? obj["matchScore"] ?? obj["score"] ?? obj["similarity"]);
+  const violationsRaw = obj["constraintViolations"] ?? obj["constraint_violations"] ?? obj["violations"];
+  const violations = Array.isArray(violationsRaw) ? violationsRaw.filter((item) => typeof item === "string") : [];
+  const engineMode = typeof obj["mode"] === "string" ? obj["mode"] : null;
+  return { score, violations, engineMode };
+}
+var NEUTRAL_COMPARISON = { score: 0, violations: [], engineMode: null };
+function engineInput(profile) {
+  const source = profile ?? {};
+  const adapted = { ...source };
+  const timezone = source["timezone"];
+  const timezoneSignals = source["timezoneSignals"];
+  if ((timezone === null || timezone === void 0 || typeof timezone === "string") && timezoneSignals && typeof timezoneSignals === "object") {
+    adapted["timezone"] = timezoneSignals;
+  }
+  return adapted;
+}
+async function runEngine(incoming, stored) {
+  const engine = compareFingerprints;
+  if (typeof engine !== "function") return NEUTRAL_COMPARISON;
+  const storedInput = engineInput(stored);
+  const incomingInput = engineInput(incoming);
+  const pickMode = () => {
+    try {
+      const mode = bestMode(storedInput, incomingInput);
+      return typeof mode === "string" ? mode : "";
+    } catch {
+      return "";
+    }
+  };
+  const attempts = [
+    () => engine(storedInput, incomingInput, pickMode()),
+    () => engine(storedInput, incomingInput),
+    () => engine(incomingInput, storedInput),
+    () => engine({ stored: storedInput, incoming: incomingInput })
+  ];
+  for (const attempt of attempts) {
+    try {
+      const raw = await Promise.resolve(attempt());
+      if (raw && typeof raw === "object") {
+        return normalizeComparison(raw);
+      }
+    } catch {
+    }
+  }
+  return NEUTRAL_COMPARISON;
+}
+var ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+var ID_LENGTH = 20;
+function randomIdByte() {
+  const cryptoRef = globalThis.crypto;
+  if (typeof cryptoRef?.getRandomValues !== "function") return null;
+  const buffer = new Uint8Array(1);
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    cryptoRef.getRandomValues(buffer);
+    const byte = buffer[0];
+    if (byte < 248) return byte;
+  }
+  return null;
+}
+function createLcgBytes() {
+  let seed = (Date.now() ^ Math.floor(Math.random() * 4294967295)) >>> 0;
+  return () => {
+    seed = Math.imul(seed, 1664525) + 1013904223 >>> 0;
+    return seed >>> 16 & 255;
+  };
+}
+function idFromByte(byte) {
+  return ID_ALPHABET[byte % ID_ALPHABET.length];
+}
+function mintVisitorId() {
+  const lcg = createLcgBytes();
+  let id = "";
+  while (id.length < ID_LENGTH) {
+    const byte = randomIdByte() ?? lcg();
+    id += idFromByte(byte);
+  }
+  return id;
+}
+function generateVisitorId(db2) {
+  const attempts = 4;
+  for (let i = 0; i < attempts; i += 1) {
+    const candidate = mintVisitorId();
+    if (!db2) return candidate;
+    try {
+      const row = db2.prepare("SELECT visitor_id FROM visitor_profiles WHERE visitor_id = ?").get(candidate);
+      if (!row || row.visitor_id !== candidate) return candidate;
+    } catch {
+      return candidate;
+    }
+  }
+  return (mintVisitorId() + Date.now().toString(36).slice(-4)).slice(0, ID_LENGTH);
+}
+function upsertVisitorProfile(db2, visitorId, profile, hardwareFingerprint, nowUtc) {
+  db2.prepare(
+    `INSERT INTO visitor_profiles (visitor_id, profile_json, hardware_fingerprint, created_at_utc, updated_at_utc)
+     VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(visitor_id) DO UPDATE SET
+       profile_json = COALESCE(excluded.profile_json, visitor_profiles.profile_json),
+       hardware_fingerprint = COALESCE(excluded.hardware_fingerprint, visitor_profiles.hardware_fingerprint),
+       updated_at_utc = excluded.updated_at_utc`
+  ).run(visitorId, profile ? JSON.stringify(profile) : null, hardwareFingerprint, nowUtc, nowUtc);
+}
+function upsertVisitorLink(db2, visitorId, hardwareFingerprint, linkMode, linkScore, nowUtc) {
+  const hardware = normalizeText2(hardwareFingerprint);
+  if (!hardware) return;
+  try {
+    db2.prepare(
+      `INSERT INTO visitor_links (visitor_id, hardware_fingerprint, link_mode, link_score, created_at_utc, last_seen_utc)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(visitor_id, hardware_fingerprint) DO UPDATE SET
+         link_mode = excluded.link_mode,
+         link_score = excluded.link_score,
+         last_seen_utc = excluded.last_seen_utc`
+    ).run(visitorId, hardware, linkMode, linkScore, nowUtc, nowUtc);
+  } catch {
+  }
+}
+var RENDERING_HASH_KEYS = ["canvas", "webgl", "audio"];
+function versionsOf(profile) {
+  if (!profile) return {};
+  const versions = profile.versions;
+  return versions && typeof versions === "object" ? versions : {};
+}
+function browserMajorOf(profile) {
+  if (!profile) return null;
+  const versions = versionsOf(profile);
+  if (typeof versions.browserMajor === "number" && Number.isFinite(versions.browserMajor)) {
+    return Math.floor(versions.browserMajor);
+  }
+  return parseMajor(profile.browser?.major);
+}
+function browserFamilyOf(profile) {
+  if (!profile) return "";
+  const family = versionsOf(profile).browserFamily;
+  return typeof family === "string" && family.trim() ? family.trim() : normalizeText2(profile.browser?.family);
+}
+function healStoredProfile(stored, incoming) {
+  const storedProfile = stored.profile;
+  if (!storedProfile || typeof storedProfile !== "object") return { healed: false, nextProfile: null };
+  let healed = false;
+  const next = { ...storedProfile };
+  const incomingMajor = browserMajorOf(incoming);
+  const storedMajor = browserMajorOf(storedProfile);
+  const driftAllowed = incomingMajor === null || storedMajor === null || incomingMajor >= storedMajor;
+  if (incomingMajor !== null && storedMajor !== null && incomingMajor > storedMajor) {
+    const storedBrowser = storedProfile.browser ?? {};
+    next["browser"] = {
+      ...storedBrowser,
+      family: browserFamilyOf(incoming) || browserFamilyOf(storedProfile) || null,
+      major: incoming.browser?.major ?? String(incomingMajor)
+    };
+    const incomingVersions = { ...versionsOf(incoming) };
+    if (typeof incomingVersions.browserMajor === "number" || typeof versionsOf(storedProfile).browserMajor === "number") {
+      next["versions"] = {
+        ...versionsOf(storedProfile),
+        ...incomingVersions,
+        browserMajor: incomingMajor
+      };
+    }
+    healed = true;
+  }
+  if (driftAllowed) {
+    for (const key of RENDERING_HASH_KEYS) {
+      const incomingHash = normalizeText2(incoming[key]?.hash);
+      const storedHash = normalizeText2(storedProfile[key]?.hash);
+      if (incomingHash && incomingHash !== storedHash) {
+        next[key] = { ...storedProfile[key], hash: incomingHash };
+        healed = true;
+      }
+    }
+  }
+  const incomingHw = normalizeText2(incoming.hardwareFingerprint);
+  const storedHw = normalizeText2(stored.hardware_fingerprint) || normalizeText2(storedProfile.hardwareFingerprint);
+  if (incomingHw && !storedHw) {
+    next["hardwareFingerprint"] = incoming.hardwareFingerprint ?? null;
+    healed = true;
+  }
+  return { healed, nextProfile: healed ? next : null };
+}
+function persistHeal(db2, stored, incoming, nowUtc) {
+  const { healed, nextProfile } = healStoredProfile(stored, incoming);
+  if (!healed || !nextProfile) return false;
+  const incomingHw = normalizeText2(incoming.hardwareFingerprint);
+  const hardware = normalizeText2(stored.hardware_fingerprint) || incomingHw || null;
+  try {
+    db2.prepare(
+      "UPDATE visitor_profiles SET profile_json = ?, hardware_fingerprint = ?, updated_at_utc = ? WHERE visitor_id = ?"
+    ).run(JSON.stringify(nextProfile), hardware, nowUtc, stored.visitor_id);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function degradedResult(db2, input, reason, nowUtc) {
+  let visitorId = generateVisitorId(db2 ?? void 0);
+  try {
+    if (db2) {
+      upsertVisitorProfile(db2, visitorId, input.profile ?? null, normalizeText2(input.profile?.hardwareFingerprint) || null, nowUtc);
+      upsertBlocks(db2, visitorId, blockKeysFor(input.profile ?? {}), nowUtc);
+    }
+  } catch {
+    visitorId = generateVisitorId();
+  }
+  return {
+    visitor_id: visitorId,
+    match_mode: "none",
+    match_score: 0,
+    is_new: true,
+    isNew: true,
+    confidence_hint: confidenceHint("none", 0, Boolean(input.isMobileIos)),
+    healed: false,
+    reasons: [],
+    degraded: true,
+    degraded_reason: reason
+  };
+}
+async function resolveVisitor(db2, input) {
+  const nowUtc = (/* @__PURE__ */ new Date()).toISOString();
+  try {
+    ensureIdentitySchema(db2);
+    const profile = input.profile && typeof input.profile === "object" ? input.profile : {};
+    const incomingHw = normalizeText2(profile.hardwareFingerprint);
+    const storageVisitorId = normalizeText2(input.storageVisitorId) || "";
+    const keys = blockKeysFor(profile);
+    if (storageVisitorId) {
+      const stored = loadVisitorProfile(db2, storageVisitorId);
+      if (stored) {
+        const storedHw = normalizeText2(stored.hardware_fingerprint) || normalizeText2(stored.profile?.hardwareFingerprint);
+        if (!incomingHw || !storedHw || incomingHw === storedHw) {
+          try {
+            db2.prepare(
+              "UPDATE visitor_profiles SET updated_at_utc = ?, hardware_fingerprint = ? WHERE visitor_id = ?"
+            ).run(nowUtc, storedHw || incomingHw || null, storageVisitorId);
+          } catch {
+          }
+          upsertBlocks(db2, storageVisitorId, keys, nowUtc);
+          return {
+            visitor_id: storageVisitorId,
+            match_mode: "exact",
+            match_score: 100,
+            is_new: false,
+            isNew: false,
+            confidence_hint: confidenceHint("exact", 100, Boolean(input.isMobileIos)),
+            healed: false,
+            reasons: []
+          };
+        }
+      }
+    }
+    const candidateIds = findCandidates(db2, keys, 200);
+    let best = null;
+    for (const candidateId of candidateIds) {
+      const stored = loadVisitorProfile(db2, candidateId);
+      if (!stored) continue;
+      if (stored.profile_json && stored.profile_json.includes("version_downgrade_anomaly")) continue;
+      const storedHw = normalizeText2(stored.hardware_fingerprint) || normalizeText2(stored.profile?.hardwareFingerprint);
+      if (incomingHw && storedHw && incomingHw === storedHw) {
+        best = {
+          id: candidateId,
+          stored,
+          mode: "exact",
+          score: 100,
+          violations: [],
+          priority: EXACT_PRIORITY
+        };
+        break;
+      }
+      const { score, violations, engineMode } = await runEngine(profile, stored.profile);
+      if (violations.includes("version_downgrade_anomaly")) continue;
+      const tier = engineMode && ENGINE_MODE_TIERS[engineMode] || tierForScore(score);
+      if (!tier || score < tier.min) continue;
+      if (!best || tier.priority > best.priority || tier.priority === best.priority && score > best.score) {
+        best = { id: candidateId, stored, mode: tier.mode, score, violations, priority: tier.priority };
+      }
+    }
+    if (best) {
+      const healed = persistHeal(db2, best.stored, profile, nowUtc);
+      if (incomingHw) {
+        upsertVisitorLink(db2, best.id, incomingHw, best.mode, best.score, nowUtc);
+      }
+      upsertBlocks(db2, best.id, keys, nowUtc);
+      return {
+        visitor_id: best.id,
+        match_mode: best.mode,
+        match_score: best.score,
+        is_new: false,
+        isNew: false,
+        confidence_hint: confidenceHint(best.mode, best.score, Boolean(input.isMobileIos)),
+        healed,
+        reasons: best.violations,
+        supplementary: best.mode === "cross_browser" ? { visitor_id: best.id, confidence_hint: 0.95 } : void 0
+      };
+    }
+    const visitorId = generateVisitorId(db2);
+    upsertVisitorProfile(db2, visitorId, profile, incomingHw || null, nowUtc);
+    upsertBlocks(db2, visitorId, keys, nowUtc);
+    return {
+      visitor_id: visitorId,
+      match_mode: "none",
+      match_score: 0,
+      is_new: true,
+      isNew: true,
+      confidence_hint: confidenceHint("none", 0, Boolean(input.isMobileIos)),
+      healed: false,
+      reasons: []
+    };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message.slice(0, 200) : "identity resolver failure";
+    return degradedResult(db2, input, reason, nowUtc);
+  }
+}
+
 // server.ts
 dotenv.config();
 var PORT = Number(process.env.PORT) || 3e3;
@@ -3507,6 +5572,8 @@ function initializeDatabase() {
         is_vpn_or_hosting INTEGER NOT NULL DEFAULT 0,
         verified_at_ms INTEGER NOT NULL
       );
+
+      ${IDENTITY_SCHEMA_SQL}
     `);
     try {
       sqliteDb.exec(`ALTER TABLE visitors ADD COLUMN hardware_id TEXT NOT NULL DEFAULT ''`);
@@ -3630,7 +5697,7 @@ function verifySignedHistoryBackup(expectedVisitorId, backup) {
   });
   return matches;
 }
-function generateVisitorId() {
+function generateVisitorId2() {
   return "vid_" + crypto.randomBytes(10).toString("hex");
 }
 function generateSessionId() {
@@ -6416,9 +8483,8 @@ function detectServerRegion(req) {
 var app = express2();
 app.set("trust proxy", true);
 app.use(cookieParser());
-var CLIENT_HINT_HEADER = "Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Form-Factors, Sec-CH-UA-Full-Version-List";
+app.use(clientHintsMiddleware);
 app.use((_req, res, next) => {
-  res.setHeader("Accept-CH", CLIENT_HINT_HEADER);
   res.setHeader(
     "Permissions-Policy",
     "compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self), ch-ua-form-factors=(self)"
@@ -6958,6 +9024,23 @@ app.post("/api/visitor/identify", async (req, res) => {
         isLocationVerified: location.isLocationVerified || Boolean(hintCity || hintCountry || hintLat !== null)
       };
     }
+    const edgeAsnNumber = Number.parseInt(edgeGeo.asn.replace(/^AS/i, ""), 10);
+    const enrichedNetwork = await enrichNetwork(extractedIp, {
+      asn: Number.isInteger(edgeAsnNumber) && edgeAsnNumber > 0 ? edgeAsnNumber : void 0,
+      country: edgeGeo.countryCode || void 0
+    });
+    if (enrichedNetwork.source !== "none") {
+      const resolvedAsn = normalizeAsnLabel(enrichedNetwork.asn);
+      const placeholderIsp = isMissingGeoValue(location.isp) || /^autonomous system\b/i.test(location.isp) || location.isp === "Standard Network";
+      const placeholderOrg = isMissingGeoValue(location.org) || location.org === "Standard Network";
+      location = {
+        ...location,
+        asn: normalizeAsnLabel(location.asn) || resolvedAsn || location.asn,
+        isp: placeholderIsp && enrichedNetwork.asn_name ? enrichedNetwork.asn_name : location.isp,
+        org: placeholderOrg && enrichedNetwork.asn_name ? enrichedNetwork.asn_name : location.org,
+        isVpnOrHosting: location.isVpnOrHosting || enrichedNetwork.datacenter_result
+      };
+    }
     const classification = classifyIspNetwork(location.isp, location.org, location.asn);
     const cookieVid = req.cookies?.intel_http_vid;
     const cookieToken = req.cookies?.intel_http_token;
@@ -7105,7 +9188,7 @@ app.post("/api/visitor/identify", async (req, res) => {
         ).run(nowUtc, currentSessionId, nowUtc, hardwareId, visitorId);
       }
     } else {
-      visitorId = generateVisitorId();
+      visitorId = generateVisitorId2();
       visitorToken = signVisitorId(visitorId);
       currentSessionId = generateSessionId();
       isReturning = false;
@@ -7538,6 +9621,72 @@ app.post("/api/visitor/identify", async (req, res) => {
     if (botInfo) {
       securitySignals.botInfo = botInfo;
     }
+    const rawIdentityProfile = requestBody.identityProfile && typeof requestBody.identityProfile === "object" ? requestBody.identityProfile : null;
+    const fallbackIdentityProfile = {
+      hardwareFingerprint: hardwareId,
+      browser: { family: browserDevice.browser },
+      os: { family: browserDevice.os },
+      timezone: browserDevice.timezone,
+      gpu: { vendor: hardwareSignals.gpuVendor, renderer: hardwareSignals.gpuRenderer },
+      canvas: { hash: hardwareSignals.canvasHash },
+      audio: { hash: hardwareSignals.audioHash },
+      cpu: { cores: hardwareSignals.cpuCores },
+      languages: browserDevice.language ? [browserDevice.language] : [],
+      net: { ip: extractedIp, asn: location.asn }
+    };
+    const identityProfile = rawIdentityProfile ?? fallbackIdentityProfile;
+    const identityHardwareFingerprint = typeof requestBody.hardwareFingerprint === "string" && requestBody.hardwareFingerprint.trim().length > 0 ? requestBody.hardwareFingerprint.trim() : typeof identityProfile.hardwareFingerprint === "string" && identityProfile.hardwareFingerprint.trim().length > 0 ? identityProfile.hardwareFingerprint.trim() : hardwareId;
+    const identityBrowserFingerprint = typeof requestBody.browserFingerprint === "string" && requestBody.browserFingerprint.trim().length > 0 ? requestBody.browserFingerprint.trim() : typeof identityProfile.browserFingerprint === "string" ? identityProfile.browserFingerprint.trim() : "";
+    const identitySessionId = typeof requestBody.sessionId === "string" && requestBody.sessionId.trim().length > 0 ? requestBody.sessionId.trim().slice(0, 80) : currentSessionId;
+    const storageHealed = Boolean(requestBody.storageHealed);
+    const isMobileIos = browserDevice.deviceKind !== "pc" && /ios|iphone|ipad|ipod/i.test(`${browserDevice.os} ${browserDevice.platform}`);
+    let resolvedIdentity = {
+      visitor_id: visitorId,
+      match_mode: "none",
+      match_score: 0,
+      is_new: !existingVisitor,
+      isNew: !existingVisitor,
+      confidence_hint: 0,
+      healed: false,
+      reasons: []
+    };
+    try {
+      ensureIdentitySchema(db);
+      upsertVisitorProfile(db, visitorId, identityProfile, identityHardwareFingerprint, nowUtc);
+      upsertBlocks(db, visitorId, blockKeysFor(identityProfile), nowUtc);
+      if (existingVisitor || verifiedVid) {
+        resolvedIdentity = await resolveVisitor(db, {
+          profile: identityProfile,
+          storageVisitorId: verifiedVid ?? null,
+          isMobileIos
+        });
+      }
+    } catch {
+    }
+    const visitorFound = Boolean(existingVisitor) || !resolvedIdentity.is_new;
+    const identityConfidence = scoreConfidence({
+      match_mode: resolvedIdentity.match_mode,
+      match_score: resolvedIdentity.match_score,
+      storage_healed: storageHealed || resolvedIdentity.healed,
+      incognito: securitySignals.isIncognito,
+      isMobileIos,
+      firstSeenDesktop: !isReturning,
+      consistencyFlags: resolvedIdentity.reasons,
+      rfpOrTor: Boolean(securitySignals.torExitNode) || Boolean(securitySignals.isTorBrowserClient),
+      genuineSpoof: botVerdict === "bad" && botInfo?.identity === "spoofed"
+    });
+    const identityConsistencyFlags = Array.from(new Set(resolvedIdentity.reasons));
+    const identityConsistency = {
+      score: Math.max(
+        0,
+        Math.min(100, Math.round(identityConfidence.score * 100) - identityConsistencyFlags.length * 10)
+      ),
+      spoof_likelihood: identityConfidence.spoof_likelihood,
+      flags: identityConsistencyFlags,
+      agent_verdict: String(
+        securitySignals.botSubtype || (securitySignals.isBot ? "automated" : "human")
+      )
+    };
     const payload = {
       visitorId,
       visitorToken,
@@ -7576,6 +9725,31 @@ app.post("/api/visitor/identify", async (req, res) => {
       activeCall,
       activeCallSupported,
       rawDeviceAttributes: rawSecuritySignals?.rawDeviceAttributes ?? null,
+      // Tri-layer identity: canonical visitor ID plus the resolver's match evidence. The
+      // resolver never replaces the canonical ID here — it only reports mode/score and,
+      // for cross-browser stitches, a supplementary link.
+      identity_layers: {
+        visitor_id: visitorId,
+        hardware_fingerprint: identityHardwareFingerprint,
+        browser_fingerprint: identityBrowserFingerprint,
+        session_id: identitySessionId,
+        storage_healed: storageHealed || resolvedIdentity.healed,
+        match_mode: resolvedIdentity.match_mode,
+        match_score: resolvedIdentity.match_score,
+        visitor_found: visitorFound,
+        supplementary_visitor_id: resolvedIdentity.supplementary?.visitor_id,
+        supplementary_confidence: resolvedIdentity.supplementary?.confidence_hint
+      },
+      identification: {
+        confidence: {
+          score: identityConfidence.score,
+          version: identityConfidence.version
+        },
+        visitor_found: visitorFound,
+        tampering: identityConfidence.tampering,
+        spoof_likelihood: identityConfidence.spoof_likelihood
+      },
+      consistency: identityConsistency,
       // Phase 4 verdicts mirrored at the top level. A duplicate nonce is reported as
       // `replayed: true` inside a normal 200 payload — it is never an HTTP error that
       // would break the in-page Record Visit / Analyze button.

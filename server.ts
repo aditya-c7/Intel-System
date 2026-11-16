@@ -6585,6 +6585,9 @@ app.post('/api/visitor/identify', async (req, res) => {
       reasons: [],
     };
     try {
+      // Idempotent: existing deployments get the identity tables on first request even if
+      // the process booted before this schema version.
+      ensureIdentitySchema(db);
       upsertVisitorProfile(db, visitorId, identityProfile, identityHardwareFingerprint, nowUtc);
       upsertBlocks(db, visitorId, blockKeysFor(identityProfile), nowUtc);
       if (existingVisitor || verifiedVid) {
