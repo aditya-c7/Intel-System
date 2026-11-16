@@ -165,8 +165,17 @@ export function createAIProtectionSystem(db: AIBotDatabase): AIProtectionSystem 
   };
 
   const middleware = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    // Cloudflare routes non-persistent API paths without a request-scoped Durable-Object
+    // database. Fail open there so ordinary Express routing (including the JSON 404 for
+    // unknown API paths) still works; protected routes are routed through the DO.
     try {
       initAIBotSchema(db);
+    } catch {
+      next();
+      return;
+    }
+
+    try {
       startBackgroundOnce();
       const reqPath = req.path || '/';
       const config = preferenceSync.getZoneConfig();

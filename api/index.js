@@ -2714,6 +2714,11 @@ function createAIProtectionSystem(db2) {
   const middleware = async (req, res, next) => {
     try {
       initAIBotSchema(db2);
+    } catch {
+      next();
+      return;
+    }
+    try {
       startBackgroundOnce();
       const reqPath = req.path || "/";
       const config = preferenceSync.getZoneConfig();
