@@ -95,6 +95,11 @@ async function main(): Promise<void> {
     cleanCymruAsName('GOOGLE - Google LLC, US'),
   );
   check(
+    'cleanCymruAsName strips a mixed-case handle',
+    cleanCymruAsName('docomo - NTT DOCOMO, INC., JP') === 'NTT DOCOMO, INC.',
+    cleanCymruAsName('docomo - NTT DOCOMO, INC., JP'),
+  );
+  check(
     'cleanCymruAsName leaves a plain name alone',
     cleanCymruAsName('Bharti Airtel Ltd., Telemedia Services') ===
       'Bharti Airtel Ltd., Telemedia Services',

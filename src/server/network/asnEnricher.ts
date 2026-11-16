@@ -185,16 +185,17 @@ export function clearNetworkCache(): void {
 
 /**
  * Cleans a raw Team Cymru AS-name: strips a trailing ', XX' two-letter country,
- * strips a leading 'HANDLE - ' prefix when the handle is ALL-CAPS/dashed, and
- * collapses whitespace. Example: `GOOGLE - Google, Inc., US` → `Google, Inc.`
+ * strips a leading 'HANDLE - ' registry prefix, and collapses whitespace.
+ * Examples: `GOOGLE - Google, Inc., US` → `Google, Inc.`,
+ * `docomo - NTT DOCOMO, INC., JP` → `NTT DOCOMO, INC.`
  */
 export function cleanCymruAsName(raw: string | null | undefined): string {
   let name = String(raw ?? '');
   name = name.replace(/^"+|"+$/g, '').trim();
   // Trailing ', XX' country suffix (also tolerate the registry date coming through).
   name = name.replace(/,\s*[A-Za-z]{2}\s*$/, '');
-  // Leading registry handle when it is ALL-CAPS / dashed: 'GOOGLE - Google, Inc.'
-  name = name.replace(/^[A-Z0-9][A-Z0-9-]{0,40}\s+-\s+/, (match, offset: number, text: string) => {
+  // Leading registry handle, which is a single token followed by ' - '.
+  name = name.replace(/^[A-Za-z0-9][A-Za-z0-9-]{0,40}\s+-\s+/, (match, offset: number, text: string) => {
     const remainder = text.slice(offset + match.length);
     return remainder.trim() ? '' : match;
   });

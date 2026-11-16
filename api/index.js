@@ -4210,7 +4210,7 @@ function cleanCymruAsName(raw) {
   let name = String(raw ?? "");
   name = name.replace(/^"+|"+$/g, "").trim();
   name = name.replace(/,\s*[A-Za-z]{2}\s*$/, "");
-  name = name.replace(/^[A-Z0-9][A-Z0-9-]{0,40}\s+-\s+/, (match, offset, text) => {
+  name = name.replace(/^[A-Za-z0-9][A-Za-z0-9-]{0,40}\s+-\s+/, (match, offset, text) => {
     const remainder = text.slice(offset + match.length);
     return remainder.trim() ? "" : match;
   });
