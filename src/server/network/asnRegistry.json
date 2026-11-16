@@ -1,0 +1,266 @@
+[
+  {
+    "asn": 55836,
+    "asn_name": "Reliance Jio Infocomm Limited",
+    "handle": "RELIANCEJIO-IN",
+    "asn_type": "isp",
+    "datacenter_result": false,
+    "sample_prefixes": ["49.44.63.0/24", "49.44.88.0/22"]
+  },
+  {
+    "asn": 24560,
+    "asn_name": "Bharti Airtel Ltd., Telemedia Services",
+    "handle": "ORG-BAL1-AP",
+    "asn_type": "isp",
+    "datacenter_result": false,
+    "sample_prefixes": []
+  },
+  {
+    "asn": 9498,
+    "asn_name": "Bharti Airtel Ltd.",
+    "handle": "ORG-BAL1-AP",
+    "asn_type": "mobile",
+    "datacenter_result": false,
+    "sample_prefixes": []
+  },
+  {
+    "asn": 9829,
+    "asn_name": "Bharat Sanchar Nigam Ltd.",
+    "handle": "ORG-BSNL1-AP",
+    "asn_type": "isp",
+    "datacenter_result": false,
+    "sample_prefixes": ["117.192.0.0/13"]
+  },
+  {
+    "asn": 714,
+    "asn_name": "Apple Inc.",
+    "handle": "APPLEC-1-Z",
+    "asn_type": "isp",
+    "datacenter_result": false,
+    "sample_prefixes": ["17.0.0.0/8"]
+  },
+  {
+    "asn": 6185,
+    "asn_name": "Apple Inc.",
+    "handle": "APPLEC-1-Z",
+    "asn_type": "isp",
+    "datacenter_result": false,
+    "sample_prefixes": []
+  },
+  {
+    "asn": 32934,
+    "asn_name": "Meta Platforms, Inc.",
+    "handle": "THEFA-3",
+    "asn_type": "datacenter",
+    "datacenter_result": false,
+    "sample_prefixes": ["31.13.64.0/18", "157.240.0.0/16", "179.60.192.0/22", "69.171.240.0/20", "173.252.64.0/18", "185.89.216.0/22"]
+  },
+  {
+    "asn": 13335,
+    "asn_name": "Cloudflare, Inc.",
+    "handle": "CLOUDFLARENET",
+    "asn_type": "cdn",
+    "datacenter_result": true,
+    "sample_prefixes": ["1.1.1.0/24", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/12", "141.101.0.0/16", "162.158.0.0/16", "172.64.0.0/13", "198.41.128.0/17"]
+  },
+  {
+    "asn": 15169,
+    "asn_name": "Google LLC",
+    "handle": "GOGL",
+    "asn_type": "cloud",
+    "datacenter_result": true,
+    "sample_prefixes": ["8.8.4.0/24", "8.8.8.0/24", "34.64.0.0/10", "35.184.0.0/13", "35.192.0.0/12", "74.125.0.0/16", "104.196.0.0/16", "130.211.0.0/16", "142.250.0.0/15", "172.217.0.0/16", "216.58.192.0/19"]
+  },
+  {
+    "asn": 16509,
+    "asn_name": "Amazon.com, Inc.",
+    "handle": "AMAZON-4",
+    "asn_type": "datacenter",
+    "datacenter_result": true,
+    "sample_prefixes": ["52.0.0.0/8", "54.0.0.0/8"]
+  },
+  {
+    "asn": 14618,
+    "asn_name": "Amazon.com, Inc.",
+    "handle": "AMAZO-4",
+    "asn_type": "datacenter",
+    "datacenter_result": true,
+    "sample_prefixes": []
+  },
+  {
+    "asn": 8075,
+    "asn_name": "Microsoft Corporation",
+    "handle": "MSFT",
+    "asn_type": "datacenter",
+    "datacenter_result": true,
+    "sample_prefixes": ["13.64.0.0/11", "20.0.0.0/8", "40.64.0.0/10", "52.136.0.0/13", "104.40.0.0/13", "168.61.0.0/16"]
+  },
+  {
+    "asn": 12076,
+    "asn_name": "Microsoft Corporation",
+    "handle": "MSFT",
+    "asn_type": "datacenter",
+    "datacenter_result": true,
+    "sample_prefixes": ["13.107.0.0/16"]
+  },
+  {
+    "asn": 14061,
+    "asn_name": "DigitalOcean LLC",
+    "handle": "DO-13",
+    "asn_type": "datacenter",
+    "datacenter_result": true,
+    "sample_prefixes": [
+      "46.101.0.0/16",
+      "68.183.0.0/16",
+      "104.131.0.0/16",
+      "104.236.0.0/16",
+      "128.199.0.0/16",
+      "134.209.0.0/16",
+      "138.68.0.0/16",
+      "139.59.0.0/16",
+      "143.198.0.0/16",
+      "157.245.0.0/16",
+      "159.65.0.0/16",
+      "159.89.0.0/16",
+      "161.35.0.0/16",
+      "165.22.0.0/16",
+      "167.71.0.0/16",
+      "167.99.0.0/16",
+      "174.138.0.0/16",
+      "178.128.0.0/16"
+    ]
+  },
+  {
+    "asn": 16276,
+    "asn_name": "OVH SAS",
+    "handle": "ORG-OS3-RIPE",
+    "asn_type": "datacenter",
+    "datacenter_result": true,
+    "sample_prefixes": ["5.196.0.0/16", "51.68.0.0/16", "51.75.0.0/16", "51.77.0.0/16", "51.83.0.0/16", "51.89.0.0/16", "54.36.0.0/16", "54.37.0.0/16", "54.38.0.0/16"]
+  },
+  {
+    "asn": 24940,
+    "asn_name": "Hetzner Online GmbH",
+    "handle": "ORG-HOA1-RIPE",
+    "asn_type": "datacenter",
+    "datacenter_result": true,
+    "sample_prefixes": [
+      "5.9.0.0/16",
+      "46.4.0.0/16",
+      "49.12.0.0/16",
+      "49.13.0.0/16",
+      "65.21.0.0/16",
+      "65.108.0.0/15",
+      "78.46.0.0/15",
+      "88.198.0.0/16",
+      "88.99.0.0/16",
+      "94.130.0.0/16",
+      "95.216.0.0/15",
+      "116.202.0.0/15",
+      "135.181.0.0/16",
+      "144.76.0.0/16",
+      "148.251.0.0/16",
+      "157.90.0.0/16",
+      "159.69.0.0/16",
+      "162.55.0.0/16",
+      "167.235.0.0/16",
+      "168.119.0.0/16"
+    ]
+  },
+  {
+    "asn": 9009,
+    "asn_name": "M247 Ltd",
+    "handle": "ORG-MES6-RIPE",
+    "asn_type": "datacenter",
+    "datacenter_result": true,
+    "sample_prefixes": ["37.19.208.0/20", "146.70.0.0/16"]
+  },
+  {
+    "asn": 51167,
+    "asn_name": "Contabo GmbH",
+    "handle": "ORG-GG22-RIPE",
+    "asn_type": "datacenter",
+    "datacenter_result": true,
+    "sample_prefixes": ["5.189.128.0/19", "62.171.128.0/17", "173.212.192.0/18"]
+  },
+  {
+    "asn": 20473,
+    "asn_name": "The Constant Company, LLC",
+    "handle": "CHOOP-1",
+    "asn_type": "datacenter",
+    "datacenter_result": true,
+    "sample_prefixes": [
+      "45.32.0.0/16",
+      "45.63.0.0/16",
+      "45.76.0.0/16",
+      "45.77.0.0/16",
+      "64.176.0.0/17",
+      "66.42.0.0/16",
+      "78.141.192.0/18",
+      "95.179.128.0/17",
+      "108.61.0.0/16",
+      "139.180.128.0/17",
+      "144.202.0.0/16",
+      "149.28.0.0/16",
+      "167.179.0.0/16",
+      "207.148.0.0/16",
+      "209.250.224.0/19"
+    ]
+  },
+  {
+    "asn": 63949,
+    "asn_name": "Akamai Technologies, Inc.",
+    "handle": "ORG-ATI1-AP",
+    "asn_type": "datacenter",
+    "datacenter_result": true,
+    "sample_prefixes": ["45.79.0.0/16", "139.162.0.0/16", "172.104.0.0/15", "172.105.0.0/16"]
+  },
+  {
+    "asn": 399358,
+    "asn_name": "Anthropic, PBC",
+    "handle": "AP-2440",
+    "asn_type": "ai_operator",
+    "datacenter_result": true,
+    "sample_prefixes": []
+  },
+  {
+    "asn": 401518,
+    "asn_name": "OpenAI OpCo, LLC",
+    "handle": "OOL-15",
+    "asn_type": "ai_operator",
+    "datacenter_result": true,
+    "sample_prefixes": []
+  },
+  {
+    "asn": 401864,
+    "asn_name": "OpenAI OpCo, LLC",
+    "handle": "OOL-15",
+    "asn_type": "ai_operator",
+    "datacenter_result": true,
+    "sample_prefixes": []
+  },
+  {
+    "asn": 400645,
+    "asn_name": "Axxess Networks LLC",
+    "handle": "ANL-362",
+    "asn_type": "datacenter",
+    "datacenter_result": true,
+    "sample_prefixes": ["130.250.218.0/24"]
+  },
+  {
+    "asn": 212949,
+    "asn_name": "Mistral AI",
+    "handle": "ORG-KS338-RIPE",
+    "asn_type": "ai_operator",
+    "datacenter_result": true,
+    "sample_prefixes": []
+  },
+  {
+    "asn": 396986,
+    "asn_name": "ByteDance Inc.",
+    "handle": "BYTED",
+    "asn_type": "ai_operator",
+    "datacenter_result": true,
+    "sample_prefixes": []
+  }
+]
