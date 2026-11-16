@@ -42,6 +42,11 @@ import {
 import { buildProximityInfo } from './src/lib/geohash';
 import { detectAiBotFromServerSignals } from './src/lib/aiBotDirectory';
 import { createAIProtectionSystem, refreshAIBotFeeds } from './src/server/ai-protection/middleware';
+import { clientHintsMiddleware } from './src/server/middleware/clientHints';
+import { enrichNetwork } from './src/server/network/asnEnricher';
+import { ensureIdentitySchema, blockKeysFor, upsertBlocks, IDENTITY_SCHEMA_SQL } from './src/server/identity/identityIndex';
+import { resolveVisitor, upsertVisitorProfile, type ResolverProfile, type ResolveVisitorResult } from './src/server/identity/resolver';
+import { scoreConfidence } from './src/server/identity/confidenceScorer';
 import type { BotInfo } from './src/types/visitor';
 
 dotenv.config();
@@ -431,6 +436,8 @@ function initializeDatabase(): DatabaseAdapter {
         is_vpn_or_hosting INTEGER NOT NULL DEFAULT 0,
         verified_at_ms INTEGER NOT NULL
       );
+
+      ${IDENTITY_SCHEMA_SQL}
     `);
 
     try {
@@ -4485,13 +4492,13 @@ export const app = express();
 app.set('trust proxy', true);
 app.use(cookieParser());
 
+// Advertise Accept-CH / Critical-CH and parse every incoming `sec-ch-ua*` hint into
+// `(req as any).intelClientHints` for the shared UA normalizer. Critical-CH makes the
+// high-entropy hints arrive on the FIRST navigation instead of after a reload.
+app.use(clientHintsMiddleware);
 // Ask mobile Chromium browsers to expose UA-CH model/architecture hints, and keep
-// Compute Pressure available. `Accept-CH` makes `Sec-CH-UA-Model` arrive in HTTP
-// headers on subsequent requests; the JS high-entropy call covers the first visit.
-const CLIENT_HINT_HEADER =
-  'Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Form-Factors, Sec-CH-UA-Full-Version-List';
+// Compute Pressure available.
 app.use((_req, res, next) => {
-  res.setHeader('Accept-CH', CLIENT_HINT_HEADER);
   res.setHeader(
     'Permissions-Policy',
     'compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self), ch-ua-form-factors=(self)'
@@ -5498,6 +5505,12 @@ app.post('/api/visitor/identify', async (req, res) => {
       browserDevice?: Partial<BrowserDeviceInfo>;
       hardwareSignals?: Partial<HardwareSignals> | null;
       securitySignals?: Partial<SecuritySignals> | null;
+      /** Tri-layer identity bundle from the client signal orchestrator (new clients). */
+      identityProfile?: Record<string, unknown> | null;
+      hardwareFingerprint?: string | null;
+      browserFingerprint?: string | null;
+      sessionId?: string | null;
+      storageHealed?: boolean;
       /** Phase 4 — sealed request envelope (timestamp / nonce / signature + JS payload identity). */
       securityEnvelope?: Partial<SecurityEnvelope> | null;
       clientGeoHint?: {
@@ -5630,6 +5643,38 @@ app.post('/api/visitor/identify', async (req, res) => {
         isLocationVerified:
           location.isLocationVerified ||
           Boolean(hintCity || hintCountry || hintLat !== null),
+      };
+    }
+
+    // Zero-cost 4-tier ASN enrichment (edge headers → bundled registry → Team Cymru over
+    // DNS-over-HTTPS). A placeholder ISP ("Standard Network" / "Autonomous System AS…")
+    // is replaced by the resolved operator name; when nothing resolves, the existing value
+    // is kept — a network name is never fabricated.
+    const edgeAsnNumber = Number.parseInt(edgeGeo.asn.replace(/^AS/i, ''), 10);
+    const enrichedNetwork = await enrichNetwork(extractedIp, {
+      asn: Number.isInteger(edgeAsnNumber) && edgeAsnNumber > 0 ? edgeAsnNumber : undefined,
+      country: edgeGeo.countryCode || undefined,
+    });
+    if (enrichedNetwork.source !== 'none') {
+      const resolvedAsn = normalizeAsnLabel(enrichedNetwork.asn);
+      const placeholderIsp =
+        isMissingGeoValue(location.isp) ||
+        /^autonomous system\b/i.test(location.isp) ||
+        location.isp === 'Standard Network';
+      const placeholderOrg =
+        isMissingGeoValue(location.org) || location.org === 'Standard Network';
+      location = {
+        ...location,
+        asn: normalizeAsnLabel(location.asn) || resolvedAsn || location.asn,
+        isp:
+          placeholderIsp && enrichedNetwork.asn_name
+            ? enrichedNetwork.asn_name
+            : location.isp,
+        org:
+          placeholderOrg && enrichedNetwork.asn_name
+            ? enrichedNetwork.asn_name
+            : location.org,
+        isVpnOrHosting: location.isVpnOrHosting || enrichedNetwork.datacenter_result,
       };
     }
 
@@ -6479,6 +6524,100 @@ app.post('/api/visitor/identify', async (req, res) => {
       securitySignals.botInfo = botInfo;
     }
 
+    /* ------------------------------------------------------------------ */
+    /* Tri-layer identity resolution + calibrated confidence (v2.0)        */
+    /* ------------------------------------------------------------------ */
+    // The client-side collector echoes its tri-layer identity profile. Older clients omit it,
+    // so a compatible fallback profile is assembled from the canonical hardware signals —
+    // resolution never depends on the new payload shape being present.
+    const rawIdentityProfile =
+      requestBody.identityProfile && typeof requestBody.identityProfile === 'object'
+        ? (requestBody.identityProfile as unknown as ResolverProfile)
+        : null;
+    const fallbackIdentityProfile: ResolverProfile = {
+      hardwareFingerprint: hardwareId,
+      browser: { family: browserDevice.browser },
+      os: { family: browserDevice.os },
+      timezone: browserDevice.timezone,
+      gpu: { vendor: hardwareSignals.gpuVendor, renderer: hardwareSignals.gpuRenderer },
+      canvas: { hash: hardwareSignals.canvasHash },
+      audio: { hash: hardwareSignals.audioHash },
+      cpu: { cores: hardwareSignals.cpuCores },
+      languages: browserDevice.language ? [browserDevice.language] : [],
+      net: { ip: extractedIp, asn: location.asn },
+    };
+    const identityProfile = rawIdentityProfile ?? fallbackIdentityProfile;
+    const identityHardwareFingerprint =
+      typeof requestBody.hardwareFingerprint === 'string' &&
+      requestBody.hardwareFingerprint.trim().length > 0
+        ? requestBody.hardwareFingerprint.trim()
+        : hardwareId;
+    const identityBrowserFingerprint =
+      typeof requestBody.browserFingerprint === 'string'
+        ? requestBody.browserFingerprint.trim()
+        : '';
+    const identitySessionId =
+      typeof requestBody.sessionId === 'string' && requestBody.sessionId.trim().length > 0
+        ? requestBody.sessionId.trim().slice(0, 80)
+        : currentSessionId;
+    const storageHealed = Boolean(requestBody.storageHealed);
+    const isMobileIos =
+      browserDevice.deviceKind !== 'pc' &&
+      /ios|iphone|ipad|ipod/i.test(`${browserDevice.os} ${browserDevice.platform}`);
+
+    // Persist the canonical visitor's profile before resolving, so the storage path and the
+    // blocking index both point at the ID this request is actually using. A brand-new visitor
+    // never runs the resolver's "fresh identity" branch (it would mint a second ID).
+    let resolvedIdentity: ResolveVisitorResult = {
+      visitor_id: visitorId,
+      match_mode: 'none',
+      match_score: 0,
+      is_new: !existingVisitor,
+      isNew: !existingVisitor,
+      confidence_hint: 0,
+      healed: false,
+      reasons: [],
+    };
+    try {
+      upsertVisitorProfile(db, visitorId, identityProfile, identityHardwareFingerprint, nowUtc);
+      upsertBlocks(db, visitorId, blockKeysFor(identityProfile), nowUtc);
+      if (existingVisitor || verifiedVid) {
+        resolvedIdentity = await resolveVisitor(db, {
+          profile: identityProfile,
+          storageVisitorId: verifiedVid ?? null,
+          isMobileIos,
+        });
+      }
+    } catch {
+      // Identity persistence is additive: a failure must never fail the visitor response.
+    }
+    const visitorFound = Boolean(existingVisitor) || !resolvedIdentity.is_new;
+
+    const identityConfidence = scoreConfidence({
+      match_mode: resolvedIdentity.match_mode,
+      match_score: resolvedIdentity.match_score,
+      storage_healed: storageHealed || resolvedIdentity.healed,
+      incognito: securitySignals.isIncognito,
+      isMobileIos,
+      firstSeenDesktop: !isReturning,
+      consistencyFlags: resolvedIdentity.reasons,
+      rfpOrTor:
+        Boolean(securitySignals.torExitNode) || Boolean(securitySignals.isTorBrowserClient),
+      genuineSpoof: botVerdict === 'bad' && botInfo?.identity === 'spoofed',
+    });
+    const identityConsistencyFlags = Array.from(new Set(resolvedIdentity.reasons));
+    const identityConsistency = {
+      score: Math.max(
+        0,
+        Math.min(100, Math.round(identityConfidence.score * 100) - identityConsistencyFlags.length * 10)
+      ),
+      spoof_likelihood: identityConfidence.spoof_likelihood,
+      flags: identityConsistencyFlags,
+      agent_verdict: String(
+        securitySignals.botSubtype || (securitySignals.isBot ? 'automated' : 'human')
+      ),
+    };
+
     const payload: IntelVisitorResponse = {
       visitorId,
       visitorToken,
@@ -6517,6 +6656,31 @@ app.post('/api/visitor/identify', async (req, res) => {
       activeCall,
       activeCallSupported,
       rawDeviceAttributes: rawSecuritySignals?.rawDeviceAttributes ?? null,
+      // Tri-layer identity: canonical visitor ID plus the resolver's match evidence. The
+      // resolver never replaces the canonical ID here — it only reports mode/score and,
+      // for cross-browser stitches, a supplementary link.
+      identity_layers: {
+        visitor_id: visitorId,
+        hardware_fingerprint: identityHardwareFingerprint,
+        browser_fingerprint: identityBrowserFingerprint,
+        session_id: identitySessionId,
+        storage_healed: storageHealed || resolvedIdentity.healed,
+        match_mode: resolvedIdentity.match_mode,
+        match_score: resolvedIdentity.match_score,
+        visitor_found: visitorFound,
+        supplementary_visitor_id: resolvedIdentity.supplementary?.visitor_id,
+        supplementary_confidence: resolvedIdentity.supplementary?.confidence_hint,
+      },
+      identification: {
+        confidence: {
+          score: identityConfidence.score,
+          version: identityConfidence.version,
+        },
+        visitor_found: visitorFound,
+        tampering: identityConfidence.tampering,
+        spoof_likelihood: identityConfidence.spoof_likelihood,
+      },
+      consistency: identityConsistency,
       // Phase 4 verdicts mirrored at the top level. A duplicate nonce is reported as
       // `replayed: true` inside a normal 200 payload — it is never an HTTP error that
       // would break the in-page Record Visit / Analyze button.

@@ -50,14 +50,35 @@ export type ResolverMatchMode = 'exact' | 'lenient' | 'cross_browser' | 'hardwar
  * The canonical identity profile. Extends the loose `BlockKeyProfile` so it can
  * be handed to the blocking index directly; every family is optional and
  * tolerant of partial telemetry (degraded clients, VPNs, hardened browsers).
+ *
+ * Family objects accept BOTH spellings — the concise fields this module uses
+ * for keys/healing (`vendor`, `hash`, …) and the engine-native fields consumed
+ * by `compareFingerprints` (`normalizedGpu`, `geometry`, …) — so a profile
+ * collected for the engine flows through unchanged.
  */
 export interface ResolverProfile extends BlockKeyProfile {
   /** Stable browser-scope fingerprint echoed from storage (cookie / localStorage). */
   browserFingerprint?: string | null;
-  fonts?: { count?: number | null; list?: string[] | null } | null;
-  mediaDevices?: { count?: number | null; kinds?: string[] | null } | null;
-  webgl?: { hash?: string | null; vendor?: string | null; renderer?: string | null } | null;
-  fontPrefs?: { hash?: string | null; families?: string[] | null } | null;
+  /** Engine-native timezone object (`timezone` stays a plain string for keys). */
+  timezoneSignals?: { name?: string | null; offsetMinutes?: number | null } | null;
+  fonts?: { count?: number | null; list?: string[] | null; hash?: string | null; platformClass?: string | null } | null;
+  mediaDevices?: {
+    count?: number | null;
+    kinds?: string[] | null;
+    audioIn?: number | boolean | null;
+    audioOut?: number | boolean | null;
+    video?: number | boolean | null;
+  } | null;
+  webgl?: {
+    hash?: string | null;
+    vendor?: string | null;
+    renderer?: string | null;
+    extensionsHash?: string | null;
+    paramsHash?: string | null;
+    shaderPrecisionHash?: string | null;
+    extensionsList?: string[] | null;
+  } | null;
+  fontPrefs?: { hash?: string | null; families?: string[] | null; widths?: Record<string, number | null> | null; emojiRectHash?: string | null } | null;
   /** Free-form signals that never block, but travel with the profile for scoring. */
   misc?: Record<string, unknown> | null;
   /** Known component versions (browser, engine, UA-CH, …) — used for heal logic. */
@@ -125,7 +146,15 @@ function confidenceHint(mode: string, score: number, isMobileIos: boolean): numb
   return scoreConfidence({ match_mode: mode, match_score: score, isMobileIos }).score;
 }
 
-const LADDER_TIERS: Array<{ mode: ResolverMatchMode; min: number; priority: number }> = [
+/** A ladder tier: minimum score, result label, and best-candidate priority. */
+interface MatchTier {
+  mode: ResolverMatchMode;
+  min: number;
+  priority: number;
+}
+
+/** Score ladder — thresholds mirror the engine's own `MODE_THRESHOLDS`. */
+const LADDER_TIERS: MatchTier[] = [
   { mode: 'hardware', min: 88, priority: 3 },
   { mode: 'cross_browser', min: 85, priority: 2 },
   { mode: 'lenient', min: 82, priority: 1 },
@@ -133,9 +162,24 @@ const LADDER_TIERS: Array<{ mode: ResolverMatchMode; min: number; priority: numb
 
 const EXACT_PRIORITY = 4;
 
-function tierForScore(score: number): { mode: ResolverMatchMode; priority: number } | null {
+/**
+ * Engine `MatchMode` → resolver tier. `exact` requires the engine's perfect
+ * score; `strict` rides the lenient tier (its ≥92 score outranks other lenient
+ * candidates by score); `engine-only` is the cross-browser rendering signal.
+ * Unknown engine modes fall back to the score-derived tier.
+ */
+const ENGINE_MODE_TIERS: Record<string, MatchTier> = {
+  exact: { mode: 'exact', min: 100, priority: EXACT_PRIORITY },
+  strict: { mode: 'lenient', min: 82, priority: 1 },
+  lenient: { mode: 'lenient', min: 82, priority: 1 },
+  'cross-browser': { mode: 'cross_browser', min: 85, priority: 2 },
+  'hardware-only': { mode: 'hardware', min: 88, priority: 3 },
+  'engine-only': { mode: 'cross_browser', min: 85, priority: 2 },
+};
+
+function tierForScore(score: number): MatchTier | null {
   for (const tier of LADDER_TIERS) {
-    if (score >= tier.min) return { mode: tier.mode, priority: tier.priority };
+    if (score >= tier.min) return tier;
   }
   return null;
 }
@@ -145,35 +189,56 @@ function tierForScore(score: number): { mode: ResolverMatchMode; priority: numbe
 /* -------------------------------------------------------------------------- */
 
 /**
- * Normalizes the concurrent engine's output defensively: the score is read from
- * any of the known key spellings and violations from theirs, so the resolver
- * compiles and behaves regardless of the engine's exact result shape.
+ * Normalizes the engine's output defensively: the score is read from any of the
+ * known key spellings (`matchScore` primary), violations from theirs, and the
+ * result's own mode is surfaced so the ladder can use engine-native tiers.
  */
-function normalizeComparison(raw: unknown): { score: number; violations: string[] } {
+function normalizeComparison(raw: unknown): { score: number; violations: string[]; engineMode: string | null } {
   const obj = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
   const score = clampScore(obj['match_score'] ?? obj['matchScore'] ?? obj['score'] ?? obj['similarity']);
   const violationsRaw = obj['constraintViolations'] ?? obj['constraint_violations'] ?? obj['violations'];
   const violations = Array.isArray(violationsRaw)
     ? violationsRaw.filter((item): item is string => typeof item === 'string')
     : [];
-  return { score, violations };
+  const engineMode = typeof obj['mode'] === 'string' ? obj['mode'] : null;
+  return { score, violations, engineMode };
 }
 
+const NEUTRAL_COMPARISON = { score: 0, violations: [] as string[], engineMode: null as string | null };
+
 /**
- * Calls the engine with a couple of plausible argument shapes (positional pair
- * first, then a single descriptor object) and awaits a possible promise. All
+ * Runs the fingerprint engine over (stored, incoming) — the engine's parameter
+ * order is load-bearing: version monotonicity treats the FIRST argument as the
+ * stored profile, so swapping it would invert downgrade detection.
+ *
+ * Primary attempt follows the real contract (`bestMode` picks the ladder mode,
+ * `compareFingerprints(stored, incoming, mode)` scores it); the remaining
+ * attempts are defensive fallbacks for older or object-style signatures. All
  * failures collapse to a neutral zero-score comparison.
  */
 async function runEngine(incoming: ResolverProfile, stored: BlockKeyProfile | null) {
   const engine = compareFingerprints as unknown as
-    | ((input: ComparisonInput | unknown, ...rest: unknown[]) => unknown)
+    | ((...args: unknown[]) => unknown)
     | null;
-  if (typeof engine !== 'function') return { score: 0, violations: [] };
+  if (typeof engine !== 'function') return NEUTRAL_COMPARISON;
+
+  const storedInput = (stored ?? {}) as unknown as ComparisonInput;
+  const incomingInput = incoming as unknown as ComparisonInput;
+
+  const pickMode = (): string => {
+    try {
+      const mode = (bestMode as unknown as (a: unknown, b: unknown) => unknown)(storedInput, incomingInput);
+      return typeof mode === 'string' ? mode : '';
+    } catch {
+      return '';
+    }
+  };
 
   const attempts: Array<() => unknown> = [
-    () => engine(incoming, stored),
-    () => engine({ incoming, stored } as unknown as ComparisonInput),
-    () => engine({ a: incoming, b: stored } as unknown as ComparisonInput),
+    () => engine(storedInput, incomingInput, pickMode()),
+    () => engine(storedInput, incomingInput),
+    () => engine(incomingInput, storedInput),
+    () => engine({ stored: storedInput, incoming: incomingInput }),
   ];
   for (const attempt of attempts) {
     try {
@@ -182,10 +247,10 @@ async function runEngine(incoming: ResolverProfile, stored: BlockKeyProfile | nu
         return normalizeComparison(raw);
       }
     } catch {
-      // Try the next argument shape; the engine may expect a single object.
+      // Try the next argument shape.
     }
   }
-  return { score: 0, violations: [] };
+  return NEUTRAL_COMPARISON;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -312,6 +377,30 @@ export function upsertVisitorLink(
 
 const RENDERING_HASH_KEYS = ['canvas', 'webgl', 'audio'] as const;
 
+/** Browser major from engine-style `versions.browserMajor`, else `browser.major`. */
+function versionsOf(profile: BlockKeyProfile | null | undefined): Record<string, string | number> {
+  if (!profile) return {};
+  const versions = (profile as { versions?: Record<string, string | number> }).versions;
+  return versions && typeof versions === 'object' ? versions : {};
+}
+
+/** Browser major from engine-style `versions.browserMajor`, else `browser.major`. */
+function browserMajorOf(profile: BlockKeyProfile | null | undefined): number | null {
+  if (!profile) return null;
+  const versions = versionsOf(profile);
+  if (typeof versions.browserMajor === 'number' && Number.isFinite(versions.browserMajor)) {
+    return Math.floor(versions.browserMajor);
+  }
+  return parseMajor(profile.browser?.major);
+}
+
+/** Browser family from engine-style `versions.browserFamily`, else `browser.family`. */
+function browserFamilyOf(profile: BlockKeyProfile | null | undefined): string {
+  if (!profile) return '';
+  const family = versionsOf(profile).browserFamily;
+  return typeof family === 'string' && family.trim() ? family.trim() : normalizeText(profile.browser?.family);
+}
+
 /**
  * Heals the stored profile strictly forward: a strictly newer incoming browser
  * major replaces the stored one (never a downgrade), and rendering hashes may
@@ -328,17 +417,25 @@ function healStoredProfile(
   let healed = false;
   const next: Record<string, unknown> = { ...storedProfile } as Record<string, unknown>;
 
-  const incomingMajor = parseMajor(incoming.browser?.major);
-  const storedMajor = parseMajor((storedProfile as BlockKeyProfile).browser?.major);
+  const incomingMajor = browserMajorOf(incoming);
+  const storedMajor = browserMajorOf(storedProfile as BlockKeyProfile);
   const driftAllowed = incomingMajor === null || storedMajor === null || incomingMajor >= storedMajor;
 
   if (incomingMajor !== null && storedMajor !== null && incomingMajor > storedMajor) {
     const storedBrowser = (storedProfile as BlockKeyProfile).browser ?? {};
     next['browser'] = {
       ...storedBrowser,
-      family: incoming.browser?.family ?? storedBrowser.family ?? null,
-      major: incoming.browser?.major ?? null,
+      family: browserFamilyOf(incoming) || browserFamilyOf(storedProfile as BlockKeyProfile) || null,
+      major: incoming.browser?.major ?? String(incomingMajor),
     };
+    const incomingVersions = { ...versionsOf(incoming) };
+    if (typeof incomingVersions.browserMajor === 'number' || typeof versionsOf(storedProfile as BlockKeyProfile).browserMajor === 'number') {
+      next['versions'] = {
+        ...versionsOf(storedProfile as BlockKeyProfile),
+        ...incomingVersions,
+        browserMajor: incomingMajor,
+      };
+    }
     healed = true;
   }
 
@@ -497,10 +594,10 @@ export async function resolveVisitor(db: AIBotDatabase, input: ResolveVisitorInp
         break;
       }
 
-      const { score, violations } = await runEngine(profile, stored.profile);
+      const { score, violations, engineMode } = await runEngine(profile, stored.profile);
       if (violations.includes('version_downgrade_anomaly')) continue;
-      const tier = tierForScore(score);
-      if (!tier) continue;
+      const tier = (engineMode && ENGINE_MODE_TIERS[engineMode]) || tierForScore(score);
+      if (!tier || score < tier.min) continue;
       if (!best || tier.priority > best.priority || (tier.priority === best.priority && score > best.score)) {
         best = { id: candidateId, stored, mode: tier.mode, score, violations, priority: tier.priority };
       }

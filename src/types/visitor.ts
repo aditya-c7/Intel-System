@@ -432,4 +432,31 @@ export interface IntelVisitorResponse {
   bot?: string;
   bot_type?: string | null;
   bot_info?: BotInfo | null;
+  /** Tri-layer identity: canonical ID + resolver match evidence (never replaces visitorId). */
+  identity_layers?: {
+    visitor_id: string;
+    hardware_fingerprint: string;
+    browser_fingerprint: string;
+    session_id: string;
+    storage_healed: boolean;
+    match_mode: string;
+    match_score: number;
+    visitor_found: boolean;
+    supplementary_visitor_id?: string;
+    supplementary_confidence?: number;
+  };
+  /** Calibrated identification confidence (v2.0, clamped to [0.10, 0.999]). */
+  identification?: {
+    confidence: { score: number; version: string };
+    visitor_found: boolean;
+    tampering: boolean;
+    spoof_likelihood: 'low' | 'medium' | 'high';
+  };
+  /** Cross-signal consistency verdict derived from the resolver's constraint violations. */
+  consistency?: {
+    score: number;
+    spoof_likelihood: 'low' | 'medium' | 'high';
+    flags: string[];
+    agent_verdict: string;
+  };
 }
