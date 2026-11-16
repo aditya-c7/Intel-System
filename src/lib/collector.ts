@@ -362,14 +362,16 @@ function extractAsnNumber(rawAsn: string | null | undefined): number | null {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
-function cleanIspBrandText(ispText: string, orgText: string): string {
+function cleanIspBrandText(ispText: string, orgText: string, asnText = ''): string {
   const candidates = [ispText, orgText];
   for (const candidate of candidates) {
     const cleaned = candidate.replace(/\s+/g, ' ').trim();
     if (!cleaned || UNKNOWN_NETWORK_NAME_PATTERN.test(cleaned)) continue;
     return cleaned;
   }
-  return 'Standard Network';
+  // Numeric ASN known but no name: `AS<number>` is honest, "Standard Network" is not.
+  const asnNumber = extractAsnNumber(asnText);
+  return asnNumber !== null ? `AS${asnNumber}` : 'Standard Network';
 }
 
 export function classifyIspNetwork(
@@ -411,7 +413,7 @@ export function classifyIspNetwork(
 
   // Fallback: nothing matched; keep the cleaned ISP / Org name as the brand.
   return {
-    brandName: cleanIspBrandText(ispText, orgText),
+    brandName: cleanIspBrandText(ispText, orgText, asn),
     networkType: RESIDENTIAL_BROADBAND,
     isConsumerBroadband: false,
     isDatacenterOrHosting: false,
@@ -1115,6 +1117,87 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
     idbDurabilityRatio: incognitoVerdict.idbDurabilityRatio,
     opfsFlushMs: incognitoVerdict.opfsFlushMs,
   };
+}
+
+/**
+ * UA-CH values posted alongside the identify payload.
+ *
+ * Low-entropy values (`brands`, `mobile`, `platform`) are always available from
+ * `navigator.userAgentData`. High-entropy values are requested per identify and raced
+ * against a 1.5 s budget: a browser that never answers must not hold up the request,
+ * so the caller always receives whatever the low-entropy layer already knew.
+ * Never throws.
+ */
+export interface ClientHintsPayload {
+  brands?: Array<{ brand: string; version: string }>;
+  fullVersionList?: Array<{ brand: string; version: string }>;
+  platform?: string;
+  platformVersion?: string;
+  architecture?: string;
+  bitness?: string;
+  model?: string;
+  mobile?: boolean;
+}
+
+let clientHintsInFlight: Promise<ClientHintsPayload | null> | null = null;
+
+async function collectClientHintsUncached(): Promise<ClientHintsPayload | null> {
+  if (typeof navigator === 'undefined') return null;
+  const uaData = (navigator as unknown as { userAgentData?: NavigatorUAData }).userAgentData;
+  if (!uaData) return null;
+
+  const lowEntropy: ClientHintsPayload = {
+    brands: Array.isArray(uaData.brands)
+      ? uaData.brands.map((entry) => ({ brand: entry.brand, version: entry.version }))
+      : undefined,
+    mobile: typeof uaData.mobile === 'boolean' ? uaData.mobile : undefined,
+    platform: typeof uaData.platform === 'string' ? uaData.platform : undefined,
+  };
+
+  if (typeof uaData.getHighEntropyValues !== 'function') return lowEntropy;
+
+  try {
+    const highEntropy = await Promise.race([
+      uaData.getHighEntropyValues([
+        'fullVersionList',
+        'platform',
+        'platformVersion',
+        'architecture',
+        'bitness',
+        'model',
+        'uaFullVersion',
+      ]),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500)),
+    ]);
+    if (!highEntropy) return lowEntropy;
+    return {
+      ...lowEntropy,
+      fullVersionList: Array.isArray(highEntropy.fullVersionList)
+        ? highEntropy.fullVersionList.map((entry) => ({
+            brand: entry.brand,
+            version: entry.version,
+          }))
+        : undefined,
+      platform: highEntropy.platform || lowEntropy.platform,
+      platformVersion: highEntropy.platformVersion || undefined,
+      architecture: highEntropy.architecture || undefined,
+      bitness: highEntropy.bitness || undefined,
+      model: highEntropy.model || undefined,
+    };
+  } catch {
+    return lowEntropy;
+  }
+}
+
+/**
+ * Shared, cached UA-CH probe. The same promise backs the identify payload and any
+ * later caller, so a single identify never asks the browser twice.
+ */
+export function collectClientHints(): Promise<ClientHintsPayload | null> {
+  if (!clientHintsInFlight) {
+    clientHintsInFlight = collectClientHintsUncached().catch(() => null);
+  }
+  return clientHintsInFlight;
 }
 
 /**
@@ -3957,9 +4040,10 @@ export async function identifyCurrentVisitor(options?: {
   }
 
   const execute = async (): Promise<IntelVisitorResponse> => {
-    const [browserDevice, clientGeoHint] = await Promise.all([
+    const [browserDevice, clientGeoHint, clientHints] = await Promise.all([
       collectBrowserDeviceInfo(),
       collectClientGeoHint(),
+      collectClientHints(),
     ]);
     const stored = getFirstPartyStorage();
     // The legacy hardware probe and the new tri-layer collectors run concurrently, so the
@@ -4049,6 +4133,8 @@ export async function identifyCurrentVisitor(options?: {
         sessionId: stored.sessionId || identitySessionId,
         storageHealed: storedIdentity.storage_healed,
         clientGeoHint,
+        // High-entropy UA-CH values; the server's own `Sec-CH-UA*` headers outrank them.
+        clientHints,
         securityEnvelope,
         // Top-level mirrors so no server-side spelling path can miss the verdict.
         incognito: incog.isPrivate,

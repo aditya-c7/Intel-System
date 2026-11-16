@@ -393,6 +393,21 @@ export interface IntelVisitorResponse {
   recognitionSource: RecognitionSource;
   location: LocationInfo;
   browserDevice: BrowserDeviceInfo;
+  /**
+   * Server-normalized UA / client-hints identity. `os` is the OS family only and the
+   * version lives in `os_version`; `browser_details` is the v4 event shape.
+   */
+  os?: string;
+  os_version?: string;
+  browser_details?: {
+    browser_name: string;
+    browser_full_version: string;
+    browser_major_version: string;
+    os: string;
+    os_version: string;
+    device: string;
+    device_model?: string;
+  };
   hardwareSignals: HardwareSignals;
   securitySignals: SecuritySignals;
   statistics: VisitStatistics;

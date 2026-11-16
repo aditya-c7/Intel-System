@@ -1030,11 +1030,22 @@ export default function App() {
     const s = data.securitySignals;
     const firstVisitMs = Date.parse(data.visitHistory[0]?.visitedAtUtc || '') || Date.now();
     const deviceType = data.browserDevice.deviceType;
-    const uaIdentity = normalizeIdentity({
+    const fallbackIdentity = normalizeIdentity({
       userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
       platform: typeof navigator !== 'undefined' ? navigator.platform : '',
       maxTouchPoints: typeof navigator !== 'undefined' ? navigator.maxTouchPoints : 0,
     });
+    // The server normalizer saw the request's own `Sec-CH-UA*` headers, so its
+    // `browser_details` outranks the client-side UA regexes when present.
+    const uaIdentity = {
+      os: data.browser_details?.os || fallbackIdentity.os,
+      os_version: data.browser_details?.os_version ?? fallbackIdentity.os_version,
+      browser_name: data.browser_details?.browser_name || fallbackIdentity.browser_name,
+      browser_major_version:
+        data.browser_details?.browser_major_version || fallbackIdentity.browser_major_version,
+      browser_full_version:
+        data.browser_details?.browser_full_version || fallbackIdentity.browser_full_version,
+    };
     const osName = uaIdentity.os;
     const osVersion = uaIdentity.os_version;
     const rawAttributes =

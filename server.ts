@@ -42,8 +42,12 @@ import {
 import { buildProximityInfo } from './src/lib/geohash';
 import { detectAiBotFromServerSignals } from './src/lib/aiBotDirectory';
 import { createAIProtectionSystem, refreshAIBotFeeds } from './src/server/ai-protection/middleware';
-import { clientHintsMiddleware } from './src/server/middleware/clientHints';
-import { enrichNetwork } from './src/server/network/asnEnricher';
+import { clientHintsMiddleware, type ParsedClientHints } from './src/server/middleware/clientHints';
+import {
+  normalizeUserAgent,
+  type ClientHintsInput,
+} from './src/shared/normalization/uaNormalizer';
+import { enrichNetwork, resolveAsnOrganization } from './src/server/network/asnEnricher';
 import { ensureIdentitySchema, blockKeysFor, upsertBlocks, IDENTITY_SCHEMA_SQL } from './src/server/identity/identityIndex';
 import { resolveVisitor, upsertVisitorProfile, type ResolverProfile, type ResolveVisitorResult } from './src/server/identity/resolver';
 import { scoreConfidence } from './src/server/identity/confidenceScorer';
@@ -1107,13 +1111,15 @@ export function classifyIspNetwork(isp: string, org: string, asn: string): IspNe
   if (residential) return residential;
 
   // Unknown / unrecognised network: never claim residential broadband without positive proof.
+  // A known numeric ASN is labelled `AS<number>`; "Standard Network" is reserved for a
+  // request where no network identity exists at all.
   return {
     brandName:
       cleanIsp && !/^(unknown|unknown isp|n\/a)$/i.test(cleanIsp)
         ? cleanIsp
         : cleanOrg && !/^(unknown|unknown isp|n\/a)$/i.test(cleanOrg)
         ? cleanOrg
-        : 'Unresolved Network',
+        : asnTokenHits[0] ?? 'Standard Network',
     networkType: 'Standard Network',
     isConsumerBroadband: false,
     isDatacenterOrHosting: false,
@@ -4299,7 +4305,8 @@ async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): 
       const asnNumber = data.data?.asns?.[0]?.asn;
       if (typeof asnNumber === 'number' && Number.isFinite(asnNumber)) {
         const asn = `AS${asnNumber}`;
-        const org = cloudProviderOrgForAsn(asn) || 'Standard Network';
+        // Never label a numeric ASN "Standard Network": the AS label is honest.
+        const org = cloudProviderOrgForAsn(asn) || asn;
         const netDetails = normalizeIspAndOrg(org, org, asn, false);
         db.prepare(
           `INSERT OR REPLACE INTO verified_geo_cache_v3 (
@@ -5490,6 +5497,49 @@ function sanitizeAndReinforceSecuritySignals(
   };
 }
 
+/**
+ * Merges the server-parsed `Sec-CH-UA*` headers with the optional client payload.
+ * Header values are browser-generated and therefore win; the client payload only
+ * fills gaps (mainly high-entropy `model`, `architecture` and `bitness` values that
+ * desktop headers never carry).
+ */
+function mergeRequestClientHints(
+  headers: ParsedClientHints | null | undefined,
+  body: ClientHintsInput | null | undefined
+): ClientHintsInput {
+  const h = headers ?? null;
+  const b = body && typeof body === 'object' ? body : null;
+  const firstText = (...values: Array<string | undefined | null>): string => {
+    for (const value of values) {
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return '';
+  };
+  const firstList = (
+    a: Array<{ brand: string; version: string }> | undefined | null,
+    bb: Array<{ brand: string; version: string }> | string | undefined | null
+  ): Array<{ brand: string; version: string }> | string | undefined => {
+    if (Array.isArray(a) && a.length > 0) return a;
+    if (Array.isArray(bb) && bb.length > 0) return bb;
+    if (typeof bb === 'string' && bb.trim()) return bb;
+    return undefined;
+  };
+
+  return {
+    brands: firstList(h?.brands, b?.brands),
+    fullVersionList: firstList(h?.fullVersionList, b?.fullVersionList),
+    platform: firstText(h?.platform, b?.platform),
+    platformVersion: firstText(h?.platformVersion, b?.platformVersion),
+    architecture: firstText(h?.architecture, b?.architecture, b?.arch),
+    bitness: firstText(h?.bitness, b?.bitness),
+    model: firstText(h?.model, b?.model),
+    mobile: b?.mobile ?? h?.mobile,
+    formFactors: Array.isArray(b?.formFactors) ? b.formFactors : undefined,
+    uaFullVersion: b?.uaFullVersion,
+    wow64: typeof b?.wow64 === 'boolean' ? b.wow64 : undefined,
+  };
+}
+
 app.post('/api/visitor/identify', async (req, res) => {
   try {
     // Start the hourly bulk Tor exit-list refresh immediately so it overlaps the geolocation
@@ -5513,6 +5563,12 @@ app.post('/api/visitor/identify', async (req, res) => {
       storageHealed?: boolean;
       /** Phase 4 — sealed request envelope (timestamp / nonce / signature + JS payload identity). */
       securityEnvelope?: Partial<SecurityEnvelope> | null;
+      /**
+       * High-entropy UA-CH values resolved from `navigator.userAgentData`
+       * (`fullVersionList`, `platformVersion`, `architecture`, `bitness`, `model`).
+       * They complement the `Sec-CH-UA*` request headers, which remain authoritative.
+       */
+      clientHints?: ClientHintsInput | null;
       clientGeoHint?: {
         ip?: string;
         city?: string;
@@ -5558,6 +5614,27 @@ app.post('/api/visitor/identify', async (req, res) => {
     const browserDevice = sanitizeBrowserDevice(rawBrowserDevice);
     const hardwareSignals = sanitizeHardwareSignals(rawHardwareSignals, browserDevice);
     const hardwareId = hardwareSignals.hardwareId;
+
+    // Authoritative browser / OS identity. The request's own `Sec-CH-UA*` headers are
+    // generated by the browser, so they outrank the client payload; missing hints fall
+    // back to the high-entropy values the client resolved from `navigator.userAgentData`
+    // and finally to the User-Agent string. `os` is always the family and the version
+    // always lands in `os_version` — never the inverse.
+    const uaIdentity = normalizeUserAgent({
+      userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '',
+      platform: typeof rawBrowserDevice?.platform === 'string' ? rawBrowserDevice.platform : '',
+      maxTouchPoints: hardwareSignals.maxTouchPoints,
+      clientHints: mergeRequestClientHints(
+        (req as express.Request & { intelClientHints?: ParsedClientHints }).intelClientHints,
+        requestBody.clientHints
+      ),
+    });
+    if (uaIdentity.os !== 'Unknown' && /^unknown|^$/i.test(browserDevice.os || '')) {
+      browserDevice.os = uaIdentity.os;
+    }
+    if (uaIdentity.browserName !== 'Unknown' && /^unknown|^$/i.test(browserDevice.browser || '')) {
+      browserDevice.browser = uaIdentity.browserName;
+    }
 
     let { ip: extractedIp, isPublic } = extractVisitorIp(req);
 
@@ -5647,34 +5724,57 @@ app.post('/api/visitor/identify', async (req, res) => {
     }
 
     // Zero-cost 4-tier ASN enrichment (edge headers → bundled registry → Team Cymru over
-    // DNS-over-HTTPS). A placeholder ISP ("Standard Network" / "Autonomous System AS…")
-    // is replaced by the resolved operator name; when nothing resolves, the existing value
-    // is kept — a network name is never fabricated.
+    // DNS TXT / DNS-over-HTTPS). A placeholder ISP ("Standard Network" /
+    // "Autonomous System AS…") is replaced by the resolved operator name. When a numeric
+    // ASN is known but every name lookup fails, the network is labelled `AS<number>`
+    // rather than "Standard Network"; a real ISP name is never overwritten.
     const edgeAsnNumber = Number.parseInt(edgeGeo.asn.replace(/^AS/i, ''), 10);
     const enrichedNetwork = await enrichNetwork(extractedIp, {
       asn: Number.isInteger(edgeAsnNumber) && edgeAsnNumber > 0 ? edgeAsnNumber : undefined,
       country: edgeGeo.countryCode || undefined,
     });
+    const placeholderIspBefore =
+      isMissingGeoValue(location.isp) ||
+      /^autonomous system\b/i.test(location.isp) ||
+      location.isp === 'Standard Network';
+    const placeholderOrgBefore =
+      isMissingGeoValue(location.org) || location.org === 'Standard Network';
     if (enrichedNetwork.source !== 'none') {
       const resolvedAsn = normalizeAsnLabel(enrichedNetwork.asn);
-      const placeholderIsp =
-        isMissingGeoValue(location.isp) ||
-        /^autonomous system\b/i.test(location.isp) ||
-        location.isp === 'Standard Network';
-      const placeholderOrg =
-        isMissingGeoValue(location.org) || location.org === 'Standard Network';
       location = {
         ...location,
         asn: normalizeAsnLabel(location.asn) || resolvedAsn || location.asn,
         isp:
-          placeholderIsp && enrichedNetwork.asn_name
+          placeholderIspBefore && enrichedNetwork.asn_name
             ? enrichedNetwork.asn_name
             : location.isp,
         org:
-          placeholderOrg && enrichedNetwork.asn_name
+          placeholderOrgBefore && enrichedNetwork.asn_name
             ? enrichedNetwork.asn_name
             : location.org,
         isVpnOrHosting: location.isVpnOrHosting || enrichedNetwork.datacenter_result,
+      };
+    }
+
+    // Numeric ASN known, organisation still unknown: resolve the name only, then degrade
+    // to `AS<number>`. The Tor / bot engines read `location.asn`, so the label stays exact.
+    const knownAsnLabel =
+      normalizeAsnLabel(location.asn) || normalizeAsnLabel(edgeGeo.asn) || '';
+    const stillPlaceholder =
+      isMissingGeoValue(location.isp) ||
+      /^autonomous system\b/i.test(location.isp) ||
+      location.isp === 'Standard Network';
+    if (knownAsnLabel && stillPlaceholder) {
+      const byAsn = await resolveAsnOrganization(knownAsnLabel);
+      location = {
+        ...location,
+        asn: knownAsnLabel,
+        isp: byAsn.asn_name || knownAsnLabel,
+        org:
+          isMissingGeoValue(location.org) || location.org === 'Standard Network'
+            ? byAsn.asn_name || knownAsnLabel
+            : location.org,
+        isVpnOrHosting: location.isVpnOrHosting || byAsn.datacenter_result,
       };
     }
 
@@ -6641,6 +6741,21 @@ app.post('/api/visitor/identify', async (req, res) => {
       bot_type: botType,
       bot_info: botInfo,
       browserDevice,
+      // Server-normalized UA / client-hints identity. `os` is the family only and the
+      // version lives in `os_version`; `browser_details` mirrors the event contract so
+      // `browser_major_version` is never empty when a full version is known.
+      os: uaIdentity.os,
+      os_version: uaIdentity.osVersion,
+      browser_details: {
+        browser_name: uaIdentity.browserName,
+        browser_full_version: uaIdentity.browserFullVersion,
+        browser_major_version: uaIdentity.browserMajorVersion,
+        os: uaIdentity.os,
+        os_version: uaIdentity.osVersion,
+        device: uaIdentity.device,
+        device_model:
+          uaIdentity.model || browserDevice.reportedModel || browserDevice.phoneModel || '',
+      },
       hardwareSignals,
       securitySignals,
       statistics,
