@@ -43,6 +43,8 @@ interface SignatureInputParts {
   tag: string;
   created: number | null;
   expires: number | null;
+  /** Inner list + parameters exactly as sent, used for the `@signature-params` line. */
+  rawParams: string;
 }
 
 interface Jwk {
@@ -90,6 +92,7 @@ function parseSignatureInput(raw: string): SignatureInputParts | null {
     const parsed = Number.parseInt(value.trim(), 10);
     return Number.isFinite(parsed) ? parsed : null;
   };
+  const equals = raw.indexOf('=');
   return {
     label: match[1],
     components,
@@ -97,6 +100,7 @@ function parseSignatureInput(raw: string): SignatureInputParts | null {
     tag: (params.tag ?? '').toLowerCase(),
     created: asNumber(params.created),
     expires: asNumber(params.expires),
+    rawParams: equals >= 0 ? raw.slice(equals + 1).trim() : '',
   };
 }
 
@@ -165,13 +169,22 @@ function componentValue(
   }
 }
 
-function signatureBase(components: string[], request: WebBotAuthRequest, headers: WebBotAuthHeaderBag): string | null {
+function signatureBase(
+  components: string[],
+  request: WebBotAuthRequest,
+  headers: WebBotAuthHeaderBag,
+  rawParams: string
+): string | null {
   const lines: string[] = [];
   for (const component of components) {
     const value = componentValue(component, request, headers);
     if (value === null) return null;
     lines.push(`"${component}": ${value}\n`);
   }
+  // RFC 9421 §2.5: the signature base always ends with the `@signature-params`
+  // line. Omitting it made every genuine Web Bot Auth signature fail verification.
+  if (!rawParams) return null;
+  lines.push(`"@signature-params": ${rawParams}\n`);
   return lines.join('');
 }
 
@@ -381,7 +394,7 @@ export class WebBotAuthVerifier {
       };
     }
 
-    const base = signatureBase(parsed.components, request, request.headers);
+    const base = signatureBase(parsed.components, request, request.headers, parsed.rawParams);
     if (!base) {
       return {
         present,

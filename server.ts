@@ -6052,6 +6052,9 @@ app.post('/api/visitor/identify', async (req, res) => {
     };
     res.cookie('intel_http_vid', visitorId, cookieOptions);
     res.cookie('intel_http_token', visitorToken, cookieOptions);
+    // Non-HttpOnly mirror used by the client storage waterfall when localStorage
+    // and IndexedDB are unavailable (private mode, storage eviction).
+    res.cookie('_intel_vid_client', visitorId, { ...cookieOptions, httpOnly: false });
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
 
     const statsAgg = db
@@ -6895,6 +6898,45 @@ app.get('/api/visitor/history/:visitorId', (req, res) => {
   });
 
   res.json({ visitorId: requestedVisitorId, visits });
+});
+
+/**
+ * HTTP-cache identity fallback.
+ *
+ * The HTTP disk cache survives a cookie/localStorage/IndexedDB wipe, so a
+ * conditional request can still recover the visitor id after full DOM storage
+ * loss. The endpoint returns the id with a strong ETag; revalidation answers
+ * 304 and the browser replays the cached body. Without an `If-None-Match`
+ * presented there is nothing to revalidate, so the response is `204`.
+ */
+app.get('/api/intel/identity-ping', (req, res) => {
+  res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
+  res.setHeader('Vary', 'Cookie');
+  const presented = typeof req.headers['if-none-match'] === 'string' ? req.headers['if-none-match'] : '';
+  if (presented) {
+    res.setHeader('ETag', presented);
+    res.status(304).end();
+    return;
+  }
+  const cookies = (req.cookies ?? {}) as Record<string, unknown>;
+  const cookieVisitor =
+    (typeof cookies['_intel_vid_client'] === 'string' && cookies['_intel_vid_client'].trim()) ||
+    (typeof cookies['intel_http_vid'] === 'string' && cookies['intel_http_vid'].trim()) ||
+    '';
+  if (!cookieVisitor) {
+    res.status(204).end();
+    return;
+  }
+  const etag = `"${crypto.createHash('sha256').update(cookieVisitor).digest('base64url')}"`;
+  res.setHeader('ETag', etag);
+  res.json({
+    identity: {
+      visitor_id: cookieVisitor,
+      hardware_fingerprint: '',
+      browser_fingerprint: '',
+      created_at: new Date().toISOString(),
+    },
+  });
 });
 
 // Native AI Crawl Control analytics, policy, telemetry and feed-sync API.

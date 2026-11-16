@@ -5,7 +5,8 @@
  * try/catch so private-mode restrictions degrade silently (nulls, empty
  * sources, storage_healed: false).
  *
- * Waterfall: localStorage → IndexedDB (800ms timeout race) → cookie mirror.
+ * Waterfall: localStorage → IndexedDB (800ms timeout race) → cookie mirror →
+ * HTTP cache revalidation.
  * As soon as one slot yields a valid identity, ALL writable slots are healed
  * (best-effort, idempotent) and `storage_healed` is true.
  */
@@ -32,6 +33,10 @@ export const SESSION_TTL_MS = 30 * 60 * 1000;
 
 /** IndexedDB waterfall race budget. */
 const IDB_TIMEOUT_MS = 800;
+
+/** Conditional-request endpoint that carries the identity in the HTTP cache. */
+const IDENTITY_PING_PATH = '/api/intel/identity-ping';
+const HTTP_CACHE_TIMEOUT_MS = 1500;
 
 /* -------------------------------------------------------------------------- */
 /* Types                                                                       */
@@ -266,6 +271,58 @@ function readClientCookie(): StoredIdentity | null {
 }
 
 /* -------------------------------------------------------------------------- */
+/* HTTP cache mirror (survives a full DOM storage wipe)                        */
+/* -------------------------------------------------------------------------- */
+
+let httpCachePrimed = false;
+
+/**
+ * Reads the identity left in the browser's HTTP disk cache by a previous
+ * `/api/intel/identity-ping` response. `no-cache` forces revalidation, so the
+ * browser attaches `If-None-Match`; the server answers 304 and the cached JSON
+ * body is replayed. Returns null when no cached record exists.
+ */
+async function readHttpCacheIdentity(): Promise<StoredIdentity | null> {
+  if (typeof fetch !== 'function') return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HTTP_CACHE_TIMEOUT_MS);
+  try {
+    const response = await fetch(IDENTITY_PING_PATH, {
+      method: 'GET',
+      cache: 'no-cache',
+      credentials: 'same-origin',
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+    const payload = (await response.json()) as { identity?: unknown };
+    return isValidStoredIdentity(payload?.identity) ? payload.identity : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Primes the HTTP cache once per page load, so a later storage wipe can still
+ * recover the visitor id. Fire-and-forget: failures are silent.
+ */
+async function primeHttpCacheIdentity(record: StoredIdentity): Promise<void> {
+  if (httpCachePrimed || typeof fetch !== 'function') return;
+  if (!isValidStoredIdentity(record)) return;
+  httpCachePrimed = true;
+  try {
+    await fetch(IDENTITY_PING_PATH, {
+      method: 'GET',
+      cache: 'no-cache',
+      credentials: 'same-origin',
+    });
+  } catch {
+    /* best-effort cache priming only */
+  }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Waterfall + healing                                                         */
 /* -------------------------------------------------------------------------- */
 
@@ -292,6 +349,11 @@ export async function loadStoredIdentity(): Promise<StoredIdentityLoad> {
 
     const fromCookie = readClientCookie();
     if (fromCookie) candidates.push({ slot: 'cookie', identity: fromCookie });
+
+    if (candidates.length === 0) {
+      const fromHttpCache = await readHttpCacheIdentity();
+      if (fromHttpCache) candidates.push({ slot: 'httpCache', identity: fromHttpCache });
+    }
 
     if (candidates.length === 0) {
       return { identity: null, sources: [], storage_healed: false };
@@ -326,6 +388,7 @@ export async function persistIdentity(record: StoredIdentity): Promise<boolean> 
   } catch {
     /* treated as a failed slot */
   }
+  void primeHttpCacheIdentity(record);
   return wrote;
 }
 

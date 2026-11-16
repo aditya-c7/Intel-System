@@ -20,6 +20,7 @@
     "test:ua": "tsx scripts/test-ua-normalizer.ts",
     "test:asn": "tsx scripts/test-asn-enricher.ts",
     "test:verify": "tsx scripts/test-verification.ts",
+    "test:t07": "tsx scripts/test-t07-agent-detection.ts",
     "phones:generate": "node scripts/generate-phone-models.mjs"
   },
   "dependencies": {

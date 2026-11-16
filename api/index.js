@@ -1830,13 +1830,15 @@ function parseSignatureInput(raw) {
     const parsed = Number.parseInt(value.trim(), 10);
     return Number.isFinite(parsed) ? parsed : null;
   };
+  const equals = raw.indexOf("=");
   return {
     label: match[1],
     components,
     keyId: params.keyid ?? "",
     tag: (params.tag ?? "").toLowerCase(),
     created: asNumber(params.created),
-    expires: asNumber(params.expires)
+    expires: asNumber(params.expires),
+    rawParams: equals >= 0 ? raw.slice(equals + 1).trim() : ""
   };
 }
 function parseSignatureAgentHost(raw) {
@@ -1894,7 +1896,7 @@ function componentValue(name, request, headers) {
     }
   }
 }
-function signatureBase(components, request, headers) {
+function signatureBase(components, request, headers, rawParams) {
   const lines = [];
   for (const component of components) {
     const value = componentValue(component, request, headers);
@@ -1902,6 +1904,9 @@ function signatureBase(components, request, headers) {
     lines.push(`"${component}": ${value}
 `);
   }
+  if (!rawParams) return null;
+  lines.push(`"@signature-params": ${rawParams}
+`);
   return lines.join("");
 }
 function collectEd25519Keys(node, depth, output) {
@@ -2090,7 +2095,7 @@ var WebBotAuthVerifier = class _WebBotAuthVerifier {
         errorDetail: "Signature header is not a labelled RFC 9421 byte-sequence value"
       };
     }
-    const base = signatureBase(parsed.components, request, request.headers);
+    const base = signatureBase(parsed.components, request, request.headers, parsed.rawParams);
     if (!base) {
       return {
         present,
@@ -9970,6 +9975,7 @@ app.post("/api/visitor/identify", async (req, res) => {
     };
     res.cookie("intel_http_vid", visitorId, cookieOptions);
     res.cookie("intel_http_token", visitorToken, cookieOptions);
+    res.cookie("_intel_vid_client", visitorId, { ...cookieOptions, httpOnly: false });
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     const statsAgg = db.prepare(
       `SELECT
@@ -10550,6 +10556,32 @@ app.get("/api/visitor/history/:visitorId", (req, res) => {
     };
   });
   res.json({ visitorId: requestedVisitorId, visits });
+});
+app.get("/api/intel/identity-ping", (req, res) => {
+  res.setHeader("Cache-Control", "private, max-age=0, must-revalidate");
+  res.setHeader("Vary", "Cookie");
+  const presented = typeof req.headers["if-none-match"] === "string" ? req.headers["if-none-match"] : "";
+  if (presented) {
+    res.setHeader("ETag", presented);
+    res.status(304).end();
+    return;
+  }
+  const cookies = req.cookies ?? {};
+  const cookieVisitor = typeof cookies["_intel_vid_client"] === "string" && cookies["_intel_vid_client"].trim() || typeof cookies["intel_http_vid"] === "string" && cookies["intel_http_vid"].trim() || "";
+  if (!cookieVisitor) {
+    res.status(204).end();
+    return;
+  }
+  const etag = `"${crypto.createHash("sha256").update(cookieVisitor).digest("base64url")}"`;
+  res.setHeader("ETag", etag);
+  res.json({
+    identity: {
+      visitor_id: cookieVisitor,
+      hardware_fingerprint: "",
+      browser_fingerprint: "",
+      created_at: (/* @__PURE__ */ new Date()).toISOString()
+    }
+  });
 });
 app.use("/api/intel/ai-crawl-control", aiProtection.apiRouter);
 app.use("/api", (_req, res) => {
