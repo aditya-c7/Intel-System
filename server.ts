@@ -4803,9 +4803,11 @@ function sanitizeAndReinforceSecuritySignals(
   const botSubtype: BotSubtype = botClassification.subtype;
   const spoofedCrawler =
     botClassification.subtype === 'bad_bot' && botClassification.label === 'Spoofed Crawler';
-  const isBot = Boolean(
-    clientAutomationDetected || botSubtype === 'bad_bot' || botSubtype === 'ai_agent'
-  );
+  // The gated subtype is the single source of truth for the public `isBot` flag. Keeping
+  // the raw client booleans in this union re-introduced false positives (a privacy
+  // extension patching a Navigator getter, a stale headless hint) even when the verdict
+  // gate had already decided the session was human.
+  const isBot = botSubtype === 'bad_bot' || botSubtype === 'ai_agent';
 
   const browserTimezone =
     typeof raw?.browserTimezone === 'string' && raw.browserTimezone.trim()

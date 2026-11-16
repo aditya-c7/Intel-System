@@ -1817,10 +1817,13 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
   // getter. Only hard signals prove automation on their own: the WebDriver handshake, a
   // CDP binding, an automation user-agent, or a BotD hard detector. Soft signals are
   // recorded as corroboration only and can never flip `isBot`.
+  // A patched Navigator.prototype.webdriver getter is NOT proof of automation: privacy
+  // extensions and hardened profiles rewrite it routinely. BotD folds both the real
+  // `navigator.webdriver` flag and the getter override into `signals.webdriver`, so the
+  // getter case is downgraded to `webdriverGetterTampered` (soft) below and only the
+  // genuine flag reaches the hard gate.
   const d19Hard =
-    Boolean(botD19.signals.user_agent) ||
-    Boolean(botD19.signals.webdriver) ||
-    Boolean(botD19.signals.distinctive_properties);
+    Boolean(botD19.signals.user_agent) || Boolean(botD19.signals.distinctive_properties);
   const d19Soft =
     Boolean(botD19.signals.rtt) ||
     Boolean(botD19.signals.plugins_array) ||
@@ -1868,7 +1871,7 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
     isHeadless:
       isHeadless || botD19.signals.window_size || botD19.signals.user_agent,
     botReason,
-    webdriver: webdriver || botD19.signals.webdriver,
+    webdriver,
     cdpDetected: cdpDetected || botD19.signals.distinctive_properties,
     botSignals: allBotReasons,
     botSuspicion,

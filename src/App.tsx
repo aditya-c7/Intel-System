@@ -378,8 +378,16 @@ function buildClientSignalRows(
   incognitoConfirmed = false,
   clientEmulator?: EmulatorEvidence | null
 ): SignalRowModel[] {
-  const isBotDetected = Boolean(signals.isBot || signals.webdriver || signals.cdpDetected);
-  const isHeadlessDetected = Boolean(signals.isHeadless);
+  const botSubtype: BotSubtype = signals.botSubtype ?? 'human';
+  // The gated server verdict is authoritative. Raw client booleans are only a fallback for
+  // legacy payloads that predate `botSubtype`; a privacy extension patching a getter (or a
+  // tampered CDP report) must never relabel a person as automated on its own.
+  const isBotDetected =
+    botSubtype === 'bad_bot' ||
+    botSubtype === 'ai_agent' ||
+    (!signals.botSubtype &&
+      Boolean(signals.isBot || signals.webdriver || signals.cdpDetected));
+  const isHeadlessDetected = Boolean(signals.isHeadless) && isBotDetected;
   const isDatacenterAsn = Boolean(signals.datacenterAsn);
   const hasTzMismatch = Boolean(signals.timezoneMismatch);
   const isVm = Boolean(signals.isVirtualMachine);
@@ -388,7 +396,6 @@ function buildClientSignalRows(
   const isRequestTampered = Boolean(signals.tamperedRequest || signals.replayDetected);
   const isTorExit = Boolean(signals.torExitNode);
   const isBlocklisted = Boolean(signals.ipBlocklisted);
-  const botSubtype: BotSubtype = signals.botSubtype ?? 'human';
   const isSpoofedCrawler =
     botSubtype === 'bad_bot' && /spoof/i.test(`${signals.botCategory || ''} ${signals.botReason || ''}`);
   const isIncognito =

@@ -9306,9 +9306,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   );
   const botSubtype = botClassification.subtype;
   const spoofedCrawler = botClassification.subtype === "bad_bot" && botClassification.label === "Spoofed Crawler";
-  const isBot = Boolean(
-    clientAutomationDetected || botSubtype === "bad_bot" || botSubtype === "ai_agent"
-  );
+  const isBot = botSubtype === "bad_bot" || botSubtype === "ai_agent";
   const browserTimezone = typeof raw?.browserTimezone === "string" && raw.browserTimezone.trim() ? raw.browserTimezone.trim().slice(0, 80) : browserDevice.timezone || "UTC";
   const ipTimezone = ipTimezoneHint || (typeof raw?.ipTimezone === "string" && raw.ipTimezone.trim() && raw.ipTimezone !== "Unavailable" ? raw.ipTimezone.trim().slice(0, 80) : "Unavailable");
   const normBrowserTz = normalizeServerTimezoneId(browserTimezone);
