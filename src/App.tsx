@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState, useCallback } from 'react';
-import type { ReactNode } from 'react';
 import { identifyCurrentVisitor, detectIncognitoMode, detectEmulatorEvidence } from './lib/collector';
 import type { EmulatorEvidence } from './lib/collector';
 import type {
