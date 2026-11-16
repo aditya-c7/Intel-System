@@ -153,7 +153,10 @@ export class BotPreferenceSyncEngine {
 
   /** `search=..., ai-input=..., ai-train=..., use=reference` as used by Cloudflare's Content-Signal draft. */
   buildContentSignalHeader(config: ZoneConfig = this.getZoneConfig()): string {
-    const signal = (policy: ZonePolicy): string => (policy === 'charge' ? 'allow' : policy);
+    // Content-Signal is a yes/no declaration (Cloudflare convention), not an allow/disallow
+    // policy name. `charge` still permits the crawl, so it maps to yes.
+    const signal = (policy: ZonePolicy): string =>
+      policy === 'allow' || policy === 'charge' ? 'yes' : 'no';
     return [
       `search=${signal(config.searchPolicy)}`,
       `ai-input=${signal(config.agentPolicy)}`,
@@ -277,6 +280,17 @@ export class BotPreferenceSyncEngine {
         edgeAction: 'block_403',
         robotsViolation: true,
         violatedDirective: 'verification_required (Web Bot Auth)',
+      };
+    }
+
+    // Operators that publish authoritative IP lists are verifiable by definition. A request
+    // claiming one of those identities from an unlisted IP is a spoof, regardless of the
+    // configured training/search policy — never let a fake GPTBot through on policy grounds.
+    if (!isVerified && bot.feedUrls?.length) {
+      return {
+        edgeAction: 'block_403',
+        robotsViolation: true,
+        violatedDirective: `verification_required (published IP ranges for ${bot.id})`,
       };
     }
 

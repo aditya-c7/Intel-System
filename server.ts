@@ -41,6 +41,7 @@ import {
 } from './src/lib/geoFallbacks';
 import { buildProximityInfo } from './src/lib/geohash';
 import { detectAiBotFromServerSignals } from './src/lib/aiBotDirectory';
+import { createAIProtectionSystem } from './src/server/ai-protection/middleware';
 import type { BotInfo } from './src/types/visitor';
 
 dotenv.config();
@@ -486,6 +487,10 @@ function initializeDatabase(): DatabaseAdapter {
 }
 
 const db = initializeDatabase();
+
+// Native AI crawler / remote-agent protection engine. The same Express app is bundled into
+// the Cloudflare Worker; schema setup is deliberately deferred to request time there.
+const aiProtection = createAIProtectionSystem(db);
 
 function signVisitorId(visitorId: string): string {
   return crypto.createHmac('sha256', HMAC_SECRET).update(visitorId).digest('hex');
@@ -4506,6 +4511,10 @@ app.get('/api/network/ping', handleNetworkPing);
 
 app.use(express.json({ limit: '512kb' }));
 
+// AI Crawl Control: Web Bot Auth, CIDR/FCrDNS attribution, Content-Signal, robots policy
+// enforcement, Markdown-for-Agents and byte accounting for every incoming request.
+app.use(aiProtection.middleware);
+
 app.get('/api/health', async (req, res) => {
   const visitorsCount = (
     db.prepare('SELECT COUNT(*) AS count FROM visitors').get() as { count: number }
@@ -6580,6 +6589,9 @@ app.get('/api/visitor/history/:visitorId', (req, res) => {
 
   res.json({ visitorId: requestedVisitorId, visits });
 });
+
+// Native AI Crawl Control analytics, policy, telemetry and feed-sync API.
+app.use('/api/intel/ai-crawl-control', aiProtection.apiRouter);
 
 // Explicit JSON 404 for unknown API routes (instead of the SPA fallback HTML).
 app.use('/api', (_req, res) => {

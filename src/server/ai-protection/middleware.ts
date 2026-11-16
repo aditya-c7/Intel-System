@@ -109,8 +109,8 @@ function buildLlmsTxt(config: ZoneConfig, signal?: string): string {
 }
 
 export function createAIProtectionSystem(db: AIBotDatabase): AIProtectionSystem {
-  initAIBotSchema(db);
-
+  // Cloudflare Workers inject a request-scoped Durable-Object database, so schema creation
+  // must happen inside a request — never at module import time. It is idempotent.
   const ipEngine = new IpVerificationEngine(db);
   const webBotAuth = new WebBotAuthVerifier(db);
   const preferenceSync = new BotPreferenceSyncEngine(db);
@@ -166,6 +166,7 @@ export function createAIProtectionSystem(db: AIBotDatabase): AIProtectionSystem 
 
   const middleware = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
     try {
+      initAIBotSchema(db);
       startBackgroundOnce();
       const reqPath = req.path || '/';
       const config = preferenceSync.getZoneConfig();
@@ -381,6 +382,14 @@ export function createAIProtectionSystem(db: AIBotDatabase): AIProtectionSystem 
 
   const apiRouter = express.Router();
   apiRouter.use(express.json({ limit: '256kb' }));
+  apiRouter.use((_req, _res, next) => {
+    try {
+      initAIBotSchema(db);
+    } catch {
+      // A read-only adapter must never fail the API route before it can answer.
+    }
+    next();
+  });
 
   apiRouter.get('/robots.txt', (_req, res) => {
     const config = preferenceSync.getZoneConfig();
@@ -491,8 +500,104 @@ export function createAIProtectionSystem(db: AIBotDatabase): AIProtectionSystem 
     }
 
     const config = preferenceSync.getZoneConfig();
+    const isAllowed = (row: Record<string, any>): boolean => {
+      const status = Number(row.http_status);
+      return status >= 200 && status < 400;
+    };
+    const rowsForBot = (botId: string): Array<Record<string, any>> =>
+      rows.filter((row) => (row.bot_id ? String(row.bot_id) : 'unknown') === botId);
+    const lastSeen = (matched: Array<Record<string, any>>): number =>
+      matched.reduce((max, row) => Math.max(max, Date.parse(String(row.observed_at_utc)) || 0), 0);
+
+    // The dashboard consumes the Cloudflare-style snake_case contract; keep the original
+    // camelCase fields as aliases so existing integrations are unaffected.
+    const snakeSummary = {
+      total_requests: rows.length,
+      allowed_requests: rows.filter(isAllowed).length,
+      unsuccessful_requests: rows.filter((row) => !isAllowed(row)).length,
+      total_bytes: bytes,
+      markdown_served_count: rows.filter((row) =>
+        String(row.edge_action ?? '').toLowerCase().includes('markdown')
+      ).length,
+      robots_violations_count: violations.length,
+    };
+    const snakeCrawlers = [...byBot.values()]
+      .sort((a, b) => b.requests - a.requests)
+      .slice(0, 50)
+      .map((entry) => {
+        const matched = rowsForBot(entry.botId);
+        const definition = BOT_MAP_BY_ID[entry.botId];
+        return {
+          ...entry,
+          bot_id: entry.botId,
+          bot_display_name: entry.displayName,
+          cf_detection_id: definition?.cfDetectionIds?.[0] ?? null,
+          legacy_category: definition?.legacyCategory ?? 'Unknown',
+          behavior: definition?.behavior ?? 'Unknown',
+          operator_label: definition?.operatorLabel ?? 'Unknown',
+          verification_status: matched[0]?.verification_status ?? 'unknown',
+          verification_method: matched[0]?.verification_method ?? 'none',
+          total_requests: entry.requests,
+          allowed_requests: matched.filter(isAllowed).length,
+          unsuccessful_requests: matched.filter((row) => !isAllowed(row)).length,
+          data_transfer_bytes: entry.bytes,
+          robots_violations: matched.filter((row) => Number(row.robots_violation) > 0).length,
+          last_seen_ms: lastSeen(matched),
+        };
+      });
+    const referralsByOperator = new Map<string, number>();
+    for (const referral of referrals) {
+      const operator = String(referral.operator ?? 'Unknown');
+      referralsByOperator.set(operator, (referralsByOperator.get(operator) ?? 0) + 1);
+    }
+    const snakeOperators = [...byOperator.values()]
+      .sort((a, b) => b.requests - a.requests)
+      .slice(0, 25)
+      .map((entry) => {
+        const matched = rows.filter((row) => (row.operator ? String(row.operator) : 'Unknown') === entry.operator);
+        return {
+          ...entry,
+          total_requests: entry.requests,
+          allowed_requests: matched.filter(isAllowed).length,
+          unsuccessful_requests: matched.filter((row) => !isAllowed(row)).length,
+          data_transfer_bytes: entry.bytes,
+          referrals: referralsByOperator.get(entry.operator) ?? 0,
+        };
+      });
+    const statusCodes = rows.map((row) => Number(row.http_status) || 0);
+    const snakeStatusDistribution = {
+      status_2xx: statusCodes.filter((code) => code >= 200 && code < 300).length,
+      status_3xx: statusCodes.filter((code) => code >= 300 && code < 400).length,
+      status_4xx: statusCodes.filter((code) => code >= 400 && code < 500).length,
+      status_403_blocked: statusCodes.filter((code) => code === 403).length,
+      status_402_charged: statusCodes.filter((code) => code === 402).length,
+      status_5xx: statusCodes.filter((code) => code >= 500).length,
+    };
+    const patternStats = new Map<string, { total: number; allowed: number; bytes: number }>();
+    for (const row of rows) {
+      const pattern = computeCloudflareUriPattern(String(row.request_path ?? '/'));
+      const stat = patternStats.get(pattern) ?? { total: 0, allowed: 0, bytes: 0 };
+      stat.total += 1;
+      if (isAllowed(row)) stat.allowed += 1;
+      stat.bytes += number(row.bytes_sent);
+      patternStats.set(pattern, stat);
+    }
+    const snakeUriPatterns = [...patternStats.entries()]
+      .map(([pattern, stat]) => ({
+        uri_pattern: pattern,
+        pattern,
+        total_requests: stat.total,
+        requests: stat.total,
+        allowed_requests: stat.allowed,
+        unsuccessful_requests: stat.total - stat.allowed,
+        data_transfer_bytes: stat.bytes,
+      }))
+      .sort((a, b) => b.total_requests - a.total_requests)
+      .slice(0, 50);
+
     res.json({
       summary: {
+        ...snakeSummary,
         totalRequests: rows.length,
         verifiedRequests: verified,
         verificationRate: rows.length ? Number((verified / rows.length).toFixed(4)) : 0,
@@ -501,15 +606,18 @@ export function createAIProtectionSystem(db: AIBotDatabase): AIProtectionSystem 
         last24hRequests: last24h,
         referralsRecorded: referrals.length,
       },
-      crawlers: [...byBot.values()].sort((a, b) => b.requests - a.requests).slice(0, 50),
-      operators: [...byOperator.values()].sort((a, b) => b.requests - a.requests).slice(0, 25),
-      statusDistribution: byStatus,
-      uriPatterns: [...byPattern.entries()]
-        .map(([pattern, requests]) => ({ pattern, requests }))
-        .sort((a, b) => b.requests - a.requests)
-        .slice(0, 50),
+      crawlers: snakeCrawlers,
+      operators: snakeOperators,
+      statusDistribution: { ...snakeStatusDistribution, ...byStatus },
+      uriPatterns: snakeUriPatterns,
       violations: violations.slice(0, 100),
-      zoneConfig: config,
+      zoneConfig: {
+        ...config,
+        policy_search: config.searchPolicy,
+        policy_agent: config.agentPolicy,
+        policy_training: config.trainingPolicy,
+        content_signal: preferenceSync.buildContentSignalHeader(config),
+      },
       liveRobotsTxt: preferenceSync.generateRobotsTxt(config),
     });
   });
@@ -524,9 +632,20 @@ export function createAIProtectionSystem(db: AIBotDatabase): AIProtectionSystem 
           body.customPolicy.note == null ? null : String(body.customPolicy.note)
         );
       }
-      const patch = { ...body };
+      const patch: Record<string, unknown> = { ...body };
       delete patch.customPolicy;
-      const config = preferenceSync.updateZoneConfig(patch);
+      // Accept both the dashboard's short keys and the internal camelCase names.
+      const alias = (names: string[]): unknown => {
+        for (const name of names) if (patch[name] !== undefined) return patch[name];
+        return undefined;
+      };
+      const search = alias(['search', 'policy_search', 'search_policy']);
+      const agent = alias(['agent', 'policy_agent', 'agent_policy']);
+      const training = alias(['training', 'policy_training', 'training_policy']);
+      if (search !== undefined) patch.searchPolicy = search;
+      if (agent !== undefined) patch.agentPolicy = agent;
+      if (training !== undefined) patch.trainingPolicy = training;
+      const config = preferenceSync.updateZoneConfig(patch as any);
       res.json({ config, robotsTxt: preferenceSync.generateRobotsTxt(config) });
     } catch {
       res.status(500).json({ error: 'policy_update_failed' });
@@ -540,7 +659,13 @@ export function createAIProtectionSystem(db: AIBotDatabase): AIProtectionSystem 
       return;
     }
     const result = convertHtmlToAgentMarkdown(html);
-    res.json(result);
+    const contentSignal = preferenceSync.buildContentSignalHeader();
+    res.json({
+      ...result,
+      content_signal: contentSignal,
+      contentSignal,
+      contentSignalHeader: contentSignal,
+    });
   });
 
   apiRouter.post('/sync-feeds', async (_req, res) => {

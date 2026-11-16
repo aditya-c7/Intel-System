@@ -167,6 +167,21 @@ function htmlToMarkdown(html: string): string {
   return text;
 }
 
+/** Reads a <meta name="..." content="..."> / <meta property="..." ...> tag in either attribute order. */
+function extractMetaContent(html: string, attribute: 'name' | 'property', key: string): string | null {
+  const tagPattern = /<meta\b[^>]*>/gi;
+  const attrPattern = new RegExp(`${attribute}\\s*=\\s*(["'])(.*?)\\1`, 'i');
+  let match: RegExpExecArray | null;
+  while ((match = tagPattern.exec(html)) !== null) {
+    const tag = match[0];
+    const attr = attrPattern.exec(tag);
+    if (!attr || attr[2].trim().toLowerCase() !== key.toLowerCase()) continue;
+    const content = /\bcontent\s*=\s*(["'])(.*?)\1/i.exec(tag);
+    if (content) return decodeEntities(content[2]).trim();
+  }
+  return null;
+}
+
 /** Converts rendered HTML into Markdown suitable for `Accept: text/markdown` clients. */
 function utf8ByteLength(text: string): number {
   return new TextEncoder().encode(text).length;
@@ -185,6 +200,19 @@ export function convertHtmlToAgentMarkdown(htmlBuffer: Buffer | string): Markdow
   if (frontmatterMatch) {
     frontmatter = `---\n${frontmatterMatch[1].trim()}\n---\n\n`;
     body = body.slice(frontmatterMatch[0].length);
+  } else {
+    // Cloudflare Markdown for Agents: synthesise YAML frontmatter from meta tags, with
+    // standard <meta name> taking priority over Open Graph <meta property> fallbacks.
+    const title = extractMetaContent(source, 'name', 'title') ?? extractMetaContent(source, 'property', 'og:title');
+    const description =
+      extractMetaContent(source, 'name', 'description') ?? extractMetaContent(source, 'property', 'og:description');
+    const image = extractMetaContent(source, 'property', 'og:image');
+    const yaml: string[] = [];
+    const yamlValue = (value: string): string => `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+    if (title) yaml.push(`title: ${yamlValue(title)}`);
+    if (description) yaml.push(`description: ${yamlValue(description)}`);
+    if (image) yaml.push(`image: ${yamlValue(image)}`);
+    if (yaml.length) frontmatter = `---\n${yaml.join('\n')}\n---\n\n`;
   }
 
   const { body: withoutJsonLd, nodes } = extractJsonLd(body);
