@@ -2,7 +2,7 @@ import { createRequire as __intelCreateRequire } from 'node:module';
 const require = __intelCreateRequire(import.meta.url);
 
 // server.ts
-import express2 from "express";
+import express from "express";
 import cookieParser from "cookie-parser";
 import crypto from "crypto";
 import net from "net";
@@ -651,2580 +651,6 @@ function detectAiBotFromServerSignals(params) {
   return { detected: false, botType: null, botInfo: null };
 }
 
-// src/server/ai-protection/middleware.ts
-import express from "express";
-
-// src/server/ai-protection/registry.ts
-var BYTESPIDER_STATIC_SUBNETS = [
-  "110.249.201.0/24",
-  "110.249.202.0/24",
-  "111.225.148.0/24",
-  "111.225.149.0/24",
-  "220.243.135.0/24",
-  "220.243.136.0/24",
-  "220.243.188.0/24",
-  "220.243.189.0/24",
-  "60.8.123.0/24",
-  "60.8.151.0/24"
-];
-var OPERATOR_REFERRER_DOMAINS = {
-  "chatgpt.com": "OpenAI",
-  "openai.com": "OpenAI",
-  "claude.ai": "Anthropic",
-  "claude.com": "Anthropic",
-  "anthropic.com": "Anthropic",
-  "perplexity.ai": "Perplexity",
-  "mistral.ai": "Mistral AI",
-  "manus.im": "Manus",
-  "google.com": "Google",
-  "gemini.google.com": "Google",
-  "bing.com": "Microsoft",
-  "copilot.microsoft.com": "Microsoft",
-  "meta.ai": "Meta",
-  "meta.com": "Meta",
-  "facebook.com": "Meta",
-  "duckduckgo.com": "DuckDuckGo",
-  "duck.com": "DuckDuckGo",
-  "bytedance.com": "ByteDance",
-  "toutiao.com": "ByteDance",
-  "tiktok.com": "ByteDance",
-  "apple.com": "Apple"
-};
-var WEB_BOT_AUTH_SIGNER_MAP = {
-  "api.manus.im": {
-    botId: "manus",
-    operator: "Manus",
-    directoryUrl: "https://api.manus.im/.well-known/http-message-signatures-directory"
-  },
-  "chatgpt.com": {
-    botId: "chatgpt-user",
-    operator: "OpenAI",
-    directoryUrl: "https://chatgpt.com/.well-known/http-message-signatures-directory"
-  },
-  "agent.bot.goog": {
-    botId: "google-agent",
-    operator: "Google",
-    directoryUrl: "https://agent.bot.goog/.well-known/http-message-signatures-directory"
-  },
-  "cursorusercontent.com": {
-    botId: "google-agent",
-    operator: "Google",
-    directoryUrl: "https://cursorusercontent.com/.well-known/http-message-signatures-directory"
-  },
-  "www.meta.com": {
-    botId: "meta-externalagent",
-    operator: "Meta",
-    directoryUrl: "https://www.meta.com/.well-known/http-message-signatures-directory"
-  },
-  "assistbot.duckduckgo.com": {
-    botId: "duckassistbot",
-    operator: "DuckDuckGo",
-    directoryUrl: "https://assistbot.duckduckgo.com/.well-known/http-message-signatures-directory"
-  },
-  "web-bot-auth.cloudflare-browser-rendering-085.workers.dev": {
-    botId: "chatgpt-user",
-    operator: "OpenAI",
-    directoryUrl: "https://web-bot-auth.cloudflare-browser-rendering-085.workers.dev/.well-known/http-message-signatures-directory"
-  }
-};
-var BOT_REGISTRY = [
-  {
-    id: "manus",
-    displayName: "Manus",
-    operator: "Manus",
-    cfDetectionIds: ["90000100"],
-    legacyCategory: "AI Assistant",
-    behavior: "Agent",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "Manus", matchMode: "bounded" }],
-    feedUrls: [],
-    webBotAuthHosts: ["api.manus.im"],
-    followsRobotsTxt: false
-  },
-  {
-    id: "gptbot",
-    displayName: "GPTBot",
-    operator: "OpenAI",
-    cfDetectionIds: ["123815556", "33563875"],
-    legacyCategory: "AI Crawler",
-    behavior: "Training",
-    operatorLabel: "Direct",
-    isMixedPurposeAccountable: true,
-    uaTokens: [{ token: "GPTBot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://openai.com/gptbot.json", format: "json" }],
-    expectedAsns: [8075, 400645],
-    followsRobotsTxt: true
-  },
-  {
-    id: "chatgpt-user",
-    displayName: "ChatGPT-User",
-    operator: "OpenAI",
-    cfDetectionIds: ["132995013", "33563857"],
-    legacyCategory: "AI Assistant",
-    behavior: "Agent",
-    operatorLabel: "Direct",
-    isMixedPurposeAccountable: true,
-    uaTokens: [{ token: "ChatGPT-User", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://openai.com/chatgpt-user.json", format: "json" }],
-    webBotAuthHosts: ["chatgpt.com"],
-    expectedAsns: [8075, 400645],
-    followsRobotsTxt: false
-  },
-  {
-    id: "oai-searchbot",
-    displayName: "OAI-SearchBot",
-    operator: "OpenAI",
-    cfDetectionIds: ["126255384", "33563986"],
-    legacyCategory: "AI Search",
-    behavior: "Search",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "OAI-SearchBot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://openai.com/searchbot.json", format: "json" }],
-    expectedAsns: [8075, 400645],
-    followsRobotsTxt: true
-  },
-  {
-    id: "chatgpt",
-    displayName: "ChatGPT",
-    operator: "OpenAI",
-    cfDetectionIds: ["90000107"],
-    legacyCategory: "AI Assistant",
-    behavior: "Agent",
-    operatorLabel: "Direct",
-    isMixedPurposeAccountable: true,
-    uaTokens: [{ token: "ChatGPT", matchMode: "bounded" }],
-    feedUrls: [],
-    webBotAuthHosts: ["chatgpt.com"],
-    expectedAsns: [8075, 400645],
-    followsRobotsTxt: false
-  },
-  {
-    id: "mistralai-user",
-    displayName: "MistralAI-User",
-    operator: "Mistral AI",
-    cfDetectionIds: ["90000101"],
-    legacyCategory: "AI Assistant",
-    behavior: "Agent",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "MistralAI-User", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://mistral.ai/mistralai-user-ips.json", format: "json" }],
-    expectedAsns: [212949],
-    followsRobotsTxt: false
-  },
-  {
-    id: "mistralai-index",
-    displayName: "MistralAI-Index",
-    operator: "Mistral AI",
-    cfDetectionIds: ["90000102"],
-    legacyCategory: "AI Search",
-    behavior: "Search",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "MistralAI-Index", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://mistral.ai/mistralai-index-ips.json", format: "json" }],
-    expectedAsns: [212949],
-    followsRobotsTxt: true
-  },
-  {
-    id: "mistralai-training",
-    displayName: "MistralAI-Training",
-    operator: "Mistral AI",
-    cfDetectionIds: ["90000109"],
-    legacyCategory: "AI Crawler",
-    behavior: "Training",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "MistralAI-Training", matchMode: "bounded" }],
-    feedUrls: [],
-    expectedAsns: [212949],
-    followsRobotsTxt: true
-  },
-  {
-    id: "claudebot",
-    displayName: "ClaudeBot",
-    operator: "Anthropic",
-    cfDetectionIds: ["33563859"],
-    legacyCategory: "AI Crawler",
-    behavior: "Training",
-    operatorLabel: "Direct",
-    isMixedPurposeAccountable: true,
-    uaTokens: [{ token: "ClaudeBot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://claude.com/crawling/bots.json", format: "json" }],
-    followsRobotsTxt: true
-  },
-  {
-    id: "claude-searchbot",
-    displayName: "Claude-SearchBot",
-    operator: "Anthropic",
-    cfDetectionIds: ["33564301"],
-    legacyCategory: "AI Search",
-    behavior: "Search",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "Claude-SearchBot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://claude.com/.well-known/sail", format: "sail_toml" }],
-    followsRobotsTxt: true
-  },
-  {
-    id: "claude-user",
-    displayName: "Claude-User",
-    operator: "Anthropic",
-    cfDetectionIds: ["33564303"],
-    legacyCategory: "AI Assistant",
-    behavior: "Agent",
-    operatorLabel: "Direct",
-    isMixedPurposeAccountable: true,
-    uaTokens: [{ token: "Claude-User", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://claude.com/.well-known/sail", format: "sail_toml" }],
-    followsRobotsTxt: false
-  },
-  {
-    id: "claude-agent",
-    displayName: "Claude-Agent",
-    operator: "Anthropic",
-    cfDetectionIds: ["90000103"],
-    legacyCategory: "AI Assistant",
-    behavior: "Agent",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "Claude-Agent", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://claude.com/.well-known/sail", format: "sail_toml" }],
-    followsRobotsTxt: false
-  },
-  {
-    id: "applebot",
-    displayName: "Applebot",
-    operator: "Apple",
-    cfDetectionIds: ["120424214", "33563845"],
-    legacyCategory: "Search Engine",
-    behavior: "Search",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "Applebot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://search.developer.apple.com/applebot.json", format: "json" }],
-    fcrdnsSuffixes: [".applebot.apple.com"],
-    dualOrVerification: true,
-    expectedAsns: [714, 6185],
-    followsRobotsTxt: true
-  },
-  {
-    id: "googlebot",
-    displayName: "Googlebot",
-    operator: "Google",
-    cfDetectionIds: ["120623194", "33554459"],
-    legacyCategory: "Search Engine",
-    behavior: "Search",
-    operatorLabel: "Direct",
-    uaTokens: [
-      { token: "Googlebot", matchMode: "bounded" },
-      { token: "Googlebot-Image", matchMode: "bounded" },
-      { token: "Googlebot-News", matchMode: "bounded" },
-      { token: "Googlebot-Video", matchMode: "bounded" }
-    ],
-    feedUrls: [
-      { url: "https://www.google.com/common-crawlers.json", format: "json" },
-      { url: "https://www.google.com/special-crawlers.json", format: "json" }
-    ],
-    fcrdnsSuffixes: [".googlebot.com", ".google.com"],
-    dualOrVerification: true,
-    expectedAsns: [15169],
-    followsRobotsTxt: true
-  },
-  {
-    id: "google-cloudvertexbot",
-    displayName: "Google-CloudVertexBot",
-    operator: "Google",
-    cfDetectionIds: ["133730073", "33564321"],
-    legacyCategory: "AI Crawler",
-    behavior: "Training",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "Google-CloudVertexBot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://www.google.com/special-crawlers.json", format: "json" }],
-    fcrdnsSuffixes: [".googlebot.com", ".google.com"],
-    dualOrVerification: true,
-    expectedAsns: [15169],
-    followsRobotsTxt: true
-  },
-  {
-    id: "google-agent",
-    displayName: "Google-Agent",
-    operator: "Google",
-    cfDetectionIds: ["90000106"],
-    legacyCategory: "AI Assistant",
-    behavior: "Agent",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "Google-Agent", matchMode: "bounded" }],
-    feedUrls: [
-      { url: "https://www.google.com/user-triggered-agents.json", format: "json" },
-      { url: "https://www.google.com/user-triggered-fetchers.json", format: "json" },
-      { url: "https://www.google.com/user-triggered-fetchers-google.json", format: "json" }
-    ],
-    fcrdnsSuffixes: [".gae.googleusercontent.com", ".google.com"],
-    dualOrVerification: true,
-    webBotAuthHosts: ["agent.bot.goog"],
-    expectedAsns: [15169],
-    followsRobotsTxt: false
-  },
-  {
-    id: "amazonbot",
-    displayName: "Amazonbot",
-    operator: "Amazon",
-    cfDetectionIds: ["118601807", "33563839"],
-    legacyCategory: "AI Crawler",
-    behavior: "Training",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "Amazonbot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://www.amazon.com/ip-addresses/", format: "amazon_html" }],
-    fcrdnsSuffixes: [".crawl.amazonbot.amazon"],
-    dualOrVerification: true,
-    expectedAsns: [16509, 14618],
-    followsRobotsTxt: true
-  },
-  {
-    id: "amzn-searchbot",
-    displayName: "amzn-searchbot",
-    operator: "Amazon",
-    cfDetectionIds: ["90000104"],
-    legacyCategory: "AI Search",
-    behavior: "Search",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "amzn-searchbot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://www.amazon.com/searchbot-ip-addresses/", format: "amazon_html" }],
-    fcrdnsSuffixes: [".crawl.amazonbot.amazon"],
-    expectedAsns: [16509, 14618],
-    followsRobotsTxt: true
-  },
-  {
-    id: "amzn-user",
-    displayName: "amzn-user",
-    operator: "Amazon",
-    cfDetectionIds: ["90000105"],
-    legacyCategory: "AI Assistant",
-    behavior: "Agent",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "amzn-user", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://www.amazon.com/live-ip-addresses/", format: "amazon_html" }],
-    fcrdnsSuffixes: [".crawl.amazonbot.amazon"],
-    expectedAsns: [16509, 14618],
-    followsRobotsTxt: false
-  },
-  {
-    id: "perplexitybot",
-    displayName: "PerplexityBot",
-    operator: "Perplexity",
-    cfDetectionIds: ["33563889"],
-    legacyCategory: "AI Crawler",
-    behavior: "Training",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "PerplexityBot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://www.perplexity.ai/perplexitybot_ips.json", format: "json" }],
-    expectedAsns: [14618, 16509],
-    followsRobotsTxt: true
-  },
-  {
-    id: "perplexity-user",
-    displayName: "Perplexity-User",
-    operator: "Perplexity",
-    cfDetectionIds: ["33564371"],
-    legacyCategory: "AI Assistant",
-    behavior: "Agent",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "Perplexity-User", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://www.perplexity.ai/perplexity-user_ips.json", format: "json" }],
-    expectedAsns: [14618, 16509],
-    followsRobotsTxt: false
-  },
-  {
-    id: "bytespider",
-    displayName: "Bytespider",
-    operator: "ByteDance",
-    cfDetectionIds: ["33563853"],
-    legacyCategory: "AI Crawler",
-    behavior: "Training",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "Bytespider", matchMode: "bounded" }],
-    feedUrls: [],
-    softPtrSuffixes: [".bytedance.com"],
-    expectedAsns: [396986, 4837, 4808, 16509],
-    followsRobotsTxt: false
-  },
-  {
-    id: "bingbot",
-    displayName: "Bingbot",
-    operator: "Microsoft",
-    cfDetectionIds: ["117479730", "33554461"],
-    legacyCategory: "Search Engine",
-    behavior: "Search",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "bingbot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://www.bing.com/toolbox/bingbot.json", format: "json" }],
-    fcrdnsSuffixes: [".search.msn.com"],
-    dualOrVerification: true,
-    expectedAsns: [8075, 12076],
-    followsRobotsTxt: true
-  },
-  {
-    id: "duckassistbot",
-    displayName: "DuckAssistBot",
-    operator: "DuckDuckGo",
-    cfDetectionIds: ["126666910", "33564037"],
-    legacyCategory: "AI Assistant",
-    behavior: "Agent",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "DuckAssistBot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://duckduckgo.com/duckassistbot.json", format: "json" }],
-    webBotAuthHosts: ["assistbot.duckduckgo.com"],
-    followsRobotsTxt: false
-  },
-  {
-    id: "ccbot",
-    displayName: "CCBot",
-    operator: "Common Crawl",
-    cfDetectionIds: ["133621792", "33563855"],
-    legacyCategory: "AI Crawler",
-    behavior: "Training",
-    operatorLabel: "Intermediary",
-    uaTokens: [{ token: "CCBot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://index.commoncrawl.org/ccbot.json", format: "json" }],
-    fcrdnsSuffixes: [".crawl.commoncrawl.org"],
-    dualOrVerification: true,
-    expectedAsns: [16509],
-    followsRobotsTxt: true
-  },
-  {
-    id: "meta-externalagent",
-    displayName: "meta-externalagent",
-    operator: "Meta",
-    cfDetectionIds: ["124581738", "33563982"],
-    legacyCategory: "AI Crawler",
-    behavior: "Training",
-    operatorLabel: "Direct",
-    isMixedPurposeAccountable: true,
-    uaTokens: [{ token: "meta-externalagent", matchMode: "bounded" }],
-    feedUrls: [],
-    fcrdnsSuffixes: [".fbsbx.com", ".facebook.com", ".tfbnw.net"],
-    webBotAuthHosts: ["www.meta.com"],
-    expectedAsns: [32934],
-    followsRobotsTxt: true
-  },
-  {
-    id: "meta-externalfetcher",
-    displayName: "meta-externalfetcher",
-    operator: "Meta",
-    cfDetectionIds: ["132272919", "33563980"],
-    legacyCategory: "AI Assistant",
-    behavior: "Agent",
-    operatorLabel: "Direct",
-    isMixedPurposeAccountable: true,
-    uaTokens: [{ token: "meta-externalfetcher", matchMode: "bounded" }],
-    feedUrls: [],
-    fcrdnsSuffixes: [".fbsbx.com", ".facebook.com", ".tfbnw.net"],
-    expectedAsns: [32934],
-    followsRobotsTxt: false
-  },
-  {
-    id: "oai-adsbot",
-    displayName: "OAI-AdsBot",
-    operator: "OpenAI",
-    cfDetectionIds: ["90000107"],
-    legacyCategory: "AI Crawler",
-    behavior: "Search",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "OAI-AdsBot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://openai.com/adsbot.json", format: "json" }],
-    expectedAsns: [8075, 400645],
-    followsRobotsTxt: true
-  },
-  {
-    id: "ahrefsbot",
-    displayName: "AhrefsBot",
-    operator: "Ahrefs",
-    cfDetectionIds: ["90000108"],
-    legacyCategory: "Search Engine",
-    behavior: "Search",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "AhrefsBot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://api.ahrefs.com/v3/metadata/crawler-ip-ranges", format: "json" }],
-    followsRobotsTxt: true
-  },
-  {
-    id: "duckduckbot",
-    displayName: "DuckDuckBot",
-    operator: "DuckDuckGo",
-    cfDetectionIds: ["90000109"],
-    legacyCategory: "Search Engine",
-    behavior: "Search",
-    operatorLabel: "Direct",
-    uaTokens: [{ token: "DuckDuckBot", matchMode: "bounded" }],
-    feedUrls: [{ url: "https://duckduckgo.com/duckduckbot.json", format: "json" }],
-    followsRobotsTxt: true
-  }
-];
-var BOT_MAP_BY_ID = Object.freeze(
-  BOT_REGISTRY.reduce((acc, bot) => {
-    acc[bot.id] = bot;
-    return acc;
-  }, {})
-);
-function escapeRegex(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-function tokenRegex(token) {
-  const escaped = escapeRegex(token.token);
-  switch (token.matchMode ?? "bounded") {
-    case "exact":
-      return new RegExp(`^\\s*${escaped}\\s*$`, "i");
-    case "versioned":
-      return new RegExp(
-        `(?:^|[^A-Za-z0-9_-])${escaped}(?:/[0-9][0-9A-Za-z._+-]*)?(?:$|[^A-Za-z0-9_-])`,
-        "i"
-      );
-    case "bounded":
-    default:
-      return new RegExp(`(?:^|[^A-Za-z0-9_-])${escaped}(?:$|[^A-Za-z0-9_-])`, "i");
-  }
-}
-var UA_PATTERNS = BOT_REGISTRY.map(
-  (bot) => ({ bot, regexes: bot.uaTokens.map(tokenRegex) })
-);
-function matchUserAgentBot(userAgent) {
-  if (typeof userAgent !== "string" || !userAgent.trim()) return null;
-  const ua = userAgent.trim();
-  const ordered = [...UA_PATTERNS].sort((a, b) => {
-    const aLen = Math.max(...a.bot.uaTokens.map((t) => t.token.length));
-    const bLen = Math.max(...b.bot.uaTokens.map((t) => t.token.length));
-    return bLen - aLen;
-  });
-  for (const entry of ordered) {
-    if (entry.regexes.some((regex) => regex.test(ua))) return entry.bot;
-  }
-  return null;
-}
-
-// src/server/ai-protection/schema.ts
-var SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS ai_bot_requests (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  observed_at_utc TEXT NOT NULL,
-  bot_id TEXT,
-  operator TEXT,
-  verification_status TEXT NOT NULL,
-  verification_method TEXT,
-  client_ip TEXT,
-  user_agent TEXT,
-  request_path TEXT,
-  request_method TEXT,
-  http_status INTEGER,
-  bytes_sent INTEGER NOT NULL DEFAULT 0,
-  referrer_domain TEXT,
-  referral_operator TEXT,
-  robots_violation INTEGER NOT NULL DEFAULT 0,
-  violated_directive TEXT,
-  reasons TEXT,
-  content_signal TEXT,
-  edge_action TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_bot_requests_bot ON ai_bot_requests(bot_id);
-CREATE INDEX IF NOT EXISTS idx_bot_requests_status ON ai_bot_requests(verification_status);
-CREATE INDEX IF NOT EXISTS idx_bot_requests_time ON ai_bot_requests(observed_at_utc);
-CREATE INDEX IF NOT EXISTS idx_bot_requests_ip ON ai_bot_requests(client_ip);
-CREATE INDEX IF NOT EXISTS idx_bot_requests_operator ON ai_bot_requests(operator);
-CREATE INDEX IF NOT EXISTS idx_bot_requests_path ON ai_bot_requests(request_path);
-
-CREATE TABLE IF NOT EXISTS ai_operator_referrals (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  observed_at_utc TEXT NOT NULL,
-  bot_id TEXT,
-  operator TEXT NOT NULL,
-  referrer_domain TEXT NOT NULL,
-  referrer_url TEXT,
-  request_path TEXT,
-  occurrences INTEGER NOT NULL DEFAULT 1
-);
-CREATE INDEX IF NOT EXISTS idx_referrals_operator ON ai_operator_referrals(operator);
-CREATE INDEX IF NOT EXISTS idx_referrals_domain ON ai_operator_referrals(referrer_domain);
-
-CREATE TABLE IF NOT EXISTS ai_bot_cidr_ranges (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  bot_id TEXT NOT NULL,
-  network TEXT NOT NULL,
-  mask TEXT NOT NULL,
-  cidr TEXT NOT NULL,
-  source TEXT NOT NULL,
-  created_at_utc TEXT NOT NULL,
-  UNIQUE(bot_id, cidr)
-);
-CREATE INDEX IF NOT EXISTS idx_cidr_bot ON ai_bot_cidr_ranges(bot_id);
-
-CREATE TABLE IF NOT EXISTS ai_bot_dns_cache (
-  ip TEXT PRIMARY KEY,
-  hostname TEXT,
-  forward_ip TEXT,
-  verification_method TEXT,
-  bot_id TEXT,
-  source TEXT,
-  observed_at_utc TEXT NOT NULL,
-  expires_at_utc TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS ai_bot_jwk_cache (
-  thumbprint TEXT PRIMARY KEY,
-  host TEXT NOT NULL,
-  kid TEXT,
-  jwk TEXT NOT NULL,
-  algorithm TEXT,
-  observed_at_utc TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS ai_zone_config (
-  id INTEGER PRIMARY KEY CHECK (id = 1),
-  bot_preference_sync_enabled INTEGER NOT NULL DEFAULT 1,
-  markdown_for_agents_enabled INTEGER NOT NULL DEFAULT 1,
-  search_policy TEXT NOT NULL DEFAULT 'allow',
-  agent_policy TEXT NOT NULL DEFAULT 'allow',
-  training_policy TEXT NOT NULL DEFAULT 'disallow',
-  content_use_signal TEXT NOT NULL DEFAULT 'reference',
-  block_status_code INTEGER NOT NULL DEFAULT 403,
-  block_response_body TEXT NOT NULL DEFAULT 'Access denied: automated crawling policy violation.',
-  price_usd REAL NOT NULL DEFAULT 0.015,
-  custom_robots_append TEXT NOT NULL DEFAULT '',
-  updated_at_utc TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS ai_bot_custom_policies (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  bot_id TEXT NOT NULL UNIQUE,
-  action TEXT NOT NULL,
-  note TEXT,
-  created_at_utc TEXT NOT NULL
-);
-`;
-var SEED_ZONE_SQL = `
-INSERT OR IGNORE INTO ai_zone_config (
-  id, bot_preference_sync_enabled, markdown_for_agents_enabled, search_policy, agent_policy,
-  training_policy, content_use_signal, block_status_code, block_response_body, price_usd,
-  custom_robots_append, updated_at_utc
-) VALUES (1, 1, 1, 'allow', 'allow', 'disallow', 'reference', 403,
-  'Access denied: automated crawling policy violation.', 0.015, '', ?)
-`;
-function initAIBotSchema(db2) {
-  db2.exec(SCHEMA_SQL);
-  try {
-    db2.prepare(SEED_ZONE_SQL).run((/* @__PURE__ */ new Date()).toISOString());
-  } catch {
-  }
-}
-function runTransaction(db2, fn) {
-  if (typeof db2.transaction === "function") {
-    const wrapped = db2.transaction(fn);
-    return wrapped();
-  }
-  return fn();
-}
-
-// src/server/ai-protection/ip-sync.ts
-var FEED_TIMEOUT_MS = 8e3;
-var DNS_TIMEOUT_MS = 1500;
-var DNS_TTL_MS = 6 * 60 * 60 * 1e3;
-function isIpv4(value) {
-  const parts = value.split(".");
-  if (parts.length !== 4) return false;
-  return parts.every((part) => /^\d{1,3}$/.test(part) && Number.parseInt(part, 10) <= 255);
-}
-function expandIpv6(value) {
-  let normalized = value.trim().replace(/%.*$/, "").toLowerCase();
-  if (normalized.includes(".")) {
-    const lastColon = normalized.lastIndexOf(":");
-    if (lastColon < 0) return null;
-    const tail2 = normalized.slice(lastColon + 1);
-    if (!isIpv4(tail2)) return null;
-    const [a, b, c, d] = tail2.split(".").map((octet) => Number.parseInt(octet, 10));
-    normalized = `${normalized.slice(0, lastColon + 1)}${(a << 8 | b).toString(16)}:${(c << 8 | d).toString(16)}`;
-  }
-  const halves = normalized.split("::");
-  if (halves.length > 2) return null;
-  const head = halves[0] ? halves[0].split(":").filter(Boolean) : [];
-  const tail = halves.length === 2 && halves[1] ? halves[1].split(":").filter(Boolean) : [];
-  let hextets;
-  if (halves.length === 2) {
-    const zeros = 8 - head.length - tail.length;
-    if (zeros < 0) return null;
-    hextets = [...head, ...new Array(zeros).fill("0"), ...tail];
-  } else {
-    hextets = head;
-  }
-  if (hextets.length !== 8 || !hextets.every((part) => /^[0-9a-f]{1,4}$/.test(part))) return null;
-  return hextets.map((part) => part.replace(/^0+(?=.)/, ""));
-}
-function bigIntToIp(value, version) {
-  if (version === 4) {
-    const octets = [];
-    for (let shift = 24; shift >= 0; shift -= 8) octets.push(Number(value >> BigInt(shift) & 0xffn));
-    return octets.join(".");
-  }
-  const hextets = [];
-  for (let shift = 112; shift >= 0; shift -= 16) {
-    hextets.push((value >> BigInt(shift) & 0xffffn).toString(16));
-  }
-  return hextets.join(":");
-}
-function countMaskBits(mask, width) {
-  let value = mask;
-  let bits = 0;
-  for (let i = 0; i < width; i += 1) {
-    if ((value & 1n) === 0n) break;
-    bits += 1;
-    value >>= 1n;
-  }
-  return bits;
-}
-function withTimeout(promise, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timeout")), timeoutMs);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      }
-    );
-  });
-}
-var IpVerificationEngine = class _IpVerificationEngine {
-  constructor(db2) {
-    this.db = db2;
-    this.ranges = [];
-  }
-  /** Converts an IPv4 or IPv6 literal into a 32/128-bit unsigned integer. */
-  static ipToBigInt(ip) {
-    if (typeof ip !== "string") return null;
-    const value = ip.trim().replace(/^\[|\]$/g, "").replace(/%.*$/, "");
-    if (!value) return null;
-    if (value.includes(":")) {
-      const hextets = expandIpv6(value);
-      if (!hextets) return null;
-      let result2 = 0n;
-      for (const hextet of hextets) result2 = result2 << 16n | BigInt(`0x${hextet}`);
-      return result2;
-    }
-    if (!isIpv4(value)) return null;
-    let result = 0n;
-    for (const octet of value.split(".")) result = result << 8n | BigInt(Number.parseInt(octet, 10));
-    return result;
-  }
-  /** Parses `192.0.2.0/24`, `2001:db8::/32` or a bare IPv4 literal (treated as /32). */
-  static parseCidrBlock(block) {
-    if (typeof block !== "string") return null;
-    const trimmed = block.trim();
-    if (!trimmed) return null;
-    const slash = trimmed.lastIndexOf("/");
-    const base = slash >= 0 ? trimmed.slice(0, slash).trim() : trimmed;
-    const version = base.includes(":") ? 6 : 4;
-    const width = version === 4 ? 32 : 128;
-    let bits = slash >= 0 ? Number.parseInt(trimmed.slice(slash + 1), 10) : width;
-    if (!Number.isInteger(bits) || bits < 0 || bits > width) return null;
-    const address = _IpVerificationEngine.ipToBigInt(base);
-    if (address === null) return null;
-    const mask = bits === 0 ? 0n : (1n << BigInt(bits)) - 1n << BigInt(width - bits);
-    const network = address & mask;
-    const networkHex = network.toString(16).padStart(width / 4, "0");
-    const maskHex = mask.toString(16).padStart(width / 4, "0");
-    return {
-      cidr: `${bigIntToIp(network, version)}/${bits}`,
-      version,
-      bits,
-      network,
-      mask,
-      networkHex,
-      maskHex
-    };
-  }
-  /** Inserts the ten documented Bytespider /24 prefixes (idempotent). */
-  seedStaticSubnets() {
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const insert = this.db.prepare(
-      `INSERT OR IGNORE INTO ai_bot_cidr_ranges (bot_id, network, mask, cidr, source, created_at_utc)
-       VALUES (?, ?, ?, ?, 'static', ?)`
-    );
-    runTransaction(this.db, () => {
-      for (const subnet of BYTESPIDER_STATIC_SUBNETS) {
-        const parsed = _IpVerificationEngine.parseCidrBlock(subnet);
-        if (!parsed) continue;
-        insert.run("bytespider", parsed.networkHex, parsed.maskHex, parsed.cidr, now);
-      }
-    });
-    this.reloadMemoryRanges();
-  }
-  /** Reloads all persisted prefixes into the synchronous in-memory matcher. */
-  reloadMemoryRanges() {
-    const rows = this.db.prepare("SELECT bot_id, network, mask, cidr, source FROM ai_bot_cidr_ranges").all();
-    const next = [];
-    for (const row of rows) {
-      try {
-        const network = BigInt(`0x${String(row.network)}`);
-        const mask = BigInt(`0x${String(row.mask)}`);
-        const version = String(row.network).replace(/^0x/, "").length <= 8 ? 4 : 6;
-        next.push({
-          botId: String(row.bot_id),
-          network,
-          mask,
-          bits: countMaskBits(mask, version === 4 ? 32 : 128),
-          version,
-          cidr: String(row.cidr),
-          source: String(row.source ?? "feed")
-        });
-      } catch {
-      }
-    }
-    this.ranges.splice(0, this.ranges.length, ...next);
-  }
-  /** Synchronous, hot-path CIDR lookup used by the request middleware. */
-  matchIpInMemory(clientIp, claimedBotId) {
-    const address = _IpVerificationEngine.ipToBigInt(clientIp);
-    if (address === null) return { matched: false };
-    const candidates = [{ address, version: clientIp.includes(":") ? 6 : 4 }];
-    if (candidates[0].version === 6 && address >> 32n === 0xffffn) {
-      candidates.push({ address: address & 0xffffffffn, version: 4 });
-    }
-    let claimedMatch = null;
-    let anyMatch = null;
-    for (const range of this.ranges) {
-      for (const candidate of candidates) {
-        if (range.version !== candidate.version) continue;
-        if ((candidate.address & range.mask) !== range.network) continue;
-        anyMatch = range;
-        if (claimedBotId && range.botId === claimedBotId) claimedMatch = range;
-        break;
-      }
-      if (claimedMatch) break;
-    }
-    const chosen = claimedMatch ?? anyMatch;
-    if (!chosen) return { matched: false };
-    const spoofed = Boolean(claimedBotId && chosen.botId !== claimedBotId);
-    const bot = BOT_MAP_BY_ID[chosen.botId];
-    return {
-      matched: true,
-      botId: chosen.botId,
-      operator: bot?.operator,
-      cidr: chosen.cidr,
-      verificationMethod: chosen.source === "static" ? "static_cidr" : "cidr",
-      spoofed
-    };
-  }
-  /** Extracts normalised CIDR strings from an operator's published feed payload. */
-  static extractCidrsFromPayload(payload, format) {
-    const found = /* @__PURE__ */ new Set();
-    const add = (value) => {
-      if (typeof value !== "string") return;
-      const candidate = value.trim().replace(/^["'\s]+|["'\s]+$/g, "");
-      if (!candidate) return;
-      const parsed = _IpVerificationEngine.parseCidrBlock(candidate);
-      if (parsed) found.add(parsed.cidr);
-    };
-    if (format === "json") {
-      let parsed = payload;
-      if (typeof payload === "string") {
-        try {
-          parsed = JSON.parse(payload);
-        } catch {
-          return [];
-        }
-      }
-      const interestingKeys = /* @__PURE__ */ new Set([
-        "ipv4prefix",
-        "ip_prefix",
-        "ipv6prefix",
-        "cidr",
-        "prefix",
-        "ipv4",
-        "ipv6",
-        "network"
-      ]);
-      const visit = (node, depth) => {
-        if (depth > 12 || node === null || node === void 0) return;
-        if (Array.isArray(node)) {
-          for (const item of node) visit(item, depth + 1);
-          return;
-        }
-        if (typeof node === "object") {
-          for (const [key, value] of Object.entries(node)) {
-            if (interestingKeys.has(key.toLowerCase())) {
-              if (Array.isArray(value)) value.forEach(add);
-              else add(value);
-            }
-            visit(value, depth + 1);
-          }
-          return;
-        }
-        add(node);
-      };
-      visit(parsed, 0);
-    } else if (format === "amazon_html") {
-      const text = decodeEntities(typeof payload === "string" ? payload : String(payload ?? ""));
-      let match;
-      const codeRegex = /<code\b[^>]*>([\s\S]*?)<\/code>/gi;
-      while ((match = codeRegex.exec(text)) !== null) {
-        const cleaned = decodeEntities(match[1].replace(/<[^>]+>/g, " "));
-        for (const line of cleaned.split(/[\r\n,;\s]+/)) add(line);
-      }
-      const loose = /(?:\d{1,3}\.){3}\d{1,3}(?:\/\d{1,2})?|(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}\/\d{1,3}/gi;
-      const looseMatches = text.match(loose);
-      if (looseMatches) for (const item of looseMatches) add(item);
-    } else {
-      const text = typeof payload === "string" ? payload : String(payload ?? "");
-      for (const rawLine of text.split(/[\r\n]+/)) {
-        const line = rawLine.replace(/#.*$/, "").trim();
-        if (!line) continue;
-        for (const token of line.match(/(?:\d{1,3}\.){3}\d{1,3}(?:\/\d{1,2})?|(?:[0-9a-f:]+:\d+)(?:\/\d{1,3})?/gi) ?? []) {
-          add(token.replace(/["',\[\]]/g, ""));
-        }
-      }
-    }
-    return [...found];
-  }
-  /** Fetches every published feed in the registry and replaces the cached prefixes. */
-  async syncAllOfficialFeeds() {
-    const urlCache = /* @__PURE__ */ new Map();
-    const fetchFeed = async (url, format) => {
-      const key = `${format}:${url}`;
-      const cached = urlCache.get(key);
-      if (cached) return cached;
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), FEED_TIMEOUT_MS);
-      try {
-        const response = await fetch(url, {
-          signal: controller.signal,
-          headers: { "user-agent": "IntelSystem-AI-Bot-Protection/1.0 (+feed-sync)" }
-        });
-        if (!response.ok) return [];
-        const body = await response.text();
-        let payload = body;
-        if (format === "json") {
-          try {
-            payload = JSON.parse(body);
-          } catch {
-            return [];
-          }
-        }
-        const cidrs = _IpVerificationEngine.extractCidrsFromPayload(payload, format);
-        urlCache.set(key, cidrs);
-        return cidrs;
-      } catch {
-        return [];
-      } finally {
-        clearTimeout(timer);
-      }
-    };
-    const deleteFeedRanges = this.db.prepare("DELETE FROM ai_bot_cidr_ranges WHERE bot_id = ? AND source = 'feed'");
-    const insertRange = this.db.prepare(
-      `INSERT OR IGNORE INTO ai_bot_cidr_ranges (bot_id, network, mask, cidr, source, created_at_utc)
-       VALUES (?, ?, ?, ?, 'feed', ?)`
-    );
-    let updatedBots = 0;
-    let totalPrefixes = 0;
-    const sync = async () => {
-      for (const bot of BOT_REGISTRY) {
-        if (!bot.feedUrls.length) continue;
-        const cidrs = [];
-        for (const feed of bot.feedUrls) {
-          cidrs.push(...await fetchFeed(feed.url, feed.format));
-        }
-        const unique = [...new Set(cidrs)].slice(0, 5e3);
-        deleteFeedRanges.run(bot.id);
-        const now = (/* @__PURE__ */ new Date()).toISOString();
-        for (const cidr of unique) {
-          const parsed = _IpVerificationEngine.parseCidrBlock(cidr);
-          if (!parsed) continue;
-          insertRange.run(bot.id, parsed.networkHex, parsed.maskHex, parsed.cidr, now);
-          totalPrefixes += 1;
-        }
-        if (unique.length > 0) updatedBots += 1;
-      }
-    };
-    await sync();
-    this.reloadMemoryRanges();
-    return { updatedBots, totalPrefixes };
-  }
-  /** Reads a cached FCrDNS decision, if any. */
-  lookupDnsCache(ip) {
-    const row = this.db.prepare("SELECT * FROM ai_bot_dns_cache WHERE ip = ?").get(ip);
-    if (!row) return null;
-    return {
-      ip: String(row.ip),
-      hostname: row.hostname ? String(row.hostname) : null,
-      forwardIp: row.forward_ip ? String(row.forward_ip) : null,
-      verificationMethod: row.verification_method ? String(row.verification_method) : null,
-      botId: row.bot_id ? String(row.bot_id) : null,
-      source: row.source ? String(row.source) : null,
-      observedAtUtc: String(row.observed_at_utc),
-      expiresAtUtc: String(row.expires_at_utc)
-    };
-  }
-  /** Queues an IP for a background reverse/forward DNS check without blocking the request. */
-  scheduleDnsLookup(ip) {
-    if (!_IpVerificationEngine.ipToBigInt(ip)) return;
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    this.db.prepare(
-      `INSERT OR IGNORE INTO ai_bot_dns_cache
-          (ip, hostname, forward_ip, verification_method, bot_id, source, observed_at_utc, expires_at_utc)
-         VALUES (?, NULL, NULL, NULL, NULL, 'pending', ?, ?)`
-    ).run(ip, now, now);
-  }
-  saveDnsCache(entry) {
-    this.db.prepare(
-      `INSERT INTO ai_bot_dns_cache
-          (ip, hostname, forward_ip, verification_method, bot_id, source, observed_at_utc, expires_at_utc)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(ip) DO UPDATE SET
-           hostname = excluded.hostname,
-           forward_ip = excluded.forward_ip,
-           verification_method = excluded.verification_method,
-           bot_id = excluded.bot_id,
-           source = excluded.source,
-           observed_at_utc = excluded.observed_at_utc,
-           expires_at_utc = excluded.expires_at_utc`
-    ).run(
-      entry.ip,
-      entry.hostname,
-      entry.forwardIp,
-      entry.verificationMethod,
-      entry.botId,
-      entry.source,
-      entry.observedAtUtc,
-      entry.expiresAtUtc
-    );
-  }
-  /** Processes expired/pending DNS cache rows. Intended to be fired in the background. */
-  async checkCachedDns() {
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const rows = this.db.prepare(
-      `SELECT ip, source FROM ai_bot_dns_cache
-         WHERE expires_at_utc <= ? OR source = 'pending'
-         ORDER BY observed_at_utc ASC LIMIT 40`
-    ).all(now);
-    for (const row of rows) {
-      await this.resolveSingleIp(String(row.ip)).catch(() => void 0);
-    }
-  }
-  async resolveSingleIp(ip) {
-    const now = /* @__PURE__ */ new Date();
-    const nowIso = now.toISOString();
-    const expiresAtUtc = new Date(now.getTime() + DNS_TTL_MS).toISOString();
-    const base = {
-      ip,
-      hostname: null,
-      forwardIp: null,
-      verificationMethod: null,
-      botId: null,
-      source: "dns",
-      observedAtUtc: nowIso,
-      expiresAtUtc
-    };
-    const hostname = await reverseDnsViaDoh(ip);
-    if (!hostname) {
-      base.expiresAtUtc = new Date(now.getTime() + 6e4).toISOString();
-      this.saveDnsCache(base);
-      return;
-    }
-    for (const bot of BOT_REGISTRY) {
-      for (const suffix of bot.softPtrSuffixes ?? []) {
-        if (hostname.endsWith(suffix.toLowerCase())) {
-          this.saveDnsCache({
-            ...base,
-            hostname,
-            verificationMethod: "soft_ptr",
-            botId: bot.id,
-            source: "dns_soft_ptr"
-          });
-          return;
-        }
-      }
-    }
-    for (const bot of BOT_REGISTRY) {
-      const suffix = (bot.fcrdnsSuffixes ?? []).find((item) => hostname.endsWith(item.toLowerCase()));
-      if (!suffix) continue;
-      try {
-        const addresses = await resolve4ViaDoh(hostname);
-        if (addresses.includes(ip)) {
-          this.saveDnsCache({
-            ...base,
-            hostname,
-            forwardIp: ip,
-            verificationMethod: "fcrdns",
-            botId: bot.id,
-            source: "dns_fcrdns"
-          });
-          return;
-        }
-      } catch {
-      }
-    }
-    base.hostname = hostname;
-    base.verificationMethod = "ptr_unverified";
-    base.expiresAtUtc = new Date(now.getTime() + 6e4).toISOString();
-    this.saveDnsCache(base);
-  }
-};
-async function dohQuery(name, type) {
-  const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`;
-  const response = await withTimeout(
-    fetch(url, { headers: { accept: "application/dns-json" } }),
-    DNS_TIMEOUT_MS
-  );
-  if (!response.ok) return [];
-  const payload = await response.json();
-  return Array.isArray(payload?.Answer) ? payload.Answer : [];
-}
-async function reverseDnsViaDoh(ip) {
-  try {
-    if (ip.includes(":")) return null;
-    const reversed = ip.split(".").reverse().join(".");
-    const answers = await dohQuery(`${reversed}.in-addr.arpa`, 12);
-    const ptr = answers.find((answer) => answer.type === 12)?.data;
-    return ptr ? ptr.replace(/\.$/, "").toLowerCase() : null;
-  } catch {
-    return null;
-  }
-}
-async function resolve4ViaDoh(hostname) {
-  try {
-    const answers = await dohQuery(hostname, 1);
-    return answers.filter((answer) => answer.type === 1).map((answer) => answer.data);
-  } catch {
-    return [];
-  }
-}
-function decodeEntities(text) {
-  return text.replace(/&nbsp;/gi, " ").replace(/&amp;/gi, "&").replace(/&lt;/gi, "<").replace(/&gt;/gi, ">").replace(/&quot;/gi, '"').replace(/&#0*39;/gi, "'").replace(/&#x0*27;/gi, "'").replace(/&#(\d+);/g, (_match, decimal) => String.fromCharCode(Number.parseInt(decimal, 10))).replace(/&#x([0-9a-f]+);/gi, (_match, hex) => String.fromCodePoint(Number.parseInt(hex, 16)));
-}
-
-// src/server/ai-protection/web-bot-auth.ts
-var DIRECTORY_TIMEOUT_MS = 8e3;
-var CLOCK_SKEW_SECONDS = 60;
-function readHeader(headers, name) {
-  const target = name.toLowerCase();
-  for (const [key, value] of Object.entries(headers ?? {})) {
-    if (key.toLowerCase() !== target) continue;
-    if (Array.isArray(value)) return value.join(", ");
-    return typeof value === "string" ? value : "";
-  }
-  return "";
-}
-function stripQuotes(value) {
-  const trimmed = value.trim();
-  if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
-    return trimmed.slice(1, -1).replace(/""/g, '"');
-  }
-  return trimmed;
-}
-function parseSignatureInput(raw) {
-  const match = /^\s*([A-Za-z0-9_-]+)\s*=\s*\(([^)]*)\)([\s\S]*)$/.exec(raw);
-  if (!match) return null;
-  const components = [...match[2].matchAll(/"([^"]+)"/g)].map((item) => item[1].toLowerCase());
-  const params = {};
-  for (const part of match[3].split(";")) {
-    const eq = part.indexOf("=");
-    if (eq < 0) continue;
-    params[part.slice(0, eq).trim().toLowerCase()] = stripQuotes(part.slice(eq + 1));
-  }
-  const asNumber = (value) => {
-    if (!value || !/^\d+$/.test(value.trim())) return null;
-    const parsed = Number.parseInt(value.trim(), 10);
-    return Number.isFinite(parsed) ? parsed : null;
-  };
-  const equals = raw.indexOf("=");
-  return {
-    label: match[1],
-    components,
-    keyId: params.keyid ?? "",
-    tag: (params.tag ?? "").toLowerCase(),
-    created: asNumber(params.created),
-    expires: asNumber(params.expires),
-    rawParams: equals >= 0 ? raw.slice(equals + 1).trim() : ""
-  };
-}
-function parseSignatureAgentHost(raw) {
-  let value = (raw ?? "").trim();
-  while (value.startsWith("<") && value.endsWith(">")) value = value.slice(1, -1).trim();
-  if (!value.startsWith('"') || !value.endsWith('"') || value.length < 3) return null;
-  const url = value.slice(1, -1);
-  if (!/^https:\/\//i.test(url)) return null;
-  try {
-    return new URL(url).hostname.toLowerCase() || null;
-  } catch {
-    return null;
-  }
-}
-function bytesToBase64Url(bytes) {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-function base64ToBytes(value) {
-  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-  const binary = atob(`${normalized}${"=".repeat((4 - normalized.length % 4) % 4)}`);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
-  return bytes;
-}
-function toArrayBuffer(bytes) {
-  const copy = new Uint8Array(bytes.length);
-  copy.set(bytes);
-  return copy.buffer;
-}
-function componentValue(name, request, headers) {
-  const scheme = (request.scheme || "https").toLowerCase();
-  const authority = request.authority.trim();
-  switch (name) {
-    case "@authority":
-      return authority;
-    case "@scheme":
-      return scheme;
-    case "@method":
-      return (request.method || "GET").toUpperCase();
-    case "@target-uri":
-      return `${scheme}://${authority}${request.pathWithQuery || "/"}`;
-    case "@request-target":
-      return request.pathWithQuery || "/";
-    case "@path":
-      return (request.pathWithQuery || "/").split("?")[0];
-    case "@query": {
-      const index = (request.pathWithQuery || "").indexOf("?");
-      return index >= 0 ? request.pathWithQuery.slice(index) : "?";
-    }
-    default: {
-      const value = readHeader(headers, name);
-      return value ? value.replace(/\s+/g, " ").trim() : null;
-    }
-  }
-}
-function signatureBase(components, request, headers, rawParams) {
-  const lines = [];
-  for (const component of components) {
-    const value = componentValue(component, request, headers);
-    if (value === null) return null;
-    lines.push(`"${component}": ${value}
-`);
-  }
-  if (!rawParams) return null;
-  lines.push(`"@signature-params": ${rawParams}
-`);
-  return lines.join("");
-}
-function collectEd25519Keys(node, depth, output) {
-  if (depth > 8 || node === null || typeof node !== "object") return;
-  if (Array.isArray(node)) {
-    for (const item of node) collectEd25519Keys(item, depth + 1, output);
-    return;
-  }
-  const record = node;
-  if (String(record.kty).toUpperCase() === "OKP" && String(record.crv ?? "Ed25519").toLowerCase() === "ed25519" && typeof record.x === "string") {
-    output.push({ ...record, kty: "OKP", crv: "Ed25519", x: record.x });
-  }
-  for (const value of Object.values(record)) collectEd25519Keys(value, depth + 1, output);
-}
-var WebBotAuthVerifier = class _WebBotAuthVerifier {
-  constructor(db2) {
-    this.db = db2;
-  }
-  /** RFC 7638 thumbprint over the three required Ed25519 JWK members. */
-  static async computeEd25519JwkThumbprint(jwk) {
-    const canonical = JSON.stringify({
-      crv: jwk.crv ?? "Ed25519",
-      kty: jwk.kty ?? "OKP",
-      x: jwk.x ?? ""
-    });
-    const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
-    return bytesToBase64Url(new Uint8Array(digest));
-  }
-  getCachedKeys(host, keyId) {
-    const rows = keyId ? this.db.prepare("SELECT jwk FROM ai_bot_jwk_cache WHERE host = ? AND kid = ?").all(host, keyId) : this.db.prepare("SELECT jwk FROM ai_bot_jwk_cache WHERE host = ?").all(host);
-    const keys = [];
-    for (const row of rows) {
-      try {
-        keys.push(JSON.parse(String(row.jwk)));
-      } catch {
-      }
-    }
-    return keys;
-  }
-  /** Fetches and caches every Ed25519 key published by a signer's directory. */
-  async refreshDirectoryKeys(host) {
-    const normalizedHost = host.toLowerCase().replace(/:\d+$/, "");
-    const directoryUrl = WEB_BOT_AUTH_SIGNER_MAP[normalizedHost]?.directoryUrl ?? `https://${normalizedHost}/.well-known/http-message-signatures-directory`;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), DIRECTORY_TIMEOUT_MS);
-    try {
-      const response = await fetch(directoryUrl, {
-        signal: controller.signal,
-        headers: { accept: "application/json", "user-agent": "IntelSystem-AI-Bot-Protection/1.0" }
-      });
-      if (!response.ok) return 0;
-      const payload = await response.json();
-      const keys = [];
-      collectEd25519Keys(payload, 0, keys);
-      if (!keys.length) return 0;
-      const upsert = this.db.prepare(
-        `INSERT INTO ai_bot_jwk_cache (thumbprint, host, kid, jwk, algorithm, observed_at_utc)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(thumbprint) DO UPDATE SET
-           host = excluded.host,
-           kid = excluded.kid,
-           jwk = excluded.jwk,
-           algorithm = excluded.algorithm,
-           observed_at_utc = excluded.observed_at_utc`
-      );
-      const thumbprints = await Promise.all(
-        keys.map((jwk) => _WebBotAuthVerifier.computeEd25519JwkThumbprint(jwk))
-      );
-      const now = (/* @__PURE__ */ new Date()).toISOString();
-      runTransaction(this.db, () => {
-        keys.forEach((jwk, index) => {
-          upsert.run(
-            thumbprints[index],
-            normalizedHost,
-            jwk.kid ?? null,
-            JSON.stringify(jwk),
-            jwk.alg ?? "Ed25519",
-            now
-          );
-        });
-      });
-      return keys.length;
-    } catch {
-      return 0;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  /** Refreshes all directories declared in the signer registry. */
-  async refreshAllDirectories() {
-    let total = 0;
-    await Promise.all(
-      Object.keys(WEB_BOT_AUTH_SIGNER_MAP).map(async (host) => {
-        total += await this.refreshDirectoryKeys(host).catch(() => 0);
-      })
-    );
-    return total;
-  }
-  /** Verifies a request; the returned result shape is stable for analytics and edge decisions. */
-  async verifyRequest(request) {
-    const signatureInput = readHeader(request.headers, "signature-input");
-    const signature = readHeader(request.headers, "signature");
-    const signatureAgent = readHeader(request.headers, "signature-agent");
-    const present = Boolean(signatureInput && signature && signatureAgent);
-    if (!present) return { present: false, verified: false, reason: "none" };
-    const signerHost = parseSignatureAgentHost(signatureAgent);
-    if (!signerHost) {
-      return {
-        present,
-        verified: false,
-        reason: "signer.web-bot-auth.declared",
-        errorDetail: "Signature-Agent must be a double-quoted https:// URL"
-      };
-    }
-    const parsed = parseSignatureInput(signatureInput);
-    if (!parsed) {
-      return {
-        present,
-        verified: false,
-        signerHost,
-        reason: "signer.web-bot-auth.declared",
-        errorDetail: "Malformed Signature-Input header"
-      };
-    }
-    if (parsed.tag !== "web-bot-auth") {
-      return {
-        present,
-        verified: false,
-        signerHost,
-        keyId: parsed.keyId || void 0,
-        reason: "signer.web-bot-auth.declared",
-        errorDetail: `Signature tag must be "web-bot-auth" (received "${parsed.tag || "none"}")`
-      };
-    }
-    const hasAuthority = parsed.components.includes("@authority") || parsed.components.includes("@target-uri");
-    const hasSigner = parsed.components.includes("signature-agent");
-    if (!hasAuthority || !hasSigner) {
-      return {
-        present,
-        verified: false,
-        signerHost,
-        keyId: parsed.keyId || void 0,
-        reason: "signer.web-bot-auth.declared",
-        errorDetail: "Signature must cover @authority (or @target-uri) and signature-agent"
-      };
-    }
-    const nowSeconds = Math.floor(Date.now() / 1e3);
-    if (parsed.created !== null && parsed.created > nowSeconds + CLOCK_SKEW_SECONDS) {
-      return {
-        present,
-        verified: false,
-        signerHost,
-        keyId: parsed.keyId || void 0,
-        reason: "signer.web-bot-auth.declared",
-        errorDetail: "Signature created timestamp is in the future"
-      };
-    }
-    if (parsed.expires !== null && parsed.expires < nowSeconds - CLOCK_SKEW_SECONDS) {
-      return {
-        present,
-        verified: false,
-        signerHost,
-        keyId: parsed.keyId || void 0,
-        reason: "signer.web-bot-auth.declared",
-        errorDetail: "Signature has expired"
-      };
-    }
-    if (parsed.created !== null && parsed.expires !== null && parsed.created > parsed.expires) {
-      return {
-        present,
-        verified: false,
-        signerHost,
-        keyId: parsed.keyId || void 0,
-        reason: "signer.web-bot-auth.declared",
-        errorDetail: "Signature created timestamp is after expires"
-      };
-    }
-    const signatureMatch = new RegExp(`(?:^|,)\\s*${parsed.label}\\s*=\\s*:([A-Za-z0-9+/=_-]+):`).exec(signature);
-    if (!signatureMatch) {
-      return {
-        present,
-        verified: false,
-        signerHost,
-        keyId: parsed.keyId || void 0,
-        reason: "signer.web-bot-auth.declared",
-        errorDetail: "Signature header is not a labelled RFC 9421 byte-sequence value"
-      };
-    }
-    const base = signatureBase(parsed.components, request, request.headers, parsed.rawParams);
-    if (!base) {
-      return {
-        present,
-        verified: false,
-        signerHost,
-        keyId: parsed.keyId || void 0,
-        reason: "signer.web-bot-auth.declared",
-        errorDetail: "A covered component could not be reconstructed"
-      };
-    }
-    let keys = this.getCachedKeys(signerHost, parsed.keyId);
-    if (!keys.length) {
-      await this.refreshDirectoryKeys(signerHost);
-      keys = this.getCachedKeys(signerHost, parsed.keyId);
-    }
-    if (!keys.length) {
-      return {
-        present,
-        verified: false,
-        signerHost,
-        keyId: parsed.keyId || void 0,
-        reason: "signer.web-bot-auth.declared",
-        errorDetail: "No verification key is available for the declared signer"
-      };
-    }
-    const signatureBytes = base64ToBytes(signatureMatch[1]);
-    const dataBytes = new TextEncoder().encode(base);
-    let verified = false;
-    for (const jwk of keys) {
-      if (!jwk.x) continue;
-      try {
-        const key = await globalThis.crypto.subtle.importKey(
-          "jwk",
-          { kty: "OKP", crv: "Ed25519", x: jwk.x },
-          { name: "Ed25519" },
-          false,
-          ["verify"]
-        );
-        if (await globalThis.crypto.subtle.verify(
-          "Ed25519",
-          key,
-          toArrayBuffer(signatureBytes),
-          toArrayBuffer(dataBytes)
-        )) {
-          verified = true;
-          break;
-        }
-      } catch {
-      }
-    }
-    if (!verified) {
-      return {
-        present,
-        verified: false,
-        signerHost,
-        keyId: parsed.keyId || void 0,
-        reason: "signer.web-bot-auth.declared",
-        errorDetail: "Signature did not verify against any published key"
-      };
-    }
-    const signer = WEB_BOT_AUTH_SIGNER_MAP[signerHost];
-    return {
-      present: true,
-      verified: true,
-      ...signer ? { botId: signer.botId, operator: signer.operator } : {},
-      signerHost,
-      keyId: parsed.keyId || void 0,
-      reason: "signer.web-bot-auth.verified"
-    };
-  }
-};
-
-// src/server/ai-protection/bot-preference-sync.ts
-var DEFAULT_CONFIG = {
-  id: 1,
-  botPreferenceSyncEnabled: true,
-  markdownForAgentsEnabled: true,
-  searchPolicy: "allow",
-  agentPolicy: "allow",
-  trainingPolicy: "disallow",
-  contentUseSignal: "reference",
-  blockStatusCode: 403,
-  blockResponseBody: "Access denied: automated crawling policy violation.",
-  priceUsd: 0.015,
-  customRobotsAppend: "",
-  updatedAtUtc: ""
-};
-function asPolicy(value, fallback) {
-  return value === "allow" || value === "disallow" || value === "charge" ? value : fallback;
-}
-function rowToConfig(row) {
-  if (!row) return { ...DEFAULT_CONFIG };
-  return {
-    id: 1,
-    botPreferenceSyncEnabled: Number(row.bot_preference_sync_enabled ?? 1) !== 0,
-    markdownForAgentsEnabled: Number(row.markdown_for_agents_enabled ?? 1) !== 0,
-    searchPolicy: asPolicy(row.search_policy, "allow"),
-    agentPolicy: asPolicy(row.agent_policy, "allow"),
-    trainingPolicy: asPolicy(row.training_policy, "disallow"),
-    contentUseSignal: String(row.content_use_signal ?? "reference"),
-    blockStatusCode: Number(row.block_status_code ?? 403),
-    blockResponseBody: String(row.block_response_body ?? DEFAULT_CONFIG.blockResponseBody),
-    priceUsd: Number(row.price_usd ?? 0.015),
-    customRobotsAppend: String(row.custom_robots_append ?? ""),
-    updatedAtUtc: String(row.updated_at_utc ?? "")
-  };
-}
-function isAlwaysAllowedPath(reqPath) {
-  const normalized = (reqPath || "/").split("?")[0];
-  return normalized === "/robots.txt" || normalized === "/llms.txt" || normalized === "/.well-known" || normalized.startsWith("/.well-known/");
-}
-var BotPreferenceSyncEngine = class {
-  constructor(db2) {
-    this.db = db2;
-    this.cachedConfig = null;
-  }
-  getZoneConfig(forceRefresh = false) {
-    if (this.cachedConfig && !forceRefresh) return this.cachedConfig;
-    const row = this.db.prepare("SELECT * FROM ai_zone_config WHERE id = 1").get();
-    this.cachedConfig = rowToConfig(row);
-    return this.cachedConfig;
-  }
-  updateZoneConfig(patch) {
-    const current = this.getZoneConfig(true);
-    const next = {
-      ...current,
-      ...patch,
-      id: 1,
-      updatedAtUtc: (/* @__PURE__ */ new Date()).toISOString()
-    };
-    next.searchPolicy = asPolicy(next.searchPolicy, current.searchPolicy);
-    next.agentPolicy = asPolicy(next.agentPolicy, current.agentPolicy);
-    next.trainingPolicy = asPolicy(next.trainingPolicy, current.trainingPolicy);
-    this.db.prepare(
-      `UPDATE ai_zone_config SET
-           bot_preference_sync_enabled = ?, markdown_for_agents_enabled = ?, search_policy = ?,
-           agent_policy = ?, training_policy = ?, content_use_signal = ?, block_status_code = ?,
-           block_response_body = ?, price_usd = ?, custom_robots_append = ?, updated_at_utc = ?
-         WHERE id = 1`
-    ).run(
-      next.botPreferenceSyncEnabled ? 1 : 0,
-      next.markdownForAgentsEnabled ? 1 : 0,
-      next.searchPolicy,
-      next.agentPolicy,
-      next.trainingPolicy,
-      next.contentUseSignal,
-      next.blockStatusCode,
-      next.blockResponseBody,
-      next.priceUsd,
-      next.customRobotsAppend,
-      next.updatedAtUtc
-    );
-    this.cachedConfig = next;
-    return next;
-  }
-  getCustomPolicies() {
-    const rows = this.db.prepare("SELECT bot_id, action, note FROM ai_bot_custom_policies").all();
-    return rows.map((row) => ({
-      botId: String(row.bot_id),
-      action: String(row.action),
-      note: row.note === null || row.note === void 0 ? null : String(row.note)
-    }));
-  }
-  upsertCustomPolicy(botId, action, note) {
-    this.db.prepare(
-      `INSERT INTO ai_bot_custom_policies (bot_id, action, note, created_at_utc)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(bot_id) DO UPDATE SET action = excluded.action, note = excluded.note`
-    ).run(botId, action, note ?? null, (/* @__PURE__ */ new Date()).toISOString());
-  }
-  /** `search=..., ai-input=..., ai-train=..., use=reference` as used by Cloudflare's Content-Signal draft. */
-  buildContentSignalHeader(config = this.getZoneConfig()) {
-    const signal = (policy) => policy === "allow" || policy === "charge" ? "yes" : "no";
-    return [
-      `search=${signal(config.searchPolicy)}`,
-      `ai-input=${signal(config.agentPolicy)}`,
-      `ai-train=${signal(config.trainingPolicy)}`,
-      `use=${config.contentUseSignal || "reference"}`
-    ].join(", ");
-  }
-  /** Builds a live robots.txt with content signals and per-bot policy groups. */
-  generateRobotsTxt(config = this.getZoneConfig()) {
-    const lines = [
-      "# Generated by Intel System AI bot protection",
-      `# Content-Signal: ${this.buildContentSignalHeader(config)}`,
-      `Content-Signal: ${this.buildContentSignalHeader(config)}`,
-      "",
-      "User-agent: *",
-      "Allow: /",
-      "Allow: /robots.txt",
-      "Allow: /llms.txt",
-      "Allow: /.well-known/",
-      ""
-    ];
-    const policyFor = (bot) => {
-      switch (bot.behavior) {
-        case "Training":
-          if (bot.isMixedPurposeAccountable) return "allow";
-          return config.trainingPolicy;
-        case "Agent":
-          return config.agentPolicy;
-        case "Search":
-          return config.searchPolicy;
-        default:
-          return "allow";
-      }
-    };
-    for (const bot of BOT_REGISTRY) {
-      const policy = policyFor(bot);
-      const tokens = bot.uaTokens.length ? bot.uaTokens : [{ token: bot.displayName }];
-      for (const token of tokens) {
-        lines.push(`User-agent: ${token.token}`);
-        if (policy === "disallow") {
-          lines.push("Disallow: /");
-        } else if (policy === "charge") {
-          lines.push("Disallow: /");
-          lines.push(`# Monetised access available at $${config.priceUsd.toFixed(3)} per request`);
-        } else {
-          lines.push("Allow: /");
-        }
-        lines.push("Allow: /robots.txt");
-        lines.push("Allow: /llms.txt");
-        lines.push("Allow: /.well-known/");
-        lines.push("");
-      }
-    }
-    if (config.trainingPolicy === "disallow") {
-      lines.push("User-agent: Applebot-Extended", "Disallow: /", "");
-      lines.push("User-agent: Google-Extended", "Disallow: /", "");
-    }
-    const custom = this.getCustomPolicies();
-    for (const policy of custom) {
-      lines.push(`User-agent: ${policy.botId}`);
-      lines.push(policy.action === "allow" ? "Allow: /" : "Disallow: /");
-      if (policy.note) lines.push(`# ${policy.note.replace(/[\r\n]+/g, " ")}`);
-      lines.push("");
-    }
-    if (config.customRobotsAppend.trim()) {
-      lines.push("# Custom site policy", config.customRobotsAppend.trim(), "");
-    }
-    return `${lines.join("\n").replace(/\n{3,}/g, "\n\n").trim()}
-`;
-  }
-  /**
-   * Decides the edge action for a request and reports whether it conflicts with the live
-   * robots.txt. Accountable mixed-purpose crawlers are deliberately exempt from training blocks.
-   */
-  evaluateAccessAndRobotsCompliance(bot, isVerified, reqPath, paymentHeaderPresent) {
-    const config = this.getZoneConfig();
-    if (isAlwaysAllowedPath(reqPath)) return { edgeAction: "allow", robotsViolation: false };
-    if (!bot) return { edgeAction: "allow", robotsViolation: false };
-    const custom = this.getCustomPolicies().find((policy) => policy.botId === bot.id);
-    if (custom) {
-      if (custom.action === "block") {
-        return {
-          edgeAction: "block_403",
-          robotsViolation: true,
-          violatedDirective: `Custom policy: block ${bot.id}`
-        };
-      }
-      if (custom.action === "charge" && !paymentHeaderPresent) {
-        return {
-          edgeAction: "charge_402",
-          robotsViolation: true,
-          violatedDirective: `Custom policy: charge ${bot.id}`
-        };
-      }
-      if (custom.action === "disallow_training" && !bot.isMixedPurposeAccountable) {
-        return {
-          edgeAction: "disallow_training",
-          robotsViolation: true,
-          violatedDirective: "Disallow: /"
-        };
-      }
-      if (custom.action === "allow") return { edgeAction: "allow", robotsViolation: false };
-    }
-    if (bot.webBotAuthHosts?.length && !isVerified) {
-      return {
-        edgeAction: "block_403",
-        robotsViolation: true,
-        violatedDirective: "verification_required (Web Bot Auth)"
-      };
-    }
-    if (!isVerified && bot.feedUrls?.length) {
-      return {
-        edgeAction: "block_403",
-        robotsViolation: true,
-        violatedDirective: `verification_required (published IP ranges for ${bot.id})`
-      };
-    }
-    const applyPolicy = (policy, directive) => {
-      if (policy === "disallow") return { edgeAction: "block_403", robotsViolation: true, violatedDirective: directive };
-      if (policy === "charge") {
-        return paymentHeaderPresent ? { edgeAction: "allow", robotsViolation: false } : { edgeAction: "charge_402", robotsViolation: true, violatedDirective: directive };
-      }
-      return { edgeAction: "allow", robotsViolation: false };
-    };
-    switch (bot.behavior) {
-      case "Training":
-        if (config.trainingPolicy === "disallow" && bot.isMixedPurposeAccountable) {
-          return { edgeAction: "allow", robotsViolation: false };
-        }
-        if (config.trainingPolicy === "disallow") {
-          return {
-            edgeAction: "disallow_training",
-            robotsViolation: true,
-            violatedDirective: `User-agent: ${bot.uaTokens[0]?.token ?? bot.id}
-Disallow: /`
-          };
-        }
-        return applyPolicy(config.trainingPolicy, "ai-train=disallow");
-      case "Agent":
-        return applyPolicy(config.agentPolicy, "ai-input=disallow");
-      case "Search":
-        return applyPolicy(config.searchPolicy, "search=disallow");
-      case "Automation":
-      default:
-        return { edgeAction: "allow", robotsViolation: false };
-    }
-  }
-};
-
-// src/server/ai-protection/markdown-for-agents.ts
-var MAX_MARKDOWN_HTML_BYTES = 6 * 1024 * 1024;
-function decodeEntities2(text) {
-  const named = {
-    amp: "&",
-    lt: "<",
-    gt: ">",
-    quot: '"',
-    apos: "'",
-    nbsp: " ",
-    ndash: "\u2013",
-    mdash: "\u2014",
-    hellip: "\u2026",
-    rsquo: "\u2019",
-    lsquo: "\u2018",
-    ldquo: "\u201C",
-    rdquo: "\u201D",
-    copy: "\xA9",
-    reg: "\xAE",
-    trade: "\u2122"
-  };
-  return text.replace(/&(#x[0-9a-f]+|#\d+|[a-zA-Z]+);/gi, (whole, entity) => {
-    if (entity.startsWith("#x") || entity.startsWith("#X")) {
-      const code = Number.parseInt(entity.slice(2), 16);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : whole;
-    }
-    if (entity.startsWith("#")) {
-      const code = Number.parseInt(entity.slice(1), 10);
-      return Number.isFinite(code) ? String.fromCodePoint(code) : whole;
-    }
-    return named[entity.toLowerCase()] ?? whole;
-  }).replace(/&#(\d+);/g, (_whole, decimal) => String.fromCodePoint(Number.parseInt(decimal, 10)));
-}
-function stripBlocks(html) {
-  let result = html;
-  const tags = ["script", "style", "noscript", "svg", "iframe", "nav", "header", "footer", "aside", "form"];
-  for (let pass = 0; pass < 4; pass += 1) {
-    for (const tag of tags) {
-      result = result.replace(new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}\\s*>`, "gi"), " ");
-      result = result.replace(new RegExp(`<${tag}\\b[^>]*\\/>`, "gi"), " ");
-    }
-  }
-  result = result.replace(/<!--[\s\S]*?-->/g, " ");
-  return result;
-}
-function extractJsonLd(html) {
-  const nodes = [];
-  const body = html.replace(
-    /<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script\s*>/gi,
-    (_whole, raw) => {
-      try {
-        const parsed = JSON.parse(raw.trim());
-        if (Array.isArray(parsed)) nodes.push(...parsed);
-        else if (parsed !== null && typeof parsed === "object") nodes.push(parsed);
-      } catch {
-      }
-      return " ";
-    }
-  );
-  return { body, nodes };
-}
-function htmlToMarkdown(html) {
-  let text = html;
-  text = text.replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1\s*>/gi, (_whole, level, inner) => {
-    const hashes = "#".repeat(Number.parseInt(level, 10));
-    return `
-
-${hashes} ${inner.replace(/\s+/g, " ").trim()}
-
-`;
-  });
-  text = text.replace(/<p\b[^>]*>/gi, "\n\n").replace(/<\/p\s*>/gi, "\n\n");
-  text = text.replace(/<div\b[^>]*>/gi, "\n").replace(/<\/div\s*>/gi, "\n");
-  text = text.replace(/<section\b[^>]*>/gi, "\n").replace(/<\/section\s*>/gi, "\n");
-  text = text.replace(/<article\b[^>]*>/gi, "\n").replace(/<\/article\s*>/gi, "\n");
-  text = text.replace(/<main\b[^>]*>/gi, "\n").replace(/<\/main\s*>/gi, "\n");
-  text = text.replace(/<br\s*\/?>/gi, "  \n");
-  text = text.replace(/<hr\b[^>]*\/?>/gi, "\n\n---\n\n");
-  text = text.replace(/<ul\b[^>]*>/gi, "\n").replace(/<\/ul\s*>/gi, "\n");
-  text = text.replace(/<ol\b[^>]*>/gi, "\n").replace(/<\/ol\s*>/gi, "\n");
-  text = text.replace(/<li\b[^>]*>([\s\S]*?)<\/li\s*>/gi, (_whole, inner) => {
-    const clean = inner.replace(/\s+/g, " ").trim();
-    return clean ? `- ${clean}
-` : "";
-  });
-  text = text.replace(/<blockquote\b[^>]*>([\s\S]*?)<\/blockquote\s*>/gi, (_whole, inner) => {
-    const quoted = inner.replace(/<[^>]+>/g, " ").split(/\n+/).map((line) => line.trim()).filter(Boolean).map((line) => `> ${line}`).join("\n");
-    return `
-
-${quoted}
-
-`;
-  });
-  text = text.replace(/<pre\b[^>]*>([\s\S]*?)<\/pre\s*>/gi, (_whole, inner) => {
-    const code = decodeEntities2(inner.replace(/<[^>]+>/g, "")).trim();
-    return `
-
-\`\`\`
-${code}
-\`\`\`
-
-`;
-  });
-  text = text.replace(/<code\b[^>]*>([\s\S]*?)<\/code\s*>/gi, (_whole, inner) => `\`${inner.trim()}\``);
-  text = text.replace(/<img\b[^>]*>/gi, (whole) => {
-    const src = /\bsrc\s*=\s*["']([^"']*)["']/i.exec(whole)?.[1] ?? "";
-    const alt = /\balt\s*=\s*["']([^"']*)["']/i.exec(whole)?.[1] ?? "";
-    if (!src) return "";
-    return `![${alt}](${src})`;
-  });
-  text = text.replace(
-    /<a\b[^>]*href\s*=\s*["']([^"']*)["'][^>]*>([\s\S]*?)<\/a\s*>/gi,
-    (_whole, href, inner) => {
-      const label = decodeEntities2(inner.replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim();
-      return label ? `[${label}](${href})` : `[${href}](${href})`;
-    }
-  );
-  text = text.replace(/<(strong|b)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi, "**$2**");
-  text = text.replace(/<(em|i)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi, "*$2*");
-  text = text.replace(/<del\b[^>]*>([\s\S]*?)<\/del\s*>/gi, "~~$1~~");
-  text = text.replace(/<table\b[^>]*>([\s\S]*?)<\/table\s*>/gi, (_whole, inner) => {
-    const rows = [...inner.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr\s*>/gi)].map(
-      (row) => [...row[1].matchAll(/<t[dh]\b[^>]*>([\s\S]*?)<\/t[dh]\s*>/gi)].map(
-        (cell) => decodeEntities2(cell[1].replace(/<[^>]+>/g, "")).replace(/\s+/g, " ").trim()
-      )
-    );
-    if (!rows.length) return "\n";
-    const width = Math.max(...rows.map((row) => row.length));
-    const format = (row) => `| ${[...row, ...new Array(width - row.length).fill("")].join(" | ")} |`;
-    const lines = [format(rows[0]), `| ${new Array(width).fill("---").join(" | ")} |`];
-    for (const row of rows.slice(1)) lines.push(format(row));
-    return `
-
-${lines.join("\n")}
-
-`;
-  });
-  text = text.replace(/<\/?[a-zA-Z][^>]*>/g, "");
-  text = decodeEntities2(text);
-  text = text.replace(/\r\n?/g, "\n");
-  text = text.split("\n").map((line) => line.replace(/[ \t]+$/g, "")).join("\n");
-  text = text.replace(/\n{3,}/g, "\n\n").replace(/[ \t]{2,}/g, " ").trim();
-  return text;
-}
-function extractMetaContent(html, attribute, key) {
-  const tagPattern = /<meta\b[^>]*>/gi;
-  const attrPattern = new RegExp(`${attribute}\\s*=\\s*(["'])(.*?)\\1`, "i");
-  let match;
-  while ((match = tagPattern.exec(html)) !== null) {
-    const tag = match[0];
-    const attr = attrPattern.exec(tag);
-    if (!attr || attr[2].trim().toLowerCase() !== key.toLowerCase()) continue;
-    const content = /\bcontent\s*=\s*(["'])(.*?)\1/i.exec(tag);
-    if (content) return decodeEntities2(content[2]).trim();
-  }
-  return null;
-}
-function utf8ByteLength(text) {
-  return new TextEncoder().encode(text).length;
-}
-function convertHtmlToAgentMarkdown(htmlBuffer) {
-  const source = typeof htmlBuffer === "string" ? htmlBuffer : String(htmlBuffer);
-  const inputBytes = utf8ByteLength(source);
-  if (inputBytes > MAX_MARKDOWN_HTML_BYTES) {
-    return { converted: false, markdown: "", byteLength: inputBytes, reason: "too_large" };
-  }
-  let body = source;
-  let frontmatter = "";
-  const frontmatterMatch = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(body);
-  if (frontmatterMatch) {
-    frontmatter = `---
-${frontmatterMatch[1].trim()}
----
-
-`;
-    body = body.slice(frontmatterMatch[0].length);
-  } else {
-    const title = extractMetaContent(source, "name", "title") ?? extractMetaContent(source, "property", "og:title");
-    const description = extractMetaContent(source, "name", "description") ?? extractMetaContent(source, "property", "og:description");
-    const image = extractMetaContent(source, "property", "og:image");
-    const yaml = [];
-    const yamlValue = (value) => `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-    if (title) yaml.push(`title: ${yamlValue(title)}`);
-    if (description) yaml.push(`description: ${yamlValue(description)}`);
-    if (image) yaml.push(`image: ${yamlValue(image)}`);
-    if (yaml.length) frontmatter = `---
-${yaml.join("\n")}
----
-
-`;
-  }
-  const { body: withoutJsonLd, nodes } = extractJsonLd(body);
-  body = stripBlocks(withoutJsonLd);
-  const markdown = htmlToMarkdown(body);
-  if (!markdown && !nodes.length) {
-    return { converted: false, markdown: "", byteLength: 0, reason: "empty" };
-  }
-  let output = `${frontmatter}${markdown}`;
-  if (nodes.length) {
-    output += `
-
-\`\`\`json
-${JSON.stringify(nodes, null, 2)}
-\`\`\`
-`;
-  }
-  output = `${output.trim()}
-`;
-  return { converted: true, markdown: output, byteLength: utf8ByteLength(output) };
-}
-function applyMarkdownResponseHeaders(res, defaultContentSignal) {
-  res.setHeader("Content-Type", "text/markdown; charset=utf-8");
-  const vary = res.getHeader("Vary");
-  const varyText = Array.isArray(vary) ? vary.join(", ") : vary == null ? "" : String(vary);
-  if (!/(?:^|,)\s*accept\s*(?:,|$)/i.test(varyText)) {
-    res.setHeader("Vary", varyText ? `${varyText}, Accept` : "Accept");
-  }
-  if (!res.getHeader("Content-Signal")) res.setHeader("Content-Signal", defaultContentSignal);
-  for (const header of [
-    "Content-Length",
-    "Content-Encoding",
-    "Content-Range",
-    "Transfer-Encoding",
-    "ETag",
-    "Last-Modified"
-  ]) {
-    res.removeHeader(header);
-  }
-}
-
-// src/server/ai-protection/middleware.ts
-async function refreshAIBotFeeds(db2) {
-  initAIBotSchema(db2);
-  const ipEngine = new IpVerificationEngine(db2);
-  const webBotAuth = new WebBotAuthVerifier(db2);
-  const [feeds, keys] = await Promise.all([
-    ipEngine.syncAllOfficialFeeds(),
-    webBotAuth.refreshAllDirectories()
-  ]);
-  ipEngine.reloadMemoryRanges();
-  return { feeds, keys };
-}
-var ROBOTS_PATHS = /* @__PURE__ */ new Set(["/robots.txt", "/api/intel/ai-crawl-control/robots.txt"]);
-var LLMS_PATHS = /* @__PURE__ */ new Set(["/llms.txt", "/api/intel/ai-crawl-control/llms.txt"]);
-function computeCloudflareUriPattern(uri) {
-  const clean = String(uri || "/").split("?")[0];
-  const segments = clean.split("/").filter(Boolean);
-  if (segments.length === 0) return "/*";
-  if (segments.length === 1) return `/${segments[0]}`;
-  return `/${segments[0]}/${segments[1]}/*`;
-}
-function utf8Length(text) {
-  return new TextEncoder().encode(text).length;
-}
-function chunkToText(chunk) {
-  if (typeof chunk === "string") return chunk;
-  if (chunk === null || chunk === void 0) return "";
-  if (chunk instanceof Uint8Array) return new TextDecoder().decode(chunk);
-  return String(chunk);
-}
-function extractClientIp(req) {
-  const forwarded = req.headers["x-forwarded-for"];
-  const first = Array.isArray(forwarded) ? forwarded[0] : forwarded;
-  const fromHeader = typeof first === "string" ? first.split(",")[0].trim() : "";
-  if (fromHeader) return fromHeader;
-  return String(req.ip || req.socket?.remoteAddress || "");
-}
-function extractReferrerDomain(req) {
-  const raw = req.headers.referer ?? req.headers.referrer;
-  const value = Array.isArray(raw) ? raw[0] : raw;
-  if (typeof value !== "string" || !value) return null;
-  try {
-    return new URL(value).hostname.toLowerCase();
-  } catch {
-    return null;
-  }
-}
-function headerValue2(req, name) {
-  const raw = req.headers[name];
-  const value = Array.isArray(raw) ? raw.join(", ") : raw;
-  return typeof value === "string" ? value : "";
-}
-function verdictFor(ctx) {
-  const label = ctx.bot?.id ?? "unknown";
-  return `${ctx.status}:${label}|${ctx.method}`;
-}
-function buildLlmsTxt(config, signal) {
-  return [
-    "# AI crawl control",
-    "",
-    `> Content-Signal: ${signal ?? `use=${config.contentUseSignal}`}`,
-    "",
-    "This site publishes machine-readable content and an explicit crawlers policy.",
-    "",
-    "See /robots.txt for per-bot directives and training opt-outs.",
-    ""
-  ].join("\n");
-}
-function createAIProtectionSystem(db2) {
-  const ipEngine = new IpVerificationEngine(db2);
-  const webBotAuth = new WebBotAuthVerifier(db2);
-  const preferenceSync = new BotPreferenceSyncEngine(db2);
-  try {
-    ipEngine.seedStaticSubnets();
-    ipEngine.reloadMemoryRanges();
-  } catch {
-  }
-  let backgroundStarted = false;
-  const startBackgroundOnce = () => {
-    if (backgroundStarted) return;
-    backgroundStarted = true;
-    void ipEngine.syncAllOfficialFeeds().catch(() => void 0);
-    void webBotAuth.refreshAllDirectories().catch(() => void 0);
-    void ipEngine.checkCachedDns().catch(() => void 0);
-  };
-  const insertRequest = (ctx, reqPath, method, httpStatus) => {
-    try {
-      db2.prepare(
-        `INSERT INTO ai_bot_requests (
-           observed_at_utc, bot_id, operator, verification_status, verification_method, client_ip,
-           user_agent, request_path, request_method, http_status, bytes_sent, referrer_domain,
-           referral_operator, robots_violation, violated_directive, reasons, content_signal, edge_action
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        (/* @__PURE__ */ new Date()).toISOString(),
-        ctx.bot?.id ?? null,
-        ctx.bot?.operator ?? ctx.referralOperator,
-        ctx.status,
-        ctx.method,
-        ctx.clientIp || null,
-        ctx.userAgent.slice(0, 1500) || null,
-        reqPath.slice(0, 2e3),
-        method,
-        httpStatus,
-        ctx.bytesSent,
-        ctx.referrerDomain,
-        ctx.referralOperator,
-        ctx.evaluation.robotsViolation ? 1 : 0,
-        ctx.evaluation.violatedDirective ?? null,
-        JSON.stringify(ctx.reasons),
-        ctx.signal,
-        ctx.evaluation.edgeAction
-      );
-    } catch {
-    }
-  };
-  const middleware = async (req, res, next) => {
-    try {
-      initAIBotSchema(db2);
-    } catch {
-      next();
-      return;
-    }
-    try {
-      startBackgroundOnce();
-      const reqPath = req.path || "/";
-      const config = preferenceSync.getZoneConfig();
-      const signal = preferenceSync.buildContentSignalHeader(config);
-      if (!res.getHeader("Content-Signal")) res.setHeader("Content-Signal", signal);
-      const clientIp = extractClientIp(req);
-      const userAgent = headerValue2(req, "user-agent");
-      const referrerDomain = extractReferrerDomain(req);
-      const referralOperator = referrerDomain ? OPERATOR_REFERRER_DOMAINS[referrerDomain] ?? null : null;
-      const claimedBot = matchUserAgentBot(userAgent);
-      let bot = claimedBot;
-      let status = claimedBot ? "declared" : "unknown";
-      let method = claimedBot ? "user_agent" : "none";
-      const reasons = [];
-      const isVerified = () => status === "verified";
-      const hasSignatureHeaders = Boolean(
-        req.headers["signature-input"] && req.headers["signature"] && req.headers["signature-agent"]
-      );
-      if (hasSignatureHeaders) {
-        const authority = String(req.headers.host || "localhost");
-        const result = await webBotAuth.verifyRequest({
-          method: req.method,
-          authority,
-          pathWithQuery: req.originalUrl || req.url || reqPath,
-          scheme: req.protocol || "https",
-          headers: req.headers
-        });
-        if (result.verified) {
-          const signerBot = result.botId && BOT_MAP_BY_ID[result.botId] || null;
-          if (signerBot) bot = signerBot;
-          status = "verified";
-          method = "web_bot_auth";
-          reasons.push(result.reason);
-          if (result.keyId) reasons.push(`keyid=${result.keyId}`);
-        } else {
-          status = "spoofed";
-          method = "web_bot_auth";
-          reasons.push(result.errorDetail ?? result.reason);
-        }
-      }
-      if (!isVerified()) {
-        const match = ipEngine.matchIpInMemory(clientIp, bot?.id);
-        if (match.matched) {
-          const matchedBot = match.botId ? BOT_MAP_BY_ID[match.botId] ?? null : null;
-          if (matchedBot && (!bot || !hasSignatureHeaders)) bot = matchedBot;
-          status = match.spoofed ? "spoofed" : "verified";
-          method = match.verificationMethod ?? "cidr";
-          reasons.push(match.spoofed ? `cidr_mismatch:${match.cidr}` : `cidr:${match.cidr}`);
-        }
-      }
-      if (!isVerified() && clientIp) {
-        const cached = ipEngine.lookupDnsCache(clientIp);
-        if (cached?.verificationMethod === "fcrdns" || cached?.verificationMethod === "soft_ptr") {
-          const dnsBot = cached.botId ? BOT_MAP_BY_ID[cached.botId] ?? null : null;
-          if (dnsBot && (!bot || dnsBot.id === bot.id)) bot = dnsBot;
-          status = "verified";
-          method = cached.verificationMethod;
-          reasons.push(`${cached.verificationMethod}:${cached.hostname ?? "unknown"}`);
-        } else if (!cached) {
-          ipEngine.scheduleDnsLookup(clientIp);
-          void ipEngine.checkCachedDns().catch(() => void 0);
-        }
-      }
-      if (status === "declared") reasons.push("user_agent_only");
-      if (status === "spoofed") reasons.push("identity_not_proven");
-      const paymentHeaderPresent = Boolean(
-        headerValue2(req, "x-payment") || headerValue2(req, "payment") || headerValue2(req, "x-payment-credential")
-      );
-      const evaluation = preferenceSync.evaluateAccessAndRobotsCompliance(bot, isVerified(), reqPath, paymentHeaderPresent);
-      if (evaluation.robotsViolation && evaluation.violatedDirective) reasons.push(evaluation.violatedDirective);
-      const ctx = {
-        bot,
-        status,
-        method,
-        reasons,
-        evaluation,
-        bytesSent: 0,
-        clientIp,
-        userAgent,
-        referrerDomain,
-        referralOperator,
-        signal
-      };
-      if (referralOperator && referrerDomain) {
-        try {
-          db2.prepare(
-            `INSERT INTO ai_operator_referrals (
-               observed_at_utc, bot_id, operator, referrer_domain, referrer_url, request_path, occurrences
-             ) VALUES (?, ?, ?, ?, ?, ?, 1)`
-          ).run(
-            (/* @__PURE__ */ new Date()).toISOString(),
-            bot?.id ?? null,
-            referralOperator,
-            referrerDomain,
-            String(req.headers.referer ?? "").slice(0, 2e3),
-            reqPath.slice(0, 2e3)
-          );
-        } catch {
-        }
-      }
-      const accept = headerValue2(req, "accept");
-      if (/text\/html/i.test(accept) || !reqPath.startsWith("/api") && req.method === "GET") {
-        const wireVerdict = verdictFor(ctx).replace(/"/g, "'");
-        res.setHeader("Server-Timing", `botscent;desc="${wireVerdict}"`);
-        res.setHeader("Botscent-Report", wireVerdict);
-      }
-      const wantsMarkdown = config.markdownForAgentsEnabled && /\btext\/markdown\b/i.test(accept) && !reqPath.startsWith("/api") && !ROBOTS_PATHS.has(reqPath) && !LLMS_PATHS.has(reqPath);
-      const originalWrite = res.write.bind(res);
-      const originalEnd = res.end.bind(res);
-      let markdownBuffer = "";
-      let finished = false;
-      res.write = (chunk, encoding, callback) => {
-        const text = chunkToText(chunk);
-        ctx.bytesSent += utf8Length(text);
-        if (wantsMarkdown) {
-          markdownBuffer += text;
-          if (typeof encoding === "function") encoding();
-          return true;
-        }
-        if (typeof encoding === "function") return originalWrite(chunk, encoding);
-        if (typeof callback === "function") return originalWrite(chunk, encoding, callback);
-        return encoding === void 0 ? originalWrite(chunk) : originalWrite(chunk, encoding);
-      };
-      res.end = (chunk, encoding, callback) => {
-        if (finished) return res;
-        finished = true;
-        if (chunk !== null && chunk !== void 0) {
-          const text = chunkToText(chunk);
-          ctx.bytesSent += utf8Length(text);
-          if (wantsMarkdown) markdownBuffer += text;
-        }
-        if (wantsMarkdown) {
-          const converted = convertHtmlToAgentMarkdown(markdownBuffer);
-          if (converted.converted) {
-            applyMarkdownResponseHeaders(res, signal);
-            ctx.bytesSent = converted.byteLength;
-            return typeof encoding === "function" ? originalEnd(converted.markdown, encoding) : originalEnd(converted.markdown);
-          }
-        }
-        if (typeof encoding === "function") return originalEnd(chunk, encoding);
-        if (typeof callback === "function") return originalEnd(chunk, encoding, callback);
-        return chunk === void 0 ? originalEnd() : originalEnd(chunk);
-      };
-      res.on("finish", () => {
-        insertRequest(ctx, reqPath, req.method, res.statusCode);
-      });
-      if (ROBOTS_PATHS.has(reqPath)) {
-        const robotsTxt = preferenceSync.generateRobotsTxt(config);
-        ctx.bytesSent = utf8Length(robotsTxt);
-        res.setHeader("Content-Type", "text/plain; charset=utf-8");
-        res.status(200).send(robotsTxt);
-        return;
-      }
-      if (LLMS_PATHS.has(reqPath)) {
-        const llmsTxt = buildLlmsTxt(config, signal);
-        ctx.bytesSent = utf8Length(llmsTxt);
-        res.setHeader("Content-Type", "text/plain; charset=utf-8");
-        res.status(200).send(llmsTxt);
-        return;
-      }
-      if (evaluation.edgeAction === "block_403") {
-        const code = config.blockStatusCode >= 400 && config.blockStatusCode < 600 ? config.blockStatusCode : 403;
-        res.status(code).type("text/plain").send(config.blockResponseBody);
-        return;
-      }
-      if (evaluation.edgeAction === "charge_402") {
-        res.status(402).json({
-          error: "payment_required",
-          price: config.priceUsd,
-          bot: bot?.id ?? null,
-          contentSignal: signal
-        });
-        return;
-      }
-      if (evaluation.edgeAction === "disallow_training") {
-        res.setHeader("X-AI-Policy", "training_disallowed");
-      }
-      next();
-    } catch (error) {
-      next(error);
-    }
-  };
-  const apiRouter = express.Router();
-  apiRouter.use(express.json({ limit: "256kb" }));
-  apiRouter.use((_req, _res, next) => {
-    try {
-      initAIBotSchema(db2);
-    } catch {
-    }
-    next();
-  });
-  apiRouter.get("/robots.txt", (_req, res) => {
-    const config = preferenceSync.getZoneConfig();
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.setHeader("Content-Signal", preferenceSync.buildContentSignalHeader(config));
-    res.status(200).send(preferenceSync.generateRobotsTxt(config));
-  });
-  apiRouter.get("/llms.txt", (_req, res) => {
-    const config = preferenceSync.getZoneConfig();
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.setHeader("Content-Signal", preferenceSync.buildContentSignalHeader(config));
-    res.status(200).send(buildLlmsTxt(config, preferenceSync.buildContentSignalHeader(config)));
-  });
-  apiRouter.post("/agent-telemetry", (req, res) => {
-    const body = req.body ?? {};
-    const reasons = Array.isArray(body.reasons) ? body.reasons.filter((item) => typeof item === "string") : [];
-    if (!reasons.length) {
-      res.status(204).end();
-      return;
-    }
-    try {
-      db2.prepare(
-        `INSERT INTO ai_bot_requests (
-           observed_at_utc, bot_id, operator, verification_status, verification_method, client_ip,
-           user_agent, request_path, request_method, http_status, bytes_sent, robots_violation,
-           reasons, content_signal, edge_action
-         ) VALUES (?, ?, NULL, 'client_probed', 'client_sdk', ?, ?, ?, 'POST', 204, 0, 0, ?, ?, 'allow')`
-      ).run(
-        (/* @__PURE__ */ new Date()).toISOString(),
-        typeof body.botId === "string" ? body.botId : null,
-        extractClientIp(req) || null,
-        headerValue2(req, "user-agent").slice(0, 1500) || null,
-        typeof body.path === "string" ? body.path : "/",
-        JSON.stringify(reasons),
-        preferenceSync.buildContentSignalHeader()
-      );
-      res.status(202).json({ recorded: true });
-    } catch {
-      res.status(500).json({ error: "telemetry_persistence_failed" });
-    }
-  });
-  apiRouter.get("/analytics", (_req, res) => {
-    let rows = [];
-    let referrals = [];
-    try {
-      rows = db2.prepare("SELECT * FROM ai_bot_requests").all();
-      referrals = db2.prepare("SELECT * FROM ai_operator_referrals").all();
-    } catch {
-      rows = [];
-      referrals = [];
-    }
-    const number = (value) => {
-      const parsed = Number(value);
-      return Number.isFinite(parsed) ? parsed : 0;
-    };
-    const byBot = /* @__PURE__ */ new Map();
-    const byOperator = /* @__PURE__ */ new Map();
-    const byStatus = {};
-    const byPattern = /* @__PURE__ */ new Map();
-    const violations = [];
-    let bytes = 0;
-    let verified = 0;
-    const since = Date.now() - 24 * 60 * 60 * 1e3;
-    let last24h = 0;
-    for (const row of rows) {
-      const botId = row.bot_id ? String(row.bot_id) : "unknown";
-      const operator = row.operator ? String(row.operator) : "Unknown";
-      const rowBytes = number(row.bytes_sent);
-      bytes += rowBytes;
-      if (row.verification_status === "verified") verified += 1;
-      if (Date.parse(String(row.observed_at_utc)) >= since) last24h += 1;
-      const botEntry = byBot.get(botId) ?? {
-        botId,
-        displayName: BOT_MAP_BY_ID[botId]?.displayName ?? botId,
-        operator,
-        requests: 0,
-        bytes: 0
-      };
-      botEntry.requests += 1;
-      botEntry.bytes += rowBytes;
-      byBot.set(botId, botEntry);
-      const operatorEntry = byOperator.get(operator) ?? { operator, requests: 0, bytes: 0 };
-      operatorEntry.requests += 1;
-      operatorEntry.bytes += rowBytes;
-      byOperator.set(operator, operatorEntry);
-      const status = String(row.verification_status ?? "unknown");
-      byStatus[status] = (byStatus[status] ?? 0) + 1;
-      const pattern = computeCloudflareUriPattern(String(row.request_path ?? "/"));
-      byPattern.set(pattern, (byPattern.get(pattern) ?? 0) + 1);
-      if (number(row.robots_violation) > 0) {
-        violations.push({
-          botId,
-          operator,
-          path: row.request_path,
-          directive: row.violated_directive,
-          status,
-          observedAt: row.observed_at_utc
-        });
-      }
-    }
-    const config = preferenceSync.getZoneConfig();
-    const isAllowed = (row) => {
-      const status = Number(row.http_status);
-      return status >= 200 && status < 400;
-    };
-    const rowsForBot = (botId) => rows.filter((row) => (row.bot_id ? String(row.bot_id) : "unknown") === botId);
-    const lastSeen = (matched) => matched.reduce((max, row) => Math.max(max, Date.parse(String(row.observed_at_utc)) || 0), 0);
-    const snakeSummary = {
-      total_requests: rows.length,
-      allowed_requests: rows.filter(isAllowed).length,
-      unsuccessful_requests: rows.filter((row) => !isAllowed(row)).length,
-      total_bytes: bytes,
-      markdown_served_count: rows.filter(
-        (row) => String(row.edge_action ?? "").toLowerCase().includes("markdown")
-      ).length,
-      robots_violations_count: violations.length
-    };
-    const snakeCrawlers = [...byBot.values()].sort((a, b) => b.requests - a.requests).slice(0, 50).map((entry) => {
-      const matched = rowsForBot(entry.botId);
-      const definition = BOT_MAP_BY_ID[entry.botId];
-      return {
-        ...entry,
-        bot_id: entry.botId,
-        bot_display_name: entry.displayName,
-        cf_detection_id: definition?.cfDetectionIds?.[0] ?? null,
-        legacy_category: definition?.legacyCategory ?? "Unknown",
-        behavior: definition?.behavior ?? "Unknown",
-        operator_label: definition?.operatorLabel ?? "Unknown",
-        verification_status: matched[0]?.verification_status ?? "unknown",
-        verification_method: matched[0]?.verification_method ?? "none",
-        total_requests: entry.requests,
-        allowed_requests: matched.filter(isAllowed).length,
-        unsuccessful_requests: matched.filter((row) => !isAllowed(row)).length,
-        data_transfer_bytes: entry.bytes,
-        robots_violations: matched.filter((row) => Number(row.robots_violation) > 0).length,
-        last_seen_ms: lastSeen(matched)
-      };
-    });
-    const referralsByOperator = /* @__PURE__ */ new Map();
-    for (const referral of referrals) {
-      const operator = String(referral.operator ?? "Unknown");
-      referralsByOperator.set(operator, (referralsByOperator.get(operator) ?? 0) + 1);
-    }
-    const snakeOperators = [...byOperator.values()].sort((a, b) => b.requests - a.requests).slice(0, 25).map((entry) => {
-      const matched = rows.filter((row) => (row.operator ? String(row.operator) : "Unknown") === entry.operator);
-      return {
-        ...entry,
-        total_requests: entry.requests,
-        allowed_requests: matched.filter(isAllowed).length,
-        unsuccessful_requests: matched.filter((row) => !isAllowed(row)).length,
-        data_transfer_bytes: entry.bytes,
-        referrals: referralsByOperator.get(entry.operator) ?? 0
-      };
-    });
-    const statusCodes = rows.map((row) => Number(row.http_status) || 0);
-    const snakeStatusDistribution = {
-      status_2xx: statusCodes.filter((code) => code >= 200 && code < 300).length,
-      status_3xx: statusCodes.filter((code) => code >= 300 && code < 400).length,
-      status_4xx: statusCodes.filter((code) => code >= 400 && code < 500).length,
-      status_403_blocked: statusCodes.filter((code) => code === 403).length,
-      status_402_charged: statusCodes.filter((code) => code === 402).length,
-      status_5xx: statusCodes.filter((code) => code >= 500).length
-    };
-    const patternStats = /* @__PURE__ */ new Map();
-    for (const row of rows) {
-      const pattern = computeCloudflareUriPattern(String(row.request_path ?? "/"));
-      const stat = patternStats.get(pattern) ?? { total: 0, allowed: 0, bytes: 0 };
-      stat.total += 1;
-      if (isAllowed(row)) stat.allowed += 1;
-      stat.bytes += number(row.bytes_sent);
-      patternStats.set(pattern, stat);
-    }
-    const snakeUriPatterns = [...patternStats.entries()].map(([pattern, stat]) => ({
-      uri_pattern: pattern,
-      pattern,
-      total_requests: stat.total,
-      requests: stat.total,
-      allowed_requests: stat.allowed,
-      unsuccessful_requests: stat.total - stat.allowed,
-      data_transfer_bytes: stat.bytes
-    })).sort((a, b) => b.total_requests - a.total_requests).slice(0, 50);
-    res.json({
-      summary: {
-        ...snakeSummary,
-        totalRequests: rows.length,
-        verifiedRequests: verified,
-        verificationRate: rows.length ? Number((verified / rows.length).toFixed(4)) : 0,
-        uniqueBots: byBot.size,
-        bytesServed: bytes,
-        last24hRequests: last24h,
-        referralsRecorded: referrals.length
-      },
-      crawlers: snakeCrawlers,
-      operators: snakeOperators,
-      statusDistribution: { ...snakeStatusDistribution, ...byStatus },
-      uriPatterns: snakeUriPatterns,
-      violations: violations.slice(0, 100),
-      zoneConfig: {
-        ...config,
-        policy_search: config.searchPolicy,
-        policy_agent: config.agentPolicy,
-        policy_training: config.trainingPolicy,
-        content_signal: preferenceSync.buildContentSignalHeader(config)
-      },
-      liveRobotsTxt: preferenceSync.generateRobotsTxt(config)
-    });
-  });
-  apiRouter.post("/policy", (req, res) => {
-    const body = req.body ?? {};
-    try {
-      if (body.customPolicy && typeof body.customPolicy.botId === "string") {
-        preferenceSync.upsertCustomPolicy(
-          body.customPolicy.botId,
-          String(body.customPolicy.action ?? "block"),
-          body.customPolicy.note == null ? null : String(body.customPolicy.note)
-        );
-      }
-      const patch = { ...body };
-      delete patch.customPolicy;
-      const alias = (names) => {
-        for (const name of names) if (patch[name] !== void 0) return patch[name];
-        return void 0;
-      };
-      const search = alias(["search", "policy_search", "search_policy"]);
-      const agent = alias(["agent", "policy_agent", "agent_policy"]);
-      const training = alias(["training", "policy_training", "training_policy"]);
-      if (search !== void 0) patch.searchPolicy = search;
-      if (agent !== void 0) patch.agentPolicy = agent;
-      if (training !== void 0) patch.trainingPolicy = training;
-      const config = preferenceSync.updateZoneConfig(patch);
-      res.json({ config, robotsTxt: preferenceSync.generateRobotsTxt(config) });
-    } catch {
-      res.status(500).json({ error: "policy_update_failed" });
-    }
-  });
-  apiRouter.post("/markdown-playground", (req, res) => {
-    const html = (req.body ?? {}).html;
-    if (typeof html !== "string") {
-      res.status(400).json({ error: "html must be a string" });
-      return;
-    }
-    const result = convertHtmlToAgentMarkdown(html);
-    const contentSignal = preferenceSync.buildContentSignalHeader();
-    res.json({
-      ...result,
-      content_signal: contentSignal,
-      contentSignal,
-      contentSignalHeader: contentSignal
-    });
-  });
-  apiRouter.post("/sync-feeds", async (_req, res) => {
-    try {
-      const feeds = await ipEngine.syncAllOfficialFeeds();
-      const keys = await webBotAuth.refreshAllDirectories();
-      ipEngine.reloadMemoryRanges();
-      res.json({ ...feeds, refreshedSignerKeys: keys });
-    } catch {
-      res.status(500).json({ error: "feed_sync_failed" });
-    }
-  });
-  return { middleware, apiRouter, ipEngine, webBotAuth, preferenceSync };
-}
-
 // src/server/middleware/clientHints.ts
 var CLIENT_HINT_ACCEPT_CH = "Sec-CH-UA, Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Model, Sec-CH-UA-Mobile";
 var CLIENT_HINT_CRITICAL_CH = "Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List";
@@ -3328,7 +754,7 @@ function filterBrands(brands) {
   const nonChromium = real.filter((b) => b.brand.toLowerCase() !== CHROMIUM_PLACEHOLDER);
   return nonChromium.length > 0 ? nonChromium : real;
 }
-function headerValue3(secCh, name) {
+function headerValue2(secCh, name) {
   if (!secCh) return "";
   const lower = name.toLowerCase();
   for (const key of Object.keys(secCh)) {
@@ -3345,18 +771,18 @@ function unquote2(value) {
   return v;
 }
 function parseSecCh(secCh) {
-  const fullListRaw = headerValue3(secCh, "sec-ch-ua-full-version-list");
-  const majorListRaw = headerValue3(secCh, "sec-ch-ua");
+  const fullListRaw = headerValue2(secCh, "sec-ch-ua-full-version-list");
+  const majorListRaw = headerValue2(secCh, "sec-ch-ua");
   const brands = fullListRaw ? parseBrandList2(fullListRaw) : parseBrandList2(majorListRaw);
   return {
     brands: filterBrands(brands),
     hasFullVersionList: Boolean(fullListRaw),
-    platform: unquote2(headerValue3(secCh, "sec-ch-ua-platform")),
-    platformVersion: unquote2(headerValue3(secCh, "sec-ch-ua-platform-version")),
-    model: unquote2(headerValue3(secCh, "sec-ch-ua-model")),
-    architecture: unquote2(headerValue3(secCh, "sec-ch-ua-arch")),
-    bitness: unquote2(headerValue3(secCh, "sec-ch-ua-bitness")),
-    formFactors: unquote2(headerValue3(secCh, "sec-ch-ua-form-factors")).split(",").map((f) => unquote2(f)).filter((f) => f.length > 0)
+    platform: unquote2(headerValue2(secCh, "sec-ch-ua-platform")),
+    platformVersion: unquote2(headerValue2(secCh, "sec-ch-ua-platform-version")),
+    model: unquote2(headerValue2(secCh, "sec-ch-ua-model")),
+    architecture: unquote2(headerValue2(secCh, "sec-ch-ua-arch")),
+    bitness: unquote2(headerValue2(secCh, "sec-ch-ua-bitness")),
+    formFactors: unquote2(headerValue2(secCh, "sec-ch-ua-form-factors")).split(",").map((f) => unquote2(f)).filter((f) => f.length > 0)
   };
 }
 var BROWSER_SPECS = [
@@ -6256,6 +3682,13 @@ function initializeDatabase() {
       );
 
       ${IDENTITY_SCHEMA_SQL}
+
+      DROP TABLE IF EXISTS ai_bot_cidr_ranges;
+      DROP TABLE IF EXISTS ai_bot_dns_cache;
+      DROP TABLE IF EXISTS ai_bot_jwk_cache;
+      DROP TABLE IF EXISTS ai_bot_requests;
+      DROP TABLE IF EXISTS ai_operator_referrals;
+      DROP TABLE IF EXISTS ai_zone_config;
     `);
     try {
       sqliteDb.exec(`ALTER TABLE visitors ADD COLUMN hardware_id TEXT NOT NULL DEFAULT ''`);
@@ -6299,13 +3732,6 @@ function initializeDatabase() {
   }
 }
 var db = initializeDatabase();
-var aiProtection = createAIProtectionSystem(db);
-if (!IS_SERVERLESS_RUNTIME) {
-  const aiFeedTimer = setInterval(() => {
-    void refreshAIBotFeeds(db).catch(() => void 0);
-  }, 60 * 60 * 1e3);
-  aiFeedTimer.unref?.();
-}
 function signVisitorId(visitorId) {
   return crypto.createHmac("sha256", HMAC_SECRET).update(visitorId).digest("hex");
 }
@@ -8719,7 +6145,7 @@ function computeSuspectScore100(input) {
   if (input.rareDevice) score += 4;
   return Math.max(0, Math.min(100, Math.round(score)));
 }
-async function lookupVerifiedGeolocation(visitorIp, isPublic) {
+async function lookupVerifiedGeolocation(visitorIp, isPublic, options) {
   const empty = (verified) => ({
     publicIp: verified ? visitorIp : "Unavailable",
     city: "Unavailable",
@@ -8908,7 +6334,7 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic) {
   const candidates = settled.filter((entry) => entry.status === "fulfilled").map((entry) => entry.value).filter((entry) => entry !== null).sort((a, b) => scoreGeoLocation(b) - scoreGeoLocation(a));
   const best = candidates[0];
   if (best) {
-    persist(best);
+    if (options?.cacheWrite !== false) persist(best);
     return best;
   }
   try {
@@ -8941,7 +6367,7 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic) {
           asn: netDetails.asn,
           isVpnOrHosting: false
         });
-        persist(location);
+        if (options?.cacheWrite !== false) persist(location);
         return location;
       }
     }
@@ -8985,8 +6411,8 @@ function applyTorRelayFallback(location, visitorIp) {
     isLocationVerified: hasCity || Boolean(countryName)
   };
 }
-async function resolveLocationWithTorFallback(visitorIp, isPublic) {
-  const location = await lookupVerifiedGeolocation(visitorIp, isPublic);
+async function resolveLocationWithTorFallback(visitorIp, isPublic, options) {
+  const location = await lookupVerifiedGeolocation(visitorIp, isPublic, options);
   return applyTorRelayFallback(location, visitorIp);
 }
 function sanitizeBrowserDevice(input) {
@@ -9078,7 +6504,7 @@ function detectServerRegion(req) {
     regionLabel: "Global Edge Network"
   };
 }
-var app = express2();
+var app = express();
 app.set("trust proxy", true);
 app.use(cookieParser());
 app.use(clientHintsMiddleware);
@@ -9112,7 +6538,7 @@ app.get("/api/intel/geolocation", async (req, res) => {
     const { ip: visitorIp, isPublic } = extractVisitorIp(req);
     const edgeGeo = extractEdgeGeo(req);
     let location = mergeLocationWithEdge(
-      await resolveLocationWithTorFallback(visitorIp, isPublic),
+      await resolveLocationWithTorFallback(visitorIp, isPublic, { cacheWrite: false }),
       edgeGeo
     );
     const edgeAsnNumber = Number.parseInt(edgeGeo.asn.replace(/^AS/i, ""), 10);
@@ -9158,11 +6584,15 @@ app.get("/api/intel/geolocation", async (req, res) => {
     res.status(500).json({ error: "Geolocation lookup failed." });
   }
 });
-app.use(express2.json({ limit: "512kb" }));
-app.use(aiProtection.middleware);
+app.use(express.json({ limit: "512kb" }));
 app.get("/api/health", async (req, res) => {
-  const visitorsCount = db.prepare("SELECT COUNT(*) AS count FROM visitors").get().count;
-  const visitsCount = db.prepare("SELECT COUNT(*) AS count FROM visits").get().count;
+  let visitorsCount = null;
+  let visitsCount = null;
+  try {
+    visitorsCount = db.prepare("SELECT COUNT(*) AS count FROM visitors").get().count;
+    visitsCount = db.prepare("SELECT COUNT(*) AS count FROM visits").get().count;
+  } catch {
+  }
   const { regionCode, regionLabel } = detectServerRegion(req);
   const torCheckIp = typeof req.query.torCheck === "string" ? normalizeIpCandidate(req.query.torCheck) : null;
   if (torCheckIp && (isIpv4Literal(torCheckIp) || expandIpv6Address(torCheckIp) !== null)) {
@@ -9767,60 +7197,66 @@ app.post("/api/visitor/identify", async (req, res) => {
         const latestBackupVisit = validHistoryBackup?.visits?.[0];
         const restoredLastUtc = latestBackupVisit?.visitedAtUtc || nowIso;
         const restoredSessionId = clientSessionId || latestBackupVisit?.sessionId || generateSessionId();
-        db.prepare(
-          `INSERT INTO visitors (
-            visitor_id, hmac_token, hardware_id, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)`
-        ).run(
-          verifiedVid,
-          verifiedToken,
-          hardwareId,
-          restoredFirstUtc,
-          restoredLastUtc,
-          restoredSessionId,
-          restoredLastUtc
-        );
-        existingVisitor = db.prepare("SELECT * FROM visitors WHERE visitor_id = ?").get(verifiedVid);
+        try {
+          db.prepare(
+            `INSERT INTO visitors (
+              visitor_id, hmac_token, hardware_id, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).run(
+            verifiedVid,
+            verifiedToken,
+            hardwareId,
+            restoredFirstUtc,
+            restoredLastUtc,
+            restoredSessionId,
+            restoredLastUtc
+          );
+          existingVisitor = db.prepare("SELECT * FROM visitors WHERE visitor_id = ?").get(verifiedVid);
+        } catch {
+        }
       }
       if (validHistoryBackup && validHistoryBackup.visits.length > 0) {
         const orderedAsc = [...validHistoryBackup.visits].reverse();
         for (const histVisit of orderedAsc) {
-          const histVisitId = typeof histVisit.visitId === "string" && histVisit.visitId.trim() ? histVisit.visitId.trim() : generateVisitId();
-          const histVisitedAt = typeof histVisit.visitedAtUtc === "string" && histVisit.visitedAtUtc.trim() ? histVisit.visitedAtUtc : (/* @__PURE__ */ new Date()).toISOString();
-          db.prepare(
-            `INSERT OR IGNORE INTO visits (
-              visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
-              public_ip, city, region, country, latitude, longitude, isp, org, asn,
-              browser, os, device_type, screen_resolution, language, timezone,
-              suspect_score, risk_level, score10, bot_name, recognition_source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          ).run(
-            histVisitId,
-            verifiedVid,
-            typeof histVisit.sessionId === "string" && histVisit.sessionId ? histVisit.sessionId : clientSessionId || generateSessionId(),
-            `rehydrated_${histVisitId}`,
-            histVisitedAt,
-            histVisit.publicIp || "Unavailable",
-            histVisit.city || "Unknown",
-            histVisit.region || "Unknown",
-            histVisit.country || "Unknown",
-            typeof histVisit.latitude === "number" ? histVisit.latitude : null,
-            typeof histVisit.longitude === "number" ? histVisit.longitude : null,
-            histVisit.isp || "Unknown",
-            histVisit.org || "Unknown",
-            histVisit.asn || "Unknown",
-            histVisit.browser || "Unknown",
-            histVisit.os || "Unknown",
-            histVisit.deviceType || "Unknown",
-            histVisit.screenResolution || "Unavailable",
-            histVisit.language || "Unavailable",
-            histVisit.timezone || "Unavailable",
-            typeof histVisit.suspectScore === "number" ? histVisit.suspectScore : null,
-            histVisit.riskLevel || null,
-            typeof histVisit.score10 === "number" ? histVisit.score10 : typeof histVisit.suspectScore === "number" ? histVisit.suspectScore : null,
-            histVisit.botName || null,
-            histVisit.recognitionSource || null
-          );
+          try {
+            const histVisitId = typeof histVisit.visitId === "string" && histVisit.visitId.trim() ? histVisit.visitId.trim() : generateVisitId();
+            const histVisitedAt = typeof histVisit.visitedAtUtc === "string" && histVisit.visitedAtUtc.trim() ? histVisit.visitedAtUtc : (/* @__PURE__ */ new Date()).toISOString();
+            db.prepare(
+              `INSERT OR IGNORE INTO visits (
+                visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
+                public_ip, city, region, country, latitude, longitude, isp, org, asn,
+                browser, os, device_type, screen_resolution, language, timezone,
+                suspect_score, risk_level, score10, bot_name, recognition_source
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            ).run(
+              histVisitId,
+              verifiedVid,
+              typeof histVisit.sessionId === "string" && histVisit.sessionId ? histVisit.sessionId : clientSessionId || generateSessionId(),
+              `rehydrated_${histVisitId}`,
+              histVisitedAt,
+              histVisit.publicIp || "Unavailable",
+              histVisit.city || "Unknown",
+              histVisit.region || "Unknown",
+              histVisit.country || "Unknown",
+              typeof histVisit.latitude === "number" ? histVisit.latitude : null,
+              typeof histVisit.longitude === "number" ? histVisit.longitude : null,
+              histVisit.isp || "Unknown",
+              histVisit.org || "Unknown",
+              histVisit.asn || "Unknown",
+              histVisit.browser || "Unknown",
+              histVisit.os || "Unknown",
+              histVisit.deviceType || "Unknown",
+              histVisit.screenResolution || "Unavailable",
+              histVisit.language || "Unavailable",
+              histVisit.timezone || "Unavailable",
+              typeof histVisit.suspectScore === "number" ? histVisit.suspectScore : null,
+              histVisit.riskLevel || null,
+              typeof histVisit.score10 === "number" ? histVisit.score10 : typeof histVisit.suspectScore === "number" ? histVisit.suspectScore : null,
+              histVisit.botName || null,
+              histVisit.recognitionSource || null
+            );
+          } catch {
+          }
         }
       }
     } else if (hardwareId) {
@@ -9838,13 +7274,13 @@ app.post("/api/visitor/identify", async (req, res) => {
     let currentSessionId;
     let currentVisitId = "";
     let isReturning = false;
-    if (existingVisitor) {
-      visitorId = existingVisitor.visitor_id;
-      visitorToken = existingVisitor.hmac_token;
+    if (existingVisitor || verifiedVid) {
+      visitorId = existingVisitor ? existingVisitor.visitor_id : verifiedVid;
+      visitorToken = existingVisitor ? existingVisitor.hmac_token : verifiedToken;
       isReturning = true;
-      const lastActivityMs = new Date(existingVisitor.last_activity_utc).getTime();
+      const lastActivityMs = existingVisitor ? new Date(existingVisitor.last_activity_utc).getTime() : NaN;
       const isExpiredByInactivity = Number.isNaN(lastActivityMs) || nowMs - lastActivityMs > SESSION_EXPIRATION_MS;
-      const isSameClientSession = Boolean(clientSessionId) && clientSessionId === existingVisitor.active_session_id;
+      const isSameClientSession = Boolean(clientSessionId) && Boolean(existingVisitor) && clientSessionId === existingVisitor.active_session_id;
       const existingPageLoadVisit = db.prepare("SELECT visit_id, session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?").get(visitorId, safePageLoadId);
       if (existingPageLoadVisit) {
         currentSessionId = existingPageLoadVisit.session_id;
@@ -9855,8 +7291,66 @@ app.post("/api/visitor/identify", async (req, res) => {
         } else {
           currentSessionId = existingVisitor.active_session_id;
         }
-        const visitId = generateVisitId();
-        currentVisitId = visitId;
+        if (existingVisitor) {
+          const visitId = generateVisitId();
+          currentVisitId = visitId;
+          try {
+            db.prepare(
+              `INSERT OR IGNORE INTO visits (
+                visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
+                public_ip, city, region, country, latitude, longitude, isp, org, asn,
+                browser, os, device_type, screen_resolution, language, timezone
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            ).run(
+              visitId,
+              visitorId,
+              currentSessionId,
+              safePageLoadId,
+              nowUtc,
+              location.publicIp,
+              location.city,
+              location.region,
+              location.country,
+              location.latitude,
+              location.longitude,
+              location.isp,
+              location.org,
+              location.asn,
+              browserDevice.browser,
+              browserDevice.os,
+              browserDevice.deviceType,
+              browserDevice.screenResolution,
+              browserDevice.language,
+              browserDevice.timezone
+            );
+          } catch {
+          }
+          try {
+            db.prepare(
+              `UPDATE visitors
+               SET updated_at_utc = ?, active_session_id = ?, last_activity_utc = ?, hardware_id = ?
+               WHERE visitor_id = ?`
+            ).run(nowUtc, currentSessionId, nowUtc, hardwareId, visitorId);
+          } catch {
+          }
+        }
+      }
+    } else {
+      visitorId = generateVisitorId2();
+      visitorToken = signVisitorId(visitorId);
+      currentSessionId = generateSessionId();
+      isReturning = false;
+      try {
+        db.prepare(
+          `INSERT INTO visitors (
+            visitor_id, hmac_token, hardware_id, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).run(visitorId, visitorToken, hardwareId, nowUtc, nowUtc, currentSessionId, nowUtc);
+      } catch {
+      }
+      const visitId = generateVisitId();
+      currentVisitId = visitId;
+      try {
         db.prepare(
           `INSERT OR IGNORE INTO visits (
             visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
@@ -9885,52 +7379,8 @@ app.post("/api/visitor/identify", async (req, res) => {
           browserDevice.language,
           browserDevice.timezone
         );
-        db.prepare(
-          `UPDATE visitors
-           SET updated_at_utc = ?, active_session_id = ?, last_activity_utc = ?, hardware_id = ?
-           WHERE visitor_id = ?`
-        ).run(nowUtc, currentSessionId, nowUtc, hardwareId, visitorId);
+      } catch {
       }
-    } else {
-      visitorId = generateVisitorId2();
-      visitorToken = signVisitorId(visitorId);
-      currentSessionId = generateSessionId();
-      isReturning = false;
-      db.prepare(
-        `INSERT INTO visitors (
-          visitor_id, hmac_token, hardware_id, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(visitorId, visitorToken, hardwareId, nowUtc, nowUtc, currentSessionId, nowUtc);
-      const visitId = generateVisitId();
-      currentVisitId = visitId;
-      db.prepare(
-        `INSERT OR IGNORE INTO visits (
-          visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
-          public_ip, city, region, country, latitude, longitude, isp, org, asn,
-          browser, os, device_type, screen_resolution, language, timezone
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        visitId,
-        visitorId,
-        currentSessionId,
-        safePageLoadId,
-        nowUtc,
-        location.publicIp,
-        location.city,
-        location.region,
-        location.country,
-        location.latitude,
-        location.longitude,
-        location.isp,
-        location.org,
-        location.asn,
-        browserDevice.browser,
-        browserDevice.os,
-        browserDevice.deviceType,
-        browserDevice.screenResolution,
-        browserDevice.language,
-        browserDevice.timezone
-      );
     }
     const cookieOptions = {
       maxAge: 365 * 24 * 60 * 60 * 1e3,
@@ -10549,7 +7999,6 @@ app.get("/api/intel/identity-ping", (req, res) => {
     }
   });
 });
-app.use("/api/intel/ai-crawl-control", aiProtection.apiRouter);
 app.use("/api", (_req, res) => {
   res.status(404).json({ error: "API endpoint not found." });
 });
@@ -10571,7 +8020,7 @@ async function startStandaloneServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express2.static(distPath));
+    app.use(express.static(distPath));
     app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
@@ -10680,9 +8129,9 @@ function restoreOriginalApiUrl(req) {
     return;
   }
   if (pathPart === "/api/index" || pathPart === "/api/index.js") {
-    const headerValue4 = req.headers["x-vercel-original-path"] || req.headers["x-original-url"] || req.headers["x-rewrite-url"] || req.headers["x-matched-path"];
-    if (headerValue4) {
-      const original = headerValue4.startsWith("http") ? new URL(headerValue4).pathname + new URL(headerValue4).search : headerValue4;
+    const headerValue3 = req.headers["x-vercel-original-path"] || req.headers["x-original-url"] || req.headers["x-rewrite-url"] || req.headers["x-matched-path"];
+    if (headerValue3) {
+      const original = headerValue3.startsWith("http") ? new URL(headerValue3).pathname + new URL(headerValue3).search : headerValue3;
       const normalized = original.startsWith("/") ? original : `/${original}`;
       const normQIdx = normalized.indexOf("?");
       const normPath = normQIdx === -1 ? normalized : normalized.slice(0, normQIdx);
