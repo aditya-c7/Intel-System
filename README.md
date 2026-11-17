@@ -86,14 +86,14 @@ Only `POST /api/visitor/identify` writes to storage. `GET /api/health`, `GET /ap
 
 ```mermaid
 flowchart TD
-  subgraph Browser["Browser: React dashboard"]
+  subgraph Browser["Browser"]
     direction TB
-    C1["Signal collectors: canvas, WebGL, audio, fonts, emoji, math, automation"]
-    C2["Device, privacy, tampering and active-call probes"]
-    C3["RTT probes and Compute Pressure CPU"]
-    C4["Storage waterfall: localStorage, IndexedDB, cookie mirror, HTTP cache"]
-    ID["Tri-layer identity: visitor id, hardware fingerprint, browser fingerprint"]
-    ENV["Sealed envelope: timestamp, nonce, SHA-256 hash"]
+    C1["Signal<br/>collectors<br/>canvas, WebGL,<br/>audio, fonts,<br/>emoji, math"]
+    C2["Device, privacy,<br/>tampering,<br/>active calls"]
+    C3["RTT and CPU<br/>pressure"]
+    C4["Storage<br/>waterfall<br/>localStorage,<br/>IndexedDB,<br/>cookie, HTTP<br/>cache"]
+    ID["Tri-layer<br/>identity"]
+    ENV["Sealed<br/>envelope<br/>timestamp,<br/>nonce, SHA-256"]
     C1 --> ID
     C2 --> ID
     C4 --> ID
@@ -102,31 +102,31 @@ flowchart TD
 
   subgraph Validate["Request validation"]
     direction TB
-    V1["Verify SHA-256 hash"] --> V2["Check 5-minute freshness"] --> V3["Check one-time nonce"]
+    V1["Verify hash"] --> V2["Check window"] --> V3["Check nonce"]
   end
 
-  subgraph Intel["First-party intelligence layer"]
+  subgraph Intel["Intelligence layer"]
     direction TB
-    NET["Client Hints, edge geo, ASN registry, Team Cymru, Tor DNSEL"] --> CLASSIFY["Bot, AI-agent, proxy, VM and emulator checks"]
-    CLASSIFY --> RESOLVE["Identity resolver: exact, hardware, cross-browser, lenient"]
-    RESOLVE --> SCORE["Four core cards, signal grid and 0-100 composite"]
+    NET["Edge geo, ASN,<br/>Cymru, DNSEL"] --> CLASSIFY["Bot, AI agent,<br/>proxy, VM"]
+    CLASSIFY --> RESOLVE["Identity<br/>resolver"]
+    RESOLVE --> SCORE["Signal<br/>scores<br/>0-100"]
   end
 
-  ENV --> ROUTE["Cloudflare Worker"]
-  ROUTE -->|"identify"| API["POST /api/visitor/identify"]
-  ROUTE -->|"geolocation retry"| GEOAPI["GET /api/intel/geolocation"]
-  ROUTE -->|"health and RTT ping"| EDGE["Stateless edge response"]
+  ENV --> ROUTE["Cloudflare<br/>Worker"]
+  ROUTE -->|"identify"| API["POST<br/>/api/visitor/<br/>identify"]
+  ROUTE -->|"geolocation"| GEOAPI["GET<br/>/api/intel/<br/>geolocation"]
+  ROUTE -->|"health, ping"| EDGE["Stateless<br/>response"]
 
   API --> V1
   V3 -->|"valid"| NET
-  V3 -->|"stale or replayed"| REJECT["Tampered / Replayed 10/10"]
+  V3 -->|"stale/replay"| REJECT["Tampered 10/10"]
 
-  NET -->|"cache write on identify"| GEO[("Geolocation and ASN cache")]
+  NET -->|"cache write"| GEO[("Geo cache")]
   GEOAPI -->|"cache read"| GEO
-  SCORE --> PERSIST["Persist visit, score and identity blocks"]
-  PERSIST --> DO[("Durable Object SQLite")]
-  DO --> RESPONSE["Return identity layers, confidence, history and backup"]
-  RESPONSE --> UI["Render identity, Risk Meter, network panel and Event JSON v4"]
+  SCORE --> PERSIST["Persist visit<br/>and identity"]
+  PERSIST --> DO[("Durable Object<br/>SQLite")]
+  DO --> RESPONSE["Identity,<br/>confidence,<br/>history,<br/>backup"]
+  RESPONSE --> UI["Dashboard and<br/>Event JSON v4"]
   C3 --> UI
 ```
 
