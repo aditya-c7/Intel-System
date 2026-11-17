@@ -10,6 +10,7 @@ import type {
   SecuritySignals,
   SmartSignal,
   SmartSignals,
+  VisitHistoryRecord,
 } from './types/visitor';
 import { LocationMap } from './components/LocationMap';
 import { NetworkStabilityPanel } from './components/NetworkStabilityPanel';
@@ -1030,7 +1031,41 @@ export default function App() {
       ).size || (data.location.isLocationVerified ? 1 : 0)
     : 0;
 
-  const visits = data?.visitHistory || [];
+  // Degraded responses can omit history entirely (for example when the Durable Object store
+  // is unavailable). Synthesize the current page load so the map, location tiles and session
+  // summary still render instead of disappearing.
+  const visits: VisitHistoryRecord[] = data
+    ? data.visitHistory.length > 0
+      ? data.visitHistory
+      : [
+          {
+            id: 0,
+            visitId: 'current',
+            visitorId: data.visitorId,
+            sessionId: data.statistics.currentSessionId,
+            visitedAtUtc: data.statistics.lastVisitUtc,
+            publicIp: data.location.publicIp,
+            city: data.location.city,
+            region: data.location.region,
+            country: data.location.country,
+            latitude: data.location.latitude,
+            longitude: data.location.longitude,
+            isp: data.location.isp,
+            org: data.location.org,
+            asn: data.location.asn,
+            browser: data.browserDevice.browser,
+            os: data.browserDevice.os,
+            deviceType: data.browserDevice.deviceType,
+            screenResolution: data.browserDevice.screenResolution,
+            language: data.browserDevice.language,
+            timezone: data.browserDevice.timezone,
+            suspectScore: data.suspectScore,
+            score10: Math.max(0, Math.min(10, Math.round(data.suspectScore ?? 0))),
+            riskLevel: data.riskLevel,
+            recognitionSource: data.recognitionSource,
+          },
+        ]
+    : [];
   const activeVisit = visits[selectedVisitIndex] || visits[0];
 
   const activeIsp = formatValidNetworkField(

@@ -7467,6 +7467,65 @@ app.post("/api/visitor/identify", async (req, res) => {
     } catch {
       rawVisits = [];
     }
+    if (rawVisits.length === 0) {
+      const backupVisits = validBackupForStats?.visits ?? [];
+      rawVisits = backupVisits.map((visit) => ({
+        id: visit.id,
+        visit_id: visit.visitId,
+        visitor_id: visitorId,
+        session_id: visit.sessionId,
+        page_load_id: `backup_${visit.visitId}`,
+        visited_at_utc: visit.visitedAtUtc,
+        public_ip: visit.publicIp,
+        city: visit.city,
+        region: visit.region,
+        country: visit.country,
+        latitude: visit.latitude,
+        longitude: visit.longitude,
+        isp: visit.isp,
+        org: visit.org,
+        asn: visit.asn,
+        browser: visit.browser,
+        os: visit.os,
+        device_type: visit.deviceType,
+        screen_resolution: visit.screenResolution,
+        language: visit.language,
+        timezone: visit.timezone,
+        suspect_score: visit.suspectScore ?? null,
+        risk_level: visit.riskLevel ?? null,
+        score10: visit.score10 ?? null,
+        bot_name: visit.botName ?? null,
+        recognition_source: visit.recognitionSource ?? null
+      }));
+      rawVisits.unshift({
+        id: 0,
+        visit_id: currentVisitId || `backup_${safePageLoadId}`,
+        visitor_id: visitorId,
+        session_id: currentSessionId,
+        page_load_id: safePageLoadId,
+        visited_at_utc: nowUtc,
+        public_ip: location.publicIp,
+        city: location.city,
+        region: location.region,
+        country: location.country,
+        latitude: location.latitude,
+        longitude: location.longitude,
+        isp: location.isp,
+        org: location.org,
+        asn: location.asn,
+        browser: browserDevice.browser,
+        os: browserDevice.os,
+        device_type: browserDevice.deviceType,
+        screen_resolution: browserDevice.screenResolution,
+        language: browserDevice.language,
+        timezone: browserDevice.timezone,
+        suspect_score: null,
+        risk_level: null,
+        score10: null,
+        bot_name: null,
+        recognition_source: recognitionSource
+      });
+    }
     const ipTimezoneHint = typeof clientGeoHint?.timezone === "string" && clientGeoHint.timezone.trim() || edgeGeo.timezone || "";
     const oneHourAgoMs = Date.now() - 3600 * 1e3;
     const lastHourVisitRows = rawVisits.filter((r) => {
