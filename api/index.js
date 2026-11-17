@@ -6158,9 +6158,14 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic, options) {
     return empty(false);
   }
   const nowMs = Date.now();
-  const cached = db.prepare(
-    "SELECT city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms FROM verified_geo_cache_v3 WHERE ip_address = ?"
-  ).get(visitorIp);
+  let cached;
+  try {
+    cached = db.prepare(
+      "SELECT city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms FROM verified_geo_cache_v3 WHERE ip_address = ?"
+    ).get(visitorIp);
+  } catch {
+    cached = void 0;
+  }
   const cachedHasLocation = Boolean(cached) && (!isMissingGeoValue(cached?.city) || !isMissingGeoValue(cached?.country));
   const cachedHasNetwork = Boolean(cached) && !isMissingGeoValue(cached?.isp) && !/^autonomous system\b/i.test(cached?.isp ?? "") && cached?.isp !== "Standard Network";
   const cachedIsComplete = cachedHasLocation && cachedHasNetwork && typeof cached?.latitude === "number" && typeof cached?.longitude === "number";
@@ -7182,7 +7187,11 @@ app.post("/api/visitor/identify", async (req, res) => {
     const verifiedToken = cookieVerified ? cookieToken : storageVerified ? storedVisitorToken : null;
     if (verifiedVid && verifiedToken) {
       recognitionSource = cookieVerified ? "First-Party Cookie" : "First-Party LocalStorage";
-      existingVisitor = db.prepare("SELECT * FROM visitors WHERE visitor_id = ?").get(verifiedVid);
+      try {
+        existingVisitor = db.prepare("SELECT * FROM visitors WHERE visitor_id = ?").get(verifiedVid);
+      } catch {
+        existingVisitor = void 0;
+      }
       const validHistoryBackup = clientHistoryBackup && verifySignedHistoryBackup(verifiedVid, clientHistoryBackup) ? clientHistoryBackup : null;
       if (!existingVisitor) {
         const nowIso = (/* @__PURE__ */ new Date()).toISOString();
@@ -7253,7 +7262,12 @@ app.post("/api/visitor/identify", async (req, res) => {
         }
       }
     } else if (hardwareId) {
-      const hwMatchedVisitor = db.prepare("SELECT * FROM visitors WHERE hardware_id = ?").get(hardwareId);
+      let hwMatchedVisitor;
+      try {
+        hwMatchedVisitor = db.prepare("SELECT * FROM visitors WHERE hardware_id = ?").get(hardwareId);
+      } catch {
+        hwMatchedVisitor = void 0;
+      }
       if (hwMatchedVisitor) {
         existingVisitor = hwMatchedVisitor;
         existingHwidVisitor = true;
@@ -7274,7 +7288,12 @@ app.post("/api/visitor/identify", async (req, res) => {
       const lastActivityMs = existingVisitor ? new Date(existingVisitor.last_activity_utc).getTime() : NaN;
       const isExpiredByInactivity = Number.isNaN(lastActivityMs) || nowMs - lastActivityMs > SESSION_EXPIRATION_MS;
       const isSameClientSession = Boolean(clientSessionId) && Boolean(existingVisitor) && clientSessionId === existingVisitor.active_session_id;
-      const existingPageLoadVisit = db.prepare("SELECT visit_id, session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?").get(visitorId, safePageLoadId);
+      let existingPageLoadVisit;
+      try {
+        existingPageLoadVisit = db.prepare("SELECT visit_id, session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?").get(visitorId, safePageLoadId);
+      } catch {
+        existingPageLoadVisit = void 0;
+      }
       if (existingPageLoadVisit) {
         currentSessionId = existingPageLoadVisit.session_id;
         currentVisitId = existingPageLoadVisit.visit_id;
@@ -7386,22 +7405,34 @@ app.post("/api/visitor/identify", async (req, res) => {
     res.cookie("intel_http_token", visitorToken, cookieOptions);
     res.cookie("_intel_vid_client", visitorId, { ...cookieOptions, httpOnly: false });
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-    const statsAgg = db.prepare(
-      `SELECT
-          COUNT(*) AS total_visits,
-          MIN(visited_at_utc) AS first_visit_utc,
-          MAX(visited_at_utc) AS last_visit_utc,
-          COUNT(DISTINCT session_id) AS total_sessions
-         FROM visits
-         WHERE visitor_id = ?`
-    ).get(visitorId);
-    const prevVisitRow = db.prepare(
-      `SELECT visited_at_utc
-         FROM visits
-         WHERE visitor_id = ?
-         ORDER BY visited_at_utc DESC, id DESC
-         LIMIT 1 OFFSET 1`
-    ).get(visitorId);
+    let statsAgg;
+    let prevVisitRow;
+    try {
+      statsAgg = db.prepare(
+        `SELECT
+            COUNT(*) AS total_visits,
+            MIN(visited_at_utc) AS first_visit_utc,
+            MAX(visited_at_utc) AS last_visit_utc,
+            COUNT(DISTINCT session_id) AS total_sessions
+           FROM visits
+           WHERE visitor_id = ?`
+      ).get(visitorId);
+      prevVisitRow = db.prepare(
+        `SELECT visited_at_utc
+           FROM visits
+           WHERE visitor_id = ?
+           ORDER BY visited_at_utc DESC, id DESC
+           LIMIT 1 OFFSET 1`
+      ).get(visitorId);
+    } catch {
+      statsAgg = {
+        total_visits: 0,
+        first_visit_utc: null,
+        last_visit_utc: null,
+        total_sessions: 0
+      };
+      prevVisitRow = void 0;
+    }
     const validBackupForStats = clientHistoryBackup && verifySignedHistoryBackup(visitorId, clientHistoryBackup) ? clientHistoryBackup : null;
     const dbTotalVisits = Number(statsAgg.total_visits) || 1;
     const mergedTotalVisits = validBackupForStats ? Math.max(dbTotalVisits, validBackupForStats.totalVisits) : dbTotalVisits;
@@ -7420,17 +7451,22 @@ app.post("/api/visitor/identify", async (req, res) => {
     if (statistics.totalVisits > 1) {
       isReturning = true;
     }
-    const rawVisits = db.prepare(
-      `SELECT
-          id, visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
-          public_ip, city, region, country, latitude, longitude, isp, org, asn,
-          browser, os, device_type, screen_resolution, language, timezone,
-          suspect_score, risk_level, score10, bot_name, recognition_source
-         FROM visits
-         WHERE visitor_id = ?
-         ORDER BY visited_at_utc DESC, id DESC
-         LIMIT 50`
-    ).all(visitorId);
+    let rawVisits = [];
+    try {
+      rawVisits = db.prepare(
+        `SELECT
+            id, visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
+            public_ip, city, region, country, latitude, longitude, isp, org, asn,
+            browser, os, device_type, screen_resolution, language, timezone,
+            suspect_score, risk_level, score10, bot_name, recognition_source
+           FROM visits
+           WHERE visitor_id = ?
+           ORDER BY visited_at_utc DESC, id DESC
+           LIMIT 50`
+      ).all(visitorId);
+    } catch {
+      rawVisits = [];
+    }
     const ipTimezoneHint = typeof clientGeoHint?.timezone === "string" && clientGeoHint.timezone.trim() || edgeGeo.timezone || "";
     const oneHourAgoMs = Date.now() - 3600 * 1e3;
     const lastHourVisitRows = rawVisits.filter((r) => {
@@ -7938,17 +7974,22 @@ app.get("/api/visitor/history/:visitorId", (req, res) => {
     });
     return;
   }
-  const rawVisits = db.prepare(
-    `SELECT
-        id, visit_id, visitor_id, session_id, visited_at_utc,
-        public_ip, city, region, country, isp, org, asn,
-        browser, os, device_type, screen_resolution, language, timezone,
-        suspect_score, risk_level, score10, bot_name, recognition_source
-       FROM visits
-       WHERE visitor_id = ?
-       ORDER BY visited_at_utc DESC, id DESC
-       LIMIT 50`
-  ).all(requestedVisitorId);
+  let rawVisits = [];
+  try {
+    rawVisits = db.prepare(
+      `SELECT
+          id, visit_id, visitor_id, session_id, visited_at_utc,
+          public_ip, city, region, country, isp, org, asn,
+          browser, os, device_type, screen_resolution, language, timezone,
+          suspect_score, risk_level, score10, bot_name, recognition_source
+         FROM visits
+         WHERE visitor_id = ?
+         ORDER BY visited_at_utc DESC, id DESC
+         LIMIT 50`
+    ).all(requestedVisitorId);
+  } catch {
+    rawVisits = [];
+  }
   const visits = rawVisits.map((row) => {
     const storedScore10 = typeof row.score10 === "number" && Number.isFinite(row.score10) ? Math.max(0, Math.min(10, Math.round(row.score10))) : null;
     const storedSuspectScore = typeof row.suspect_score === "number" && Number.isFinite(row.suspect_score) ? normalizeLegacySuspectScore(row.suspect_score) : storedScore10 ?? 0;

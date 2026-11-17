@@ -3967,11 +3967,7 @@ async function lookupVerifiedGeolocation(
   }
 
   const nowMs = Date.now();
-  const cached = db
-    .prepare(
-      'SELECT city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms FROM verified_geo_cache_v3 WHERE ip_address = ?'
-    )
-    .get(visitorIp) as
+  let cached:
     | {
         city: string;
         region: string;
@@ -3986,6 +3982,17 @@ async function lookupVerifiedGeolocation(
         verified_at_ms: number;
       }
     | undefined;
+  try {
+    cached = db
+      .prepare(
+        'SELECT city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms FROM verified_geo_cache_v3 WHERE ip_address = ?'
+      )
+      .get(visitorIp) as typeof cached;
+  } catch {
+    // An unreadable store (e.g. a blocked daily Durable Object quota) must never fail
+    // geolocation: fall through to the provider cascade instead.
+    cached = undefined;
+  }
 
   // Only a COMPLETE cache entry may short-circuit the provider cascade. A miss that
   // recorded "Unavailable" city/country (provider rate-limit, cold start, ISP-only RIPE
@@ -5870,9 +5877,14 @@ app.post('/api/visitor/identify', async (req, res) => {
 
     if (verifiedVid && verifiedToken) {
       recognitionSource = cookieVerified ? 'First-Party Cookie' : 'First-Party LocalStorage';
-      existingVisitor = db
-        .prepare('SELECT * FROM visitors WHERE visitor_id = ?')
-        .get(verifiedVid) as VisitorRow | undefined;
+      try {
+        existingVisitor = db
+          .prepare('SELECT * FROM visitors WHERE visitor_id = ?')
+          .get(verifiedVid) as VisitorRow | undefined;
+      } catch {
+        // Unreadable store (blocked daily quota): keep the verified identity from the client.
+        existingVisitor = undefined;
+      }
 
       // Serverless cold-start rehydration: if HMAC token is valid, restore visitor & signed history backup into db
       const validHistoryBackup =
@@ -5974,9 +5986,15 @@ app.post('/api/visitor/identify', async (req, res) => {
       }
     } else if (hardwareId) {
       // Cookie-less / Incognito recovery: look up visitor by deterministic Hardware ID (hwid_...)
-      const hwMatchedVisitor = db
-        .prepare('SELECT * FROM visitors WHERE hardware_id = ?')
-        .get(hardwareId) as VisitorRow | undefined;
+      let hwMatchedVisitor: VisitorRow | undefined;
+      try {
+        hwMatchedVisitor = db
+          .prepare('SELECT * FROM visitors WHERE hardware_id = ?')
+          .get(hardwareId) as VisitorRow | undefined;
+      } catch {
+        // Unreadable store (blocked daily quota): treat as an unknown device.
+        hwMatchedVisitor = undefined;
+      }
 
       if (hwMatchedVisitor) {
         existingVisitor = hwMatchedVisitor;
@@ -6009,11 +6027,17 @@ app.post('/api/visitor/identify', async (req, res) => {
         Boolean(existingVisitor) &&
         clientSessionId === existingVisitor!.active_session_id;
 
-      const existingPageLoadVisit = db
-        .prepare('SELECT visit_id, session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?')
-        .get(visitorId, safePageLoadId) as
+      let existingPageLoadVisit:
         | { visit_id: string; session_id: string; visited_at_utc: string }
         | undefined;
+      try {
+        existingPageLoadVisit = db
+          .prepare('SELECT visit_id, session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?')
+          .get(visitorId, safePageLoadId) as typeof existingPageLoadVisit;
+      } catch {
+        // Unreadable store (blocked daily quota): treat every load as a new visit.
+        existingPageLoadVisit = undefined;
+      }
 
       if (existingPageLoadVisit) {
         currentSessionId = existingPageLoadVisit.session_id;
@@ -6141,32 +6165,45 @@ app.post('/api/visitor/identify', async (req, res) => {
     res.cookie('_intel_vid_client', visitorId, { ...cookieOptions, httpOnly: false });
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
 
-    const statsAgg = db
-      .prepare(
-        `SELECT
-          COUNT(*) AS total_visits,
-          MIN(visited_at_utc) AS first_visit_utc,
-          MAX(visited_at_utc) AS last_visit_utc,
-          COUNT(DISTINCT session_id) AS total_sessions
-         FROM visits
-         WHERE visitor_id = ?`
-      )
-      .get(visitorId) as {
+    let statsAgg: {
       total_visits: number;
       first_visit_utc: string | null;
       last_visit_utc: string | null;
       total_sessions: number;
     };
+    let prevVisitRow: { visited_at_utc: string } | undefined;
+    try {
+      statsAgg = db
+        .prepare(
+          `SELECT
+            COUNT(*) AS total_visits,
+            MIN(visited_at_utc) AS first_visit_utc,
+            MAX(visited_at_utc) AS last_visit_utc,
+            COUNT(DISTINCT session_id) AS total_sessions
+           FROM visits
+           WHERE visitor_id = ?`
+        )
+        .get(visitorId) as typeof statsAgg;
 
-    const prevVisitRow = db
-      .prepare(
-        `SELECT visited_at_utc
-         FROM visits
-         WHERE visitor_id = ?
-         ORDER BY visited_at_utc DESC, id DESC
-         LIMIT 1 OFFSET 1`
-      )
-      .get(visitorId) as { visited_at_utc: string } | undefined;
+      prevVisitRow = db
+        .prepare(
+          `SELECT visited_at_utc
+           FROM visits
+           WHERE visitor_id = ?
+           ORDER BY visited_at_utc DESC, id DESC
+           LIMIT 1 OFFSET 1`
+        )
+        .get(visitorId) as { visited_at_utc: string } | undefined;
+    } catch {
+      // Unreadable store (blocked daily quota): fall back to the client's signed backup.
+      statsAgg = {
+        total_visits: 0,
+        first_visit_utc: null,
+        last_visit_utc: null,
+        total_sessions: 0,
+      };
+      prevVisitRow = undefined;
+    }
 
     const validBackupForStats =
       clientHistoryBackup && verifySignedHistoryBackup(visitorId, clientHistoryBackup)
@@ -6204,19 +6241,25 @@ app.post('/api/visitor/identify', async (req, res) => {
       isReturning = true;
     }
 
-    const rawVisits = db
-      .prepare(
-        `SELECT
-          id, visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
-          public_ip, city, region, country, latitude, longitude, isp, org, asn,
-          browser, os, device_type, screen_resolution, language, timezone,
-          suspect_score, risk_level, score10, bot_name, recognition_source
-         FROM visits
-         WHERE visitor_id = ?
-         ORDER BY visited_at_utc DESC, id DESC
-         LIMIT 50`
-      )
-      .all(visitorId) as Array<Record<string, unknown>>;
+    let rawVisits: Array<Record<string, unknown>> = [];
+    try {
+      rawVisits = db
+        .prepare(
+          `SELECT
+            id, visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
+            public_ip, city, region, country, latitude, longitude, isp, org, asn,
+            browser, os, device_type, screen_resolution, language, timezone,
+            suspect_score, risk_level, score10, bot_name, recognition_source
+           FROM visits
+           WHERE visitor_id = ?
+           ORDER BY visited_at_utc DESC, id DESC
+           LIMIT 50`
+        )
+        .all(visitorId) as Array<Record<string, unknown>>;
+    } catch {
+      // Unreadable store (blocked daily quota): keep the response, just without history rows.
+      rawVisits = [];
+    }
 
     const ipTimezoneHint =
       (typeof clientGeoHint?.timezone === 'string' && clientGeoHint.timezone.trim()) ||
@@ -6933,19 +6976,25 @@ app.get('/api/visitor/history/:visitorId', (req, res) => {
     return;
   }
 
-  const rawVisits = db
-    .prepare(
-      `SELECT
-        id, visit_id, visitor_id, session_id, visited_at_utc,
-        public_ip, city, region, country, isp, org, asn,
-        browser, os, device_type, screen_resolution, language, timezone,
-        suspect_score, risk_level, score10, bot_name, recognition_source
-       FROM visits
-       WHERE visitor_id = ?
-       ORDER BY visited_at_utc DESC, id DESC
-       LIMIT 50`
-    )
-    .all(requestedVisitorId) as Array<Record<string, unknown>>;
+  let rawVisits: Array<Record<string, unknown>> = [];
+  try {
+    rawVisits = db
+      .prepare(
+        `SELECT
+          id, visit_id, visitor_id, session_id, visited_at_utc,
+          public_ip, city, region, country, isp, org, asn,
+          browser, os, device_type, screen_resolution, language, timezone,
+          suspect_score, risk_level, score10, bot_name, recognition_source
+         FROM visits
+         WHERE visitor_id = ?
+         ORDER BY visited_at_utc DESC, id DESC
+         LIMIT 50`
+      )
+      .all(requestedVisitorId) as Array<Record<string, unknown>>;
+  } catch {
+    // Unreadable store (blocked daily quota): answer with an empty history, never a 500.
+    rawVisits = [];
+  }
 
   // Every row always carries suspectScore / riskLevel / recognitionSource (with safe defaults
   // for legacy rows that have no stored per-visit risk record). Task 2b — legacy 0..100
