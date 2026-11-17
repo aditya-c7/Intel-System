@@ -557,13 +557,9 @@ export async function resolveVisitor(db: AIBotDatabase, input: ResolveVisitorInp
           normalizeText(stored.hardware_fingerprint) ||
           normalizeText((stored.profile as BlockKeyProfile | null)?.hardwareFingerprint);
         if (!incomingHw || !storedHw || incomingHw === storedHw) {
-          try {
-            db.prepare(
-              'UPDATE visitor_profiles SET updated_at_utc = ?, hardware_fingerprint = ? WHERE visitor_id = ?'
-            ).run(nowUtc, storedHw || incomingHw || null, storageVisitorId);
-          } catch {
-            // Touch failure must not downgrade an exact match.
-          }
+          // `touchVisitorProfile` used to UPDATE updated_at_utc here, but the identify
+          // handler has already upserted this profile (with a fresh timestamp) moments
+          // earlier. Dropping it removes one Durable Object row write per page load.
           upsertBlocks(db, storageVisitorId, keys, nowUtc);
           return {
             visitor_id: storageVisitorId,

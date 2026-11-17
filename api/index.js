@@ -2198,9 +2198,8 @@ function blockKeysFor(profile) {
 }
 function upsertBlocks(db2, visitorId, keys, nowUtc) {
   const statement = db2.prepare(
-    `INSERT INTO identity_blocks (bucket_key, visitor_id, created_at_utc, updated_at_utc)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(bucket_key, visitor_id) DO UPDATE SET updated_at_utc = excluded.updated_at_utc`
+    `INSERT OR IGNORE INTO identity_blocks (bucket_key, visitor_id, created_at_utc, updated_at_utc)
+     VALUES (?, ?, ?, ?)`
   );
   for (const key of keys) {
     if (typeof key !== "string" || key.length === 0) continue;
@@ -3310,12 +3309,6 @@ async function resolveVisitor(db2, input) {
       if (stored) {
         const storedHw = normalizeText2(stored.hardware_fingerprint) || normalizeText2(stored.profile?.hardwareFingerprint);
         if (!incomingHw || !storedHw || incomingHw === storedHw) {
-          try {
-            db2.prepare(
-              "UPDATE visitor_profiles SET updated_at_utc = ?, hardware_fingerprint = ? WHERE visitor_id = ?"
-            ).run(nowUtc, storedHw || incomingHw || null, storageVisitorId);
-          } catch {
-          }
           upsertBlocks(db2, storageVisitorId, keys, nowUtc);
           return {
             visitor_id: storageVisitorId,

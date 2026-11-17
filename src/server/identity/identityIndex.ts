@@ -271,16 +271,18 @@ export function blockKeysFor(profile: BlockKeyProfile): string[] {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Registers a visitor under every bucket key. Uses the standard
- * `ON CONFLICT DO UPDATE` upsert (supported by better-sqlite3 and Durable Object
- * SQLite); each key is wrapped in its own try/catch so one malformed key can
- * never abort the whole write batch.
+ * Registers a visitor under every bucket key.
+ *
+ * `INSERT OR IGNORE` is deliberate: an existing (bucket_key, visitor_id) row already links
+ * the visitor, so refreshing its `updated_at_utc` bought nothing but one Durable Object
+ * `rows_written` per key on every page load — the exact resource the free tier caps. New
+ * keys (a changed GPU, a new simhash band) are still inserted, so matching keeps improving.
+ * Each key is wrapped in its own try/catch so one malformed key cannot abort the batch.
  */
 export function upsertBlocks(db: AIBotDatabase, visitorId: string, keys: string[], nowUtc: string): void {
   const statement = db.prepare(
-    `INSERT INTO identity_blocks (bucket_key, visitor_id, created_at_utc, updated_at_utc)
-     VALUES (?, ?, ?, ?)
-     ON CONFLICT(bucket_key, visitor_id) DO UPDATE SET updated_at_utc = excluded.updated_at_utc`
+    `INSERT OR IGNORE INTO identity_blocks (bucket_key, visitor_id, created_at_utc, updated_at_utc)
+     VALUES (?, ?, ?, ?)`
   );
   for (const key of keys) {
     if (typeof key !== 'string' || key.length === 0) continue;

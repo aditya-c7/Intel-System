@@ -43,10 +43,32 @@ export class VisitorStore extends DurableObject {
         };
       },
     };
-    ctx.storage.transactionSync(() => initializeDatabaseSchema(this.database));
+    this.schemaReady = false;
+    this.schemaAttemptedAtMs = 0;
+    this.ensureSchema();
+  }
+
+  /**
+   * Schema bootstrap is idempotent DDL, but DDL still counts as a write once the daily
+   * `rows_written` budget is exhausted. If it fails, the object must keep serving: the
+   * tables already exist from earlier deployments, reads still work, and every write path
+   * in the API degrades gracefully instead of taking the whole site down.
+   */
+  ensureSchema(force = false) {
+    if (this.schemaReady) return;
+    const now = Date.now();
+    if (!force && now - this.schemaAttemptedAtMs < 5 * 60 * 1000) return;
+    this.schemaAttemptedAtMs = now;
+    try {
+      this.ctx.storage.transactionSync(() => initializeDatabaseSchema(this.database));
+      this.schemaReady = true;
+    } catch (error) {
+      console.error('VisitorStore schema init deferred:', error);
+    }
   }
 
   fetch(request) {
+    this.ensureSchema();
     return withDatabase(this.database, () => handleAsNodeRequest(API_PORT, request));
   }
 }
