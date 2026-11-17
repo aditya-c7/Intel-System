@@ -41,7 +41,6 @@ import {
 } from './src/lib/geoFallbacks';
 import { buildProximityInfo } from './src/lib/geohash';
 import { detectAiBotFromServerSignals } from './src/lib/aiBotDirectory';
-import { createAIProtectionSystem, refreshAIBotFeeds } from './src/server/ai-protection/middleware';
 import { clientHintsMiddleware, type ParsedClientHints } from './src/server/middleware/clientHints';
 import {
   normalizeUserAgent,
@@ -442,6 +441,13 @@ function initializeDatabase(): DatabaseAdapter {
       );
 
       ${IDENTITY_SCHEMA_SQL}
+
+      DROP TABLE IF EXISTS ai_bot_cidr_ranges;
+      DROP TABLE IF EXISTS ai_bot_dns_cache;
+      DROP TABLE IF EXISTS ai_bot_jwk_cache;
+      DROP TABLE IF EXISTS ai_bot_requests;
+      DROP TABLE IF EXISTS ai_operator_referrals;
+      DROP TABLE IF EXISTS ai_zone_config;
     `);
 
     try {
@@ -498,20 +504,6 @@ function initializeDatabase(): DatabaseAdapter {
 }
 
 const db = initializeDatabase();
-
-// Native AI crawler / remote-agent protection engine. The same Express app is bundled into
-// the Cloudflare Worker; schema setup is deliberately deferred to request time there.
-const aiProtection = createAIProtectionSystem(db);
-
-// Hourly authoritative-feed refresh in the long-lived Express/VPS runtime. Cloudflare uses
-// the scheduled Worker handler in worker/index.js instead (Durable Object isolates are
-// ephemeral, so a setInterval here would not be reliable there).
-if (!IS_SERVERLESS_RUNTIME) {
-  const aiFeedTimer = setInterval(() => {
-    void refreshAIBotFeeds(db).catch(() => undefined);
-  }, 60 * 60 * 1000);
-  aiFeedTimer.unref?.();
-}
 
 function signVisitorId(visitorId: string): string {
   return crypto.createHmac('sha256', HMAC_SECRET).update(visitorId).digest('hex');
@@ -3949,7 +3941,11 @@ function computeSuspectScore100(input: {
   return Math.max(0, Math.min(100, Math.round(score)));
 }
 
-async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): Promise<LocationInfo> {
+async function lookupVerifiedGeolocation(
+  visitorIp: string,
+  isPublic: boolean,
+  options?: { cacheWrite?: boolean }
+): Promise<LocationInfo> {
   const empty = (verified: boolean): LocationInfo => ({
     publicIp: verified ? visitorIp : 'Unavailable',
     city: 'Unavailable',
@@ -4222,7 +4218,7 @@ async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): 
 
   const best = candidates[0];
   if (best) {
-    persist(best);
+    if (options?.cacheWrite !== false) persist(best);
     return best;
   }
 
@@ -4261,7 +4257,7 @@ async function lookupVerifiedGeolocation(visitorIp: string, isPublic: boolean): 
           asn: netDetails.asn,
           isVpnOrHosting: false,
         });
-        persist(location);
+        if (options?.cacheWrite !== false) persist(location);
         return location;
       }
     }
@@ -4330,9 +4326,10 @@ function applyTorRelayFallback(location: LocationInfo, visitorIp: string): Locat
 
 async function resolveLocationWithTorFallback(
   visitorIp: string,
-  isPublic: boolean
+  isPublic: boolean,
+  options?: { cacheWrite?: boolean }
 ): Promise<LocationInfo> {
-  const location = await lookupVerifiedGeolocation(visitorIp, isPublic);
+  const location = await lookupVerifiedGeolocation(visitorIp, isPublic, options);
   return applyTorRelayFallback(location, visitorIp);
 }
 function sanitizeBrowserDevice(input: Partial<BrowserDeviceInfo> | undefined): BrowserDeviceInfo {
@@ -4518,7 +4515,7 @@ app.get('/api/intel/geolocation', async (req, res) => {
     const edgeGeo = extractEdgeGeo(req);
 
     let location = mergeLocationWithEdge(
-      await resolveLocationWithTorFallback(visitorIp, isPublic),
+      await resolveLocationWithTorFallback(visitorIp, isPublic, { cacheWrite: false }),
       edgeGeo
     );
 
@@ -4594,17 +4591,19 @@ app.get('/api/intel/geolocation', async (req, res) => {
 
 app.use(express.json({ limit: '512kb' }));
 
-// AI Crawl Control: Web Bot Auth, CIDR/FCrDNS attribution, Content-Signal, robots policy
-// enforcement, Markdown-for-Agents and byte accounting for every incoming request.
-app.use(aiProtection.middleware);
-
 app.get('/api/health', async (req, res) => {
-  const visitorsCount = (
-    db.prepare('SELECT COUNT(*) AS count FROM visitors').get() as { count: number }
-  ).count;
-  const visitsCount = (
-    db.prepare('SELECT COUNT(*) AS count FROM visits').get() as { count: number }
-  ).count;
+  let visitorsCount: number | null = null;
+  let visitsCount: number | null = null;
+  try {
+    visitorsCount = (
+      db.prepare('SELECT COUNT(*) AS count FROM visitors').get() as { count: number }
+    ).count;
+    visitsCount = (
+      db.prepare('SELECT COUNT(*) AS count FROM visits').get() as { count: number }
+    ).count;
+  } catch {
+    // Health must answer even when the stateless edge has no Durable-Object database context.
+  }
   const { regionCode, regionLabel } = detectServerRegion(req);
 
   // Diagnostics: `?torCheck=<ipv4>` reports whether the Tor Project exit list resolves this
@@ -5890,23 +5889,27 @@ app.post('/api/visitor/identify', async (req, res) => {
         const restoredSessionId =
           clientSessionId || latestBackupVisit?.sessionId || generateSessionId();
 
-        db.prepare(
-          `INSERT INTO visitors (
-            visitor_id, hmac_token, hardware_id, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
-          ) VALUES (?, ?, ?, ?, ?, ?, ?)`
-        ).run(
-          verifiedVid,
-          verifiedToken,
-          hardwareId,
-          restoredFirstUtc,
-          restoredLastUtc,
-          restoredSessionId,
-          restoredLastUtc
-        );
+        try {
+          db.prepare(
+            `INSERT INTO visitors (
+              visitor_id, hmac_token, hardware_id, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).run(
+            verifiedVid,
+            verifiedToken,
+            hardwareId,
+            restoredFirstUtc,
+            restoredLastUtc,
+            restoredSessionId,
+            restoredLastUtc
+          );
 
-        existingVisitor = db
-          .prepare('SELECT * FROM visitors WHERE visitor_id = ?')
-          .get(verifiedVid) as VisitorRow | undefined;
+          existingVisitor = db
+            .prepare('SELECT * FROM visitors WHERE visitor_id = ?')
+            .get(verifiedVid) as VisitorRow | undefined;
+        } catch {
+          // quota / transient DB failure: response still succeeds
+        }
       }
 
       if (validHistoryBackup && validHistoryBackup.visits.length > 0) {
@@ -5915,54 +5918,58 @@ app.post('/api/visitor/identify', async (req, res) => {
           // Legacy backups may omit newer columns. better-sqlite3 rejects `undefined`
           // bindings, which used to surface as a 500 on the in-page Analyze / Record Visit
           // button, so every field is coerced to a SQLite-safe value.
-          const histVisitId =
-            typeof histVisit.visitId === 'string' && histVisit.visitId.trim()
-              ? histVisit.visitId.trim()
-              : generateVisitId();
-          const histVisitedAt =
-            typeof histVisit.visitedAtUtc === 'string' && histVisit.visitedAtUtc.trim()
-              ? histVisit.visitedAtUtc
-              : new Date().toISOString();
-          db.prepare(
-            `INSERT OR IGNORE INTO visits (
-              visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
-              public_ip, city, region, country, latitude, longitude, isp, org, asn,
-              browser, os, device_type, screen_resolution, language, timezone,
-              suspect_score, risk_level, score10, bot_name, recognition_source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-          ).run(
-            histVisitId,
-            verifiedVid,
-            typeof histVisit.sessionId === 'string' && histVisit.sessionId
-              ? histVisit.sessionId
-              : clientSessionId || generateSessionId(),
-            `rehydrated_${histVisitId}`,
-            histVisitedAt,
-            histVisit.publicIp || 'Unavailable',
-            histVisit.city || 'Unknown',
-            histVisit.region || 'Unknown',
-            histVisit.country || 'Unknown',
-            typeof histVisit.latitude === 'number' ? histVisit.latitude : null,
-            typeof histVisit.longitude === 'number' ? histVisit.longitude : null,
-            histVisit.isp || 'Unknown',
-            histVisit.org || 'Unknown',
-            histVisit.asn || 'Unknown',
-            histVisit.browser || 'Unknown',
-            histVisit.os || 'Unknown',
-            histVisit.deviceType || 'Unknown',
-            histVisit.screenResolution || 'Unavailable',
-            histVisit.language || 'Unavailable',
-            histVisit.timezone || 'Unavailable',
-            typeof histVisit.suspectScore === 'number' ? histVisit.suspectScore : null,
-            histVisit.riskLevel || null,
-            typeof histVisit.score10 === 'number'
-              ? histVisit.score10
-              : typeof histVisit.suspectScore === 'number'
-              ? histVisit.suspectScore
-              : null,
-            histVisit.botName || null,
-            histVisit.recognitionSource || null
-          );
+          try {
+            const histVisitId =
+              typeof histVisit.visitId === 'string' && histVisit.visitId.trim()
+                ? histVisit.visitId.trim()
+                : generateVisitId();
+            const histVisitedAt =
+              typeof histVisit.visitedAtUtc === 'string' && histVisit.visitedAtUtc.trim()
+                ? histVisit.visitedAtUtc
+                : new Date().toISOString();
+            db.prepare(
+              `INSERT OR IGNORE INTO visits (
+                visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
+                public_ip, city, region, country, latitude, longitude, isp, org, asn,
+                browser, os, device_type, screen_resolution, language, timezone,
+                suspect_score, risk_level, score10, bot_name, recognition_source
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            ).run(
+              histVisitId,
+              verifiedVid,
+              typeof histVisit.sessionId === 'string' && histVisit.sessionId
+                ? histVisit.sessionId
+                : clientSessionId || generateSessionId(),
+              `rehydrated_${histVisitId}`,
+              histVisitedAt,
+              histVisit.publicIp || 'Unavailable',
+              histVisit.city || 'Unknown',
+              histVisit.region || 'Unknown',
+              histVisit.country || 'Unknown',
+              typeof histVisit.latitude === 'number' ? histVisit.latitude : null,
+              typeof histVisit.longitude === 'number' ? histVisit.longitude : null,
+              histVisit.isp || 'Unknown',
+              histVisit.org || 'Unknown',
+              histVisit.asn || 'Unknown',
+              histVisit.browser || 'Unknown',
+              histVisit.os || 'Unknown',
+              histVisit.deviceType || 'Unknown',
+              histVisit.screenResolution || 'Unavailable',
+              histVisit.language || 'Unavailable',
+              histVisit.timezone || 'Unavailable',
+              typeof histVisit.suspectScore === 'number' ? histVisit.suspectScore : null,
+              histVisit.riskLevel || null,
+              typeof histVisit.score10 === 'number'
+                ? histVisit.score10
+                : typeof histVisit.suspectScore === 'number'
+                ? histVisit.suspectScore
+                : null,
+              histVisit.botName || null,
+              histVisit.recognitionSource || null
+            );
+          } catch {
+            // quota / transient DB failure: response still succeeds
+          }
         }
       }
     } else if (hardwareId) {
@@ -5987,16 +5994,20 @@ app.post('/api/visitor/identify', async (req, res) => {
     let currentVisitId = '';
     let isReturning = false;
 
-    if (existingVisitor) {
-      visitorId = existingVisitor.visitor_id;
-      visitorToken = existingVisitor.hmac_token;
+    if (existingVisitor || verifiedVid) {
+      visitorId = existingVisitor ? existingVisitor.visitor_id : verifiedVid!;
+      visitorToken = existingVisitor ? existingVisitor.hmac_token : verifiedToken!;
       isReturning = true;
 
-      const lastActivityMs = new Date(existingVisitor.last_activity_utc).getTime();
+      const lastActivityMs = existingVisitor
+        ? new Date(existingVisitor.last_activity_utc).getTime()
+        : NaN;
       const isExpiredByInactivity =
         Number.isNaN(lastActivityMs) || nowMs - lastActivityMs > SESSION_EXPIRATION_MS;
       const isSameClientSession =
-        Boolean(clientSessionId) && clientSessionId === existingVisitor.active_session_id;
+        Boolean(clientSessionId) &&
+        Boolean(existingVisitor) &&
+        clientSessionId === existingVisitor!.active_session_id;
 
       const existingPageLoadVisit = db
         .prepare('SELECT visit_id, session_id, visited_at_utc FROM visits WHERE visitor_id = ? AND page_load_id = ?')
@@ -6011,11 +6022,78 @@ app.post('/api/visitor/identify', async (req, res) => {
         if (isExpiredByInactivity || !isSameClientSession) {
           currentSessionId = generateSessionId();
         } else {
-          currentSessionId = existingVisitor.active_session_id;
+          currentSessionId = existingVisitor!.active_session_id;
         }
 
-        const visitId = generateVisitId();
-        currentVisitId = visitId;
+        // When the rehydration INSERT above was rejected (daily write quota), there is no
+        // row to update: skip the follow-up writes instead of retrying a write that will
+        // fail again. The identity is still returned to the client.
+        if (existingVisitor) {
+          const visitId = generateVisitId();
+          currentVisitId = visitId;
+          try {
+            db.prepare(
+              `INSERT OR IGNORE INTO visits (
+                visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
+                public_ip, city, region, country, latitude, longitude, isp, org, asn,
+                browser, os, device_type, screen_resolution, language, timezone
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            ).run(
+              visitId,
+              visitorId,
+              currentSessionId,
+              safePageLoadId,
+              nowUtc,
+              location.publicIp,
+              location.city,
+              location.region,
+              location.country,
+              location.latitude,
+              location.longitude,
+              location.isp,
+              location.org,
+              location.asn,
+              browserDevice.browser,
+              browserDevice.os,
+              browserDevice.deviceType,
+              browserDevice.screenResolution,
+              browserDevice.language,
+              browserDevice.timezone
+            );
+          } catch {
+            // quota / transient DB failure: response still succeeds
+          }
+
+          try {
+            db.prepare(
+              `UPDATE visitors
+               SET updated_at_utc = ?, active_session_id = ?, last_activity_utc = ?, hardware_id = ?
+               WHERE visitor_id = ?`
+            ).run(nowUtc, currentSessionId, nowUtc, hardwareId, visitorId);
+          } catch {
+            // quota / transient DB failure: response still succeeds
+          }
+        }
+      }
+    } else {
+      visitorId = generateVisitorId();
+      visitorToken = signVisitorId(visitorId);
+      currentSessionId = generateSessionId();
+      isReturning = false;
+
+      try {
+        db.prepare(
+          `INSERT INTO visitors (
+            visitor_id, hmac_token, hardware_id, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`
+        ).run(visitorId, visitorToken, hardwareId, nowUtc, nowUtc, currentSessionId, nowUtc);
+      } catch {
+        // quota / transient DB failure: response still succeeds
+      }
+
+      const visitId = generateVisitId();
+      currentVisitId = visitId;
+      try {
         db.prepare(
           `INSERT OR IGNORE INTO visits (
             visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
@@ -6044,55 +6122,9 @@ app.post('/api/visitor/identify', async (req, res) => {
           browserDevice.language,
           browserDevice.timezone
         );
-
-        db.prepare(
-          `UPDATE visitors
-           SET updated_at_utc = ?, active_session_id = ?, last_activity_utc = ?, hardware_id = ?
-           WHERE visitor_id = ?`
-        ).run(nowUtc, currentSessionId, nowUtc, hardwareId, visitorId);
+      } catch {
+        // quota / transient DB failure: response still succeeds
       }
-    } else {
-      visitorId = generateVisitorId();
-      visitorToken = signVisitorId(visitorId);
-      currentSessionId = generateSessionId();
-      isReturning = false;
-
-      db.prepare(
-        `INSERT INTO visitors (
-          visitor_id, hmac_token, hardware_id, created_at_utc, updated_at_utc, active_session_id, last_activity_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)`
-      ).run(visitorId, visitorToken, hardwareId, nowUtc, nowUtc, currentSessionId, nowUtc);
-
-      const visitId = generateVisitId();
-      currentVisitId = visitId;
-      db.prepare(
-        `INSERT OR IGNORE INTO visits (
-          visit_id, visitor_id, session_id, page_load_id, visited_at_utc,
-          public_ip, city, region, country, latitude, longitude, isp, org, asn,
-          browser, os, device_type, screen_resolution, language, timezone
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ).run(
-        visitId,
-        visitorId,
-        currentSessionId,
-        safePageLoadId,
-        nowUtc,
-        location.publicIp,
-        location.city,
-        location.region,
-        location.country,
-        location.latitude,
-        location.longitude,
-        location.isp,
-        location.org,
-        location.asn,
-        browserDevice.browser,
-        browserDevice.os,
-        browserDevice.deviceType,
-        browserDevice.screenResolution,
-        browserDevice.language,
-        browserDevice.timezone
-      );
     }
 
     const cookieOptions = {
@@ -6990,9 +7022,6 @@ app.get('/api/intel/identity-ping', (req, res) => {
     },
   });
 });
-
-// Native AI Crawl Control analytics, policy, telemetry and feed-sync API.
-app.use('/api/intel/ai-crawl-control', aiProtection.apiRouter);
 
 // Explicit JSON 404 for unknown API routes (instead of the SPA fallback HTML).
 app.use('/api', (_req, res) => {

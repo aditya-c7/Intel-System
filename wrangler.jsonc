@@ -12,7 +12,7 @@
     "directory": "./dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/api", "/api/*", "/robots.txt", "/llms.txt"]
+    "run_worker_first": ["/api", "/api/*"]
   },
   "durable_objects": {
     "bindings": [
@@ -24,8 +24,5 @@
     { "tag": "v2", "new_sqlite_classes": ["SpeedTestStore"] },
     { "tag": "v3", "deleted_classes": ["SpeedTestStore"] }
   ],
-  "triggers": {
-    "crons": ["0 */1 * * *"]
-  },
   "observability": { "enabled": true }
 }

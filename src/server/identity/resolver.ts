@@ -24,7 +24,7 @@
  */
 
 import { bestMode, compareFingerprints, type ComparisonInput } from '../../shared/matching/compareFingerprints';
-import type { AIBotDatabase } from '../ai-protection/schema';
+import type { AIBotDatabase } from '../db/types';
 import { scoreConfidence } from './confidenceScorer';
 import {
   blockKeysFor,
@@ -346,7 +346,7 @@ export function generateVisitorId(db?: AIBotDatabase): string {
  * Inserts or merges a visitor profile. On conflict, non-null incoming values
  * replace stored ones (COALESCE) and `created_at_utc` is preserved. Production
  * adapters (better-sqlite3, Durable Object SQLite) support this upsert natively;
- * the local MemoryDatabase adapter in `../ai-protection/schema` does not parse
+ * the local in-memory adapter does not parse
  * COALESCE expressions and would overwrite the column instead of merging.
  */
 export function upsertVisitorProfile(

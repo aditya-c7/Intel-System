@@ -2,7 +2,6 @@ import { createServer } from 'node:http';
 import { handleAsNodeRequest } from 'cloudflare:node';
 import { DurableObject } from 'cloudflare:workers';
 import app, { initializeDatabaseSchema, withDatabase } from '../server.ts';
-import { refreshAIBotFeeds } from '../src/server/ai-protection/middleware.ts';
 
 // Workers' node:http adapter uses this as a routing key, not a public TCP port.
 const API_PORT = 3000;
@@ -50,20 +49,12 @@ export class VisitorStore extends DurableObject {
   fetch(request) {
     return withDatabase(this.database, () => handleAsNodeRequest(API_PORT, request));
   }
-
-  /** Cron-triggered refresh of official crawler CIDR feeds and Web Bot Auth JWKs. */
-  async refreshAIBotFeeds() {
-    return withDatabase(this.database, () => refreshAIBotFeeds(this.database));
-  }
 }
 
 export default {
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
-    // Dynamic crawler-policy documents are Worker-first (see wrangler.jsonc) and must be
-    // answered by the Express app, not by static assets.
-    const isPolicyDocument = pathname === '/robots.txt' || pathname === '/llms.txt';
-    if (pathname !== '/api' && !pathname.startsWith('/api/') && !isPolicyDocument) {
+    if (pathname !== '/api' && !pathname.startsWith('/api/')) {
       const asset = await env.ASSETS.fetch(request);
       const result = new Response(asset.body, asset);
       result.headers.set(
@@ -84,14 +75,11 @@ export default {
       return apiResponse(Response.json({ error: 'Configure VISITOR_HMAC_SECRET with at least 32 characters.' }, { status: 503 }));
     }
     try {
-      // Every AI protection route needs request-scoped Durable-Object SQLite access: the
-      // analytics/telemetry/policy APIs, plus the two dynamic crawler-policy documents.
+      // Visitor routes need request-scoped Durable-Object SQLite access; every other API
+      // route runs statelessly so it cannot consume the daily row-write quota.
       const persistent =
-        pathname === '/api/health' ||
         pathname.startsWith('/api/visitor/') ||
-        pathname === '/api/intel/geolocation' ||
-        pathname.startsWith('/api/intel/ai-crawl-control/') ||
-        isPolicyDocument;
+        pathname === '/api/intel/geolocation';
       const response = persistent
         ? await env.VISITOR_STORE.get(env.VISITOR_STORE.idFromName('visitor-store-v1')).fetch(request)
         : await handleAsNodeRequest(API_PORT, request);
@@ -100,12 +88,5 @@ export default {
       console.error('Worker API failure:', error);
       return apiResponse(Response.json({ error: 'Internal server error.' }, { status: 500 }));
     }
-  },
-
-  /** Runs hourly via the wrangler cron trigger to keep CIDR/JWK caches current. */
-  async scheduled(_controller, env, ctx) {
-    if (!env.VISITOR_STORE) return;
-    const store = env.VISITOR_STORE.get(env.VISITOR_STORE.idFromName('visitor-store-v1'));
-    ctx.waitUntil(store.refreshAIBotFeeds());
   },
 };

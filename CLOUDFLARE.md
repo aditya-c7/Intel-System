@@ -50,24 +50,7 @@ Both must return HTTP 200 and JSON. Unknown API paths must return JSON 404. Brow
 
 Application rejection still consumes an incoming Worker invocation. Inspect real Cloudflare CPU and request metrics after deployment; a local build does not prove compliance with the free-tier per-invocation CPU allowance. Do not insert tokens or secrets into logs, screenshots or issue reports.
 
-## AI Crawl Control (native bot & agent defense)
-
-The Worker also serves native crawler-policy documents and a small analytics/control API on the same Durable-Object SQLite store used for visitor history. The request middleware runs, in order: RFC 9421 Web Bot Auth verification of Ed25519-signed requests against published JWK directories; attribution from published operator CIDR feeds (JSON, Amazon HTML `<code>`, Anthropic SAIL TOML) plus static ByteDance subnets; DNS-based FCrDNS / soft-PTR checks; a client-side agent probe (Botscent `Server-Timing` header, CDP/headless probes, pointer kinematics); and a `Server-Timing` verdict on document navigations. The live `robots.txt`, Content-Signal header, and per-bot edge actions are derived from the persisted zone policy.
-
-### Cloudflare routing
-
-`wrangler.jsonc` sets `run_worker_first` for `/api`, `/api/*`, `/robots.txt`, and `/llms.txt`, so the dynamic policy documents are answered by the Worker rather than static assets. In `worker/index.js`, `/robots.txt`, `/llms.txt`, and everything under `/api/intel/ai-crawl-control/` are forwarded to the `VISITOR_STORE` Durable Object, giving the Express `apiRouter` request-scoped SQLite access. The policy documents are also reachable under the API prefix as aliases.
-
-### API endpoints
-
-- `GET /api/intel/ai-crawl-control/analytics?hours=168` — request/bot/operator stats and violations (the dashboard requests a 168-hour window).
-- `POST /api/intel/ai-crawl-control/policy` — update the zone policy; returns the new config and generated robots.txt.
-- `POST /api/intel/ai-crawl-control/agent-telemetry` — record client-side agent probe results.
-- `POST /api/intel/ai-crawl-control/markdown-playground` — convert HTML into Markdown-for-Agents output.
-- `POST /api/intel/ai-crawl-control/sync-feeds` — refresh published operator CIDR feeds.
-- `GET /robots.txt` and `GET /llms.txt` — dynamic crawler-policy documents (also available as `/api/intel/ai-crawl-control/robots.txt` and `/api/intel/ai-crawl-control/llms.txt`).
-
-### Verification
+## Local Worker verification
 
 ```sh
 node scripts/test-worker.mjs

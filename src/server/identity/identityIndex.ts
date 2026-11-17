@@ -15,7 +15,7 @@
  *                                    64-bit FNV-1a simhash are fully deterministic, so
  *                                    the same profile always lands in the same buckets).
  *
- * Adapter notes (mirrors `src/server/ai-protection/schema.ts`):
+ * Adapter notes (see `src/server/db/types.ts`):
  *   • Schema is ensured via `exec` and is safe to call on every request.
  *   • All statements use positional parameters; LIMIT values are inlined integers.
  *   • `findCandidates` deliberately avoids `IN (...)` and uses per-key point queries plus
@@ -23,7 +23,7 @@
  *     of SQL used by `schema.ts`.
  */
 
-import type { AIBotDatabase } from '../ai-protection/schema';
+import type { AIBotDatabase } from '../db/types';
 
 /* -------------------------------------------------------------------------- */
 /* Schema                                                                      */
@@ -64,7 +64,7 @@ CREATE INDEX IF NOT EXISTS idx_visitor_links_hw ON visitor_links(hardware_finger
 
 /**
  * Idempotently creates the three identity tables and their indexes.
- * Mirrors `initAIBotSchema` from `../ai-protection/schema.ts`.
+ * Mirrors the identity section of the Worker DB bootstrap.
  */
 export function ensureIdentitySchema(db: AIBotDatabase): void {
   db.exec(IDENTITY_SCHEMA_SQL);
