@@ -45,7 +45,7 @@ Verify the Worker locally with `node scripts/test-worker.mjs`, and build it with
 | Bots and automation | User-Agent and Client Hints consistency, operator ASN, reverse DNS, WebDriver and CDP bindings, headless-rendering signals, and a weighted evidence gate so weak quirks never mark a person automated |
 | AI agents and crawlers | ChatGPT-User, OAI-SearchBot, GPTBot, ChatGPT Agent, Codex, Gemini Deep Research, Google-Agent, Google NotebookLM, Claude-User, Claude-SearchBot, ClaudeBot, Claude Code, Claude Duet, Perplexity-User, PerplexityBot, Grok Bot, Meta-ExternalAgent, Meta-WebIndexer, Muse, Kimi-User, Cursor, Manus Agent, AGI Agent, Browserbase Agent, Anchor Browser, Notte Browser, Bedrock AgentCore, Cloudflare Browser Rendering, DuckAssistBot, Instinct, and verified Googlebot traffic, with operator and execution-mode attribution |
 | Remote browser agents | Firecrawl, Browserbase, Browser Use, Skyvern, MultiOn, Hyperbrowser, Steel, Airtop, Notte, Lightpanda, Browserless, and managed scraping fleets |
-| VPN, proxy, and Tor | Tor exit nodes, Tor Browser clients, Tor relays, datacenter ASN, timezone mismatch, proxy headers, forwarded-IP chains, and a Tor relay country fallback |
+| VPN, proxy, and Tor | Cloudflare edge country, Tor exit nodes (`T1` plus DNSEL), Tor relays, datacenter ASN, timezone mismatch, proxy headers, forwarded-IP chains, and exit-node location reported separately from the visitor |
 | Network classification | Tor anonymity network, AI-agent cloud network, datacenter or hosting ASN, VPN or proxy relay on a residential line, cellular, satellite, and standard ISP traffic |
 | Hardware and rendering entropy | CPU cores, memory, GPU vendor and renderer, max texture size, canvas stability, WebGL limits and hashes, audio fingerprint, font inventory, font preferences, emoji metrics, and math vectors |
 | Virtual machines and emulators | GPU vendor and renderer, platform, touch points, screen dimensions, and emulator markers |
@@ -67,6 +67,8 @@ Browser-tampering checks cross-reference the mobile User-Agent with `navigator.p
 Proxy signals include `Proxy-Authorization`, `Proxy-Connection`, a non-CDN `Via` header, an upstream `Forwarded` address, and a three-hop public `X-Forwarded-For` chain. The dashboard identifies the proving header when proxy detection triggers.
 
 Only `POST /api/visitor/identify` writes to storage. `GET /api/health`, `GET /api/network/ping`, and `GET /api/intel/geolocation` perform no row writes, and a blocked daily write quota returns a normal `200` with cached or signed-backup data instead of an error.
+
+Location is resolved from Cloudflare `request.cf` first, then a provider consensus, and a map pin is drawn only when its coordinate fits the reported country. For Tor, VPN and proxy traffic the city and pin describe the egress node and are labelled as such, never as the visitor's physical location.
 
 </details>
 
