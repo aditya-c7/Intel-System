@@ -1467,21 +1467,147 @@ export default function App() {
         )}
 
         {loading && !data && (
-          <div className="bg-white border border-[#E5E7EB] rounded-2xl p-6 sm:p-8 space-y-6" role="status" aria-label="Loading device intelligence">
-            <div className="space-y-2">
-              <div className="skeleton-shimmer h-7 w-64 max-w-full rounded" />
-              <div className="skeleton-shimmer h-3 w-80 max-w-full rounded" />
-              <div className="pt-2 flex justify-center">
-                <div className="skeleton-shimmer h-4 w-44 max-w-full rounded" />
+          <div className="space-y-6" role="status" aria-label="Loading device intelligence">
+            {/* Overview: hero, map, location tiles, device summary */}
+            <section className="bg-white rounded-2xl border border-[#E5E7EB] overflow-hidden">
+              <div className="px-4 sm:px-7 py-5 border-b border-[#E5E7EB] flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+                <div className="space-y-2 min-w-0">
+                  <div className="skeleton-shimmer h-6 w-56 max-w-full rounded" />
+                  <div className="skeleton-shimmer h-3 w-80 max-w-full rounded" />
+                  <div className="flex flex-wrap gap-1.5 pt-1">
+                    <div className="skeleton-shimmer h-4 w-36 rounded-full" />
+                    <div className="skeleton-shimmer h-4 w-28 rounded-full" />
+                    <div className="skeleton-shimmer h-4 w-32 rounded-full" />
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 w-full lg:w-auto lg:min-w-[520px]">
+                  <div className="skeleton-shimmer h-14 rounded-xl" />
+                  <div className="skeleton-shimmer h-14 rounded-xl" />
+                </div>
               </div>
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 pt-4 border-t border-slate-100">
-              <div className="skeleton-shimmer h-16 rounded-xl" />
-              <div className="skeleton-shimmer h-16 rounded-xl" />
-              <div className="skeleton-shimmer h-16 rounded-xl" />
-              <div className="skeleton-shimmer h-16 rounded-xl" />
-            </div>
-            <div className="skeleton-shimmer h-64 rounded-xl" />
+
+              <div className="flex flex-col lg:grid lg:grid-cols-2">
+                <div className="border-b lg:border-b-0 lg:border-r border-[#E5E7EB] min-w-0">
+                  <div className="px-4 sm:px-6 py-3 border-b border-[#E5E7EB] flex items-center justify-between gap-2">
+                    <div className="skeleton-shimmer h-3 w-36 rounded" />
+                    <div className="skeleton-shimmer h-3 w-24 rounded" />
+                  </div>
+                  <div className="skeleton-shimmer h-[215px] sm:h-[235px]" />
+                  <div className="grid grid-cols-2">
+                    {Array.from({ length: 4 }).map((_, index) => (
+                      <div
+                        key={`overview-tile-${index}`}
+                        className="p-3.5 sm:px-5 border-b border-[#E5E7EB] odd:border-r space-y-2"
+                      >
+                        <div className="skeleton-shimmer h-2.5 w-16 rounded" />
+                        <div className="skeleton-shimmer h-3.5 w-28 max-w-full rounded" />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="p-4 sm:p-6">
+                  <div className="skeleton-shimmer h-3 w-44 rounded" />
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 sm:gap-3 mt-4">
+                    {Array.from({ length: 6 }).map((_, index) => (
+                      <div
+                        key={`summary-tile-${index}`}
+                        className="skeleton-shimmer h-20 sm:h-24 rounded-xl"
+                      />
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            {/* Hardware and rendering entropy */}
+            <section className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6 space-y-4">
+              <div className="flex items-center justify-between gap-3 pb-3.5 border-b border-[#E5E7EB]">
+                <div className="skeleton-shimmer h-4 w-64 max-w-full rounded" />
+                <div className="skeleton-shimmer h-3 w-24 rounded" />
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                {Array.from({ length: 6 }).map((_, index) => (
+                  <div
+                    key={`hardware-tile-${index}`}
+                    className="skeleton-shimmer h-16 rounded-xl"
+                  />
+                ))}
+              </div>
+            </section>
+
+            {/* Smart signals */}
+            <section className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6 space-y-4">
+              <div className="flex items-center justify-between gap-3 pb-3.5 border-b border-[#E5E7EB]">
+                <div className="skeleton-shimmer h-4 w-52 max-w-full rounded" />
+                <div className="skeleton-shimmer h-3 w-20 rounded" />
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+                {Array.from({ length: 8 }).map((_, index) => (
+                  <div
+                    key={`signal-tile-${index}`}
+                    className="skeleton-shimmer h-24 rounded-xl"
+                  />
+                ))}
+              </div>
+            </section>
+
+            {/* Diagnostics: network stability and CPU activity */}
+            <section className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch">
+              {Array.from({ length: 2 }).map((_, cardIndex) => (
+                <div
+                  key={`diagnostics-card-${cardIndex}`}
+                  className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6 space-y-4"
+                >
+                  <div className="flex items-center justify-between gap-3 pb-3.5 border-b border-[#E5E7EB]">
+                    <div className="skeleton-shimmer h-4 w-40 max-w-full rounded" />
+                    <div className="skeleton-shimmer h-3 w-16 rounded" />
+                  </div>
+                  <div className="grid grid-cols-3 gap-3">
+                    {Array.from({ length: 3 }).map((__, tileIndex) => (
+                      <div
+                        key={`diagnostics-stat-${cardIndex}-${tileIndex}`}
+                        className="skeleton-shimmer h-14 rounded-xl"
+                      />
+                    ))}
+                  </div>
+                  <div className="skeleton-shimmer h-32 rounded-xl" />
+                  <div className="space-y-2">
+                    <div className="skeleton-shimmer h-3 w-full rounded" />
+                    <div className="skeleton-shimmer h-3 w-5/6 rounded" />
+                  </div>
+                </div>
+              ))}
+            </section>
+
+            {/* Visit history table */}
+            <section className="bg-white border border-[#E5E7EB] rounded-2xl overflow-hidden">
+              <div className="px-4 sm:px-6 py-3.5 border-b border-[#E5E7EB] flex items-center justify-between gap-3">
+                <div className="skeleton-shimmer h-4 w-32 rounded" />
+                <div className="skeleton-shimmer h-3 w-24 rounded" />
+              </div>
+              <div className="divide-y divide-[#E5E7EB]">
+                {Array.from({ length: 6 }).map((_, rowIndex) => (
+                  <div
+                    key={`history-row-${rowIndex}`}
+                    className="grid grid-cols-6 gap-3 px-4 sm:px-6 py-3.5 items-center"
+                  >
+                    <div className="skeleton-shimmer h-3 w-6 rounded" />
+                    <div className="skeleton-shimmer h-3 w-24 max-w-full rounded" />
+                    <div className="skeleton-shimmer h-3 w-28 max-w-full rounded" />
+                    <div className="skeleton-shimmer h-3 w-32 max-w-full rounded" />
+                    <div className="skeleton-shimmer h-3 w-20 max-w-full rounded" />
+                    <div className="skeleton-shimmer h-5 w-16 rounded-full justify-self-end" />
+                  </div>
+                ))}
+              </div>
+            </section>
+
+            {/* Raw event JSON */}
+            <section className="bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6 space-y-3">
+              <div className="skeleton-shimmer h-4 w-44 max-w-full rounded" />
+              <div className="skeleton-shimmer h-40 rounded-xl" />
+            </section>
           </div>
         )}
 

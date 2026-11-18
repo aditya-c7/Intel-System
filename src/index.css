@@ -33,10 +33,12 @@
 /* The dashboard is light-only. The `dark` variant above stays class-gated, so any
  * leftover `dark:` utility can never activate from the OS color scheme. */
 
-/* Shimmer skeleton: neutral sweep used while device telemetry resolves. */
+/* Shimmer skeleton: neutral sweep used while device telemetry resolves.
+ * The highlight travels left to right: the image is wider than the box, so a
+ * decreasing background-position moves it from the left edge to the right. */
 @keyframes shimmer-sweep {
-  0% { background-position: -160% 0; }
-  100% { background-position: 260% 0; }
+  0% { background-position: 260% 0; }
+  100% { background-position: -160% 0; }
 }
 
 .skeleton-shimmer {
