@@ -1656,8 +1656,16 @@ export default function App() {
                       city={activeVisit.city}
                       region={activeVisit.region}
                       country={activeVisit.country}
+                      countryCode={
+                        selectedVisitIndex === 0 ? data.location.countryCode : undefined
+                      }
                       publicIp={activeVisit.publicIp}
                       timezone={activeVisit.timezone || data.browserDevice.timezone}
+                      networkLabel={
+                        selectedVisitIndex === 0 && data.location.isNetworkLocation
+                          ? data.location.networkLocation?.label
+                          : undefined
+                      }
                     />
                   </div>
                 )}
@@ -1723,7 +1731,13 @@ export default function App() {
                             <MapPin className="w-4 h-4 text-[#F05A28]" />
                           </div>
                           <div className="min-w-0 flex-1">
-                            <span className="block text-[11px] text-slate-500">Location</span>
+                            <span className="block text-[11px] text-slate-500">
+                              {selectedVisitIndex === 0 && data.location.isNetworkLocation
+                                ? data.location.isTorExit
+                                  ? 'Exit Node Location'
+                                  : 'Network Location'
+                                : 'Location'}
+                            </span>
                             <span
                               className="block text-xs sm:text-sm font-semibold text-[#111827] break-words leading-snug"
                               title={formatLocationDisplay(
@@ -1738,6 +1752,16 @@ export default function App() {
                                 activeVisit.country
                               )}
                             </span>
+                            {selectedVisitIndex === 0 &&
+                              data.location.isNetworkLocation &&
+                              data.location.networkLocation?.label && (
+                                <span
+                                  className="mt-1 inline-block text-[10px] font-mono uppercase tracking-wide rounded px-1.5 py-0.5 bg-orange-50 text-[#F05A28] border border-orange-100"
+                                  title="This city and pin describe the egress node, not the visitor"
+                                >
+                                  {data.location.networkLocation.label}
+                                </span>
+                              )}
                           </div>
                         </div>
 

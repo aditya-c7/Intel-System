@@ -11,6 +11,7 @@
  */
 
 import type { LocationInfo } from '../types/visitor';
+import { countryAnchor, isCoordinateConsistentWithCountry } from './countryGeo';
 
 export type EdgeHeaderBag = Record<string, string | string[] | undefined>;
 
@@ -28,7 +29,13 @@ export interface EdgeGeoHeaders {
   longitude: number | null;
   /** Normalised ASN (`AS15169`) or an empty string. */
   asn: string;
+  /** ASN owner reported by the edge (`request.cf.asOrganization`). */
+  organization: string;
   postalCode: string;
+  /** Cloudflare reports `T1` for requests that arrive over the Tor network. */
+  isTorNetwork: boolean;
+  /** True when the values came from the Worker-signed header, not a raw client header. */
+  trusted: boolean;
   source: EdgeGeoSource;
 }
 
@@ -185,12 +192,6 @@ function decodeCity(raw: string): string {
   }
 }
 
-function parseCoord(raw: string): number | null {
-  if (!raw) return null;
-  const value = Number.parseFloat(raw);
-  return Number.isFinite(value) && Math.abs(value) <= 180 ? value : null;
-}
-
 /** Normalises `15169`, `as15169` and `AS15169` to `AS15169`; invalid input yields ''. */
 export function normalizeAsnLabel(raw: string | null | undefined): string {
   if (typeof raw !== 'string') return '';
@@ -198,21 +199,102 @@ export function normalizeAsnLabel(raw: string | null | undefined): string {
   return match ? `AS${match[1]}` : '';
 }
 
+function parseLat(raw: string): number | null {
+  if (!raw) return null;
+  const value = Number.parseFloat(raw);
+  return Number.isFinite(value) && Math.abs(value) <= 90 ? value : null;
+}
+
+function parseLng(raw: string): number | null {
+  if (!raw) return null;
+  const value = Number.parseFloat(raw);
+  return Number.isFinite(value) && Math.abs(value) <= 180 ? value : null;
+}
+
+/** Country codes that are sentinels rather than real ISO countries. */
+function normalizeCountryCode(raw: string | null | undefined): string {
+  if (typeof raw !== 'string') return '';
+  const upper = raw.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(upper)) return '';
+  if (upper === 'XX' || upper === 'T1') return '';
+  return upper;
+}
+
+interface EdgeGeoPayload {
+  country?: string;
+  region?: string;
+  regionCode?: string;
+  city?: string;
+  latitude?: string;
+  longitude?: string;
+  timezone?: string;
+  asn?: string;
+  organization?: string;
+  postalCode?: string;
+  continent?: string;
+  colo?: string;
+}
+
 /**
- * Reads Vercel (`x-vercel-ip-*`) and Cloudflare (`cf-*`) edge geolocation headers.
- * Vercel wins when both are present because it also exposes the ASN.
+ * Decodes the Worker-signed `x-intel-edge-geo` header. Returns null for anything that is
+ * not a well-formed payload, so a malformed header degrades to the ordinary header path.
+ */
+function parseEdgeGeoPayload(raw: string): EdgeGeoPayload | null {
+  if (!raw) return null;
+  try {
+    const decoded = JSON.parse(decodeURIComponent(raw)) as unknown;
+    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) return null;
+    return decoded as EdgeGeoPayload;
+  } catch {
+    return null;
+  }
+}
+
+function payloadText(payload: EdgeGeoPayload, key: keyof EdgeGeoPayload): string {
+  const value = payload[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+/**
+ * Reads edge geolocation. The Worker-signed `x-intel-edge-geo` header wins because it is
+ * built from `request.cf`, which a client cannot forge. Raw Vercel / Cloudflare headers are
+ * still supported for local development and for deployments that do not use the Worker.
  */
 export function readEdgeGeoHeaders(headers: EdgeHeaderBag): EdgeGeoHeaders {
+  const signedPayload = parseEdgeGeoPayload(headerValue(headers, ['x-intel-edge-geo']));
+  if (signedPayload) {
+    const rawCountry = payloadText(signedPayload, 'country');
+    const isTorNetwork = /^t1$/i.test(rawCountry);
+    const countryCode = normalizeCountryCode(rawCountry);
+    const city = decodeCity(payloadText(signedPayload, 'city'));
+    const region = payloadText(signedPayload, 'region');
+    return {
+      city: isMissingGeoValue(city) ? '' : city,
+      region: isMissingGeoValue(region) ? '' : region,
+      country: countryNameFromCode(countryCode),
+      countryCode,
+      timezone: isMissingGeoValue(payloadText(signedPayload, 'timezone'))
+        ? ''
+        : payloadText(signedPayload, 'timezone'),
+      latitude: parseLat(payloadText(signedPayload, 'latitude')),
+      longitude: parseLng(payloadText(signedPayload, 'longitude')),
+      asn: normalizeAsnLabel(payloadText(signedPayload, 'asn')),
+      organization: payloadText(signedPayload, 'organization'),
+      postalCode: payloadText(signedPayload, 'postalCode'),
+      isTorNetwork,
+      trusted: true,
+      source: 'cloudflare',
+    };
+  }
+
   const vercelCountryCode = headerValue(headers, [
     'x-vercel-ip-country',
     'x-vercel-ip-country-code',
   ]);
   const cloudflareCountryCode = headerValue(headers, ['cf-ipcountry']);
   const rawCountryCode = vercelCountryCode || cloudflareCountryCode;
-  const countryCode =
-    rawCountryCode && !/^(xx|t1)$/i.test(rawCountryCode)
-      ? rawCountryCode.toUpperCase()
-      : '';
+  const isTorNetwork = /^t1$/i.test(rawCountryCode);
+  const countryCode = normalizeCountryCode(rawCountryCode);
 
   const city = decodeCity(
     headerValue(headers, ['x-vercel-ip-city']) ||
@@ -224,13 +306,12 @@ export function readEdgeGeoHeaders(headers: EdgeHeaderBag): EdgeGeoHeaders {
     'cf-region-code',
   ]);
   const timezone = headerValue(headers, ['x-vercel-ip-timezone', 'cf-timezone']);
-  const latitude = parseCoord(headerValue(headers, ['x-vercel-ip-latitude', 'cf-iplatitude']));
-  const longitude = parseCoord(
-    headerValue(headers, ['x-vercel-ip-longitude', 'cf-iplongitude'])
-  );
+  const latitude = parseLat(headerValue(headers, ['x-vercel-ip-latitude', 'cf-iplatitude']));
+  const longitude = parseLng(headerValue(headers, ['x-vercel-ip-longitude', 'cf-iplongitude']));
   const asn = normalizeAsnLabel(
     headerValue(headers, ['x-vercel-ip-as-number', 'x-vercel-ip-asn', 'cf-asn'])
   );
+  const organization = headerValue(headers, ['x-vercel-ip-as-organization']);
   const postalCode = headerValue(headers, ['x-vercel-ip-postal-code', 'cf-postal-code']);
 
   const source: EdgeGeoSource = headerValue(headers, ['x-vercel-id', 'x-vercel-ip-country'])
@@ -248,7 +329,10 @@ export function readEdgeGeoHeaders(headers: EdgeHeaderBag): EdgeGeoHeaders {
     latitude,
     longitude,
     asn,
+    organization: isMissingGeoValue(organization) ? '' : organization,
     postalCode: isMissingGeoValue(postalCode) ? '' : postalCode,
+    isTorNetwork,
+    trusted: false,
     source,
   };
 }
@@ -296,58 +380,120 @@ function meaningful(value: string | null | undefined): value is string {
 
 /**
  * Field-level merge of an edge-header geo result onto a provider-resolved location.
- * Edge fields only fill gaps, so a provider that answers with a city or ASN always
- * wins, while a provider timeout still leaves the edge values intact.
+ *
+ * Trust order follows the evidence: the edge country comes from `request.cf`, which the
+ * client cannot forge, so it always wins. Provider city/region/coordinates are only kept
+ * when they agree with that country; a coordinate that falls outside the reported country
+ * is discarded rather than plotted.
  */
 export function mergeLocationWithEdge(
   location: LocationInfo,
   edge: EdgeGeoHeaders
 ): LocationInfo {
-  const countryCodeRaw = meaningful(location.countryCode)
-    ? location.countryCode
-    : edge.countryCode;
-  const providerCountry =
-    meaningful(location.country) && !/^[a-z]{2}$/i.test(location.country)
-      ? location.country
-      : '';
+  const edgeCountryCode = normalizeCountryCode(edge.countryCode);
+  const providerCountryCode = normalizeCountryCode(location.countryCode);
+  const countryCode = edgeCountryCode || providerCountryCode;
+
+  const providerCountryAgrees =
+    !edgeCountryCode || !providerCountryCode || edgeCountryCode === providerCountryCode;
+
   const country =
-    providerCountry ||
-    countryNameFromCode(countryCodeRaw) ||
-    countryNameFromCode(location.country) ||
+    countryNameFromCode(countryCode) ||
+    (providerCountryAgrees && meaningful(location.country) ? location.country : '') ||
     edge.country ||
+    countryNameFromCode(location.country) ||
     'Unknown';
 
-  const asn = normalizeAsnLabel(location.asn) || edge.asn;
-  const edgeOrg = cloudProviderOrgForAsn(edge.asn);
-  const isp = meaningful(location.isp)
+  const asn = edge.asn || normalizeAsnLabel(location.asn);
+  const edgeOrg = meaningful(edge.organization)
+    ? edge.organization
+    : cloudProviderOrgForAsn(edge.asn);
+  const providerIspUsable = providerCountryAgrees && meaningful(location.isp);
+  const isp = providerIspUsable
     ? location.isp
-    : meaningful(location.org)
+    : edgeOrg ||
+      (meaningful(location.org)
+        ? location.org
+        : meaningful(location.isp)
+        ? location.isp
+        : asn
+        ? `Autonomous System ${asn}`
+        : 'Unknown');
+  const org = meaningful(location.org) && providerCountryAgrees
     ? location.org
-    : edgeOrg || (asn ? `Autonomous System ${asn}` : 'Unknown');
-  const org = meaningful(location.org) ? location.org : edgeOrg || isp;
+    : edgeOrg || isp;
 
-  const latitude = location.latitude !== null ? location.latitude : edge.latitude;
-  const longitude = location.longitude !== null ? location.longitude : edge.longitude;
-  const city = meaningful(location.city) ? location.city : edge.city || 'Unknown';
-  const region = meaningful(location.region) ? location.region : edge.region || 'Unknown';
+  const providerHasCoords =
+    providerCountryAgrees &&
+    typeof location.latitude === 'number' &&
+    typeof location.longitude === 'number';
+  let latitude = providerHasCoords ? location.latitude : null;
+  let longitude = providerHasCoords ? location.longitude : null;
+
+  const providerCoordsUsable =
+    latitude !== null &&
+    longitude !== null &&
+    (!countryCode || isCoordinateConsistentWithCountry(latitude, longitude, countryCode));
+  if (!providerCoordsUsable) {
+    latitude = null;
+    longitude = null;
+  }
+
+  if (
+    latitude === null &&
+    edge.latitude !== null &&
+    edge.longitude !== null &&
+    (!countryCode || isCoordinateConsistentWithCountry(edge.latitude, edge.longitude, countryCode))
+  ) {
+    latitude = edge.latitude;
+    longitude = edge.longitude;
+  }
+
+  // A city is only as trustworthy as the country and coordinates it arrived with. When the
+  // provider's own coordinate falls outside its own country (the classic stale-record bug),
+  // the city goes with it instead of being plotted or labelled in the wrong country.
+  const providerLocationTrusted =
+    providerCountryAgrees &&
+    (!providerHasCoords || providerCoordsUsable) &&
+    (!edgeCountryCode || Boolean(providerCountryCode) || providerCoordsUsable);
+
+  const city = providerLocationTrusted && meaningful(location.city)
+    ? location.city
+    : edge.city || 'Unknown';
+  const region = providerLocationTrusted && meaningful(location.region)
+    ? location.region
+    : edge.region || 'Unknown';
   const timezone = meaningful(location.timezone)
     ? location.timezone
     : edge.timezone || undefined;
+
+  const locationPrecision =
+    meaningful(city) && !isMissingGeoValue(city)
+      ? 'city'
+      : meaningful(region) && !isMissingGeoValue(region)
+      ? 'region'
+      : countryCode
+      ? 'country'
+      : 'unknown';
+
+  const hasCountry = Boolean(countryCode) || (meaningful(country) && country !== 'Unknown');
 
   return {
     ...location,
     city,
     region,
     country,
-    countryCode: countryCodeRaw.toUpperCase(),
+    countryCode: countryCode.toUpperCase(),
     latitude,
     longitude,
     timezone,
     isp,
     org,
     asn,
-    isLocationVerified:
-      location.isLocationVerified ||
-      Boolean(edge.city || edge.countryCode || latitude !== null),
+    isTor: Boolean(location.isTor) || edge.isTorNetwork,
+    isTorExit: Boolean(location.isTorExit) || edge.isTorNetwork,
+    locationSource: edgeCountryCode ? 'edge' : location.locationSource ?? 'provider',
+    locationPrecision,
+    isLocationVerified: hasCountry,
   };
 }

@@ -701,14 +701,15 @@ export function isPublicRoutableIp(ip: string | null): boolean {
 }
 
 export function extractVisitorIp(req: express.Request): { ip: string; isPublic: boolean } {
+  // Trust order matters. `cf-connecting-ip` is written by Cloudflare and cannot be set by
+  // the client, so it is checked first. Vercel's forwarded headers are platform-written but
+  // only when the request actually came through Vercel. Everything a client can freely send
+  // (`x-real-ip`, `x-client-ip`, an arbitrary `x-forwarded-for`) is checked later and is
+  // never allowed to outrank a platform-verified address.
   const singleHeaders = [
+    'cf-connecting-ip',
     'x-vercel-forwarded-for',
     'x-vercel-proxied-for',
-    'cf-connecting-ip',
-    'true-client-ip',
-    'x-real-ip',
-    'x-client-ip',
-    'x-appengine-user-ip',
   ];
 
   for (const headerName of singleHeaders) {
@@ -743,6 +744,17 @@ export function extractVisitorIp(req: express.Request): { ip: string; isPublic: 
         if (normalized && isPublicRoutableIp(normalized)) {
           return { ip: normalized, isPublic: true };
         }
+      }
+    }
+  }
+
+  const fallbackHeaders = ['x-real-ip', 'x-client-ip', 'x-appengine-user-ip'];
+  for (const headerName of fallbackHeaders) {
+    const rawVal = req.headers[headerName];
+    if (typeof rawVal === 'string' && rawVal.trim()) {
+      const normalized = normalizeIpCandidate(rawVal.split(',')[0]);
+      if (normalized && isPublicRoutableIp(normalized)) {
+        return { ip: normalized, isPublic: true };
       }
     }
   }
@@ -3360,10 +3372,25 @@ interface TorExitStatus {
 async function resolveTorExitStatus(
   publicIp: string,
   location: { isp?: string; org?: string; asn?: string },
-  prefetched?: Promise<TorExitVerdict>
+  prefetched?: Promise<TorExitVerdict>,
+  trustedTorNetwork = false
 ): Promise<TorExitStatus> {
   const relay = lookupTorRelayMetadata(publicIp);
   const operator = describeTorRelay(publicIp) ?? relayOperatorLabel(location);
+
+  // Cloudflare reports `T1` as the country for requests that arrive over the Tor network.
+  // A Tor client can only reach the origin through an exit relay, so `T1` is an exit
+  // verdict on its own and does not need the DNSEL round trip.
+  if (trustedTorNetwork) {
+    return {
+      isExit: true,
+      isRelay: true,
+      verdict: 'exit',
+      viaOperatorHint: false,
+      operator,
+      relay,
+    };
+  }
 
   if (isTorBulkListed(publicIp)) {
     return {
@@ -3944,7 +3971,7 @@ function computeSuspectScore100(input: {
 async function lookupVerifiedGeolocation(
   visitorIp: string,
   isPublic: boolean,
-  options?: { cacheWrite?: boolean }
+  options?: { cacheWrite?: boolean; edge?: EdgeGeoHeaders }
 ): Promise<LocationInfo> {
   const empty = (verified: boolean): LocationInfo => ({
     publicIp: verified ? visitorIp : 'Unavailable',
@@ -3964,6 +3991,42 @@ async function lookupVerifiedGeolocation(
 
   if (!isPublic || !visitorIp || visitorIp === 'Unavailable') {
     return empty(false);
+  }
+
+  // The Cloudflare edge already resolved this request from `request.cf`. When it carries a
+  // city or coordinates, that answer is authoritative and consistent, and it removes a
+  // 4-provider waterfall (and its latency) from the critical path. A country-only edge
+  // answer still probes the providers, because they may know the city.
+  const edge = options?.edge;
+  const edgeHasCoords =
+    edge !== null &&
+    edge !== undefined &&
+    edge.latitude !== null &&
+    edge.longitude !== null &&
+    Boolean(edge.countryCode);
+  const edgeHasCity = Boolean(edge?.countryCode && edge.city);
+  if (edge && (edgeHasCoords || edgeHasCity)) {
+    const net = normalizeIspAndOrg(edge.organization, edge.organization, edge.asn, false);
+    return {
+      publicIp: visitorIp,
+      city: edge.city || 'Unknown',
+      region: edge.region || 'Unknown',
+      country: edge.country || countryNameFromCode(edge.countryCode),
+      countryCode: edge.countryCode,
+      latitude: edge.latitude,
+      longitude: edge.longitude,
+      isp: net.isp,
+      org: net.org,
+      asn: net.asn || edge.asn || 'Unknown',
+      timezone: edge.timezone || undefined,
+      isVpnOrHosting: false,
+      isIpVerified: true,
+      isLocationVerified: true,
+      locationSource: 'edge',
+      locationPrecision: edge.city ? 'city' : 'country',
+      isTor: edge.isTorNetwork,
+      isTorExit: edge.isTorNetwork,
+    };
   }
 
   const nowMs = Date.now();
@@ -4028,6 +4091,14 @@ async function lookupVerifiedGeolocation(
       isIpVerified: true,
       isLocationVerified:
         !isMissingGeoValue(cached.city) || !isMissingGeoValue(cached.country),
+      locationSource: 'provider',
+      locationPrecision: !isMissingGeoValue(cached.city)
+        ? 'city'
+        : !isMissingGeoValue(cached.region)
+        ? 'region'
+        : !isMissingGeoValue(cached.country)
+        ? 'country'
+        : 'unknown',
     };
   }
 
@@ -4063,6 +4134,14 @@ async function lookupVerifiedGeolocation(
     ...input,
     isIpVerified: true,
     isLocationVerified: !isMissingGeoValue(input.city) || !isMissingGeoValue(input.country),
+    locationSource: 'provider',
+    locationPrecision: !isMissingGeoValue(input.city)
+      ? 'city'
+      : !isMissingGeoValue(input.region)
+      ? 'region'
+      : !isMissingGeoValue(input.country)
+      ? 'country'
+      : 'unknown',
   });
 
   /** Cache write shared by every provider; a failed write never loses the answer. */
@@ -4097,7 +4176,7 @@ async function lookupVerifiedGeolocation(
    * on the first two providers, leaving only RIPE's ASN — i.e. an ISP with no location.
    * Parallel probes make a usable answer far more likely and cap the whole lookup at 6 s.
    */
-  const PROVIDER_TIMEOUT_MS = 6000;
+  const PROVIDER_TIMEOUT_MS = 4000;
   const probe = async (url: string, parse: (data: Record<string, unknown>) => LocationInfo | null): Promise<LocationInfo | null> => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
@@ -4164,8 +4243,14 @@ async function lookupVerifiedGeolocation(
 
   // Provider 3: freeipapi.com
   const probeFreeIpApi = () =>
-    probe(`https://freeipapi.com/api/json/${encodeURIComponent(visitorIp)}`, (data) => {
-      const providerIp = normalizeIpCandidate(typeof data.ipAddress === 'string' ? data.ipAddress : '');
+    probe(`https://free.freeipapi.com/api/v1/json/${encodeURIComponent(visitorIp)}`, (data) => {
+      const providerIp = normalizeIpCandidate(
+        typeof data.ipAddress === 'string'
+          ? data.ipAddress
+          : typeof data.ip === 'string'
+          ? data.ip
+          : ''
+      );
       if (!providerIp || providerIp.toLowerCase() !== visitorIp.toLowerCase()) return null;
       const net = network(data.asnOrganization, data.asnOrganization, data.asn, Boolean(data.isProxy));
       return build({
@@ -4327,6 +4412,7 @@ function applyTorRelayFallback(location: LocationInfo, visitorIp: string): Locat
     org: !isMissingGeoValue(location.org) ? location.org : isp,
     asn: normalizeAsnLabel(location.asn) || relayAsn || location.asn,
     isVpnOrHosting: true,
+    isTor: true,
     isLocationVerified: hasCity || Boolean(countryName),
   };
 }
@@ -4334,7 +4420,7 @@ function applyTorRelayFallback(location: LocationInfo, visitorIp: string): Locat
 async function resolveLocationWithTorFallback(
   visitorIp: string,
   isPublic: boolean,
-  options?: { cacheWrite?: boolean }
+  options?: { cacheWrite?: boolean; edge?: EdgeGeoHeaders }
 ): Promise<LocationInfo> {
   const location = await lookupVerifiedGeolocation(visitorIp, isPublic, options);
   return applyTorRelayFallback(location, visitorIp);
@@ -4522,7 +4608,7 @@ app.get('/api/intel/geolocation', async (req, res) => {
     const edgeGeo = extractEdgeGeo(req);
 
     let location = mergeLocationWithEdge(
-      await resolveLocationWithTorFallback(visitorIp, isPublic, { cacheWrite: false }),
+      await resolveLocationWithTorFallback(visitorIp, isPublic, { cacheWrite: false, edge: edgeGeo }),
       edgeGeo
     );
 
@@ -4582,11 +4668,22 @@ app.get('/api/intel/geolocation', async (req, res) => {
       !/^autonomous system\b/i.test(location.isp) &&
       location.isp !== 'Standard Network';
     const resolved = location.isIpVerified && hasLocation && hasNetwork;
+    const hasCountry = Boolean(location.countryCode) || !isMissingGeoValue(location.country);
 
     res.json({
       location: {
         ...location,
-        isLocationVerified: hasLocation,
+        isTor: Boolean(location.isTor) || edgeGeo.isTorNetwork,
+        isTorExit: Boolean(location.isTorExit) || edgeGeo.isTorNetwork,
+        locationSource: location.locationSource ?? (edgeGeo.countryCode ? 'edge' : 'provider'),
+        locationPrecision: !isMissingGeoValue(location.city)
+          ? 'city'
+          : !isMissingGeoValue(location.region)
+          ? 'region'
+          : hasCountry
+          ? 'country'
+          : 'unknown',
+        isLocationVerified: hasCountry,
       },
       resolved,
       checkedAt: new Date().toISOString(),
@@ -5725,7 +5822,7 @@ app.post('/api/visitor/identify', async (req, res) => {
     // the location: city / region / country / lat / lon / timezone survive from the edge.
     const edgeGeo = extractEdgeGeo(req);
     let location = mergeLocationWithEdge(
-      await resolveLocationWithTorFallback(extractedIp, isPublic),
+      await resolveLocationWithTorFallback(extractedIp, isPublic, { edge: edgeGeo }),
       edgeGeo
     );
 
@@ -6473,9 +6570,58 @@ app.post('/api/visitor/identify', async (req, res) => {
     const torStatus = await resolveTorExitStatus(
       location.publicIp,
       location,
-      torLookupTarget === extractedIp.trim().toLowerCase() ? torLookupPromise : undefined
+      torLookupTarget === extractedIp.trim().toLowerCase() ? torLookupPromise : undefined,
+      edgeGeo.isTorNetwork
     );
     const torExitNode = torStatus.isExit;
+
+    // Location semantics. Country is the only field that is reliable for every network
+    // type, so it is what `isLocationVerified` certifies. When the request came over Tor,
+    // the resolved city and coordinates belong to the exit relay, not the visitor: they are
+    // exposed separately as `networkLocation` so the UI can label them honestly.
+    const isTorExit = torStatus.isExit;
+    const isTor = isTorExit || edgeGeo.isTorNetwork || Boolean(location.isTor);
+    const networkTypeLabel = String(classification.networkType || '');
+    const isProxyOrVpn =
+      Boolean(location.isProxyOrVpn) ||
+      isTorExit ||
+      /vpn|proxy/i.test(networkTypeLabel);
+    const isNetworkLocation = isTorExit || /vpn|proxy|tor/i.test(networkTypeLabel);
+    const hasCountryForLocation =
+      Boolean(location.countryCode) || !isMissingGeoValue(location.country);
+    const resolvedPrecision: LocationInfo['locationPrecision'] =
+      !isMissingGeoValue(location.city)
+        ? 'city'
+        : !isMissingGeoValue(location.region)
+        ? 'region'
+        : hasCountryForLocation
+        ? 'country'
+        : 'unknown';
+
+    location = {
+      ...location,
+      isTor,
+      isTorExit,
+      isProxyOrVpn,
+      locationSource: location.locationSource ?? 'provider',
+      locationPrecision: resolvedPrecision,
+      isNetworkLocation,
+      networkLocation: isNetworkLocation
+        ? {
+            label: isTorExit ? 'Tor exit node' : isProxyOrVpn ? 'VPN / proxy egress' : 'Network egress',
+            city: !isMissingGeoValue(location.city) ? location.city : 'Unknown',
+            region: !isMissingGeoValue(location.region) ? location.region : 'Unknown',
+            country: location.country,
+            countryCode: location.countryCode,
+            latitude: location.latitude,
+            longitude: location.longitude,
+            isp: location.isp,
+            org: location.org,
+            asn: location.asn,
+          }
+        : location.networkLocation,
+      isLocationVerified: hasCountryForLocation,
+    };
 
     // Phase 1b — granular AI-agent attribution. CIDR / FCrDNS / RFC 9421 verification is only
     // attempted when the request actually claims an agent identity, so a normal page load pays

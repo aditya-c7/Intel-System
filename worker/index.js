@@ -7,6 +7,82 @@ import app, { initializeDatabaseSchema, withDatabase } from '../server.ts';
 const API_PORT = 3000;
 createServer(app).listen(API_PORT);
 
+/**
+ * Canonical edge-geolocation header built from `request.cf`.
+ *
+ * The Worker is the only component that can see the real Cloudflare edge object, and it
+ * is also the only trust boundary: `request.cf` cannot be set by a client. Everything is
+ * encoded so the value stays inside the ASCII ByteString range that fetch() headers allow.
+ */
+const EDGE_GEO_HEADER = 'x-intel-edge-geo';
+
+/** Headers a client could otherwise spoof to fake an IP or a location. */
+const UNTRUSTED_FORWARD_HEADERS = [
+  'x-intel-edge-geo',
+  'x-vercel-forwarded-for',
+  'x-vercel-proxied-for',
+  'x-vercel-ip-country',
+  'x-vercel-ip-country-code',
+  'x-vercel-ip-city',
+  'x-vercel-ip-country-region',
+  'x-vercel-ip-latitude',
+  'x-vercel-ip-longitude',
+  'x-vercel-ip-timezone',
+  'x-vercel-ip-as-number',
+  'x-vercel-ip-postal-code',
+  'x-vercel-ip-continent',
+  'x-vercel-id',
+  'true-client-ip',
+  'x-real-ip',
+  'x-client-ip',
+  'x-appengine-user-ip',
+];
+
+function cfString(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : '';
+}
+
+function buildEdgeGeoHeader(request) {
+  const cf = request.cf || {};
+  const payload = {
+    v: 1,
+    country: cfString(cf.country),
+    region: cfString(cf.region),
+    regionCode: cfString(cf.regionCode),
+    city: cfString(cf.city),
+    latitude: cfString(cf.latitude),
+    longitude: cfString(cf.longitude),
+    timezone: cfString(cf.timezone),
+    asn: typeof cf.asn === 'number' && Number.isFinite(cf.asn) ? String(cf.asn) : cfString(cf.asn),
+    organization: cfString(cf.asOrganization),
+    postalCode: cfString(cf.postalCode),
+    continent: cfString(cf.continent),
+    colo: cfString(cf.colo),
+  };
+  return encodeURIComponent(JSON.stringify(payload));
+}
+
+/**
+ * Forwards the request to the API with a sanitized header set.
+ *
+ * Cloudflare overwrites `cf-connecting-ip`, so that value is the only trustworthy client
+ * address. Any inbound geo/IP header is deleted and replaced, which closes the spoofing
+ * path where a client could send `x-vercel-ip-country` through Cloudflare untouched.
+ */
+function forwardApiRequest(request) {
+  const headers = new Headers(request.headers);
+  for (const name of UNTRUSTED_FORWARD_HEADERS) headers.delete(name);
+
+  const clientIp = request.headers.get('cf-connecting-ip') || '';
+  if (clientIp) {
+    headers.set('cf-connecting-ip', clientIp);
+    headers.set('x-forwarded-for', clientIp);
+  }
+  headers.set(EDGE_GEO_HEADER, buildEdgeGeoHeader(request));
+
+  return new Request(request, { headers });
+}
+
 function apiResponse(response) {
   const result = new Response(response.body, response);
   result.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, no-transform');
@@ -97,14 +173,15 @@ export default {
       return apiResponse(Response.json({ error: 'Configure VISITOR_HMAC_SECRET with at least 32 characters.' }, { status: 503 }));
     }
     try {
+      const forwardedRequest = forwardApiRequest(request);
       // Visitor routes need request-scoped Durable-Object SQLite access; every other API
       // route runs statelessly so it cannot consume the daily row-write quota.
       const persistent =
         pathname.startsWith('/api/visitor/') ||
         pathname === '/api/intel/geolocation';
       const response = persistent
-        ? await env.VISITOR_STORE.get(env.VISITOR_STORE.idFromName('visitor-store-v1')).fetch(request)
-        : await handleAsNodeRequest(API_PORT, request);
+        ? await env.VISITOR_STORE.get(env.VISITOR_STORE.idFromName('visitor-store-v1')).fetch(forwardedRequest)
+        : await handleAsNodeRequest(API_PORT, forwardedRequest);
       return apiResponse(response);
     } catch (error) {
       console.error('Worker API failure:', error);

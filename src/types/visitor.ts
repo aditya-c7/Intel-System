@@ -313,6 +313,28 @@ export interface SecuritySignals {
   rareDevicePercentileBucket?: string;
 }
 
+export type LocationSource = 'edge' | 'provider' | 'consensus' | 'tor-relay' | 'none';
+
+export type LocationPrecision = 'city' | 'region' | 'country' | 'unknown';
+
+/**
+ * Physical/network location of the egress node, kept separate from the visitor's claimed
+ * location. For Tor, VPN and proxy connections only this object is factual: the exit
+ * relay's city is not the user's city.
+ */
+export interface NetworkLocationInfo {
+  label: string;
+  city: string;
+  region: string;
+  country: string;
+  countryCode: string;
+  latitude: number | null;
+  longitude: number | null;
+  isp: string;
+  org: string;
+  asn: string;
+}
+
 export interface LocationInfo {
   publicIp: string;
   city: string;
@@ -328,6 +350,20 @@ export interface LocationInfo {
   isVpnOrHosting: boolean;
   isIpVerified: boolean;
   isLocationVerified: boolean;
+  /** How the location was resolved. `edge` is `request.cf`, the most trustworthy source. */
+  locationSource?: LocationSource;
+  /** Best precision actually available. Coordinates are never a point, even at `city`. */
+  locationPrecision?: LocationPrecision;
+  /** True when the request arrived over the Tor network (`T1` or a verified exit). */
+  isTor?: boolean;
+  /** True only for a verified exit relay, never for a middle relay. */
+  isTorExit?: boolean;
+  /** VPN / proxy indicator reported by a provider or inferred from the network. */
+  isProxyOrVpn?: boolean;
+  /** True when `city`/coordinates describe the exit node, not the visitor. */
+  isNetworkLocation?: boolean;
+  /** Egress-node details, populated for Tor / VPN / proxy connections. */
+  networkLocation?: NetworkLocationInfo;
 }
 
 export interface VisitStatistics {
