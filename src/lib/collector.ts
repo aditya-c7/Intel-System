@@ -2067,6 +2067,10 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
   if (isBot && botD19.detected) {
     allBotReasons.push(...botD19.reasons.filter((reason) => reason !== botReason));
   }
+  // Detail/verdict invariant: the human default must never sit next to a bot verdict.
+  if (isBot && botReason === 'Verified human runtime & native DOM prototypes') {
+    botReason = allBotReasons[0] || 'Hard automation artifact detected';
+  }
 
   return {
     isBot,
@@ -2096,15 +2100,32 @@ export function detectTorBrowserClient(
   browserDevice: Pick<BrowserDeviceInfo, 'browser' | 'platform' | 'timezone' | 'screenResolution' | 'pixelRatio'>,
   hardwareSignals: Pick<HardwareSignals, 'cpuCores' | 'deviceMemoryGb' | 'gpuVendor' | 'gpuRenderer'>,
   incognitoMethod: string
-): { detected: boolean; signals: string[]; reasons: string[] } {
+): { detected: boolean; confirmed: boolean; signals: string[]; reasons: string[] } {
   const signals: string[] = [];
   const reasons: string[] = [];
 
   const browserLabel = `${browserDevice.browser || ''} ${browserDevice.platform || ''}`;
   const geckoEngine = /firefox|gecko|spidermonkey/i.test(browserLabel);
-  if (!geckoEngine) return { detected: false, signals, reasons };
+  if (!geckoEngine) return { detected: false, confirmed: false, signals, reasons };
 
   signals.push('gecko-engine');
+
+  // Dedicated RFP confirmation gate. A Chromium stealth plugin can spoof a Firefox UA,
+  // but it cannot change the JavaScript engine or remove Chromium-only surfaces.
+  let geckoRuntime = false;
+  let chromiumArtifact = false;
+  try {
+    geckoRuntime = getEngineErrorLength() === 25; // SpiderMonkey (V8 = 51)
+    const scope = window as unknown as { chrome?: unknown };
+    chromiumArtifact =
+      /Chrome\/|Chromium\/|Edg\/|OPR\//i.test(navigator.userAgent || '') ||
+      Boolean((navigator as unknown as { userAgentData?: unknown }).userAgentData) ||
+      Boolean(scope.chrome) ||
+      navigator.webdriver === true;
+  } catch {
+    // Hostile proxy: abstain from confirmation rather than trust the spoofable UA.
+  }
+  if (chromiumArtifact) return { detected: false, confirmed: false, signals, reasons };
 
   const timezone = (browserDevice.timezone || '').trim();
   if (/^(utc|etc\/utc|gmt)$/i.test(timezone)) {
@@ -2164,7 +2185,10 @@ export function detectTorBrowserClient(
   const uniqueSignals = Array.from(new Set(signals));
   const rfpSignals = uniqueSignals.filter((signal) => signal !== 'gecko-engine');
   const detected = geckoEngine && rfpSignals.length >= 2;
-  return { detected, signals: uniqueSignals, reasons };
+  // Confirmed = genuine Gecko runtime + RFP evidence + no Chromium-only surfaces.
+  // This is the ONLY condition allowed to suppress RFP-induced tamper false positives.
+  const confirmed = detected && geckoRuntime;
+  return { detected, confirmed, signals: uniqueSignals, reasons };
 }
 
 /**
@@ -3214,6 +3238,49 @@ export async function evaluateSecuritySignals(
       tampering.tampering_details.reasons.push(
         'Canvas toDataURL/getImageData pixel noise (farbling) detected'
       );
+    }
+  }
+
+  // Genuine Tor Browser / Firefox RFP confirmation gate.
+  // RFP + letterboxing deliberately make `screen.width` disagree with a raw
+  // `(device-width: Wpx)` media query — an intentional anti-fingerprinting measure, not
+  // active spoofing. Suppress ONLY that RFP-induced anti-detect false positive when the
+  // runtime is a confirmed Gecko/RFP browser and there is no independent protocol-level
+  // proof of automation. Every real signal keeps its full weight.
+  const independentRfpAutomationProof =
+    botAssessment.isBot ||
+    botAssessment.webdriver ||
+    botAssessment.cdpDetected ||
+    Boolean(botAssessment.cdpRuntimeLeak) ||
+    Boolean(botAssessment.stealthPluginDetected) ||
+    canvasNoiseDetected ||
+    browserDevice.devtoolsDeviceEmulation ||
+    vmStatus.isOsTampered ||
+    tampering.tampering_details.reasons.some((reason) =>
+      /Navigator getter|non-native|HTTP User-Agent header/i.test(reason)
+    );
+  const rfpExempt = torBrowserClient.confirmed && !independentRfpAutomationProof;
+  if (rfpExempt) {
+    const rfpReason = /screen\.width disagrees with its own device-width media query/i;
+    const survivingReasons = tampering.tampering_details.reasons.filter(
+      (reason) => !rfpReason.test(reason)
+    );
+    if (survivingReasons.length !== tampering.tampering_details.reasons.length) {
+      tampering.tampering_details.reasons = survivingReasons;
+      tampering.tampering_details.anomaly_score = Math.max(
+        0,
+        Number((tampering.tampering_details.anomaly_score - 0.3).toFixed(2))
+      );
+      if (
+        !survivingReasons.some((reason) =>
+          /devtools|device emulation|canvas|farbling|HTTP User-Agent/i.test(reason)
+        )
+      ) {
+        tampering.tampering_details.anti_detect_browser = false;
+        tampering.tampering = false;
+        tampering.tampering_confidence = 'high';
+        tampering.tampering_ml_score = 0.0024;
+      }
     }
   }
 

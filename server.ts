@@ -5027,6 +5027,62 @@ interface RequestIntegrityContext {
   botClassification?: BotClassification;
 }
 
+/**
+ * A genuine Tor Browser / Firefox RFP runtime only earns an exemption from RFP-induced
+ * anti-detect false positives while there is NO independent protocol-level proof of
+ * automation. CDP leaks, stealth plugins, WebDriver bindings, canvas farbling and
+ * tampered/replayed envelopes are engine- or protocol-level facts a privacy preference
+ * cannot explain, so they always keep their full weight.
+ */
+function hasIndependentAutomationProof(
+  raw: Partial<SecuritySignals> | null | undefined,
+  requestContext?: { tamperedRequest?: boolean; replayDetected?: boolean } | null
+): boolean {
+  return Boolean(
+    raw?.cdpRuntimeLeak ||
+      raw?.stealthPluginDetected ||
+      raw?.webdriver ||
+      raw?.cdpDetected ||
+      raw?.isBot ||
+      raw?.canvasFarblingDetected ||
+      raw?.replayDetected ||
+      raw?.tamperedRequest ||
+      requestContext?.tamperedRequest ||
+      requestContext?.replayDetected
+  );
+}
+
+function isConfirmedTorRfpClient(
+  raw: Partial<SecuritySignals> | null | undefined,
+  requestContext?: {
+    clientTorBrowser?: boolean;
+    tamperedRequest?: boolean;
+    replayDetected?: boolean;
+  } | null
+): boolean {
+  return (
+    Boolean(requestContext?.clientTorBrowser ?? raw?.isTorBrowserClient) &&
+    !hasIndependentAutomationProof(raw, requestContext)
+  );
+}
+
+const RFP_DEVICE_WIDTH_REASON = /screen\.width disagrees with its own device-width media query/i;
+
+function rfpExemptTamperingDetails(raw: Partial<SecuritySignals> | null | undefined) {
+  const details = raw?.tamperingDetails ?? {
+    anomaly_score: 0,
+    anti_detect_browser: false,
+    devtools_device_emulation: false,
+    reasons: [],
+  };
+  return {
+    ...details,
+    anti_detect_browser: false,
+    reasons: details.reasons.filter((reason) => !RFP_DEVICE_WIDTH_REASON.test(reason)),
+    anomaly_score: Math.min(details.anomaly_score, 0.39),
+  };
+}
+
 function sanitizeAndReinforceSecuritySignals(
   raw: Partial<SecuritySignals> | null | undefined,
   browserDevice: BrowserDeviceInfo,
@@ -5047,13 +5103,20 @@ function sanitizeAndReinforceSecuritySignals(
           .slice(0, 10)
       : [];
 
+  // Confirmed Tor Browser / RFP client: suppress only RFP-induced anti-detect false
+  // positives. Hard automation proof below vetoes the exemption entirely.
+  const rfpExempt = isConfirmedTorRfpClient(raw, requestContext);
+  const clientTorBrowser = Boolean(requestContext.clientTorBrowser ?? raw?.isTorBrowserClient);
+  const tamperingResponse = rfpExempt ? false : Boolean(raw?.tampering);
+  const tamperingDetailsResponse = rfpExempt ? rfpExemptTamperingDetails(raw) : raw?.tamperingDetails;
+
   // Bot / automation: client flags plus the server-side identity classification. `isBot` is
   // the union of the explicit client verdict, the WebDriver handshake, the CDP (Chrome DevTools
   // Protocol) runtime probe and any non-human subtype the request signature proves.
   const webdriver = Boolean(raw?.webdriver);
   const cdpDetected = Boolean(raw?.cdpDetected);
   const isHeadless = Boolean(raw?.isHeadless);
-  const botReason =
+  const rawBotReason =
     typeof raw?.botReason === 'string' && raw.botReason.trim()
       ? raw.botReason.trim().slice(0, 200)
       : '';
@@ -5062,12 +5125,14 @@ function sanitizeAndReinforceSecuritySignals(
 
   // Hard automation artifacts — the exact same set classifyBotTraffic gates on. One source of
   // truth for the tile score, the composite, the echoed signals and the subtype escalation.
-  const antiDetectBrowser = Boolean(raw?.tamperingDetails?.anti_detect_browser);
+  const antiDetectBrowser = rfpExempt
+    ? false
+    : Boolean(raw?.tamperingDetails?.anti_detect_browser);
   const tamperingMlScore =
     typeof raw?.tamperingMlScore === 'number' && Number.isFinite(raw.tamperingMlScore)
       ? raw.tamperingMlScore
       : 0;
-  const mlTampering = tamperingMlScore >= 0.5;
+  const mlTampering = rfpExempt ? false : tamperingMlScore >= 0.5;
   const stealthAutomation = Boolean(
     raw?.stealthPluginDetected || raw?.cdpRuntimeLeak || antiDetectBrowser || mlTampering
   );
@@ -5127,6 +5192,15 @@ function sanitizeAndReinforceSecuritySignals(
         }
       : rawBotClassification;
   const botSubtype: BotSubtype = botClassification.subtype;
+  // The detail text must always agree with the verdict. A stale "Verified human runtime"
+  // string from an older bundle must not sit next to a "You are a bot" tile.
+  const botReason =
+    (botSubtype === 'bad_bot' || botSubtype === 'ai_agent') &&
+    (!rawBotReason || /verified human|native dom/i.test(rawBotReason))
+      ? hardAutomationReasons[0] ||
+        botClassification.reasons[0] ||
+        'Automation runtime detected'
+      : rawBotReason;
   const spoofedCrawler =
     botClassification.subtype === 'bad_bot' && botClassification.label === 'Spoofed Crawler';
   // The gated subtype is the single source of truth for the public `isBot` flag. Keeping
@@ -5161,8 +5235,6 @@ function sanitizeAndReinforceSecuritySignals(
     !hardwareSignals.gpuRenderer ||
     hardwareSignals.gpuRenderer === 'Unavailable' ||
     /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuRenderer);
-
-  const clientTorBrowser = Boolean(requestContext.clientTorBrowser ?? raw?.isTorBrowserClient);
 
   // Strict priority reconciliation: Tor anonymity > AI agent cloud > datacenter/VM > VPN >
   // mobile > residential > unknown. The base classifier is network-only; these verdicts are
@@ -5511,10 +5583,10 @@ function sanitizeAndReinforceSecuritySignals(
   // Calibrated network scale: anonymity infrastructure stays critical (9-10), a relay is 6, an
   // attributed AI agent is 7, and a bare cloud egress is 3 (4 with a timezone mismatch) so a
   // plain datacenter IP is never presented as a commercial VPN.
+  // 10/10 is reserved for active deception (tampering, replay, spoofed impostor).
+  // A genuine Tor exit + RFP client is an anonymity/network reputation result, capped at 9.
   const vpnScore = torAnonymity
-    ? torExitNode && torBrowserClient
-      ? 10
-      : 9
+    ? 9
     : ipBlocklisted
     ? 9
     : verifiedCrawlerNetwork
@@ -5554,7 +5626,7 @@ function sanitizeAndReinforceSecuritySignals(
         location.publicIp
       } · ${torOperatorLabel || asnOrOrg})${
         torOperatorHint ? ' — DNSEL unreachable, operator attribution used' : ''
-      }${torExitNode && torBrowserClient ? ' · server exit IP and client RFP both matched (10/10)' : ''}`
+      }${torExitNode && torBrowserClient ? ' · server exit IP and client RFP both matched' : ''}`
     : ipBlocklisted
     ? 'IP flagged on abuse / tamper blocklist'
     : verifiedCrawlerNetwork
@@ -5667,7 +5739,7 @@ function sanitizeAndReinforceSecuritySignals(
   if (isHeadless && !isBot) calibratedScore = Math.max(calibratedScore, 6);
   if (isBot) calibratedScore = Math.max(calibratedScore, activeDeception ? 9 : 7);
   if (ipBlocklisted) calibratedScore = Math.max(calibratedScore, 8);
-  if (tamperDetected || Boolean(raw?.tampering)) calibratedScore = Math.max(calibratedScore, 9);
+  if (tamperDetected || tamperingResponse) calibratedScore = Math.max(calibratedScore, 9);
   if (integrityViolation) calibratedScore = Math.max(calibratedScore, 9);
   if (torExitNode) calibratedScore = Math.max(calibratedScore, 9);
   if (activeDeception) calibratedScore = Math.max(calibratedScore, 9);
@@ -5688,7 +5760,7 @@ function sanitizeAndReinforceSecuritySignals(
     activeDeception ||
       spoofedImpostor ||
       tamperDetected ||
-      raw?.tampering ||
+      tamperingResponse ||
       integrityViolation ||
       torExitNode
   );
@@ -5718,9 +5790,7 @@ function sanitizeAndReinforceSecuritySignals(
   }
   if (torAnonymity) {
     riskFactors.push(
-      `${torExitNode ? 'Confirmed Tor exit relay' : 'Tor Browser fingerprint'} (+${
-        torExitNode && torBrowserClient ? 10 : 9
-      } card): ${
+      `${torExitNode ? 'Confirmed Tor exit relay' : 'Tor Browser fingerprint'} (+9 card): ${
         torExitNode
           ? torOperatorHint
             ? 'exit-operator attribution'
@@ -5871,14 +5941,17 @@ function sanitizeAndReinforceSecuritySignals(
       emulatorDetected,
       emulatorReason,
       // Phase 5 — browser tampering / docked DevTools (client-probed, echoed for the grid)
-      tampering: Boolean(raw?.tampering),
+      tampering: tamperingResponse,
       tamperingConfidence: (raw?.tamperingConfidence || 'high') as
         | 'low'
         | 'medium'
         | 'high',
-      tamperingMlScore:
-        typeof raw?.tamperingMlScore === 'number' ? raw.tamperingMlScore : 0.0024,
-      tamperingDetails: raw?.tamperingDetails,
+      tamperingMlScore: rfpExempt
+        ? 0.0024
+        : typeof raw?.tamperingMlScore === 'number'
+        ? raw.tamperingMlScore
+        : 0.0024,
+      tamperingDetails: tamperingDetailsResponse,
       developerTools: Boolean(raw?.developerTools),
       privacySettings: Boolean(raw?.privacySettings || clientTorBrowser),
       // Phase 4 — sealed request envelope verdicts
@@ -6782,13 +6855,16 @@ app.post('/api/visitor/identify', async (req, res) => {
     // bot_info / bot_type / history verdict) and the sanitizer's per-tile escalation. Omitting
     // them here used to leave the final classification as "Verified Human" even when the bot
     // tile was escalated — the two paths now read the exact same client fields.
-    const hardAutomationSignals = Boolean(
-      rawSecuritySignals?.cdpRuntimeLeak ||
-        rawSecuritySignals?.stealthPluginDetected ||
-        rawSecuritySignals?.tamperingDetails?.anti_detect_browser ||
-        (typeof rawSecuritySignals?.tamperingMlScore === 'number' &&
-          rawSecuritySignals.tamperingMlScore >= 0.5)
-    );
+    const rfpExemptRequest = isConfirmedTorRfpClient(rawSecuritySignals);
+    const hardAutomationSignals =
+      !rfpExemptRequest &&
+      Boolean(
+        rawSecuritySignals?.cdpRuntimeLeak ||
+          rawSecuritySignals?.stealthPluginDetected ||
+          rawSecuritySignals?.tamperingDetails?.anti_detect_browser ||
+          (typeof rawSecuritySignals?.tamperingMlScore === 'number' &&
+            rawSecuritySignals.tamperingMlScore >= 0.5)
+      );
     const botClassification = classifyBotTraffic(
       { ...rawRequestHeaders, 'user-agent': fullRequestUserAgent },
       { org: location.org, isp: location.isp, asn: location.asn },
@@ -6806,11 +6882,14 @@ app.post('/api/visitor/identify', async (req, res) => {
           : [],
         cdpRuntimeLeak: Boolean(rawSecuritySignals?.cdpRuntimeLeak),
         stealthPluginDetected: Boolean(rawSecuritySignals?.stealthPluginDetected),
-        antiDetectBrowser: Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
-        tamperingMlScore:
-          typeof rawSecuritySignals?.tamperingMlScore === 'number'
-            ? rawSecuritySignals.tamperingMlScore
-            : 0,
+        antiDetectBrowser: rfpExemptRequest
+          ? false
+          : Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
+        tamperingMlScore: rfpExemptRequest
+          ? 0
+          : typeof rawSecuritySignals?.tamperingMlScore === 'number'
+          ? rawSecuritySignals.tamperingMlScore
+          : 0,
       }
     );
 
@@ -7053,25 +7132,33 @@ app.post('/api/visitor/identify', async (req, res) => {
     // Per-IP event counts stay in the velocity object but never flag the device on their own.
     const highActivityDevice = velocityReport.events24h >= 20;
     const clientTampering = rawSecuritySignals?.tampering ?? null;
+    const rfpExemptResponse = isConfirmedTorRfpClient(rawSecuritySignals, {
+      clientTorBrowser: Boolean(rawSecuritySignals?.isTorBrowserClient),
+      tamperedRequest: envelopeVerdict.tamperedRequest,
+      replayDetected: envelopeVerdict.replayDetected,
+    });
     const tamperingAssessment =
       clientTampering === null
         ? null
         : {
-            tampering: Boolean(clientTampering),
+            tampering: rfpExemptResponse ? false : Boolean(clientTampering),
             confidence: (rawSecuritySignals?.tamperingConfidence || 'high') as
               | 'low'
               | 'medium'
               | 'high',
-            mlScore:
-              typeof rawSecuritySignals?.tamperingMlScore === 'number'
-                ? rawSecuritySignals.tamperingMlScore
-                : 0.0024,
-            details: rawSecuritySignals?.tamperingDetails ?? {
-              anomaly_score: 0,
-              anti_detect_browser: false,
-              devtools_device_emulation: false,
-              reasons: [],
-            },
+            mlScore: rfpExemptResponse
+              ? 0.0024
+              : typeof rawSecuritySignals?.tamperingMlScore === 'number'
+              ? rawSecuritySignals.tamperingMlScore
+              : 0.0024,
+            details: rfpExemptResponse
+              ? rfpExemptTamperingDetails(rawSecuritySignals)
+              : rawSecuritySignals?.tamperingDetails ?? {
+                  anomaly_score: 0,
+                  anti_detect_browser: false,
+                  devtools_device_emulation: false,
+                  reasons: [],
+                },
           };
     const activeCallSupported = Boolean(rawSecuritySignals?.activeCallSupported);
     const activeCall = activeCallSupported && Boolean(rawSecuritySignals?.activeCall);

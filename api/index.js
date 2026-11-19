@@ -7195,17 +7195,44 @@ function sanitizeHardwareSignals(raw, browserDevice) {
     architecture: safeStr(raw?.architecture, browserDevice.os, 80)
   };
 }
+function hasIndependentAutomationProof(raw, requestContext) {
+  return Boolean(
+    raw?.cdpRuntimeLeak || raw?.stealthPluginDetected || raw?.webdriver || raw?.cdpDetected || raw?.isBot || raw?.canvasFarblingDetected || raw?.replayDetected || raw?.tamperedRequest || requestContext?.tamperedRequest || requestContext?.replayDetected
+  );
+}
+function isConfirmedTorRfpClient(raw, requestContext) {
+  return Boolean(requestContext?.clientTorBrowser ?? raw?.isTorBrowserClient) && !hasIndependentAutomationProof(raw, requestContext);
+}
+var RFP_DEVICE_WIDTH_REASON = /screen\.width disagrees with its own device-width media query/i;
+function rfpExemptTamperingDetails(raw) {
+  const details = raw?.tamperingDetails ?? {
+    anomaly_score: 0,
+    anti_detect_browser: false,
+    devtools_device_emulation: false,
+    reasons: []
+  };
+  return {
+    ...details,
+    anti_detect_browser: false,
+    reasons: details.reasons.filter((reason) => !RFP_DEVICE_WIDTH_REASON.test(reason)),
+    anomaly_score: Math.min(details.anomaly_score, 0.39)
+  };
+}
 function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals, location, ipTimezoneHint, recognitionSource, baseClassification, velocity, incognitoContext = {}, requestContext = {}) {
   const safeStrArray = (arr) => Array.isArray(arr) ? arr.filter((item) => typeof item === "string" && item.trim().length > 0).map((s) => s.trim().slice(0, 180)).slice(0, 10) : [];
+  const rfpExempt = isConfirmedTorRfpClient(raw, requestContext);
+  const clientTorBrowser = Boolean(requestContext.clientTorBrowser ?? raw?.isTorBrowserClient);
+  const tamperingResponse = rfpExempt ? false : Boolean(raw?.tampering);
+  const tamperingDetailsResponse = rfpExempt ? rfpExemptTamperingDetails(raw) : raw?.tamperingDetails;
   const webdriver = Boolean(raw?.webdriver);
   const cdpDetected = Boolean(raw?.cdpDetected);
   const isHeadless = Boolean(raw?.isHeadless);
-  const botReason = typeof raw?.botReason === "string" && raw.botReason.trim() ? raw.botReason.trim().slice(0, 200) : "";
+  const rawBotReason = typeof raw?.botReason === "string" && raw.botReason.trim() ? raw.botReason.trim().slice(0, 200) : "";
   const botSignals = safeStrArray(raw?.botSignals);
   const clientAutomationDetected = Boolean(raw?.isBot || webdriver || cdpDetected);
-  const antiDetectBrowser = Boolean(raw?.tamperingDetails?.anti_detect_browser);
+  const antiDetectBrowser = rfpExempt ? false : Boolean(raw?.tamperingDetails?.anti_detect_browser);
   const tamperingMlScore = typeof raw?.tamperingMlScore === "number" && Number.isFinite(raw.tamperingMlScore) ? raw.tamperingMlScore : 0;
-  const mlTampering = tamperingMlScore >= 0.5;
+  const mlTampering = rfpExempt ? false : tamperingMlScore >= 0.5;
   const stealthAutomation = Boolean(
     raw?.stealthPluginDetected || raw?.cdpRuntimeLeak || antiDetectBrowser || mlTampering
   );
@@ -7249,6 +7276,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     reasons: hardAutomationReasons.length > 0 ? hardAutomationReasons : ["Hard automation artifact reported by client"]
   } : rawBotClassification;
   const botSubtype = botClassification.subtype;
+  const botReason = (botSubtype === "bad_bot" || botSubtype === "ai_agent") && (!rawBotReason || /verified human|native dom/i.test(rawBotReason)) ? hardAutomationReasons[0] || botClassification.reasons[0] || "Automation runtime detected" : rawBotReason;
   const spoofedCrawler = botClassification.subtype === "bad_bot" && botClassification.label === "Spoofed Crawler";
   const isBot = botSubtype === "bad_bot" || botSubtype === "ai_agent";
   const browserTimezone = typeof raw?.browserTimezone === "string" && raw.browserTimezone.trim() ? raw.browserTimezone.trim().slice(0, 80) : browserDevice.timezone || "UTC";
@@ -7258,7 +7286,6 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const serverTzMismatch = Boolean(normBrowserTz && normIpTz && normBrowserTz !== normIpTz);
   const timezoneMismatch = Boolean(raw?.timezoneMismatch) || serverTzMismatch;
   const isGpuMaskedOrUnavailable = !hardwareSignals.gpuVendor || hardwareSignals.gpuVendor === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuVendor) || !hardwareSignals.gpuRenderer || hardwareSignals.gpuRenderer === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuRenderer);
-  const clientTorBrowser = Boolean(requestContext.clientTorBrowser ?? raw?.isTorBrowserClient);
   const classification = applyNetworkOverrides(baseClassification, {
     torExit: Boolean(requestContext.torExitNode || requestContext.torRelay),
     torOperatorHint: Boolean(requestContext.torOperatorHint),
@@ -7391,9 +7418,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const torRelayNetwork = requestContext.torVerdict === "relay" || requestContext.torRelay === true;
   const torAnonymity = torExitNode || torBrowserClient;
   const torOperatorLabel = requestContext.torOperator ?? describeTorRelay(location.publicIp) ?? null;
-  const vpnScore = torAnonymity ? torExitNode && torBrowserClient ? 10 : 9 : ipBlocklisted ? 9 : verifiedCrawlerNetwork ? 2 : torRelayNetwork ? 6 : aiAgent?.detected ? 7 : isDatacenterAsn && hasTzMismatch ? 4 : isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0;
+  const vpnScore = torAnonymity ? 9 : ipBlocklisted ? 9 : verifiedCrawlerNetwork ? 2 : torRelayNetwork ? 6 : aiAgent?.detected ? 7 : isDatacenterAsn && hasTzMismatch ? 4 : isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0;
   const vpnStatus = torAnonymity ? torExitNode && torBrowserClient ? "Tor Exit Node & Tor Browser" : torExitNode ? "Tor Exit Node" : "Tor Browser (Onion Routing / RFP)" : ipBlocklisted ? "Blocklisted IP" : verifiedCrawlerNetwork ? "Verified Crawler Network" : torRelayNetwork ? "Tor Relay (Non-Exit)" : aiAgent?.detected ? "AI Agent Cloud Network" : isDatacenterAsn ? "VPN / Datacenter Proxy" : hasTzMismatch ? "VPN / Timezone Relay" : "Standard ISP";
-  const vpnDetail = torAnonymity ? `${torExitNode ? "Confirmed active Tor exit relay" : "Tor Browser fingerprint (Gecko RFP + letterboxing)"} (${location.publicIp} \xB7 ${torOperatorLabel || asnOrOrg})${torOperatorHint ? " \u2014 DNSEL unreachable, operator attribution used" : ""}${torExitNode && torBrowserClient ? " \xB7 server exit IP and client RFP both matched (10/10)" : ""}` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : verifiedCrawlerNetwork ? `${botClassification.provider} crawler operating from its own ${ispBrand}${asnSuffix} \u2014 crawler infrastructure, not a consumer proxy` : torRelayNetwork ? `Tor relay network (${torOperatorLabel || asnOrOrg}) \u2014 part of the Tor network but not an exit egress` : aiAgent?.detected ? `${aiAgent.agentName} (${aiAgent.operator}) \u2014 ${aiAgent.executionMode || "AI agent"} traffic from ${ispBrand}${asnSuffix}` : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
+  const vpnDetail = torAnonymity ? `${torExitNode ? "Confirmed active Tor exit relay" : "Tor Browser fingerprint (Gecko RFP + letterboxing)"} (${location.publicIp} \xB7 ${torOperatorLabel || asnOrOrg})${torOperatorHint ? " \u2014 DNSEL unreachable, operator attribution used" : ""}${torExitNode && torBrowserClient ? " \xB7 server exit IP and client RFP both matched" : ""}` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : verifiedCrawlerNetwork ? `${botClassification.provider} crawler operating from its own ${ispBrand}${asnSuffix} \u2014 crawler infrastructure, not a consumer proxy` : torRelayNetwork ? `Tor relay network (${torOperatorLabel || asnOrOrg}) \u2014 part of the Tor network but not an exit egress` : aiAgent?.detected ? `${aiAgent.agentName} (${aiAgent.operator}) \u2014 ${aiAgent.executionMode || "AI agent"} traffic from ${ispBrand}${asnSuffix}` : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
   const vpnSignal = {
     id: "vpn",
     title: "VPN / Proxy & Network Type",
@@ -7439,7 +7466,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   if (isHeadless && !isBot) calibratedScore = Math.max(calibratedScore, 6);
   if (isBot) calibratedScore = Math.max(calibratedScore, activeDeception ? 9 : 7);
   if (ipBlocklisted) calibratedScore = Math.max(calibratedScore, 8);
-  if (tamperDetected || Boolean(raw?.tampering)) calibratedScore = Math.max(calibratedScore, 9);
+  if (tamperDetected || tamperingResponse) calibratedScore = Math.max(calibratedScore, 9);
   if (integrityViolation) calibratedScore = Math.max(calibratedScore, 9);
   if (torExitNode) calibratedScore = Math.max(calibratedScore, 9);
   if (activeDeception) calibratedScore = Math.max(calibratedScore, 9);
@@ -7450,7 +7477,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const elevatedCardCount = cardScores.filter((score) => score >= 4).length;
   const synergyBonus = elevatedCardCount >= 3 ? 2 : elevatedCardCount === 2 ? 1 : 0;
   const criticalDeception = Boolean(
-    activeDeception || spoofedImpostor || tamperDetected || raw?.tampering || integrityViolation || torExitNode
+    activeDeception || spoofedImpostor || tamperDetected || tamperingResponse || integrityViolation || torExitNode
   );
   const cardFloorScore = Math.max(weightedCompositeScore, maxCardScore + synergyBonus);
   const suspectScore = criticalDeception ? Math.min(10, cardFloorScore) : Math.min(8, cardFloorScore);
@@ -7468,7 +7495,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   }
   if (torAnonymity) {
     riskFactors.push(
-      `${torExitNode ? "Confirmed Tor exit relay" : "Tor Browser fingerprint"} (+${torExitNode && torBrowserClient ? 10 : 9} card): ${torExitNode ? torOperatorHint ? "exit-operator attribution" : "Tor Project DNSEL / consensus exit list" : "Gecko RFP + letterboxing detected on the client"} ${location.publicIp}`
+      `${torExitNode ? "Confirmed Tor exit relay" : "Tor Browser fingerprint"} (+9 card): ${torExitNode ? torOperatorHint ? "exit-operator attribution" : "Tor Project DNSEL / consensus exit list" : "Gecko RFP + letterboxing detected on the client"} ${location.publicIp}`
     );
   } else if (torRelayNetwork) {
     riskFactors.push(
@@ -7593,10 +7620,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       emulatorDetected,
       emulatorReason,
       // Phase 5 — browser tampering / docked DevTools (client-probed, echoed for the grid)
-      tampering: Boolean(raw?.tampering),
+      tampering: tamperingResponse,
       tamperingConfidence: raw?.tamperingConfidence || "high",
-      tamperingMlScore: typeof raw?.tamperingMlScore === "number" ? raw.tamperingMlScore : 24e-4,
-      tamperingDetails: raw?.tamperingDetails,
+      tamperingMlScore: rfpExempt ? 24e-4 : typeof raw?.tamperingMlScore === "number" ? raw.tamperingMlScore : 24e-4,
+      tamperingDetails: tamperingDetailsResponse,
       developerTools: Boolean(raw?.developerTools),
       privacySettings: Boolean(raw?.privacySettings || clientTorBrowser),
       // Phase 4 — sealed request envelope verdicts
@@ -8171,7 +8198,8 @@ app.post("/api/visitor/identify", async (req, res) => {
     const envelopeRequestUserAgent = typeof requestBody.securityEnvelope?.userAgent === "string" ? requestBody.securityEnvelope.userAgent.trim() : "";
     const headerCarriesBotSignature = Boolean(headerRequestUserAgent) && (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) || GOOD_BOT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)) || AI_AGENT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)));
     const fullRequestUserAgent = headerCarriesBotSignature ? headerRequestUserAgent : envelopeRequestUserAgent || headerRequestUserAgent;
-    const hardAutomationSignals = Boolean(
+    const rfpExemptRequest = isConfirmedTorRfpClient(rawSecuritySignals);
+    const hardAutomationSignals = !rfpExemptRequest && Boolean(
       rawSecuritySignals?.cdpRuntimeLeak || rawSecuritySignals?.stealthPluginDetected || rawSecuritySignals?.tamperingDetails?.anti_detect_browser || typeof rawSecuritySignals?.tamperingMlScore === "number" && rawSecuritySignals.tamperingMlScore >= 0.5
     );
     const botClassification = classifyBotTraffic(
@@ -8187,8 +8215,8 @@ app.post("/api/visitor/identify", async (req, res) => {
         botSignals: Array.isArray(rawSecuritySignals?.botSignals) ? rawSecuritySignals.botSignals : [],
         cdpRuntimeLeak: Boolean(rawSecuritySignals?.cdpRuntimeLeak),
         stealthPluginDetected: Boolean(rawSecuritySignals?.stealthPluginDetected),
-        antiDetectBrowser: Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
-        tamperingMlScore: typeof rawSecuritySignals?.tamperingMlScore === "number" ? rawSecuritySignals.tamperingMlScore : 0
+        antiDetectBrowser: rfpExemptRequest ? false : Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
+        tamperingMlScore: rfpExemptRequest ? 0 : typeof rawSecuritySignals?.tamperingMlScore === "number" ? rawSecuritySignals.tamperingMlScore : 0
       }
     );
     const torLookupTarget = location.publicIp.trim().toLowerCase();
@@ -8357,11 +8385,16 @@ app.post("/api/visitor/identify", async (req, res) => {
     const rarityReport = computeDeviceRarity(db, browserDevice);
     const highActivityDevice = velocityReport.events24h >= 20;
     const clientTampering = rawSecuritySignals?.tampering ?? null;
+    const rfpExemptResponse = isConfirmedTorRfpClient(rawSecuritySignals, {
+      clientTorBrowser: Boolean(rawSecuritySignals?.isTorBrowserClient),
+      tamperedRequest: envelopeVerdict.tamperedRequest,
+      replayDetected: envelopeVerdict.replayDetected
+    });
     const tamperingAssessment = clientTampering === null ? null : {
-      tampering: Boolean(clientTampering),
+      tampering: rfpExemptResponse ? false : Boolean(clientTampering),
       confidence: rawSecuritySignals?.tamperingConfidence || "high",
-      mlScore: typeof rawSecuritySignals?.tamperingMlScore === "number" ? rawSecuritySignals.tamperingMlScore : 24e-4,
-      details: rawSecuritySignals?.tamperingDetails ?? {
+      mlScore: rfpExemptResponse ? 24e-4 : typeof rawSecuritySignals?.tamperingMlScore === "number" ? rawSecuritySignals.tamperingMlScore : 24e-4,
+      details: rfpExemptResponse ? rfpExemptTamperingDetails(rawSecuritySignals) : rawSecuritySignals?.tamperingDetails ?? {
         anomaly_score: 0,
         anti_detect_browser: false,
         devtools_device_emulation: false,
