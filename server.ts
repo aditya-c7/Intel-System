@@ -5282,8 +5282,8 @@ function sanitizeAndReinforceSecuritySignals(
 
   /* ---- 4-signal Smart Signals grid, every tile rated strictly out of 10 ---- */
 
-  // Tile 1 — Incognito / Private Browsing (4)
-  const incognitoScore = isIncognito ? 4 : 0;
+  // Tile 1 — Incognito / Private Browsing (3). A lone private window is a benign anomaly.
+  const incognitoScore = isIncognito ? 3 : 0;
   const incognitoSignal: SmartSignal = {
     id: 'incognito',
     title: 'Incognito / Private Browsing',
@@ -5300,14 +5300,27 @@ function sanitizeAndReinforceSecuritySignals(
       : `Persistent disk-backed storage verified (${incognitoMethod || 'Standard profile'})`,
   };
 
-  // Tile 2 — Bot & Automation Detection (10 spoofed impostor / 9 bad bot / 8 AI agent /
-  // 2 good bot / 0). The attribution engine names the exact agent and quotes its evidence.
+  // Tile 2 — Bot & Automation Detection (10 spoofed impostor / 9 stealth automation /
+  // 7 automation or AI agent / 2 good bot / 0). The attribution engine names the exact agent
+  // and quotes its evidence.
   const aiAgent = requestContext.aiAgent ?? null;
   const spoofedImpostor =
     aiAgent?.agentId === 'impostor-spoof' ||
     (botSubtype === 'bad_bot' && spoofedCrawler);
-  const botScore =
-    spoofedImpostor ? 10 : botSubtype === 'bad_bot' ? 9 : botSubtype === 'ai_agent' ? 8 : botSubtype === 'good_bot' ? 2 : 0;
+  // Calibrated scale: a spoofed impostor is 10, stealth automation is 9, plain automation and a
+  // named AI agent are 7, a verified crawler is 2. Only 9-10 means confirmed active deception.
+  const stealthAutomation = Boolean(raw?.stealthPluginDetected || raw?.cdpRuntimeLeak);
+  const botScore = spoofedImpostor
+    ? 10
+    : botSubtype === 'bad_bot'
+    ? stealthAutomation
+      ? 9
+      : 7
+    : botSubtype === 'ai_agent'
+    ? 7
+    : botSubtype === 'good_bot'
+    ? 2
+    : 0;
   const botStatus = spoofedImpostor
     ? 'Spoofed AI Impostor'
     : botSubtype === 'bad_bot'
@@ -5356,7 +5369,8 @@ function sanitizeAndReinforceSecuritySignals(
     detail: botDetail,
   };
 
-  // Tile 3 — VPN / Proxy & Network Type (10 Tor / 9 blocklisted / 8 datacenter + tz / 6 / 5 / 0)
+  // Tile 3 — VPN / Proxy & Network Type (10 Tor / 9 blocklisted / 7 AI agent / 6 relay /
+  // 4 datacenter + timezone mismatch / 3 datacenter / 2 timezone only / 0)
   const isDatacenterAsn = datacenterAsn;
   // A verified search crawler legitimately runs on its operator's own datacenter ASN. Scoring
   // that as a consumer-facing "VPN / datacenter proxy" is a false positive produced by two
@@ -5376,6 +5390,9 @@ function sanitizeAndReinforceSecuritySignals(
   const torAnonymity = torExitNode || torBrowserClient;
   const torOperatorLabel =
     requestContext.torOperator ?? describeTorRelay(location.publicIp) ?? null;
+  // Calibrated network scale: anonymity infrastructure stays critical (9-10), a relay is 6, an
+  // attributed AI agent is 7, and a bare cloud egress is 3 (4 with a timezone mismatch) so a
+  // plain datacenter IP is never presented as a commercial VPN.
   const vpnScore = torAnonymity
     ? torExitNode && torBrowserClient
       ? 10
@@ -5387,13 +5404,13 @@ function sanitizeAndReinforceSecuritySignals(
     : torRelayNetwork
     ? 6
     : aiAgent?.detected
-    ? 8
+    ? 7
     : isDatacenterAsn && hasTzMismatch
-    ? 8
+    ? 4
     : isDatacenterAsn
-    ? 6
+    ? 3
     : hasTzMismatch
-    ? 5
+    ? 2
     : 0;
   const vpnStatus = torAnonymity
     ? torExitNode && torBrowserClient
@@ -5446,21 +5463,19 @@ function sanitizeAndReinforceSecuritySignals(
     detail: vpnDetail,
   };
 
-  // Tile 4 — Virtual Machine, Emulator & OS Integrity (10 tampered / 8 emulator or cloud VM
-  // with masked GPU / 7 VM or cloud container / 6 spoofed environment / 0 physical hardware)
+  // Tile 4 — Virtual Machine, Emulator & OS Integrity (10 replayed or tampered payload /
+  // 8 emulator / 6 cloud VM, masked GPU or spoofed environment / 0 physical hardware)
   const isVm = isVirtualMachine;
   const isTampered = isOsTampered;
   const cloudContainerVm = datacenterAsn && (isGpuMaskedOrUnavailable || cloudOrMaskedGpu);
   const vmLike = isVm || cloudContainerVm;
-  // Table: turquoise 7 = cloud VM / masked WebGL on a datacenter ASN. An emulator stays 8 and
+  // Table: a cloud VM or masked WebGL on a datacenter ASN is 6, an emulator is 8 and
   // cryptographic tampering stays 10.
   const vmScore = tamperedRequest || replayDetected
     ? 10
     : emulatorDetected
     ? 8
-    : vmLike
-    ? 7
-    : isTampered
+    : vmLike || isTampered
     ? 6
     : 0;
   const vmStatus =
@@ -5518,13 +5533,28 @@ function sanitizeAndReinforceSecuritySignals(
     : hasTzMismatch
     ? 2
     : 0;
-  const rawCompositePoints =
-    (isBot ? 5 : isHeadless ? 4 : 0) +
-    networkPoints +
-    (vmScore > 0 ? 3 : 0) +
-    (isIncognito ? 2 : 0) +
-    (integrityViolation ? 2 : 0);
-  const weightedCompositeScore = Math.min(10, rawCompositePoints);
+  // Calibrated 0-10 risk tiers. Each tier is a floor, so no single weak signal can saturate the
+  // headline: 0-2 authentic browser, 3-4 one benign anomaly (private window, cloud egress with a
+  // timezone mismatch), 5-6 cloud VM / software renderer, 7-8 automation or an attributed agent,
+  // 9-10 confirmed active deception (stealth plugins, tampering, replay, Tor exit, impostor).
+  let calibratedScore = 0;
+  if (isIncognito) calibratedScore = Math.max(calibratedScore, 3);
+  if (raw?.developerTools) calibratedScore = Math.max(calibratedScore, 3);
+  if (hasTzMismatch) calibratedScore = Math.max(calibratedScore, 2);
+  if (raw?.proxyDetected) calibratedScore = Math.max(calibratedScore, 4);
+  if (isDatacenterAsn) {
+    calibratedScore = Math.max(calibratedScore, hasTzMismatch ? 4 : 3);
+  }
+  if (vmScore > 0) calibratedScore = Math.max(calibratedScore, vmScore);
+  if (isHeadless && !isBot) calibratedScore = Math.max(calibratedScore, 6);
+  if (isBot) calibratedScore = Math.max(calibratedScore, stealthAutomation ? 9 : 7);
+  if (ipBlocklisted) calibratedScore = Math.max(calibratedScore, 8);
+  if (tamperDetected || Boolean(raw?.tampering)) calibratedScore = Math.max(calibratedScore, 9);
+  if (integrityViolation) calibratedScore = Math.max(calibratedScore, 9);
+  if (torExitNode) calibratedScore = Math.max(calibratedScore, 9);
+  if (stealthAutomation) calibratedScore = Math.max(calibratedScore, 9);
+  if (spoofedImpostor) calibratedScore = 10;
+  const weightedCompositeScore = Math.min(10, calibratedScore);
   // Monotonic card-floor invariant: the headline score can never be lower than the highest
   // individual card. Two elevated cards add +1 synergy, three or more add +2. This is why a
   // 4/10 Incognito card next to a 5/10 VPN card can never be summarised as "4/10".

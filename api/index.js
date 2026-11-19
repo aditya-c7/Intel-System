@@ -7292,7 +7292,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const isIncognito = clientReportedIncognito;
   const tierFor = (score) => score >= 7 ? "High" : score >= 3 ? "Medium" : "Low";
   const levelFor = (score) => score >= 7 ? "high" : score >= 3 ? "medium" : "low";
-  const incognitoScore = isIncognito ? 4 : 0;
+  const incognitoScore = isIncognito ? 3 : 0;
   const incognitoSignal = {
     id: "incognito",
     title: "Incognito / Private Browsing",
@@ -7306,7 +7306,8 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   };
   const aiAgent = requestContext.aiAgent ?? null;
   const spoofedImpostor = aiAgent?.agentId === "impostor-spoof" || botSubtype === "bad_bot" && spoofedCrawler;
-  const botScore = spoofedImpostor ? 10 : botSubtype === "bad_bot" ? 9 : botSubtype === "ai_agent" ? 8 : botSubtype === "good_bot" ? 2 : 0;
+  const stealthAutomation = Boolean(raw?.stealthPluginDetected || raw?.cdpRuntimeLeak);
+  const botScore = spoofedImpostor ? 10 : botSubtype === "bad_bot" ? stealthAutomation ? 9 : 7 : botSubtype === "ai_agent" ? 7 : botSubtype === "good_bot" ? 2 : 0;
   const botStatus = spoofedImpostor ? "Spoofed AI Impostor" : botSubtype === "bad_bot" ? "Bot / Automated" : aiAgent?.detected && aiAgent.agentName ? aiAgent.agentName : botSubtype === "ai_agent" ? "AI Agent \xB7 Cloud Browser" : botSubtype === "good_bot" ? "Good Bot \xB7 Search Crawler" : "Verified Human";
   const aiAgentDetail = aiAgent?.detected && aiAgent.agentName ? `${aiAgent.agentName} \u2014 ${aiAgent.operator}${aiAgent.executionMode ? ` \xB7 ${aiAgent.executionMode}` : ""} \xB7 ${aiAgent.confidence}${aiAgent.verified ? " (verified)" : ""}: ${aiAgent.evidence[0] || "agent identity attributed from request headers"}` : "";
   const botDetail = botSubtype === "human" && !aiAgent?.detected ? "Verified human interactive session" : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected");
@@ -7329,7 +7330,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const torRelayNetwork = requestContext.torVerdict === "relay" || requestContext.torRelay === true;
   const torAnonymity = torExitNode || torBrowserClient;
   const torOperatorLabel = requestContext.torOperator ?? describeTorRelay(location.publicIp) ?? null;
-  const vpnScore = torAnonymity ? torExitNode && torBrowserClient ? 10 : 9 : ipBlocklisted ? 9 : verifiedCrawlerNetwork ? 2 : torRelayNetwork ? 6 : aiAgent?.detected ? 8 : isDatacenterAsn && hasTzMismatch ? 8 : isDatacenterAsn ? 6 : hasTzMismatch ? 5 : 0;
+  const vpnScore = torAnonymity ? torExitNode && torBrowserClient ? 10 : 9 : ipBlocklisted ? 9 : verifiedCrawlerNetwork ? 2 : torRelayNetwork ? 6 : aiAgent?.detected ? 7 : isDatacenterAsn && hasTzMismatch ? 4 : isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0;
   const vpnStatus = torAnonymity ? torExitNode && torBrowserClient ? "Tor Exit Node & Tor Browser" : torExitNode ? "Tor Exit Node" : "Tor Browser (Onion Routing / RFP)" : ipBlocklisted ? "Blocklisted IP" : verifiedCrawlerNetwork ? "Verified Crawler Network" : torRelayNetwork ? "Tor Relay (Non-Exit)" : aiAgent?.detected ? "AI Agent Cloud Network" : isDatacenterAsn ? "VPN / Datacenter Proxy" : hasTzMismatch ? "VPN / Timezone Relay" : "Standard ISP";
   const vpnDetail = torAnonymity ? `${torExitNode ? "Confirmed active Tor exit relay" : "Tor Browser fingerprint (Gecko RFP + letterboxing)"} (${location.publicIp} \xB7 ${torOperatorLabel || asnOrOrg})${torOperatorHint ? " \u2014 DNSEL unreachable, operator attribution used" : ""}${torExitNode && torBrowserClient ? " \xB7 server exit IP and client RFP both matched (10/10)" : ""}` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : verifiedCrawlerNetwork ? `${botClassification.provider} crawler operating from its own ${ispBrand}${asnSuffix} \u2014 crawler infrastructure, not a consumer proxy` : torRelayNetwork ? `Tor relay network (${torOperatorLabel || asnOrOrg}) \u2014 part of the Tor network but not an exit egress` : aiAgent?.detected ? `${aiAgent.agentName} (${aiAgent.operator}) \u2014 ${aiAgent.executionMode || "AI agent"} traffic from ${ispBrand}${asnSuffix}` : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
   const vpnSignal = {
@@ -7345,7 +7346,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const isTampered = isOsTampered;
   const cloudContainerVm = datacenterAsn && (isGpuMaskedOrUnavailable || cloudOrMaskedGpu);
   const vmLike = isVm || cloudContainerVm;
-  const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : vmLike ? 7 : isTampered ? 6 : 0;
+  const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : vmLike || isTampered ? 6 : 0;
   const vmStatus = tamperedRequest || replayDetected ? "Tampered / Replayed" : emulatorDetected ? "Mobile Emulator" : vmLike ? "Virtual Machine / VM" : isTampered ? "Spoofed Environment" : "Physical Hardware";
   const vmDetail = tamperedRequest || replayDetected ? requestIntegrityReason || "Sealed request envelope failed verification" : emulatorDetected ? emulatorReason || vmReason || "Mobile emulator / simulator runtime detected" : vmLike ? vmReason || (cloudContainerVm ? `Cloud container on ${ispBrand}${asnSuffix} exposed an unavailable / masked GPU` : "Hypervisor CPUID / virtualised GPU footprint detected") : isTampered ? vmReason || tamperReasons[0] || "Operating-system / User-Agent tampering detected" : "Unmasked physical GPU & consistent OS platform verified";
   const vmSignal = {
@@ -7365,8 +7366,24 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   };
   const integrityViolation = Boolean(tamperedRequest || replayDetected);
   const networkPoints = torExitNode ? 5 : verifiedCrawlerNetwork ? 0 : isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0;
-  const rawCompositePoints = (isBot ? 5 : isHeadless ? 4 : 0) + networkPoints + (vmScore > 0 ? 3 : 0) + (isIncognito ? 2 : 0) + (integrityViolation ? 2 : 0);
-  const weightedCompositeScore = Math.min(10, rawCompositePoints);
+  let calibratedScore = 0;
+  if (isIncognito) calibratedScore = Math.max(calibratedScore, 3);
+  if (raw?.developerTools) calibratedScore = Math.max(calibratedScore, 3);
+  if (hasTzMismatch) calibratedScore = Math.max(calibratedScore, 2);
+  if (raw?.proxyDetected) calibratedScore = Math.max(calibratedScore, 4);
+  if (isDatacenterAsn) {
+    calibratedScore = Math.max(calibratedScore, hasTzMismatch ? 4 : 3);
+  }
+  if (vmScore > 0) calibratedScore = Math.max(calibratedScore, vmScore);
+  if (isHeadless && !isBot) calibratedScore = Math.max(calibratedScore, 6);
+  if (isBot) calibratedScore = Math.max(calibratedScore, stealthAutomation ? 9 : 7);
+  if (ipBlocklisted) calibratedScore = Math.max(calibratedScore, 8);
+  if (tamperDetected || Boolean(raw?.tampering)) calibratedScore = Math.max(calibratedScore, 9);
+  if (integrityViolation) calibratedScore = Math.max(calibratedScore, 9);
+  if (torExitNode) calibratedScore = Math.max(calibratedScore, 9);
+  if (stealthAutomation) calibratedScore = Math.max(calibratedScore, 9);
+  if (spoofedImpostor) calibratedScore = 10;
+  const weightedCompositeScore = Math.min(10, calibratedScore);
   const cardScores = [incognitoScore, botScore, vpnScore, vmScore];
   const maxCardScore = Math.max(0, ...cardScores);
   const elevatedCardCount = cardScores.filter((score) => score >= 4).length;
