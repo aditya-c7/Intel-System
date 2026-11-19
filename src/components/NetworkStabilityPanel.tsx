@@ -474,28 +474,26 @@ export function NetworkStabilityPanel() {
     totalCount > 0 ? Number(((failedCount / totalCount) * 100).toFixed(1)) : 0;
 
   // Derived connection status — measured probes are authoritative; navigator.onLine is
-  // consulted only as a last resort when no probe has completed yet.
+  // consulted only as a last resort before any probe has completed.
   //
-  //   Online   : probes > 0, no consecutive failures, RTT measured, RTT <= 500 ms, loss < 15%
-  //   Degraded : probes > 0, RTT > 500 ms or loss >= 15%
-  //   Offline  : two consecutive probe failures, or no probes yet while the browser is offline
+  //   Online   : a completed probe with a measured RTT and fewer than two consecutive failures.
+  //              A successful HTTP round trip is proof of reachability, so a slow RTT or a
+  //              single lost sample can never render the panel "Offline" while 0% of probes fail.
+  //   Degraded : probes exist but the latest one failed once, or no RTT is measured yet
+  //   Offline  : two consecutive probe failures, or no probes while the browser is offline
   //   Probing… : no probes yet and the browser is not explicitly offline
   const totalProbes = samples.length;
   const navigatorOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
-  const slowRtt = currentLatencyMs !== null && currentLatencyMs > 500;
-  const highLoss = failureRatePercent >= 15;
   const connectionStatus: 'Offline' | 'Probing...' | 'Degraded' | 'Online' =
-    totalProbes > 0 && consecutiveFailures >= 2
-      ? 'Offline'
-      : totalProbes === 0
-      ? navigatorOffline
-        ? 'Offline'
-        : 'Probing...'
-      : consecutiveFailures === 0 && currentLatencyMs !== null && !slowRtt && !highLoss
+    totalProbes > 0 && consecutiveFailures < 2 && currentLatencyMs !== null
       ? 'Online'
-      : slowRtt || highLoss || (currentLatencyMs !== null && consecutiveFailures > 0)
+      : totalProbes > 0 && consecutiveFailures >= 2
+      ? 'Offline'
+      : totalProbes > 0
       ? 'Degraded'
-      : 'Online';
+      : navigatorOffline
+      ? 'Offline'
+      : 'Probing...';
 
   // Responsive 1:1 SVG Chart Geometry (never shrinks or squeezes on mobile screens)
   const isCompactMobile = chartWidth < 420;
