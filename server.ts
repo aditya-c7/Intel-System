@@ -921,6 +921,8 @@ export function normalizeIspAndOrg(
 /** ASN numbers of the major cloud / hosting providers used by the network classification. */
 const CLOUD_PROVIDER_ASN_NUMBERS = new Set<number>([
   396178, 15169, 16509, 14618, 13335, 14061, 9009, 60068, 24940, 63949, 16276, 8075, 20473,
+  11878, // Tzulo — hosting network rented by VPN providers, not a VPN operator itself
+  212238, // CDNEXT / Datacamp — hosting network, not a VPN operator itself
 ]);
 
 /**
@@ -1077,7 +1079,7 @@ export function classifyIspNetwork(isp: string, org: string, asn: string): IspNe
   // Cloud / datacenter — only reached when no consumer rule matched above.
   const cloudAsnHit = Array.from(asnNumbers).find((n) => CLOUD_PROVIDER_ASN_NUMBERS.has(n));
   const cloudKeywords =
-    /google llc|google cloud|amazonaws|cloudflare|digitalocean|hetzner|m247|datacamp|linode|ovh|choopa|vultr|leaseweb|hostinger|contabo|akamai|oracle cloud|alibaba|aliyun|tencent cloud/i;
+    /google llc|google cloud|amazonaws|cloudflare|digitalocean|hetzner|m247|datacamp|datapacket|cdnext|cdn77|tzulo|linode|ovh|choopa|vultr|leaseweb|hostinger|contabo|akamai|oracle cloud|alibaba|aliyun|tencent cloud/i;
   if (cloudAsnHit !== undefined || cloudKeywords.test(keywordHaystack)) {
     return {
       // Prefer the real operator name (Google LLC, Amazon.com, Inc., Microsoft
@@ -5048,6 +5050,12 @@ function sanitizeAndReinforceSecuritySignals(
   const stealthAutomation = Boolean(
     raw?.stealthPluginDetected || raw?.cdpRuntimeLeak || antiDetectBrowser || mlTampering
   );
+  // A bare CDP Runtime leak proves automation, but it is not active deception: stock Playwright
+  // and Puppeteer always emit it. Only plugin patches, an anti-detect footprint or a tampering
+  // model score justify the critical 9/10 tier. This keeps a plain headless browser at 7–8.
+  const activeDeception = Boolean(
+    raw?.stealthPluginDetected || antiDetectBrowser || mlTampering
+  );
   const hardAutomationReasons: string[] = [];
   if (raw?.cdpRuntimeLeak) {
     hardAutomationReasons.push('CDP Runtime.enable serialization leak');
@@ -5400,7 +5408,7 @@ function sanitizeAndReinforceSecuritySignals(
   // never suppress the escalation on the tile.
   const botScore = spoofedImpostor
     ? 10
-    : stealthAutomation
+    : activeDeception
     ? 9
     : botSubtype === 'bad_bot'
     ? 7
@@ -5636,12 +5644,12 @@ function sanitizeAndReinforceSecuritySignals(
   }
   if (vmScore > 0) calibratedScore = Math.max(calibratedScore, vmScore);
   if (isHeadless && !isBot) calibratedScore = Math.max(calibratedScore, 6);
-  if (isBot) calibratedScore = Math.max(calibratedScore, stealthAutomation ? 9 : 7);
+  if (isBot) calibratedScore = Math.max(calibratedScore, activeDeception ? 9 : 7);
   if (ipBlocklisted) calibratedScore = Math.max(calibratedScore, 8);
   if (tamperDetected || Boolean(raw?.tampering)) calibratedScore = Math.max(calibratedScore, 9);
   if (integrityViolation) calibratedScore = Math.max(calibratedScore, 9);
   if (torExitNode) calibratedScore = Math.max(calibratedScore, 9);
-  if (stealthAutomation) calibratedScore = Math.max(calibratedScore, 9);
+  if (activeDeception) calibratedScore = Math.max(calibratedScore, 9);
   if (spoofedImpostor) calibratedScore = 10;
   const weightedCompositeScore = Math.min(10, calibratedScore);
   // Monotonic card-floor invariant: the headline score can never be lower than the highest
@@ -5656,7 +5664,7 @@ function sanitizeAndReinforceSecuritySignals(
   // a plain headless / cloud-VM / timezone-relay session to a critical headline — cap the
   // non-deception path at 8 so those combinations cannot saturate at 10.
   const criticalDeception = Boolean(
-    stealthAutomation ||
+    activeDeception ||
       spoofedImpostor ||
       tamperDetected ||
       raw?.tampering ||
