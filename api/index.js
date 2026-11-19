@@ -4470,7 +4470,8 @@ var TOR_OPERATOR_ORG_PATTERN = /\b(church of cyberology|cyberology|nothing to hi
 var TOR_OPERATOR_IPV4_CIDRS = ["192.42.116.0/24"];
 var TOR_OPERATOR_IPV6_PREFIXES = ["2001:67c:e60::/48", "2a02:898:256::/48"];
 var TOR_OPERATOR_REVERSE_DNS_PATTERN = /\b(tor-?exit|tor-?relay|exit-?node|nothingtohide\.nl|hartvoorinternetvrijheid\.nl|cyberology\.(nl|church)|torservers\.net|emeraldonion\.org|applied-privacy\.net|artikel10\.org|nos-oignons\.net|tor\.r0cket\.net)\b/i;
-var VPN_PROXY_PATTERN = /\b(vpn|nordvpn|expressvpn|surfshark|cyberghost|private internet access|proton\s?vpn|mullvad|windscribe|ipvanish|hide\.?me|hola vpn|psiphon|packet hub|packethub|tor ?guard|proxy|socks5|smart dns)\b/i;
+var VPN_PROXY_PATTERN = /\b(vpn|nordvpn|expressvpn|surfshark|cyberghost|cyberzone|private internet access|proton(?:\s?vpn)?|mullvad|31173|windscribe|ipvanish|hide\.?me|hola vpn|psiphon|packet hub|packethub|tor ?guard|proxy|socks5|smart dns)\b/i;
+var HOSTING_EGRESS_PATTERN = /\b(m247|datacamp|cdnext|tzulo|cloudflare|amazonaws|amazon|aws|google cloud|google llc|azure|microsoft|digitalocean|hetzner|linode|ovh|choopa|vultr|leaseweb|hostinger|contabo|akamai|oracle cloud|alibaba|aliyun|tencent cloud|latitude|hosting|hosted|datacenter|data center|cloud)\b/i;
 var MOBILE_CARRIER_PATTERN = /\b(mobile|cellular|wireless|5g|4g|lte|t-mobile|tmobile|verizon wireless|cellco|vodafone|orange s\.?a|telefonica|movistar|claro|tim s\.?p\.?a|mtn)\b/i;
 function matchesTorOperatorAsn(asn) {
   const clean = typeof asn === "string" ? asn.trim().toUpperCase() : "";
@@ -4785,6 +4786,31 @@ function classifyBotTraffic(headers, network, client) {
   const secFetchDest = readRequestHeader(headers, "sec-fetch-dest");
   const networkHaystack = [network.org, network.isp, network.asn].filter((part) => typeof part === "string" && part.trim().length > 0).join(" ");
   const clientSignals = Array.isArray(client.botSignals) ? client.botSignals.filter((s) => typeof s === "string" && s.trim().length > 0) : [];
+  const hardAutomation = Boolean(client.stealthPluginDetected || client.cdpRuntimeLeak || client.antiDetectBrowser) || typeof client.tamperingMlScore === "number" && client.tamperingMlScore >= 0.5;
+  if (hardAutomation) {
+    const reasons = [];
+    if (client.cdpRuntimeLeak) {
+      reasons.push("CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked)");
+    }
+    if (client.stealthPluginDetected) {
+      reasons.push("Stealth plugin artifacts (rewritten native getters / iframe identity leak)");
+    }
+    if (client.antiDetectBrowser) {
+      reasons.push("Anti-detect browser footprint (spoofed screen / patched navigator getters)");
+    }
+    if (typeof client.tamperingMlScore === "number" && client.tamperingMlScore >= 0.5) {
+      reasons.push(`Browser tampering ML score ${client.tamperingMlScore.toFixed(3)}`);
+    }
+    for (const signal of clientSignals.slice(0, 2)) reasons.push(signal);
+    return {
+      subtype: "bad_bot",
+      label: client.antiDetectBrowser ? "Anti-Detect Browser" : client.stealthPluginDetected ? "Puppeteer / Playwright Stealth" : "HeadlessChrome / CDP Automation",
+      provider: client.antiDetectBrowser ? "Anti-Detect Browser" : client.stealthPluginDetected ? "Stealth Automation (Puppeteer/Playwright)" : "Chromium",
+      category: "Automation",
+      confidence: 0.94,
+      reasons: reasons.length > 0 ? reasons : ["Hard automation artifact reported by client"]
+    };
+  }
   for (const rule of GOOD_BOT_UA_RULES) {
     if (!rule.pattern.test(ua)) continue;
     if (rule.network.test(networkHaystack)) {
@@ -4860,24 +4886,6 @@ function classifyBotTraffic(headers, network, client) {
         client.webdriver ? "WebDriver runtime binding present" : "CDP runtime binding present",
         `Datacenter ASN hosting the agent (${networkHaystack})`
       ]
-    };
-  }
-  if (client.stealthPluginDetected || client.cdpRuntimeLeak) {
-    const reasons = [];
-    if (client.cdpRuntimeLeak) {
-      reasons.push("CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked)");
-    }
-    if (client.stealthPluginDetected) {
-      reasons.push("Stealth plugin artifacts (rewritten native getters / iframe identity leak)");
-    }
-    for (const signal of clientSignals.slice(0, 2)) reasons.push(signal);
-    return {
-      subtype: "bad_bot",
-      label: client.stealthPluginDetected ? "Puppeteer / Playwright Stealth" : "HeadlessChrome / CDP Automation",
-      provider: client.stealthPluginDetected ? "Stealth Automation (Puppeteer/Playwright)" : "Chromium",
-      category: "Automation",
-      confidence: 0.94,
-      reasons
     };
   }
   const isDesktopChromeOrSafari = /chrome\/|crios\/|safari\//i.test(ua) && !/mobile|android|iphone|ipad/i.test(ua);
@@ -7173,7 +7181,26 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const botReason = typeof raw?.botReason === "string" && raw.botReason.trim() ? raw.botReason.trim().slice(0, 200) : "";
   const botSignals = safeStrArray(raw?.botSignals);
   const clientAutomationDetected = Boolean(raw?.isBot || webdriver || cdpDetected);
-  const botClassification = requestContext.botClassification ?? classifyBotTraffic(
+  const antiDetectBrowser = Boolean(raw?.tamperingDetails?.anti_detect_browser);
+  const tamperingMlScore = typeof raw?.tamperingMlScore === "number" && Number.isFinite(raw.tamperingMlScore) ? raw.tamperingMlScore : 0;
+  const mlTampering = tamperingMlScore >= 0.5;
+  const stealthAutomation = Boolean(
+    raw?.stealthPluginDetected || raw?.cdpRuntimeLeak || antiDetectBrowser || mlTampering
+  );
+  const hardAutomationReasons = [];
+  if (raw?.cdpRuntimeLeak) {
+    hardAutomationReasons.push("CDP Runtime.enable serialization leak");
+  }
+  if (raw?.stealthPluginDetected) {
+    hardAutomationReasons.push("Stealth plugin artifacts (non-native getters / iframe leak)");
+  }
+  if (antiDetectBrowser) {
+    hardAutomationReasons.push("Anti-detect browser footprint (tamperingDetails)");
+  }
+  if (mlTampering) {
+    hardAutomationReasons.push(`Browser tampering ML score ${tamperingMlScore.toFixed(3)}`);
+  }
+  const rawBotClassification = requestContext.botClassification ?? classifyBotTraffic(
     requestContext.headers,
     { org: location.org, isp: location.isp, asn: location.asn },
     {
@@ -7183,9 +7210,19 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       cdpDetected,
       botSignals,
       cdpRuntimeLeak: Boolean(raw?.cdpRuntimeLeak),
-      stealthPluginDetected: Boolean(raw?.stealthPluginDetected)
+      stealthPluginDetected: Boolean(raw?.stealthPluginDetected),
+      antiDetectBrowser,
+      tamperingMlScore
     }
   );
+  const botClassification = stealthAutomation && rawBotClassification.subtype !== "bad_bot" ? {
+    subtype: "bad_bot",
+    label: antiDetectBrowser ? "Anti-Detect Browser" : "Stealth / CDP Automation",
+    provider: antiDetectBrowser ? "Anti-Detect Browser" : "Stealth Automation (Puppeteer/Playwright)",
+    category: "Automation",
+    confidence: 0.94,
+    reasons: hardAutomationReasons.length > 0 ? hardAutomationReasons : ["Hard automation artifact reported by client"]
+  } : rawBotClassification;
   const botSubtype = botClassification.subtype;
   const spoofedCrawler = botClassification.subtype === "bad_bot" && botClassification.label === "Spoofed Crawler";
   const isBot = botSubtype === "bad_bot" || botSubtype === "ai_agent";
@@ -7229,7 +7266,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     clientTzCanonical && ipTzCanonical && clientTzCanonical.toLowerCase() !== ipTzCanonical.toLowerCase()
   );
   const networkHaystackForVpn = `${location.isp} ${location.org}`;
-  const commercialVpnProvider = !classification.isConsumerBroadband && VPN_PROXY_PATTERN.test(networkHaystackForVpn) && !/\bcloud\b|\bhosting\b|\bdatacenter\b|\bdata center\b/i.test(networkHaystackForVpn);
+  const commercialVpnProvider = !baseClassification.isConsumerBroadband && baseClassification.networkType === "VPN / Proxy Relay" && VPN_PROXY_PATTERN.test(networkHaystackForVpn) && !HOSTING_EGRESS_PATTERN.test(networkHaystackForVpn);
   const vpnMethods = {
     timezone_mismatch: hasTzMismatch,
     public_vpn: commercialVpnProvider,
@@ -7306,11 +7343,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   };
   const aiAgent = requestContext.aiAgent ?? null;
   const spoofedImpostor = aiAgent?.agentId === "impostor-spoof" || botSubtype === "bad_bot" && spoofedCrawler;
-  const stealthAutomation = Boolean(raw?.stealthPluginDetected || raw?.cdpRuntimeLeak);
-  const botScore = spoofedImpostor ? 10 : botSubtype === "bad_bot" ? stealthAutomation ? 9 : 7 : botSubtype === "ai_agent" ? 7 : botSubtype === "good_bot" ? 2 : 0;
-  const botStatus = spoofedImpostor ? "Spoofed AI Impostor" : botSubtype === "bad_bot" ? "Bot / Automated" : aiAgent?.detected && aiAgent.agentName ? aiAgent.agentName : botSubtype === "ai_agent" ? "AI Agent \xB7 Cloud Browser" : botSubtype === "good_bot" ? "Good Bot \xB7 Search Crawler" : "Verified Human";
+  const botScore = spoofedImpostor ? 10 : stealthAutomation ? 9 : botSubtype === "bad_bot" ? 7 : botSubtype === "ai_agent" ? 7 : botSubtype === "good_bot" ? 2 : 0;
+  const botStatus = spoofedImpostor ? "Spoofed AI Impostor" : stealthAutomation || botSubtype === "bad_bot" ? "Bot / Automated" : aiAgent?.detected && aiAgent.agentName ? aiAgent.agentName : botSubtype === "ai_agent" ? "AI Agent \xB7 Cloud Browser" : botSubtype === "good_bot" ? "Good Bot \xB7 Search Crawler" : "Verified Human";
   const aiAgentDetail = aiAgent?.detected && aiAgent.agentName ? `${aiAgent.agentName} \u2014 ${aiAgent.operator}${aiAgent.executionMode ? ` \xB7 ${aiAgent.executionMode}` : ""} \xB7 ${aiAgent.confidence}${aiAgent.verified ? " (verified)" : ""}: ${aiAgent.evidence[0] || "agent identity attributed from request headers"}` : "";
-  const botDetail = botSubtype === "human" && !aiAgent?.detected ? "Verified human interactive session" : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected");
+  const botDetail = stealthAutomation ? `${hardAutomationReasons.join("; ") || "Stealth / anti-detect automation runtime detected"} \u2014 hard automation artifact, never a verified human` : botSubtype === "human" && !aiAgent?.detected ? "Verified human interactive session" : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected");
   const botSignal = {
     id: "bot",
     title: "Bot & Automation Detection",
@@ -7388,10 +7424,11 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const maxCardScore = Math.max(0, ...cardScores);
   const elevatedCardCount = cardScores.filter((score) => score >= 4).length;
   const synergyBonus = elevatedCardCount >= 3 ? 2 : elevatedCardCount === 2 ? 1 : 0;
-  const suspectScore = Math.min(
-    10,
-    Math.max(weightedCompositeScore, maxCardScore + synergyBonus)
+  const criticalDeception = Boolean(
+    stealthAutomation || spoofedImpostor || tamperDetected || raw?.tampering || integrityViolation || torExitNode
   );
+  const cardFloorScore = Math.max(weightedCompositeScore, maxCardScore + synergyBonus);
+  const suspectScore = criticalDeception ? Math.min(10, cardFloorScore) : Math.min(8, cardFloorScore);
   const riskLevel = tierFor(suspectScore);
   const riskBadgeText = `${riskLevel} Risk \u2022 ${suspectScore}/10`;
   const riskFactors = [];
@@ -8109,6 +8146,9 @@ app.post("/api/visitor/identify", async (req, res) => {
     const envelopeRequestUserAgent = typeof requestBody.securityEnvelope?.userAgent === "string" ? requestBody.securityEnvelope.userAgent.trim() : "";
     const headerCarriesBotSignature = Boolean(headerRequestUserAgent) && (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) || GOOD_BOT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)) || AI_AGENT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)));
     const fullRequestUserAgent = headerCarriesBotSignature ? headerRequestUserAgent : envelopeRequestUserAgent || headerRequestUserAgent;
+    const hardAutomationSignals = Boolean(
+      rawSecuritySignals?.cdpRuntimeLeak || rawSecuritySignals?.stealthPluginDetected || rawSecuritySignals?.tamperingDetails?.anti_detect_browser || typeof rawSecuritySignals?.tamperingMlScore === "number" && rawSecuritySignals.tamperingMlScore >= 0.5
+    );
     const botClassification = classifyBotTraffic(
       { ...rawRequestHeaders, "user-agent": fullRequestUserAgent },
       { org: location.org, isp: location.isp, asn: location.asn },
@@ -8119,7 +8159,11 @@ app.post("/api/visitor/identify", async (req, res) => {
         isHeadless: Boolean(rawSecuritySignals?.isHeadless),
         webdriver: Boolean(rawSecuritySignals?.webdriver),
         cdpDetected: Boolean(rawSecuritySignals?.cdpDetected),
-        botSignals: Array.isArray(rawSecuritySignals?.botSignals) ? rawSecuritySignals.botSignals : []
+        botSignals: Array.isArray(rawSecuritySignals?.botSignals) ? rawSecuritySignals.botSignals : [],
+        cdpRuntimeLeak: Boolean(rawSecuritySignals?.cdpRuntimeLeak),
+        stealthPluginDetected: Boolean(rawSecuritySignals?.stealthPluginDetected),
+        antiDetectBrowser: Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
+        tamperingMlScore: typeof rawSecuritySignals?.tamperingMlScore === "number" ? rawSecuritySignals.tamperingMlScore : 0
       }
     );
     const torLookupTarget = location.publicIp.trim().toLowerCase();
@@ -8193,7 +8237,7 @@ app.post("/api/visitor/identify", async (req, res) => {
       confidence: aiAgent.verified ? 0.99 : 0.85,
       reasons: aiAgent.evidence.slice(0, 3)
     } : null;
-    const effectiveBotClassification = attributedBotClassification ?? botClassification;
+    const effectiveBotClassification = hardAutomationSignals && attributedBotClassification?.subtype !== "bad_bot" ? botClassification : attributedBotClassification ?? botClassification;
     const signedPayloadTampered = /Payload integrity hash mismatch/i.test(
       envelopeVerdict.requestIntegrityReason
     );
@@ -8246,6 +8290,39 @@ app.post("/api/visitor/identify", async (req, res) => {
         botClassification: effectiveBotClassification
       }
     );
+    const serverVerifiedBrowser = uaIdentity.browserName && uaIdentity.browserName !== "Unknown" ? `${uaIdentity.browserName}${uaIdentity.browserFullVersion ? ` ${uaIdentity.browserFullVersion}` : ""}` : browserDevice.browser;
+    const serverVerifiedOs = uaIdentity.os && uaIdentity.os !== "Unknown" ? `${uaIdentity.os}${uaIdentity.osVersion ? ` ${uaIdentity.osVersion}` : ""}` : browserDevice.os;
+    const osFamilyKey = (value) => {
+      const text = String(value || "").toLowerCase();
+      if (!text || text === "unknown") return "";
+      if (/mac os x|macos|macintosh|\bmac\b/.test(text)) return "macos";
+      if (/iphone|ipad|ipod|ipados|\bios\b/.test(text)) return "ios";
+      if (/android/.test(text)) return "android";
+      if (/windows|win32|win64/.test(text)) return "windows";
+      if (/linux|ubuntu|fedora|debian|chrome ?os/.test(text)) return "linux";
+      return text.replace(/[^a-z0-9]/g, "");
+    };
+    const browserFamilyKey = (value) => {
+      const text = String(value || "").toLowerCase();
+      if (!text || text === "unknown") return "";
+      if (/edg(e|a|ios)?\b|edge/.test(text)) return "edge";
+      if (/opera|\bopr\b/.test(text)) return "opera";
+      if (/firefox|fxios/.test(text)) return "firefox";
+      if (/crios|chrome|chromium/.test(text)) return "chrome";
+      if (/safari/.test(text)) return "safari";
+      return text.replace(/[^a-z0-9]/g, "");
+    };
+    const serverOsFamily = osFamilyKey(serverVerifiedOs);
+    const clientOsFamily = osFamilyKey(browserDevice.os);
+    const serverBrowserFamily = browserFamilyKey(serverVerifiedBrowser);
+    const clientBrowserFamily = browserFamilyKey(browserDevice.browser);
+    const headerMismatch = Boolean(
+      serverOsFamily && clientOsFamily && serverOsFamily !== clientOsFamily || serverBrowserFamily && clientBrowserFamily && serverBrowserFamily !== clientBrowserFamily
+    );
+    securitySignals.serverVerifiedBrowser = serverVerifiedBrowser;
+    securitySignals.serverVerifiedOs = serverVerifiedOs;
+    securitySignals.headerMismatch = headerMismatch;
+    securitySignals.headerMismatchReason = headerMismatch ? `Server headers report ${serverVerifiedBrowser} on ${serverVerifiedOs}, but the client reported ${browserDevice.browser} on ${browserDevice.os}` : "";
     const velocityReport = computeVelocitySignals(
       db,
       visitorId,
@@ -8293,7 +8370,7 @@ app.post("/api/visitor/identify", async (req, res) => {
       developerTools,
       rareDevice: rarityReport.rareDevice
     });
-    const currentBotName = (aiAgent?.detected ? aiAgent.agentName : "") || (effectiveBotClassification.subtype !== "human" ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim() : "");
+    const currentBotName = hardAutomationSignals ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim() : (aiAgent?.detected ? aiAgent.agentName : "") || (effectiveBotClassification.subtype !== "human" ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim() : "");
     const visitHistory = rawVisits.map((r) => {
       const storedScore10 = typeof r.score10 === "number" && Number.isFinite(r.score10) ? Math.max(0, Math.min(10, Math.round(r.score10))) : null;
       const storedSuspectScore = typeof r.suspect_score === "number" && Number.isFinite(r.suspect_score) ? normalizeLegacySuspectScore(r.suspect_score) : storedScore10;
@@ -8371,7 +8448,16 @@ app.post("/api/visitor/identify", async (req, res) => {
     let botInfo = null;
     let botType = null;
     let botVerdict = "not_detected";
-    if (robodexResult.detected && robodexResult.botInfo) {
+    if (hardAutomationSignals) {
+      botInfo = {
+        category: "browser_automation",
+        provider: effectiveBotClassification.provider || "Unknown",
+        name: effectiveBotClassification.label || "Automated Tool",
+        identity: "unknown"
+      };
+      botType = "browser_automation";
+      botVerdict = "bad";
+    } else if (robodexResult.detected && robodexResult.botInfo) {
       botInfo = robodexResult.botInfo;
       botType = robodexResult.botType;
       botVerdict = botInfo?.identity === "spoofed" || botInfo?.identity === "unknown" ? "bad" : botType === "ai_agent" || botType === "ai_browser" || botType === "browser_automation" ? "bad" : "good";
