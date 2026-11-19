@@ -2,7 +2,7 @@ import { build } from 'esbuild';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 
-// Adapt only the Worker bundle. The Node/Vercel source and build remain unchanged.
+// Adapt only the Worker bundle. The shared Node source and build remain unchanged.
 // Fail closed if server.ts changes shape rather than silently publishing a broken adapter.
 function replaceOnce(source, before, after) {
   if (source.split(before).length !== 2) {

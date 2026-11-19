@@ -3,10 +3,10 @@ import { existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 
 /**
- * Bundles the Express application (server.ts) together with the Vercel
+ * Bundles the Express application (server.ts) together with the portable Node
  * entry point into a single ESM function at `api/index.js`.
  *
- * Why: the Vercel Node.js runtime executes the function as native ESM because
+ * Why: the runtime executes the bundle as native ESM because
  * package.json has `"type": "module"`. Extensionless TypeScript imports are
  * not valid ESM specifiers at runtime, so shipping an unbundled `api/index.ts`
  * can crash with ERR_MODULE_NOT_FOUND. Pre-bundling removes the whole class of

@@ -1,32 +1,31 @@
 /**
- * Vercel serverless entry point.
+ * Portable Node/Edge entry point (deployed on Cloudflare).
  *
- * This file is NOT exposed as a Vercel Function (files starting with "_" inside
- * /api are ignored by Vercel). `npm run build` bundles it together with
+ * This file is NOT routed directly (files starting with "_" inside /api are
+ * ignored by deploy adapters). `npm run build` bundles it together with
  * `server.ts` into the single `api/index.js` function using esbuild, which
- * removes every ESM/TypeScript path-resolution problem on the Vercel Node.js
- * runtime.
+ * removes every ESM/TypeScript path-resolution problem on the Node runtime.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import app from '../server';
 
 const API_PREFIX = '/api';
 
-type VercelRequest = IncomingMessage & {
+type EdgeRequest = IncomingMessage & {
   url?: string;
   originalUrl?: string;
   query?: Record<string, string | string[] | undefined>;
 };
 
 /**
- * Vercel rewrites `/api/(.*)` to `/api/index?__ipath=$1` so that this single
+ * A platform rewrite maps `/api/(.*)` to `/api/index?__ipath=$1` so that this single
  * function can serve every API route. Depending on the routing layer the
  * incoming `req.url` can be either the original path or the rewritten one, so
  * we normalise it here: Express always receives the real route and all original
  * query parameters (token, bytes, s, t, etc.) intact.
  */
 function applyRestoredUrlAndQuery(
-  req: VercelRequest,
+  req: EdgeRequest,
   restoredPath: string,
   params: URLSearchParams
 ): void {
@@ -77,10 +76,10 @@ function applyRestoredUrlAndQuery(
   }
 }
 
-function restoreOriginalApiUrl(req: VercelRequest): void {
+function restoreOriginalApiUrl(req: EdgeRequest): void {
   const rawUrl = typeof req.url === 'string' && req.url.length > 0 ? req.url : '/';
 
-  // Parse the (possibly rewritten) request URL safely. Vercel rewrites `/api/(.*)`
+  // Parse the (possibly rewritten) request URL safely. The platform rewrites `/api/(.*)`
   // to `/api/index?__ipath=$1`, so the rewritten URL carries the real route inside
   // the __ipath query parameter.
   let parsedUrl: URL;
@@ -97,7 +96,7 @@ function restoreOriginalApiUrl(req: VercelRequest): void {
 
   const searchParams = parsedUrl.searchParams;
 
-  // Merge any query parameters pre-parsed by the Vercel runtime into searchParams
+  // Merge any query parameters pre-parsed by the runtime into searchParams
   try {
     if (req.query && typeof req.query === 'object') {
       for (const [k, v] of Object.entries(req.query)) {
@@ -146,7 +145,7 @@ function restoreOriginalApiUrl(req: VercelRequest): void {
   }
 
   // Safety net: if the platform handed us the rewritten path (/api/index) without __ipath,
-  // recover the original path from Vercel headers.
+  // recover the original path from platform rewrite headers.
   if (pathPart === '/api/index' || pathPart === '/api/index.js') {
     const headerValue =
       (req.headers['x-vercel-original-path'] as string | undefined) ||
@@ -177,12 +176,12 @@ function restoreOriginalApiUrl(req: VercelRequest): void {
   applyRestoredUrlAndQuery(req, pathPart, searchParams);
 }
 
-export default function handler(req: VercelRequest, res: ServerResponse): void {
+export default function handler(req: EdgeRequest, res: ServerResponse): void {
   try {
     restoreOriginalApiUrl(req);
   } catch {
     // Never block a request because of URL normalisation.
   }
 
-  (app as unknown as (request: VercelRequest, response: ServerResponse) => void)(req, res);
+  (app as unknown as (request: EdgeRequest, response: ServerResponse) => void)(req, res);
 }
