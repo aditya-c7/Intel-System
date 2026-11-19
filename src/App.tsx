@@ -1105,6 +1105,15 @@ export default function App() {
   const rawGpuTooltip = data?.hardwareSignals
     ? `${data.hardwareSignals.gpuVendor} • ${data.hardwareSignals.gpuRenderer}`
     : '';
+  // Anti-spoof integrity. When the server caught an anti-detect browser or rewritten Navigator
+  // getters, the cores / RAM / GPU numbers come from the very getters that were patched, so the
+  // dashboard shows them with an explicit unverified tag instead of presenting them as facts.
+  const spoofedSpecs = Boolean(
+    data?.tamperingDetails?.anti_detect_browser ||
+      data?.securitySignals?.stealthPluginDetected ||
+      data?.securitySignals?.cdpRuntimeLeak
+  );
+  const spoofedSpecTag = spoofedSpecs ? ' (Spoofed / Unverified)' : '';
 
   // 4-signal core grid model (null-safe: renders only inside the data block). The server's
   // computed grid is preferred; the client mirror covers older responses.
@@ -1286,7 +1295,9 @@ export default function App() {
             accuracy_radius: data.location.isLocationVerified ? 100 : null,
             latitude: data.location.latitude,
             longitude: data.location.longitude,
-            timezone: data.browserDevice.timezone,
+            // IP geolocation timezone only. Falling back to the browser timezone here is what
+            // made a Singapore egress print "Asia/Calcutta" inside ip_info.
+            timezone: data.location.timezone ?? null,
             city_name: data.location.city,
             country_code: data.location.countryCode,
             country_name: data.location.country,
@@ -1319,13 +1330,15 @@ export default function App() {
       virtual_machine: Boolean(s.isVirtualMachine || s.emulatorDetected),
       vpn: Boolean(s.vpnSuspected),
       vpn_confidence: s.vpnSuspected ? 'high' : 'low',
+      // Server-authoritative method object: the grid tile count is derived from this exact
+      // object, so the subtitle can never disagree with #raw-json.
       vpn_methods: {
-        timezone_mismatch: Boolean(s.timezoneMismatch),
-        public_vpn: Boolean(s.datacenterAsn),
-        auxiliary_mobile: false,
-        os_mismatch: Boolean(s.isOsTampered),
-        relay: Boolean(s.torExitNode),
-        ml_prediction: Boolean(s.vpnSuspected),
+        timezone_mismatch: Boolean(s.vpnMethods?.timezone_mismatch ?? s.timezoneMismatch),
+        public_vpn: Boolean(s.vpnMethods?.public_vpn),
+        auxiliary_mobile: Boolean(s.vpnMethods?.auxiliary_mobile),
+        os_mismatch: Boolean(s.vpnMethods?.os_mismatch ?? s.isOsTampered),
+        relay: Boolean(s.vpnMethods?.relay ?? s.torExitNode),
+        ml_prediction: Boolean(s.vpnMethods?.ml_prediction),
       },
       high_activity_device: Boolean(data.highActivityDevice ?? s.highActivityDevice),
       rare_device: Boolean(data.rareDevice ?? s.rareDevice),
@@ -2178,6 +2191,11 @@ export default function App() {
                           ? `${data.hardwareSignals.cpuCores} Cores`
                           : 'Multi-Core'}{' '}
                         • {data.hardwareSignals.architecture}
+                        {spoofedSpecs && (
+                          <span className="ml-1.5 text-[9px] font-sans font-medium text-amber-600">
+                            (Spoofed / Unverified)
+                          </span>
+                        )}
                       </span>
                     </div>
                   </div>
@@ -2201,6 +2219,11 @@ export default function App() {
                       </div>
                       <span className="block text-xs sm:text-sm font-semibold text-[#111827] truncate mt-0.5">
                         {cleanGpuName}
+                        {spoofedSpecs && (
+                          <span className="ml-1.5 text-[9px] font-sans font-medium text-amber-600">
+                            (Spoofed / Unverified)
+                          </span>
+                        )}
                       </span>
                     </div>
                   </div>
@@ -2212,11 +2235,23 @@ export default function App() {
                     </div>
                     <div className="min-w-0 flex-1">
                       <span className="block text-[11px] text-slate-500">Memory Tier</span>
-                      <span className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5">
+                      <span
+                        className="block text-xs sm:text-sm font-semibold font-mono tabular-nums text-[#111827] truncate mt-0.5"
+                        title={
+                          data.hardwareSignals.deviceMemoryGb
+                            ? `${data.hardwareSignals.deviceMemoryGb} GB reported by navigator.deviceMemory${spoofedSpecTag}`
+                            : 'navigator.deviceMemory is hidden by this browser'
+                        }
+                      >
                         {data.hardwareSignals.deviceMemoryGb
                           ? `~${data.hardwareSignals.deviceMemoryGb} GB RAM`
-                          : 'Standard RAM'}{' '}
+                          : 'Hidden / N/A'}{' '}
                         • {data.hardwareSignals.colorDepth}-bit
+                        {spoofedSpecs && data.hardwareSignals.deviceMemoryGb != null && (
+                          <span className="ml-1.5 text-[9px] font-sans font-medium text-amber-600">
+                            (Spoofed / Unverified)
+                          </span>
+                        )}
                       </span>
                     </div>
                   </div>

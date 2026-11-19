@@ -100,11 +100,30 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   });
 
   const vpn = Boolean(signals.vpnSuspected);
-  const vpnMethodCount = Array.isArray(signals.vpnReasons) ? signals.vpnReasons.length : 0;
+  // The count comes from the server's `vpnMethods` object, the same object the event JSON
+  // prints, so the subtitle can never claim more methods than `#raw-json` contains.
+  const methods = signals.vpnMethods;
+  const vpnMethodCount = methods
+    ? Object.values(methods).filter(Boolean).length
+    : Array.isArray(signals.vpnReasons)
+    ? signals.vpnReasons.length
+    : 0;
+  const datacenterEgress = Boolean(signals.datacenterAsn ?? signals.isDatacenterOrHosting);
+  const vpnStatus = !vpn
+    ? 'Not detected'
+    : methods?.public_vpn
+    ? 'You are using a VPN'
+    : methods?.relay
+    ? 'Tor relay network'
+    : datacenterEgress && methods?.timezone_mismatch
+    ? 'Datacenter / Timezone Mismatch'
+    : datacenterEgress
+    ? 'Datacenter / hosting network'
+    : 'Network anomaly detected';
   rows.push({
     key: 'vpn',
     label: 'VPN',
-    status: vpn ? 'You are using a VPN' : 'Not detected',
+    status: vpnStatus,
     triggered: vpn,
     detail: vpnMethodCount > 1 ? `${vpnMethodCount} matching network methods` : signals.vpnReasons?.[0],
   });
