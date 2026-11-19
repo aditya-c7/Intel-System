@@ -1347,6 +1347,10 @@ export interface BotAutomationSignals {
   botSignals?: string[];
   /** True when only ambiguous environment quirks were found. Never a bot verdict. */
   botSuspicion?: boolean;
+  /** CDP Runtime domain serialization leak: protocol-level automation proof. */
+  cdpRuntimeLeak?: boolean;
+  /** Stealth plugin (puppeteer-extra / playwright-stealth) artifacts detected. */
+  stealthPluginDetected?: boolean;
 }
 
 /**
@@ -1755,6 +1759,177 @@ export function detectVmAndIntegrity(
   };
 }
 
+/**
+ * Stealth-plugin and CDP serialization probe.
+ *
+ * `puppeteer-extra-plugin-stealth` and `playwright-stealth` hide the WebDriver flag, so the
+ * only reliable evidence left is the *side effect* of the patching itself: rewritten native
+ * getters, a patched `Function.prototype.toString`, proxy-backed `navigator` objects, a
+ * same-origin iframe whose `contentWindow` leaks the parent, and the CDP Runtime domain
+ * serializing an Error through `Error.prepareStackTrace` (a protocol-level leak that page
+ * JavaScript cannot patch away).
+ *
+ * Single ambiguous artifacts are recorded but never sufficient; two independent artifacts or
+ * a definitive one (iframe leak, prepareStackTrace invocation) raise the flag.
+ */
+export interface StealthArtifacts {
+  cdpRuntimeLeak: boolean;
+  stealthPluginDetected: boolean;
+  stealthReasons: string[];
+}
+
+export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
+  const reasons: string[] = [];
+  let cdpRuntimeLeak = false;
+  let definitive = false;
+
+  if (typeof window === 'undefined' || typeof document === 'undefined') {
+    return { cdpRuntimeLeak: false, stealthPluginDetected: false, stealthReasons: [] };
+  }
+
+  // C2 / Rebrowser: with the CDP Runtime domain enabled, `console.debug` of an Error is
+  // serialized through V8 and invokes `Error.prepareStackTrace`. A plain page never does.
+  try {
+    const errorCtor = Error as unknown as { prepareStackTrace?: unknown };
+    const originalPrepare = errorCtor.prepareStackTrace;
+    let invoked = false;
+    errorCtor.prepareStackTrace = (error: unknown, stack: unknown) => {
+      invoked = true;
+      return typeof originalPrepare === 'function'
+        ? (originalPrepare as (e: unknown, s: unknown) => string)(error, stack)
+        : '';
+    };
+    try {
+      const probe = new Error('intel-cdp-probe');
+      let nameReads = 0;
+      try {
+        Object.defineProperty(probe, 'name', {
+          configurable: true,
+          get() {
+            nameReads += 1;
+            return 'intel-cdp-probe';
+          },
+        });
+      } catch {
+        // Frozen Error instances still exercise the prepareStackTrace path.
+      }
+      console.debug(probe);
+      // Serialization reads the accessor more than once; local code does not touch it.
+      if (nameReads > 1) invoked = true;
+    } finally {
+      if (originalPrepare === undefined) {
+        try {
+          delete errorCtor.prepareStackTrace;
+        } catch {
+          errorCtor.prepareStackTrace = undefined;
+        }
+      } else {
+        errorCtor.prepareStackTrace = originalPrepare;
+      }
+    }
+    if (invoked) {
+      cdpRuntimeLeak = true;
+      reasons.push('CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked on console.debug)');
+    }
+  } catch {
+    // A hostile console proxy is not evidence on its own.
+  }
+
+  // Stealth plugin artifact: a same-origin iframe whose contentWindow is the parent window,
+  // or whose navigator disagrees with the parent while sharing an origin.
+  try {
+    const frame = document.createElement('iframe');
+    frame.style.position = 'absolute';
+    frame.style.left = '-9999px';
+    frame.style.width = '1px';
+    frame.style.height = '1px';
+    frame.style.opacity = '0';
+    frame.src = 'about:blank';
+    document.body.appendChild(frame);
+    try {
+      const childWindow = frame.contentWindow as (Window & typeof globalThis) | null;
+      if (childWindow === (window as unknown as Window & typeof globalThis)) {
+        definitive = true;
+        reasons.push('iframe.contentWindow resolves to the parent window (stealth plugin artifact)');
+      } else if (childWindow) {
+        const childUa = String(childWindow.navigator?.userAgent || '');
+        if (childUa && childUa !== String(navigator.userAgent || '')) {
+          definitive = true;
+          reasons.push('User-Agent differs between the top window and a same-origin iframe');
+        }
+        const childTouch = Number(childWindow.navigator?.maxTouchPoints ?? 0);
+        if (childTouch !== Number(navigator.maxTouchPoints ?? 0)) {
+          reasons.push('maxTouchPoints differs between the top window and a same-origin iframe');
+        }
+      }
+    } finally {
+      frame.remove();
+    }
+  } catch {
+    // Blocked iframes are not evidence.
+  }
+
+  // Patched native accessors across the properties stealth plugins forge.
+  const navProto = typeof Navigator !== 'undefined' ? Navigator.prototype : undefined;
+  const tamperedGetters: string[] = [];
+  for (const property of ['webdriver', 'userAgent', 'platform', 'hardwareConcurrency', 'deviceMemory', 'languages', 'plugins']) {
+    if (!isNativeAccessor(navProto, property)) tamperedGetters.push(property);
+  }
+  if (tamperedGetters.length > 0) {
+    reasons.push(`Navigator getters rewritten by a non-native function (${tamperedGetters.join(', ')})`);
+  }
+
+  // Non-native Function.prototype.toString: the wrapper used to mask those getters.
+  try {
+    const fnToString = Function.prototype.toString;
+    const nativeSource = Function.prototype.toString.call(fnToString);
+    if (!/\[native code\]/.test(nativeSource)) {
+      reasons.push('Function.prototype.toString is not native (stealth wrapper)');
+    }
+  } catch {
+    reasons.push('Function.prototype.toString is unreadable (stealth wrapper)');
+  }
+
+  // Chrome runtime integrity: a Chromium UA without window.chrome is a stripped build.
+  try {
+    const ua = String(navigator.userAgent || '');
+    const claimsChromium = /Chrome\/|Chromium\/|Edg\//i.test(ua);
+    const chromeObject = (window as unknown as { chrome?: { runtime?: unknown } }).chrome;
+    if (claimsChromium && (!chromeObject || typeof chromeObject !== 'object')) {
+      reasons.push('Chromium user-agent without a window.chrome object');
+    }
+  } catch {
+    // Ignore.
+  }
+
+  // Plugin array prototype integrity: faked plugin lists are plain arrays, not PluginArray.
+  try {
+    const plugins = navigator.plugins as unknown;
+    if (plugins && typeof PluginArray !== 'undefined' && !(plugins instanceof PluginArray)) {
+      reasons.push('navigator.plugins is not a native PluginArray instance');
+    }
+    if (plugins && typeof PluginArray !== 'undefined') {
+      const proto = Object.getPrototypeOf(plugins);
+      if (proto !== PluginArray.prototype) {
+        reasons.push('navigator.plugins prototype chain was replaced');
+      }
+    }
+    const mimeTypes = navigator.mimeTypes as unknown;
+    if (mimeTypes && typeof MimeTypeArray !== 'undefined' && !(mimeTypes instanceof MimeTypeArray)) {
+      reasons.push('navigator.mimeTypes is not a native MimeTypeArray instance');
+    }
+  } catch {
+    // Ignore.
+  }
+
+  // A software rasterizer plus forged getters is the classic headless stealth profile.
+  const softwareGpu = /swiftshader|llvmpipe/i.test(String(gpuRenderer || ''));
+  const artifactCount = reasons.length + (softwareGpu ? 1 : 0);
+  const stealthPluginDetected = definitive || artifactCount >= 2;
+
+  return { cdpRuntimeLeak, stealthPluginDetected, stealthReasons: reasons };
+}
+
 const CDP_GLOBAL_KEY_PATTERN =
   /^cdc_|^\$cdc_|^__\$webdriverAsyncExecutor|^__webdriver|^__selenium|^__fxdriver|^__playwright|^__pwInitScripts|^_phantom|^callPhantom|^domAutomation/i;
 
@@ -1813,6 +1988,10 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
   // Run all 19 fingerprintjs/BotD detectors
   const botD19 = detectBotD19Signals(gpuRenderer);
 
+  // Stealth plugins hide every classic flag, so their own patching side effects become the
+  // evidence: CDP Runtime serialization, forged native getters, iframe identity leaks.
+  const stealth = detectStealthArtifacts(gpuRenderer);
+
   // Weighted evidence gate. A real person must never be branded as a bot from ambiguous
   // environment quirks: SwiftShader appears whenever hardware acceleration is off (battery
   // saver, blocklisted GPU, Linux), in-app browsers report zero outer geometry, empty
@@ -1845,7 +2024,15 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
 
   // Soft evidence alone is suspicion, never a verdict: two coincidental quirks (an in-app
   // browser with a disabled GPU) must not label a human as automated.
-  const isBot = webdriver || cdpDetected || headlessUa || d19Hard;
+  // A stealth plugin or a live CDP Runtime session is automation even when `navigator.webdriver`
+  // was rewritten: the protocol layer sits above the page and cannot be patched.
+  const isBot =
+    webdriver ||
+    cdpDetected ||
+    headlessUa ||
+    d19Hard ||
+    stealth.cdpRuntimeLeak ||
+    stealth.stealthPluginDetected;
   const botSuspicion = !isBot && softEvidenceCount >= 2;
   let botReason = 'Verified human runtime & native DOM prototypes';
   const allBotReasons: string[] = [];
@@ -1858,12 +2045,23 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
     botReason = 'Headless browser User-Agent signature detected';
   } else if (d19Hard) {
     botReason = botD19.reasons[0] || 'BotD hard automation signal detected';
+  } else if (stealth.cdpRuntimeLeak || stealth.stealthPluginDetected) {
+    botReason =
+      stealth.stealthReasons[0] ||
+      (stealth.cdpRuntimeLeak
+        ? 'CDP Runtime session detected through the serialization side channel'
+        : 'Stealth automation plugin artifacts detected');
   } else if (botSuspicion) {
     botReason = `Low-confidence environment quirks (${softEvidenceCount} soft signals)`;
   }
 
   if (botReason !== 'Verified human runtime & native DOM prototypes') {
     allBotReasons.push(botReason);
+  }
+  if (isBot) {
+    for (const reason of stealth.stealthReasons) {
+      if (!allBotReasons.includes(reason)) allBotReasons.push(reason);
+    }
   }
   if (isBot && botD19.detected) {
     allBotReasons.push(...botD19.reasons.filter((reason) => reason !== botReason));
@@ -1878,6 +2076,8 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
     cdpDetected: cdpDetected || botD19.signals.distinctive_properties,
     botSignals: allBotReasons,
     botSuspicion,
+    cdpRuntimeLeak: stealth.cdpRuntimeLeak,
+    stealthPluginDetected: stealth.stealthPluginDetected,
   };
 }
 
@@ -3141,8 +3341,8 @@ export async function evaluateSecuritySignals(
     activeCallSupported: activeCall.supported,
     activeCallReasons: activeCall.reasons,
     /* Phase 6 — raw device attributes for the event JSON inspector */
-    rawDeviceAttributes: (() => {
-      const rawAttributes = collectRawDeviceAttributes() as unknown as Record<string, unknown>;
+    rawDeviceAttributes: await (async () => {
+      const rawAttributes = (await collectRawDeviceAttributes()) as unknown as Record<string, unknown>;
       if (browserDevice.genuineMobile && browserDevice.phoneModel) {
         rawAttributes.device_model = browserDevice.phoneModel;
         rawAttributes.device_model_code = browserDevice.phoneModelCode || null;
@@ -3364,6 +3564,8 @@ export interface RawDeviceAttributes {
     winding: boolean | null;
     geometry: string;
     text: string;
+    /** True when two reads of the same static bitmap differ, or a flat fill was rewritten. */
+    noise?: boolean;
   };
   languages: string[][];
   webgl_extensions: {
@@ -3378,6 +3580,8 @@ export interface RawDeviceAttributes {
     version: string;
     vendor: string;
     renderer: string;
+    vendor_unmasked?: string;
+    renderer_unmasked?: string;
     shading_language_version: string;
   };
   screen_resolution: [number, number];
@@ -3390,6 +3594,8 @@ export interface RawDeviceAttributes {
   architecture: number;
   cookies_enabled: boolean;
   hardware_concurrency: number | null;
+  /** navigator.deviceMemory, or null when the browser hides it. Never estimated. */
+  device_memory: number | null;
   date_time_locale: string;
   vendor: string;
   color_depth: number;
@@ -3429,26 +3635,37 @@ const FONT_PROFILES: Record<string, string> = {
   system: 'system-ui, -apple-system, "Segoe UI", Roboto, Arial',
 };
 
-const PROBE_FONT_FAMILIES = [
-  'Arial',
-  'Courier New',
-  'Georgia',
-  'Helvetica Neue',
-  'Menlo',
-  'Monaco',
-  'Roboto',
-  'Segoe UI',
-  'Tahoma',
-  'Times New Roman',
-  'Trebuchet MS',
-  'Verdana',
+/**
+ * Probe fonts paired with the CSS generic family each one belongs to. A candidate is only
+ * reported as installed when it changes the metrics of ITS OWN generic baseline: comparing
+ * every font against `monospace` falsely reported Arial and Times New Roman on Linux, where
+ * they fall back to Liberation Sans / Liberation Serif and never match the monospace width.
+ */
+const PROBE_FONT_FAMILIES: Array<[font: string, generic: 'serif' | 'sans-serif' | 'monospace']> = [
+  ['Arial', 'sans-serif'],
+  ['Arial Narrow', 'sans-serif'],
+  ['Calibri', 'sans-serif'],
+  ['Cambria', 'serif'],
+  ['Courier New', 'monospace'],
+  ['Georgia', 'serif'],
+  ['Helvetica', 'sans-serif'],
+  ['Helvetica Neue', 'sans-serif'],
+  ['Menlo', 'monospace'],
+  ['Monaco', 'monospace'],
+  ['Roboto', 'sans-serif'],
+  ['Segoe UI', 'sans-serif'],
+  ['Tahoma', 'sans-serif'],
+  ['Times New Roman', 'serif'],
+  ['Trebuchet MS', 'sans-serif'],
+  ['Ubuntu', 'sans-serif'],
+  ['Verdana', 'sans-serif'],
 ];
 
 /**
  * Measures font metrics, emoji bounding boxes, canvas stability, WebGL hashes and the math
  * vector with native APIs. Returns `null` only when the DOM is unavailable.
  */
-export function collectRawDeviceAttributes(): RawDeviceAttributes | null {
+export async function collectRawDeviceAttributes(): Promise<RawDeviceAttributes | null> {
   if (typeof document === 'undefined' || typeof window === 'undefined') return null;
 
   const makeSpan = (text: string, style: string): HTMLSpanElement | null => {
@@ -3487,12 +3704,15 @@ export function collectRawDeviceAttributes(): RawDeviceAttributes | null {
   }
 
   const detectedFonts: string[] = [];
-  for (const family of PROBE_FONT_FAMILIES) {
-    const withFamily = makeSpan('mmmmmmmmmmlli', `"${family}", monospace`);
-    const without = makeSpan('mmmmmmmmmmlli', 'monospace');
-    const diff = Math.abs(measure(withFamily) - measure(without));
+  const genericBaselines: Record<string, number> = {
+    serif: measure(makeSpan('mmmmmmmmmmlli', 'serif')),
+    'sans-serif': measure(makeSpan('mmmmmmmmmmlli', 'sans-serif')),
+    monospace: measure(makeSpan('mmmmmmmmmmlli', 'monospace')),
+  };
+  for (const [family, generic] of PROBE_FONT_FAMILIES) {
+    const withFamily = makeSpan('mmmmmmmmmmlli', `"${family}", ${generic}`);
+    const diff = Math.abs(measure(withFamily) - genericBaselines[generic]);
     withFamily?.remove();
-    without?.remove();
     if (diff > 0.1) detectedFonts.push(family);
   }
 
@@ -3518,41 +3738,88 @@ export function collectRawDeviceAttributes(): RawDeviceAttributes | null {
     emojiSpan.remove();
   }
 
-  // Canvas: winding + double-encoded geometry/text stability (anti-fingerprinting noise).
+  // Canvas: one isolated canvas per probe so no composite mode or sub-path from the geometry
+  // pass can contaminate the text pass, and the two stability reads happen on the SAME static
+  // bitmap. Re-painting between reads is what used to report "unstable" on every clean browser.
   let winding: boolean | null = null;
   let geometry = 'unavailable';
   let textHash = 'unavailable';
+  let canvasNoiseDetected = false;
   try {
-    const canvas = document.createElement('canvas');
-    canvas.width = 240;
-    canvas.height = 60;
-    const ctx = canvas.getContext('2d');
-    if (ctx) {
-      const path = new Path2D('M 10 10 L 100 10 L 100 50 Z');
+    const windingCanvas = document.createElement('canvas');
+    windingCanvas.width = 10;
+    windingCanvas.height = 10;
+    const windingCtx = windingCanvas.getContext('2d');
+    if (windingCtx) {
       try {
-        winding = ctx.isPointInPath(path, 50, 20, 'evenodd');
+        windingCtx.rect(0, 0, 10, 10);
+        windingCtx.rect(2, 2, 6, 6);
+        winding = !windingCtx.isPointInPath(5, 5, 'evenodd');
       } catch {
         winding = null;
       }
-      const paint = () => {
-        ctx.fillStyle = '#f60';
-        ctx.fillRect(0, 0, 120, 30);
-        ctx.fillStyle = '#069';
-        ctx.font = '14px "Arial"';
-        ctx.fillText('Intel🔒System', 2, 45);
-        ctx.strokeStyle = 'rgba(102, 204, 0, 0.7)';
-        ctx.beginPath();
-        ctx.arc(60, 30, 20, 0, Math.PI * 2);
-        ctx.stroke();
-      };
-      const read = () => canvas.toDataURL();
-      paint();
-      const first = read();
-      paint();
-      const second = read();
-      geometry = first === second ? hash128(first) : 'unstable';
-      textHash = first === second ? hash128(`${first}|text`) : 'unstable';
     }
+
+    /** Renders once, then verifies the static bitmap and a flat interior pixel. */
+    const renderOnce = (
+      width: number,
+      height: number,
+      paint: (context: CanvasRenderingContext2D) => void
+    ): { hash: string; unstable: boolean; fillParity: boolean | null } => {
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext('2d', { willReadFrequently: true });
+      if (!context) return { hash: 'unavailable', unstable: false, fillParity: null };
+      paint(context);
+      const first = canvas.toDataURL();
+      const second = canvas.toDataURL();
+      let fillParity: boolean | null = null;
+      try {
+        const sample = context.getImageData(1, 1, 1, 1).data;
+        // A flat opaque fill must read back exactly; per-read noise changes these channels.
+        fillParity = sample[3] === 255;
+      } catch {
+        fillParity = null;
+      }
+      return { hash: hash128(first), unstable: first !== second, fillParity };
+    };
+
+    const geometryRender = renderOnce(122, 110, (context) => {
+      context.globalCompositeOperation = 'multiply';
+      for (const [color, x, y] of [
+        ['#f2f', 40, 40],
+        ['#2ff', 80, 40],
+        ['#ff2', 60, 80],
+      ] as const) {
+        context.fillStyle = color;
+        context.beginPath();
+        context.arc(x, y, 40, 0, Math.PI * 2, true);
+        context.closePath();
+        context.fill();
+      }
+      context.fillStyle = '#f9c';
+      context.beginPath();
+      context.arc(60, 60, 60, 0, Math.PI * 2, true);
+      context.arc(60, 60, 20, 0, Math.PI * 2, true);
+      context.fill('evenodd');
+    });
+    geometry = geometryRender.unstable ? 'unstable' : geometryRender.hash;
+
+    const textRender = renderOnce(240, 60, (context) => {
+      context.textBaseline = 'alphabetic';
+      context.fillStyle = '#f60';
+      context.fillRect(0, 0, 120, 30);
+      context.fillStyle = '#069';
+      context.font = '11pt "Times New Roman"';
+      context.fillText('Cwm fjordbank glyphs vext quiz', 2, 15);
+      context.fillStyle = 'rgba(102, 204, 0, 0.2)';
+      context.font = '18pt Arial';
+      context.fillText('Cwm fjordbank glyphs vext quiz', 4, 45);
+    });
+    textHash = textRender.unstable ? 'unstable' : textRender.hash;
+    canvasNoiseDetected =
+      geometryRender.unstable || textRender.unstable || geometryRender.fillParity === false;
   } catch {
     // Canvas blocked: report the hash as unavailable rather than throwing.
   }
@@ -3650,10 +3917,19 @@ export function collectRawDeviceAttributes(): RawDeviceAttributes | null {
         extension_parameters: hash128(extensionParameters),
         unsupported_extensions: [],
       };
+      const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+      const unmaskedVendor = debugInfo
+        ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL)
+        : 'unavailable';
+      const unmaskedRenderer = debugInfo
+        ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)
+        : 'unavailable';
       webglBasics = {
         version: gl.getParameter(gl.VERSION) || 'unavailable',
         vendor: gl.getParameter(gl.VENDOR) || 'unavailable',
         renderer: gl.getParameter(gl.RENDERER) || 'unavailable',
+        vendor_unmasked: unmaskedVendor || 'unavailable',
+        renderer_unmasked: unmaskedRenderer || 'unavailable',
         shading_language_version:
           gl.getParameter(gl.SHADING_LANGUAGE_VERSION) || 'unavailable',
       };
@@ -3717,7 +3993,13 @@ export function collectRawDeviceAttributes(): RawDeviceAttributes | null {
     // Plugin array blocked by the browser.
   }
 
-  const audio = (() => {
+  /**
+   * Rendered OfflineAudioContext fingerprint: the summed absolute samples of frames
+   * 4500..4999 after a 10000 Hz triangle oscillator is squashed by a DynamicsCompressor.
+   * The previous implementation returned `context.sampleRate` (44100), which is a hardware
+   * constant, not a rendering fingerprint.
+   */
+  const audio = await (async (): Promise<number | null> => {
     if (typeof window === 'undefined') return null;
     const OfflineCtor =
       (window as unknown as { OfflineAudioContext?: typeof OfflineAudioContext })
@@ -3739,8 +4021,15 @@ export function collectRawDeviceAttributes(): RawDeviceAttributes | null {
       oscillator.connect(compressor);
       compressor.connect(context.destination);
       oscillator.start(0);
-      void context.startRendering();
-      return Number(context.sampleRate.toFixed(6));
+      const rendered = context.startRendering().then((buffer) => {
+        const samples = buffer.getChannelData(0);
+        let sum = 0;
+        for (let i = 4500; i < samples.length; i += 1) sum += Math.abs(samples[i]);
+        return Number(sum.toFixed(10));
+      });
+      // A suspended or legacy context must never stall the identify call.
+      const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500));
+      return await Promise.race([rendered, timeout]);
     } catch {
       return null;
     }
@@ -3763,20 +4052,27 @@ export function collectRawDeviceAttributes(): RawDeviceAttributes | null {
         return 'Unknown';
       }
     })(),
-    canvas: { winding, geometry, text: textHash },
+    canvas: { winding, geometry, text: textHash, noise: canvasNoiseDetected },
     languages,
     webgl_extensions: webglExtensions,
     webgl_basics: webglBasics,
     screen_resolution: [window.screen?.width ?? 0, window.screen?.height ?? 0],
     touch_support: {
+      // `ontouchstart` presence is the only honest touch-point signal. A defined TouchEvent
+      // constructor only means the engine implements the API, which desktop Chrome always does.
       touch_event: 'ontouchstart' in window,
-      touch_start: typeof (window as unknown as { TouchEvent?: unknown }).TouchEvent === 'function',
+      touch_start: 'ontouchstart' in window,
       max_touch_points: navigator.maxTouchPoints ?? 0,
     },
     oscpu: (navigator as unknown as { oscpu?: string }).oscpu || '',
     architecture: Number((navigator as unknown as { architecture?: number }).architecture ?? 255),
     cookies_enabled: navigator.cookieEnabled,
     hardware_concurrency: navigator.hardwareConcurrency ?? null,
+    device_memory:
+      typeof (navigator as unknown as { deviceMemory?: number }).deviceMemory === 'number' &&
+      Number((navigator as unknown as { deviceMemory: number }).deviceMemory) > 0
+        ? Number((navigator as unknown as { deviceMemory: number }).deviceMemory)
+        : null,
     date_time_locale: (() => {
       try {
         return Intl.DateTimeFormat().resolvedOptions().locale || 'Unknown';
