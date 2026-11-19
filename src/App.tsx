@@ -1259,7 +1259,12 @@ export default function App() {
         ? s.ipTimezone
         : null;
     const asnName = s.brandName && s.brandName !== 'Unavailable' ? s.brandName : data.location.org;
-    const isHostingNetwork = Boolean(s.datacenterAsn ?? s.isDatacenterOrHosting);
+    // A commercial VPN egress is not a hosting verdict: the server keeps `datacenterAsn` for
+    // any VPN-or-hosting network, so the public-VPN verdict must explicitly win here.
+    const publicVpn = Boolean(
+      s.publicVpn || s.vpnMethods?.public_vpn || s.networkType === 'VPN / Proxy Relay'
+    );
+    const isHostingNetwork = Boolean(s.datacenterAsn ?? s.isDatacenterOrHosting) && !publicVpn;
     const firstVisitMs = Date.parse(data.visitHistory[0]?.visitedAtUtc || '') || Date.now();
     const deviceType = data.browserDevice.deviceType;
     const fallbackIdentity = normalizeIdentity({
@@ -1311,7 +1316,10 @@ export default function App() {
         hardware_id: data.hardwareId,
         confidence: data.identification?.confidence ?? { score: 1, version: '2.1' },
         visitor_found: data.identification?.visitor_found ?? data.isReturning,
-        recognition_mode: data.recognitionSource,
+        recognition_mode:
+          s.persistenceMode === 'Hardware ID Recovered'
+            ? 'Hardware ID Recovered'
+            : data.recognitionSource,
         first_seen_at: Date.parse(data.statistics.firstVisitUtc) || null,
         last_seen_at: Date.parse(data.statistics.lastVisitUtc) || null,
       },

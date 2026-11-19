@@ -215,6 +215,8 @@ export interface SecuritySignals {
   stealthPluginDetected?: boolean;
 
   /* Network anonymity methods — the single source of truth for the VPN tile count */
+  /** True only for a real commercial VPN provider, never for plain hosting/datacenter. */
+  publicVpn?: boolean;
   vpnMethods?: {
     timezone_mismatch: boolean;
     public_vpn: boolean;
