@@ -3102,13 +3102,13 @@ export async function evaluateSecuritySignals(
     datacenterAsn,
   });
   const tamperReasons: string[] = [];
-  if (vmStatus.isVirtualMachine) {
+  // A virtual machine / software rasterizer is an environment signal (the VM card), not
+  // evidence of active tampering. Counting it as tamperDetected pushed plain SwiftShader
+  // headless sessions into the 9/10 critical tier. Only OS/UA integrity breaks belong here.
+  if (vmStatus.isOsTampered) {
     tamperReasons.push(vmStatus.vmReason);
   }
-  if (vmStatus.isOsTampered && !vmStatus.isVirtualMachine) {
-    tamperReasons.push(vmStatus.vmReason);
-  }
-  const tamperDetected = vmStatus.isOsTampered || vmStatus.isVirtualMachine;
+  const tamperDetected = vmStatus.isOsTampered;
 
   // 3b. Mobile emulator / iOS simulator evidence (Phase 3). The client-side derivation
   // uses the same predicates the server applies, so the `emulatorDetected` verdict is
