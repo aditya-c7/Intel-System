@@ -4446,7 +4446,11 @@ var CLOUD_PROVIDER_ASN_NUMBERS = /* @__PURE__ */ new Set([
   63949,
   16276,
   8075,
-  20473
+  20473,
+  11878,
+  // Tzulo — hosting network rented by VPN providers, not a VPN operator itself
+  212238
+  // CDNEXT / Datacamp — hosting network, not a VPN operator itself
 ]);
 var TOR_OPERATOR_ASN_SET = /* @__PURE__ */ new Set([
   "AS215125",
@@ -4522,7 +4526,7 @@ function classifyIspNetwork(isp, org, asn) {
     };
   }
   const cloudAsnHit = Array.from(asnNumbers).find((n) => CLOUD_PROVIDER_ASN_NUMBERS.has(n));
-  const cloudKeywords = /google llc|google cloud|amazonaws|cloudflare|digitalocean|hetzner|m247|datacamp|linode|ovh|choopa|vultr|leaseweb|hostinger|contabo|akamai|oracle cloud|alibaba|aliyun|tencent cloud/i;
+  const cloudKeywords = /google llc|google cloud|amazonaws|cloudflare|digitalocean|hetzner|m247|datacamp|datapacket|cdnext|cdn77|tzulo|linode|ovh|choopa|vultr|leaseweb|hostinger|contabo|akamai|oracle cloud|alibaba|aliyun|tencent cloud/i;
   if (cloudAsnHit !== void 0 || cloudKeywords.test(keywordHaystack)) {
     return {
       // Prefer the real operator name (Google LLC, Amazon.com, Inc., Microsoft
@@ -6296,7 +6300,8 @@ function lookupSuspiciousIp(ip) {
     reasons: [...suspiciousIpReasons.get(cleanIp) ?? []]
   };
 }
-var ENVELOPE_FRESHNESS_WINDOW_MS = 3e5;
+var ENVELOPE_MAX_AGE_MS = 65e3;
+var ENVELOPE_MAX_FUTURE_SKEW_MS = 3e5;
 var NONCE_TTL_MS = 15 * 60 * 1e3;
 var NONCE_CACHE_MAX_ENTRIES = 5e3;
 var seenEnvelopeNonces = /* @__PURE__ */ new Map();
@@ -6361,9 +6366,12 @@ function verifySecurityEnvelope(args) {
       reasons.push("Payload integrity hash mismatch");
     }
   }
-  if (timestamp > 0 && Math.abs(nowMs - timestamp) > ENVELOPE_FRESHNESS_WINDOW_MS) {
+  if (timestamp > 0 && nowMs - timestamp > ENVELOPE_MAX_AGE_MS) {
     tamperedRequest = true;
-    reasons.push("Expired or replayed payload timestamp (>5m)");
+    reasons.push("Expired or replayed payload timestamp (>65s)");
+  } else if (timestamp > 0 && timestamp - nowMs > ENVELOPE_MAX_FUTURE_SKEW_MS) {
+    tamperedRequest = true;
+    reasons.push("Payload timestamp too far in the future");
   }
   let replayDetected = false;
   if (requestNonce) {
@@ -7187,6 +7195,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const stealthAutomation = Boolean(
     raw?.stealthPluginDetected || raw?.cdpRuntimeLeak || antiDetectBrowser || mlTampering
   );
+  const activeDeception = Boolean(
+    raw?.stealthPluginDetected || antiDetectBrowser || mlTampering
+  );
   const hardAutomationReasons = [];
   if (raw?.cdpRuntimeLeak) {
     hardAutomationReasons.push("CDP Runtime.enable serialization leak");
@@ -7343,7 +7354,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   };
   const aiAgent = requestContext.aiAgent ?? null;
   const spoofedImpostor = aiAgent?.agentId === "impostor-spoof" || botSubtype === "bad_bot" && spoofedCrawler;
-  const botScore = spoofedImpostor ? 10 : stealthAutomation ? 9 : botSubtype === "bad_bot" ? 7 : botSubtype === "ai_agent" ? 7 : botSubtype === "good_bot" ? 2 : 0;
+  const botScore = spoofedImpostor ? 10 : activeDeception ? 9 : botSubtype === "bad_bot" ? 7 : botSubtype === "ai_agent" ? 7 : botSubtype === "good_bot" ? 2 : 0;
   const botStatus = spoofedImpostor ? "Spoofed AI Impostor" : stealthAutomation || botSubtype === "bad_bot" ? "Bot / Automated" : aiAgent?.detected && aiAgent.agentName ? aiAgent.agentName : botSubtype === "ai_agent" ? "AI Agent \xB7 Cloud Browser" : botSubtype === "good_bot" ? "Good Bot \xB7 Search Crawler" : "Verified Human";
   const aiAgentDetail = aiAgent?.detected && aiAgent.agentName ? `${aiAgent.agentName} \u2014 ${aiAgent.operator}${aiAgent.executionMode ? ` \xB7 ${aiAgent.executionMode}` : ""} \xB7 ${aiAgent.confidence}${aiAgent.verified ? " (verified)" : ""}: ${aiAgent.evidence[0] || "agent identity attributed from request headers"}` : "";
   const botDetail = stealthAutomation ? `${hardAutomationReasons.join("; ") || "Stealth / anti-detect automation runtime detected"} \u2014 hard automation artifact, never a verified human` : botSubtype === "human" && !aiAgent?.detected ? "Verified human interactive session" : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected");
@@ -7412,12 +7423,12 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   }
   if (vmScore > 0) calibratedScore = Math.max(calibratedScore, vmScore);
   if (isHeadless && !isBot) calibratedScore = Math.max(calibratedScore, 6);
-  if (isBot) calibratedScore = Math.max(calibratedScore, stealthAutomation ? 9 : 7);
+  if (isBot) calibratedScore = Math.max(calibratedScore, activeDeception ? 9 : 7);
   if (ipBlocklisted) calibratedScore = Math.max(calibratedScore, 8);
   if (tamperDetected || Boolean(raw?.tampering)) calibratedScore = Math.max(calibratedScore, 9);
   if (integrityViolation) calibratedScore = Math.max(calibratedScore, 9);
   if (torExitNode) calibratedScore = Math.max(calibratedScore, 9);
-  if (stealthAutomation) calibratedScore = Math.max(calibratedScore, 9);
+  if (activeDeception) calibratedScore = Math.max(calibratedScore, 9);
   if (spoofedImpostor) calibratedScore = 10;
   const weightedCompositeScore = Math.min(10, calibratedScore);
   const cardScores = [incognitoScore, botScore, vpnScore, vmScore];
@@ -7425,7 +7436,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const elevatedCardCount = cardScores.filter((score) => score >= 4).length;
   const synergyBonus = elevatedCardCount >= 3 ? 2 : elevatedCardCount === 2 ? 1 : 0;
   const criticalDeception = Boolean(
-    stealthAutomation || spoofedImpostor || tamperDetected || raw?.tampering || integrityViolation || torExitNode
+    activeDeception || spoofedImpostor || tamperDetected || raw?.tampering || integrityViolation || torExitNode
   );
   const cardFloorScore = Math.max(weightedCompositeScore, maxCardScore + synergyBonus);
   const suspectScore = criticalDeception ? Math.min(10, cardFloorScore) : Math.min(8, cardFloorScore);
@@ -8352,7 +8363,12 @@ app.post("/api/visitor/identify", async (req, res) => {
     const suspectScore100 = computeSuspectScore100({
       bot: Boolean(securitySignals.isBot),
       replayed: Boolean(securitySignals.replayDetected),
-      tampering: Boolean(tamperingAssessment?.tampering),
+      // The client DevTools probe is not the same as a sealed-envelope failure. Both must feed
+      // the 0-100 Risk Meter or a forged payload can score 10/10 on the 0-10 cards but 0/100
+      // for consumers reading `suspectScore100`.
+      tampering: Boolean(
+        tamperingAssessment?.tampering || securitySignals.tamperedRequest || securitySignals.tamperDetected
+      ),
       vpn: Boolean(securitySignals.vpnSuspected),
       vpnMethodCount: Array.isArray(securitySignals.vpnReasons) ? securitySignals.vpnReasons.length : 0,
       blocklisted: Boolean(securitySignals.torExitNode || securitySignals.ipBlocklisted),
