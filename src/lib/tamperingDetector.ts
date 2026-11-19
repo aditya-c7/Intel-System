@@ -84,22 +84,30 @@ function detectEngine(): { evalLen: number; isV8: boolean } {
   return { evalLen, isV8 };
 }
 
-/** True when a `Navigator.prototype` getter was replaced by a non-native function. */
+/** True when a `Navigator` getter on the prototype OR the instance was replaced by a spoof. */
 function hasHookedNavigatorGetter(): boolean {
   try {
-    if (typeof Navigator === 'undefined') return false;
-    const descriptors = [
-      Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent')?.get,
-      Object.getOwnPropertyDescriptor(Navigator.prototype, 'platform')?.get,
-      Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver')?.get,
+    if (typeof navigator === 'undefined') return false;
+    const touched: (object | null)[] = [
+      typeof Navigator !== 'undefined' ? Navigator.prototype : null,
+      navigator,
     ];
-    return descriptors.some((getter) => {
-      if (!getter) return false;
-      try {
-        return !/\[native code\]/.test(Function.prototype.toString.call(getter));
-      } catch {
-        return true;
-      }
+    return touched.some((target) => {
+      if (!target) return false;
+      return ['userAgent', 'platform', 'webdriver'].some((property) => {
+        const descriptor = Object.getOwnPropertyDescriptor(target, property);
+        if (!descriptor) return false;
+        // An own data property on the navigator instance is an explicit spoof: real browsers
+        // expose these as prototype getters, never as instance values.
+        if (target === navigator && !descriptor.get && !descriptor.set) return true;
+        const getter = descriptor.get;
+        if (!getter) return false;
+        try {
+          return !/\[native code\]/.test(Function.prototype.toString.call(getter));
+        } catch {
+          return true;
+        }
+      });
     });
   } catch {
     return false;
@@ -194,7 +202,7 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
   if (hasHookedNavigatorGetter()) {
     antiDetect = true;
     anomalyPoints += 50;
-    reasons.push('Navigator.prototype getter replaced by a non-native function');
+    reasons.push('Navigator getter / own property replaced by a non-native spoof');
   }
 
   // 7. A docked DevTools window reserves a large slice of the outer viewport. Chrome and

@@ -3166,6 +3166,12 @@ export async function evaluateSecuritySignals(
 
   // Browser tampering — DevTools Device Mode emulation and anti-detect browsers. Compares
   // engine, platform, touch, viewport and GPU invariants rather than trusting one getter.
+  // Canvas attributes are collected here once and reused for both the event payload and the
+  // verdict: per-read pixel noise (farbling) is active spoofing, not a privacy preference.
+  const rawDeviceAttributes = await collectRawDeviceAttributes();
+  const canvasNoiseDetected = Boolean(
+    (rawDeviceAttributes as ({ canvas?: { noise?: boolean } } | null))?.canvas?.noise
+  );
   const tampering = detectBrowserTampering({
     webglVendor: hardwareSignals.gpuVendor,
     webglRenderer: hardwareSignals.gpuRenderer,
@@ -3190,6 +3196,24 @@ export async function evaluateSecuritySignals(
       ...tampering.tampering_details.reasons,
       'Mobile user-agent on desktop x86/GPU hardware (DevTools device emulation)',
     ];
+  }
+
+  // Canvas farbling injects different pixels on every read. It must reach every verdict surface,
+  // not just `raw_device_attributes.canvas.noise`.
+  if (canvasNoiseDetected) {
+    tampering.tampering = true;
+    tampering.tampering_confidence = 'high';
+    tampering.tampering_ml_score = Math.max(0.72, tampering.tampering_ml_score);
+    tampering.tampering_details.anti_detect_browser = true;
+    tampering.tampering_details.anomaly_score = Math.max(
+      0.6,
+      tampering.tampering_details.anomaly_score
+    );
+    if (!tampering.tampering_details.reasons.some((reason) => /canvas/i.test(reason))) {
+      tampering.tampering_details.reasons.push(
+        'Canvas toDataURL/getImageData pixel noise (farbling) detected'
+      );
+    }
   }
 
   // Active call — WebRTC audio transceivers, navigator.audioSession, voice-routed AudioContext.
@@ -3343,8 +3367,9 @@ export async function evaluateSecuritySignals(
     activeCallSupported: activeCall.supported,
     activeCallReasons: activeCall.reasons,
     /* Phase 6 — raw device attributes for the event JSON inspector */
-    rawDeviceAttributes: await (async () => {
-      const rawAttributes = (await collectRawDeviceAttributes()) as unknown as Record<string, unknown>;
+    rawDeviceAttributes: (() => {
+      const rawAttributes =
+        (rawDeviceAttributes as unknown as Record<string, unknown> | null) ?? {};
       if (browserDevice.genuineMobile && browserDevice.phoneModel) {
         rawAttributes.device_model = browserDevice.phoneModel;
         rawAttributes.device_model_code = browserDevice.phoneModelCode || null;
@@ -3355,8 +3380,8 @@ export async function evaluateSecuritySignals(
       }
       return rawAttributes;
     })(),
-    /* Privacy settings: Tor Browser RFP / anti-fingerprinting evidence */
-    privacySettings: torBrowserClient.detected,
+    /* Privacy settings: Tor Browser RFP / anti-fingerprinting evidence, including canvas farbling. */
+    privacySettings: torBrowserClient.detected || canvasNoiseDetected,
     /* Removed probes are neutralised so downstream consumers see explicit falses. */
     devToolsOpen: false,
     adBlockerDetected: false,
@@ -3767,24 +3792,39 @@ export async function collectRawDeviceAttributes(): Promise<RawDeviceAttributes 
       width: number,
       height: number,
       paint: (context: CanvasRenderingContext2D) => void
-    ): { hash: string; unstable: boolean; fillParity: boolean | null } => {
+    ): { dataUrl: string; unstable: boolean; fillParity: boolean | null } => {
       const canvas = document.createElement('canvas');
       canvas.width = width;
       canvas.height = height;
       const context = canvas.getContext('2d', { willReadFrequently: true });
-      if (!context) return { hash: 'unavailable', unstable: false, fillParity: null };
+      if (!context) return { dataUrl: 'unavailable', unstable: false, fillParity: null };
       paint(context);
       const first = canvas.toDataURL();
       const second = canvas.toDataURL();
       let fillParity: boolean | null = null;
       try {
-        const sample = context.getImageData(1, 1, 1, 1).data;
-        // A flat opaque fill must read back exactly; per-read noise changes these channels.
-        fillParity = sample[3] === 255;
+        // Paint a known opaque marker pixel so the parity check never samples transparent background
+        // (which used to report noise on every clean browser). Two independent reads must agree.
+        context.save();
+        context.globalCompositeOperation = 'source-over';
+        context.fillStyle = '#123456';
+        context.fillRect(0, 0, 1, 1);
+        context.restore();
+        const a = context.getImageData(0, 0, 1, 1).data;
+        const b = context.getImageData(0, 0, 1, 1).data;
+        fillParity =
+          a[0] === 0x12 &&
+          a[1] === 0x34 &&
+          a[2] === 0x56 &&
+          a[3] === 255 &&
+          b[0] === a[0] &&
+          b[1] === a[1] &&
+          b[2] === a[2] &&
+          b[3] === a[3];
       } catch {
         fillParity = null;
       }
-      return { hash: hash128(first), unstable: first !== second, fillParity };
+      return { dataUrl: first, unstable: first !== second, fillParity };
     };
 
     const geometryRender = renderOnce(122, 110, (context) => {
@@ -3806,7 +3846,11 @@ export async function collectRawDeviceAttributes(): Promise<RawDeviceAttributes 
       context.arc(60, 60, 20, 0, Math.PI * 2, true);
       context.fill('evenodd');
     });
-    geometry = geometryRender.unstable ? 'unstable' : geometryRender.hash;
+    geometry = geometryRender.unstable
+      ? 'unstable'
+      : geometryRender.dataUrl === 'unavailable'
+      ? 'unavailable'
+      : await sha256Hex(geometryRender.dataUrl);
 
     const textRender = renderOnce(240, 60, (context) => {
       context.textBaseline = 'alphabetic';
@@ -3819,7 +3863,11 @@ export async function collectRawDeviceAttributes(): Promise<RawDeviceAttributes 
       context.font = '18pt Arial';
       context.fillText('Cwm fjordbank glyphs vext quiz', 4, 45);
     });
-    textHash = textRender.unstable ? 'unstable' : textRender.hash;
+    textHash = textRender.unstable
+      ? 'unstable'
+      : textRender.dataUrl === 'unavailable'
+      ? 'unavailable'
+      : await sha256Hex(textRender.dataUrl);
     canvasNoiseDetected =
       geometryRender.unstable || textRender.unstable || geometryRender.fillParity === false;
   } catch {
