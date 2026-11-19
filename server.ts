@@ -7052,7 +7052,14 @@ app.post('/api/visitor/identify', async (req, res) => {
     const suspectScore100 = computeSuspectScore100({
       bot: Boolean(securitySignals.isBot),
       replayed: Boolean(securitySignals.replayDetected),
-      tampering: Boolean(tamperingAssessment?.tampering),
+      // The client DevTools probe is not the same as a sealed-envelope failure. Both must feed
+      // the 0-100 Risk Meter or a forged payload can score 10/10 on the 0-10 cards but 0/100
+      // for consumers reading `suspectScore100`.
+      tampering: Boolean(
+        tamperingAssessment?.tampering ||
+          securitySignals.tamperedRequest ||
+          securitySignals.tamperDetected
+      ),
       vpn: Boolean(securitySignals.vpnSuspected),
       vpnMethodCount: Array.isArray(securitySignals.vpnReasons)
         ? securitySignals.vpnReasons.length
