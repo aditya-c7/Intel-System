@@ -99,32 +99,26 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     detail: bot.detail,
   });
 
-  const vpn = Boolean(signals.vpnSuspected);
-  // The count comes from the server's `vpnMethods` object, the same object the event JSON
-  // prints, so the subtitle can never claim more methods than `#raw-json` contains.
+  // The server's `vpnMethods` object is the single source of truth for both the method count
+  // and the status label — the same object the event JSON prints, so this tile can never claim
+  // more methods (or a different verdict) than `#raw-json`. A plain datacenter / hosting ASN is
+  // explicitly NOT a commercial VPN: only the server's `public_vpn` method earns that label.
   const methods = signals.vpnMethods;
-  const vpnMethodCount = methods
-    ? Object.values(methods).filter(Boolean).length
-    : Array.isArray(signals.vpnReasons)
-    ? signals.vpnReasons.length
-    : 0;
-  const datacenterEgress = Boolean(signals.datacenterAsn ?? signals.isDatacenterOrHosting);
-  const vpnStatus = !vpn
-    ? 'Not detected'
-    : methods?.public_vpn
-    ? 'You are using a VPN'
-    : methods?.relay
-    ? 'Tor relay network'
-    : datacenterEgress && methods?.timezone_mismatch
-    ? 'Datacenter / Timezone Mismatch'
-    : datacenterEgress
-    ? 'Datacenter / hosting network'
-    : 'Network anomaly detected';
+  const vpnMethodCount = methods ? Object.values(methods).filter(Boolean).length : 0;
+  const vpnDetected = Boolean(vpnMethodCount > 0 || signals.vpnSuspected);
+  const datacenterHosting = Boolean(signals.datacenterAsn ?? signals.isDatacenterOrHosting);
+  let vpnStatus = 'Not detected';
+  if (vpnDetected) {
+    if (methods?.public_vpn) vpnStatus = 'Commercial VPN';
+    else if (methods?.relay) vpnStatus = 'Tor exit / relay';
+    else if (datacenterHosting) vpnStatus = 'Datacenter / hosting';
+    else if (methods?.timezone_mismatch) vpnStatus = 'Timezone mismatch';
+  }
   rows.push({
     key: 'vpn',
     label: 'VPN',
     status: vpnStatus,
-    triggered: vpn,
+    triggered: vpnDetected,
     detail: vpnMethodCount > 1 ? `${vpnMethodCount} matching network methods` : signals.vpnReasons?.[0],
   });
 

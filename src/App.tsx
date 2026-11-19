@@ -1105,15 +1105,63 @@ export default function App() {
   const rawGpuTooltip = data?.hardwareSignals
     ? `${data.hardwareSignals.gpuVendor} • ${data.hardwareSignals.gpuRenderer}`
     : '';
-  // Anti-spoof integrity. When the server caught an anti-detect browser or rewritten Navigator
-  // getters, the cores / RAM / GPU numbers come from the very getters that were patched, so the
-  // dashboard shows them with an explicit unverified tag instead of presenting them as facts.
+  // Anti-spoof integrity. When tampering, an anti-detect browser, CDP / stealth artifacts or a
+  // high tampering-ML score are present, the cores / RAM / GPU numbers come from the very
+  // getters that were patched, so the dashboard tags them as unverified instead of facts.
+  const tamperingMlScore = data?.securitySignals?.tamperingMlScore;
   const spoofedSpecs = Boolean(
     data?.tamperingDetails?.anti_detect_browser ||
+      data?.tamperingDetails?.devtools_device_emulation ||
       data?.securitySignals?.stealthPluginDetected ||
-      data?.securitySignals?.cdpRuntimeLeak
+      data?.securitySignals?.cdpRuntimeLeak ||
+      data?.tampering ||
+      data?.securitySignals?.tampering ||
+      (typeof tamperingMlScore === 'number' && tamperingMlScore >= 0.5)
   );
   const spoofedSpecTag = spoofedSpecs ? ' (Spoofed / Unverified)' : '';
+
+  // Server-verified UA-CH identity for the current session. `browserDevice.browser/os` is read
+  // from mutable JS APIs and is spoofable, so the summary tiles prefer the request's own
+  // Sec-CH-UA* headers. A selected past visit keeps its own recorded browser / OS values.
+  const isCurrentVisit = selectedVisitIndex === 0;
+  const serverBrowserDetails = data?.browser_details;
+  const currentBrowserLabel = serverBrowserDetails
+    ? [
+        serverBrowserDetails.browser_name,
+        serverBrowserDetails.browser_full_version !== serverBrowserDetails.browser_name
+          ? serverBrowserDetails.browser_full_version
+          : '',
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .trim()
+    : '';
+  const currentOsLabel = serverBrowserDetails
+    ? [serverBrowserDetails.os, serverBrowserDetails.os_version]
+        .filter(Boolean)
+        .join(' ')
+        .trim()
+    : '';
+  const displayBrowser =
+    isCurrentVisit && currentBrowserLabel
+      ? currentBrowserLabel
+      : activeVisit?.browser || data?.browserDevice.browser || 'Unavailable';
+  const displayOs =
+    isCurrentVisit && currentOsLabel
+      ? currentOsLabel
+      : activeVisit?.os || data?.browserDevice.os || 'Unavailable';
+  // Only annotate the tiles when the current session actually shows tampering / stealth
+  // evidence — on a clean session the server-verified value is the unremarkable default.
+  const showServerVerifiedNote = Boolean(
+    isCurrentVisit &&
+      (data?.tampering ||
+        data?.securitySignals?.tampering ||
+        data?.securitySignals?.stealthPluginDetected ||
+        data?.securitySignals?.cdpRuntimeLeak ||
+        data?.tamperingDetails?.anti_detect_browser ||
+        data?.tamperingDetails?.devtools_device_emulation ||
+        (typeof tamperingMlScore === 'number' && tamperingMlScore >= 0.5))
+  );
 
   // 4-signal core grid model (null-safe: renders only inside the data block). The server's
   // computed grid is preferred; the client mirror covers older responses.
@@ -1203,6 +1251,15 @@ export default function App() {
   const eventJson = useMemo(() => {
     if (!data) return null;
     const s = data.securitySignals;
+    // Canonical network identity is derived only from server-side IP geolocation and the
+    // server's ISP classification. The JS `browserDevice` object is spoofable and must never
+    // leak into `ip_info` (it used to print a browser timezone inside `geolocation.timezone`).
+    const ipGeoTimezone =
+      typeof s.ipTimezone === 'string' && s.ipTimezone && s.ipTimezone !== 'Unavailable'
+        ? s.ipTimezone
+        : null;
+    const asnName = s.brandName && s.brandName !== 'Unavailable' ? s.brandName : data.location.org;
+    const isHostingNetwork = Boolean(s.datacenterAsn ?? s.isDatacenterOrHosting);
     const firstVisitMs = Date.parse(data.visitHistory[0]?.visitedAtUtc || '') || Date.now();
     const deviceType = data.browserDevice.deviceType;
     const fallbackIdentity = normalizeIdentity({
@@ -1295,18 +1352,20 @@ export default function App() {
             accuracy_radius: data.location.isLocationVerified ? 100 : null,
             latitude: data.location.latitude,
             longitude: data.location.longitude,
-            // IP geolocation timezone only. Falling back to the browser timezone here is what
-            // made a Singapore egress print "Asia/Calcutta" inside ip_info.
-            timezone: data.location.timezone ?? null,
+            // Server IP-geolocation timezone only — never `browserDevice.timezone`, which is
+            // client-controlled and made a Singapore egress print "Asia/Calcutta" in ip_info.
+            timezone: ipGeoTimezone,
             city_name: data.location.city,
             country_code: data.location.countryCode,
             country_name: data.location.country,
             subdivisions: data.location.region ? [{ name: data.location.region }] : [],
           },
           asn: data.location.asn,
-          asn_name: data.location.org,
-          asn_type: s.isDatacenterOrHosting ? 'hosting' : 'isp',
-          datacenter_result: Boolean(s.isDatacenterOrHosting),
+          // Prefer the server-classified retail brand over the raw geo-provider org string.
+          asn_name: asnName,
+          asn_type: isHostingNetwork ? 'hosting' : 'isp',
+          // Hosting/datacenter ASNs only. A commercial VPN (public_vpn) is not a datacenter.
+          datacenter_result: isHostingNetwork,
         },
       },
       proxy: Boolean((s as unknown as { proxyDetected?: boolean }).proxyDetected),
@@ -1952,9 +2011,9 @@ export default function App() {
                         <span className="block text-[10px] sm:text-[11px] text-slate-500">Browser</span>
                         <span
                           className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"
-                          title={activeVisit?.browser || data.browserDevice.browser}
+                          title={displayBrowser}
                         >
-                          {activeVisit?.browser || data.browserDevice.browser}
+                          {displayBrowser}
                         </span>
                       </div>
                     </div>
@@ -1982,17 +2041,17 @@ export default function App() {
                             <span className="block text-[10px] sm:text-[11px] text-slate-500 leading-snug">
                               {torBrowserClient && !data.browserDevice.reportedModel
                                 ? 'Model hidden by Tor Browser'
-                                : `${data.browserDevice.os} • ${data.browserDevice.deviceType}`}
+                                : `${displayOs} • ${activeVisit?.deviceType || data.browserDevice.deviceType}`}
                             </span>
                           </>
                         ) : (
                           <span
                             className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"
-                            title={`${activeVisit?.os || data.browserDevice.os} • ${
+                            title={`${displayOs} • ${
                               activeVisit?.deviceType || data.browserDevice.deviceType
                             }`}
                           >
-                            {activeVisit?.os || data.browserDevice.os} •{' '}
+                            {displayOs} •{' '}
                             {activeVisit?.deviceType || data.browserDevice.deviceType}
                           </span>
                         )}
@@ -2070,6 +2129,12 @@ export default function App() {
                       </div>
                     </div>
                   </div>
+                  {showServerVerifiedNote && (
+                    <p className="mt-2.5 text-[10px] leading-relaxed text-slate-500">
+                      Browser &amp; OS shown from server-verified HTTP / UA-CH headers; the
+                      values reported by page scripts may be spoofed.
+                    </p>
+                  )}
                 </div>
               </div>
 
