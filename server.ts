@@ -2463,6 +2463,23 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
       (aiBotPrefixTable.get('chatgpt-user')?.length ?? 0) > 0 ||
       (aiBotPrefixTable.get('gptbot')?.length ?? 0) > 0;
     const verified = webBotAuth.operator === 'openai' || openAiDns || openAiCidr;
+    // An official OpenAI UA from an IP that the loaded verification sources positively exclude
+    // is an impostor. When those sources are merely unavailable, keep the attribution but do
+    // not claim a verified spoof.
+    if (openAiUa && !verified && (openAiRangesLoaded || openAiDnsNames.length > 0)) {
+      return aiAgentResult({
+        agentId: 'impostor-spoof',
+        agentName: 'Spoofed AI Bot Impostor (Unverified IP)',
+        operator: 'Unverified OpenAI claim',
+        executionMode: 'Spoofed Impostor',
+        verified: false,
+        confidence: 'Verified',
+        evidence: [
+          `OpenAI user-agent claim: ${ua.slice(0, 120)}`,
+          `Source IP ${input.publicIp} is not on OpenAI infrastructure`,
+        ],
+      });
+    }
     return aiAgentResult({
       agentId: 'openai',
       agentName: directoryHint?.clientName || 'OpenAI ChatGPT Agent / Operator',
@@ -2509,7 +2526,9 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
     const anthropicDnsNames = await confirmedNames();
     const anthropicDns = hostMatchesSuffix(anthropicDnsNames, ANTHROPIC_VERIFICATION_SUFFIXES);
     const verified = webBotAuth.operator === 'anthropic' || anthropicDns;
-    if (claudeUa && !verified && anthropicDns) {
+    // `verified` already includes `anthropicDns`, so the old `!verified && anthropicDns` guard
+    // could never fire. Use "verification sources loaded but did not match" instead.
+    if (claudeUa && !verified && anthropicDnsNames.length > 0) {
       return aiAgentResult({
         agentId: 'impostor-spoof',
         agentName: 'Spoofed Anthropic Claude Agent (Unverified IP)',

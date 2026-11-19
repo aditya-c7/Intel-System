@@ -5482,6 +5482,20 @@ async function resolveAiAgentIdentity(input) {
     const openAiCidr = matchesAiPrefixTable(input.publicIp, ["chatgpt-user", "gptbot", "searchbot"]);
     const openAiRangesLoaded = (aiBotPrefixTable.get("chatgpt-user")?.length ?? 0) > 0 || (aiBotPrefixTable.get("gptbot")?.length ?? 0) > 0;
     const verified = webBotAuth.operator === "openai" || openAiDns || openAiCidr;
+    if (openAiUa && !verified && (openAiRangesLoaded || openAiDnsNames.length > 0)) {
+      return aiAgentResult({
+        agentId: "impostor-spoof",
+        agentName: "Spoofed AI Bot Impostor (Unverified IP)",
+        operator: "Unverified OpenAI claim",
+        executionMode: "Spoofed Impostor",
+        verified: false,
+        confidence: "Verified",
+        evidence: [
+          `OpenAI user-agent claim: ${ua.slice(0, 120)}`,
+          `Source IP ${input.publicIp} is not on OpenAI infrastructure`
+        ]
+      });
+    }
     return aiAgentResult({
       agentId: "openai",
       agentName: directoryHint?.clientName || "OpenAI ChatGPT Agent / Operator",
@@ -5518,7 +5532,7 @@ async function resolveAiAgentIdentity(input) {
     const anthropicDnsNames = await confirmedNames();
     const anthropicDns = hostMatchesSuffix(anthropicDnsNames, ANTHROPIC_VERIFICATION_SUFFIXES);
     const verified = webBotAuth.operator === "anthropic" || anthropicDns;
-    if (claudeUa && !verified && anthropicDns) {
+    if (claudeUa && !verified && anthropicDnsNames.length > 0) {
       return aiAgentResult({
         agentId: "impostor-spoof",
         agentName: "Spoofed Anthropic Claude Agent (Unverified IP)",
