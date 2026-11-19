@@ -2526,9 +2526,11 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
     const anthropicDnsNames = await confirmedNames();
     const anthropicDns = hostMatchesSuffix(anthropicDnsNames, ANTHROPIC_VERIFICATION_SUFFIXES);
     const verified = webBotAuth.operator === 'anthropic' || anthropicDns;
-    // `verified` already includes `anthropicDns`, so the old `!verified && anthropicDns` guard
-    // could never fire. Use "verification sources loaded but did not match" instead.
-    if (claudeUa && !verified && anthropicDnsNames.length > 0) {
+    // Anthropic has no published CIDR table here, so the only verification is FCrDNS. An
+    // official Claude crawler has a matching forward-confirmed name; a spoof on an arbitrary IP
+    // does not. Treat any unverified Claude UA as an impostor rather than attributing it to
+    // Anthropic with a misleading "Medium" confidence.
+    if (claudeUa && !verified) {
       return aiAgentResult({
         agentId: 'impostor-spoof',
         agentName: 'Spoofed Anthropic Claude Agent (Unverified IP)',

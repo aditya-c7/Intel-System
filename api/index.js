@@ -5532,7 +5532,7 @@ async function resolveAiAgentIdentity(input) {
     const anthropicDnsNames = await confirmedNames();
     const anthropicDns = hostMatchesSuffix(anthropicDnsNames, ANTHROPIC_VERIFICATION_SUFFIXES);
     const verified = webBotAuth.operator === "anthropic" || anthropicDns;
-    if (claudeUa && !verified && anthropicDnsNames.length > 0) {
+    if (claudeUa && !verified) {
       return aiAgentResult({
         agentId: "impostor-spoof",
         agentName: "Spoofed Anthropic Claude Agent (Unverified IP)",
