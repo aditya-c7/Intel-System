@@ -3328,6 +3328,8 @@ export async function evaluateSecuritySignals(
     botReason: botAssessment.botReason,
     webdriver: botAssessment.webdriver,
     cdpDetected: botAssessment.cdpDetected,
+    cdpRuntimeLeak: Boolean(botAssessment.cdpRuntimeLeak),
+    stealthPluginDetected: Boolean(botAssessment.stealthPluginDetected),
     /* Phase 2 — client-side Tor Browser fingerprint (Gecko RFP + letterboxing) */
     isTorBrowserClient: torBrowserClient.detected,
     /* Phase 5 — browser tampering (DevTools device emulation / anti-detect browsers) */

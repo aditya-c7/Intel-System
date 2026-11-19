@@ -210,6 +210,20 @@ export interface SecuritySignals {
   isConsumerBroadband?: boolean;
   isDatacenterOrHosting?: boolean;
 
+  /* Automation depth — protocol-level leaks and stealth-plugin artifacts */
+  cdpRuntimeLeak?: boolean;
+  stealthPluginDetected?: boolean;
+
+  /* Network anonymity methods — the single source of truth for the VPN tile count */
+  vpnMethods?: {
+    timezone_mismatch: boolean;
+    public_vpn: boolean;
+    auxiliary_mobile: boolean;
+    os_mismatch: boolean;
+    relay: boolean;
+    ml_prediction: boolean;
+  };
+
   /* Task 3 — deep technical detection payloads */
   webrtcLeak?: boolean;
   webrtcCandidateIp?: string | null;

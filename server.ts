@@ -437,6 +437,7 @@ function initializeDatabase(): DatabaseAdapter {
         org TEXT NOT NULL,
         asn TEXT NOT NULL,
         is_vpn_or_hosting INTEGER NOT NULL DEFAULT 0,
+        timezone TEXT,
         verified_at_ms INTEGER NOT NULL
       );
 
@@ -479,6 +480,11 @@ function initializeDatabase(): DatabaseAdapter {
       } catch {
         // Column already exists
       }
+    }
+    try {
+      sqliteDb.exec(`ALTER TABLE verified_geo_cache_v3 ADD COLUMN timezone TEXT`);
+    } catch {
+      // Column already exists
     }
     // Per-visit risk persistence (Fix 7): survive serverless cold starts with the exact
     // score, level and bot attribution that were shown when the visit happened.
@@ -1218,6 +1224,10 @@ interface BotClientSignals {
   webdriver?: boolean;
   cdpDetected?: boolean;
   botSignals?: string[];
+  /** Protocol-level CDP Runtime serialization leak reported by the page. */
+  cdpRuntimeLeak?: boolean;
+  /** Stealth plugin artifacts (non-native getters, iframe leak, proxy chain). */
+  stealthPluginDetected?: boolean;
 }
 
 /** Reads a header case-insensitively, collapsing repeated headers into a comma list. */
@@ -1542,6 +1552,31 @@ function classifyBotTraffic(
         client.webdriver ? 'WebDriver runtime binding present' : 'CDP runtime binding present',
         `Datacenter ASN hosting the agent (${networkHaystack})`,
       ],
+    };
+  }
+
+  // Stealth plugins erase the WebDriver flag, so the patching side effects reported by the
+  // page are the only client-side evidence left. They are proof of automation, not suspicion.
+  if (client.stealthPluginDetected || client.cdpRuntimeLeak) {
+    const reasons: string[] = [];
+    if (client.cdpRuntimeLeak) {
+      reasons.push('CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked)');
+    }
+    if (client.stealthPluginDetected) {
+      reasons.push('Stealth plugin artifacts (rewritten native getters / iframe identity leak)');
+    }
+    for (const signal of clientSignals.slice(0, 2)) reasons.push(signal);
+    return {
+      subtype: 'bad_bot',
+      label: client.stealthPluginDetected
+        ? 'Puppeteer / Playwright Stealth'
+        : 'HeadlessChrome / CDP Automation',
+      provider: client.stealthPluginDetected
+        ? 'Stealth Automation (Puppeteer/Playwright)'
+        : 'Chromium',
+      category: 'Automation',
+      confidence: 0.94,
+      reasons,
     };
   }
 
@@ -4042,13 +4077,14 @@ async function lookupVerifiedGeolocation(
         org: string;
         asn: string;
         is_vpn_or_hosting: number;
+        timezone: string | null;
         verified_at_ms: number;
       }
     | undefined;
   try {
     cached = db
       .prepare(
-        'SELECT city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms FROM verified_geo_cache_v3 WHERE ip_address = ?'
+        'SELECT city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, timezone, verified_at_ms FROM verified_geo_cache_v3 WHERE ip_address = ?'
       )
       .get(visitorIp) as typeof cached;
   } catch {
@@ -4087,6 +4123,7 @@ async function lookupVerifiedGeolocation(
       isp: cached.isp,
       org: cached.org,
       asn: cached.asn,
+      timezone: cached.timezone || undefined,
       isVpnOrHosting: Boolean(cached.is_vpn_or_hosting),
       isIpVerified: true,
       isLocationVerified:
@@ -4129,6 +4166,7 @@ async function lookupVerifiedGeolocation(
     org: string;
     asn: string;
     isVpnOrHosting: boolean;
+    timezone?: string;
   }): LocationInfo => ({
     publicIp: visitorIp,
     ...input,
@@ -4149,8 +4187,8 @@ async function lookupVerifiedGeolocation(
     try {
       db.prepare(
         `INSERT OR REPLACE INTO verified_geo_cache_v3 (
-          ip_address, city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, verified_at_ms
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ip_address, city, region, country, country_code, latitude, longitude, isp, org, asn, is_vpn_or_hosting, timezone, verified_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         visitorIp,
         location.city,
@@ -4163,6 +4201,7 @@ async function lookupVerifiedGeolocation(
         location.org,
         location.asn,
         location.isVpnOrHosting ? 1 : 0,
+        location.timezone ?? null,
         nowMs
       );
     } catch {
@@ -4205,6 +4244,7 @@ async function lookupVerifiedGeolocation(
       const conn = (data.connection as Record<string, unknown>) || {};
       const sec = (data.security as Record<string, unknown>) || {};
       const net = network(conn.isp, conn.org, conn.asn, Boolean(sec.vpn || sec.proxy || sec.tor || sec.hosting));
+      const providerTimezone = (data.timezone as Record<string, unknown> | undefined)?.id;
       const location = build({
         city: cleanField(data.city),
         region: cleanField(data.region),
@@ -4216,6 +4256,7 @@ async function lookupVerifiedGeolocation(
         org: net.org,
         asn: net.asn,
         isVpnOrHosting: net.isVpnOrHosting,
+        timezone: cleanText(providerTimezone) || undefined,
       });
       return location;
     });
@@ -4238,6 +4279,7 @@ async function lookupVerifiedGeolocation(
         org: net.org,
         asn: net.asn,
         isVpnOrHosting: net.isVpnOrHosting,
+        timezone: cleanText(data.timezone) || undefined,
       });
     });
 
@@ -4253,6 +4295,7 @@ async function lookupVerifiedGeolocation(
       );
       if (!providerIp || providerIp.toLowerCase() !== visitorIp.toLowerCase()) return null;
       const net = network(data.asnOrganization, data.asnOrganization, data.asn, Boolean(data.isProxy));
+      const timezones = Array.isArray(data.timeZones) ? data.timeZones : [];
       return build({
         city: cleanField(data.cityName),
         region: cleanField(data.regionName),
@@ -4264,6 +4307,7 @@ async function lookupVerifiedGeolocation(
         org: net.org,
         asn: net.asn,
         isVpnOrHosting: net.isVpnOrHosting,
+        timezone: cleanText(timezones[0]) || undefined,
       });
     });
 
@@ -4292,6 +4336,7 @@ async function lookupVerifiedGeolocation(
         org: net.org,
         asn: net.asn,
         isVpnOrHosting: net.isVpnOrHosting,
+        timezone: cleanText(data.timezone) || undefined,
       });
     });
 
@@ -4960,7 +5005,15 @@ function sanitizeAndReinforceSecuritySignals(
     classifyBotTraffic(
       requestContext.headers,
       { org: location.org, isp: location.isp, asn: location.asn },
-      { isBot: clientAutomationDetected, isHeadless, webdriver, cdpDetected, botSignals }
+      {
+        isBot: clientAutomationDetected,
+        isHeadless,
+        webdriver,
+        cdpDetected,
+        botSignals,
+        cdpRuntimeLeak: Boolean(raw?.cdpRuntimeLeak),
+        stealthPluginDetected: Boolean(raw?.stealthPluginDetected),
+      }
     );
   const botSubtype: BotSubtype = botClassification.subtype;
   const spoofedCrawler =
@@ -5052,12 +5105,6 @@ function sanitizeAndReinforceSecuritySignals(
 
   // A confirmed Tor exit relay is a network-reputation verdict in its own right; it must reach
   // `vpnSuspected` even when the relay sits on a residential ASN.
-  const vpnSuspected =
-    Boolean(raw?.vpnSuspected) ||
-    timezoneMismatch ||
-    torExitNode ||
-    (datacenterAsn && botSubtype !== 'good_bot');
-
   // Smart-signal timezone comparison: both sides are canonicalized through normalizeTimezone so
   // a legacy alias (Asia/Calcutta vs Asia/Kolkata, US/Pacific vs America/Los_Angeles) is never
   // mis-reported as a timezone relay. Casing is folded for the comparison only.
@@ -5068,6 +5115,26 @@ function sanitizeAndReinforceSecuritySignals(
       ipTzCanonical &&
       clientTzCanonical.toLowerCase() !== ipTzCanonical.toLowerCase()
   );
+
+  // A commercial VPN provider is not the same claim as a cloud/datacenter egress. Only a
+  // provider match (or an explicit relay signal) may set `public_vpn`; a bare AWS/Azure/
+  // Alibaba/DO address stays a datacenter result so the dashboard never says "You are using
+  // a VPN" to someone on a plain cloud host.
+  const networkHaystackForVpn = `${location.isp} ${location.org}`;
+  const commercialVpnProvider =
+    !classification.isConsumerBroadband &&
+    VPN_PROXY_PATTERN.test(networkHaystackForVpn) &&
+    !/\bcloud\b|\bhosting\b|\bdatacenter\b|\bdata center\b/i.test(networkHaystackForVpn);
+  const vpnMethods = {
+    timezone_mismatch: hasTzMismatch,
+    public_vpn: commercialVpnProvider,
+    auxiliary_mobile: false,
+    os_mismatch: Boolean(raw?.isOsTampered),
+    relay: Boolean(torExitNode),
+    ml_prediction: Boolean(raw?.vpnSuspected) && !commercialVpnProvider && !hasTzMismatch,
+  };
+  const vpnSuspected =
+    Object.values(vpnMethods).some(Boolean) || (datacenterAsn && botSubtype !== 'good_bot');
 
   const tamperDetected = Boolean(raw?.tamperDetected || requestContext.tamperedRequest);
   const tamperReasons = safeStrArray(raw?.tamperReasons);
@@ -5614,6 +5681,11 @@ function sanitizeAndReinforceSecuritySignals(
       botReason,
       webdriver,
       cdpDetected,
+      // Protocol-level and stealth-plugin evidence reaches the payload, the grid and the JSON.
+      cdpRuntimeLeak: Boolean(raw?.cdpRuntimeLeak),
+      stealthPluginDetected: Boolean(raw?.stealthPluginDetected),
+      // The single source of truth for `vpn_methods`: the UI derives its count from this object.
+      vpnMethods,
       smartSignals,
       riskBadgeText,
       // Phase 1 — bot / AI-agent subtype classification
