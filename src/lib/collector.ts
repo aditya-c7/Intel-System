@@ -1922,9 +1922,10 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
     // Ignore.
   }
 
-  // A software rasterizer plus forged getters is the classic headless stealth profile.
-  const softwareGpu = /swiftshader|llvmpipe/i.test(String(gpuRenderer || ''));
-  const artifactCount = reasons.length + (softwareGpu ? 1 : 0);
+  // A software rasterizer is a VM/headless signal, NOT evidence of a stealth plugin. Counting
+  // it here made plain SwiftShader headless sessions look like "Puppeteer / Playwright Stealth"
+  // and pushed them into the critical tier. Only actual patch artifacts count toward this flag.
+  const artifactCount = reasons.length;
   const stealthPluginDetected = definitive || artifactCount >= 2;
 
   return { cdpRuntimeLeak, stealthPluginDetected, stealthReasons: reasons };
