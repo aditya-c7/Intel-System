@@ -950,8 +950,20 @@ const TOR_OPERATOR_IPV6_PREFIXES = ['2001:67c:e60::/48', '2a02:898:256::/48'];
 const TOR_OPERATOR_REVERSE_DNS_PATTERN =
   /\b(tor-?exit|tor-?relay|exit-?node|nothingtohide\.nl|hartvoorinternetvrijheid\.nl|cyberology\.(nl|church)|torservers\.net|emeraldonion\.org|applied-privacy\.net|artikel10\.org|nos-oignons\.net|tor\.r0cket\.net)\b/i;
 
+// Provider-owned VPN / privacy brands and ASNs (Proton AG, Mullvad's 31173 Services AB,
+// NordVPN / PacketHub, Surfshark / Cyberzone, ...) are genuine commercial VPNs. Generic
+// hosting operators are deliberately NOT listed here — see HOSTING_EGRESS_PATTERN below.
 const VPN_PROXY_PATTERN =
-  /\b(vpn|nordvpn|expressvpn|surfshark|cyberghost|private internet access|proton\s?vpn|mullvad|windscribe|ipvanish|hide\.?me|hola vpn|psiphon|packet hub|packethub|tor ?guard|proxy|socks5|smart dns)\b/i;
+  /\b(vpn|nordvpn|expressvpn|surfshark|cyberghost|cyberzone|private internet access|proton(?:\s?vpn)?|mullvad|31173|windscribe|ipvanish|hide\.?me|hola vpn|psiphon|packet hub|packethub|tor ?guard|proxy|socks5|smart dns)\b/i;
+
+/**
+ * General hosting / datacenter / CDN operators that commonly RENT capacity to VPN services but
+ * are NOT commercial VPN providers themselves (2026 cross-check: Netify, GeoIPHub, iplogs,
+ * AbstractAPI). A match here must keep the egress a datacenter result — `public_vpn` is reserved
+ * for provider-run ASNs (Proton AG, Mullvad/31173, NordVPN/PacketHub, Surfshark/Cyberzone, ...).
+ */
+const HOSTING_EGRESS_PATTERN =
+  /\b(m247|datacamp|cdnext|tzulo|cloudflare|amazonaws|amazon|aws|google cloud|google llc|azure|microsoft|digitalocean|hetzner|linode|ovh|choopa|vultr|leaseweb|hostinger|contabo|akamai|oracle cloud|alibaba|aliyun|tencent cloud|latitude|hosting|hosted|datacenter|data center|cloud)\b/i;
 
 // Indian carriers (Jio / Airtel) are intentionally absent: their branded consumer rules label
 // them as Residential Broadband, and the mobile step must not pre-empt those.
@@ -1228,6 +1240,10 @@ interface BotClientSignals {
   cdpRuntimeLeak?: boolean;
   /** Stealth plugin artifacts (non-native getters, iframe leak, proxy chain). */
   stealthPluginDetected?: boolean;
+  /** Client tamperingDetails.anti_detect_browser — hard proof of an anti-detect browser. */
+  antiDetectBrowser?: boolean;
+  /** Client tampering_ml_score; >= 0.5 is a hard automation escalation. */
+  tamperingMlScore?: number;
 }
 
 /** Reads a header case-insensitively, collapsing repeated headers into a comma list. */
@@ -1471,6 +1487,46 @@ function classifyBotTraffic(
     ? client.botSignals.filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
     : [];
 
+  // HARD INVARIANT — a stealth / anti-detect runtime is proof of automation and must never be
+  // labelled "Verified Human". These client artifacts are checked BEFORE every UA rule so no
+  // crawler, agent or interactive-browser path can downgrade the verdict. `anti_detect_browser`
+  // and a >= 0.5 tampering ML score arrive from the collector's browser-tampering assessment.
+  const hardAutomation =
+    Boolean(client.stealthPluginDetected || client.cdpRuntimeLeak || client.antiDetectBrowser) ||
+    (typeof client.tamperingMlScore === 'number' && client.tamperingMlScore >= 0.5);
+  if (hardAutomation) {
+    const reasons: string[] = [];
+    if (client.cdpRuntimeLeak) {
+      reasons.push('CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked)');
+    }
+    if (client.stealthPluginDetected) {
+      reasons.push('Stealth plugin artifacts (rewritten native getters / iframe identity leak)');
+    }
+    if (client.antiDetectBrowser) {
+      reasons.push('Anti-detect browser footprint (spoofed screen / patched navigator getters)');
+    }
+    if (typeof client.tamperingMlScore === 'number' && client.tamperingMlScore >= 0.5) {
+      reasons.push(`Browser tampering ML score ${client.tamperingMlScore.toFixed(3)}`);
+    }
+    for (const signal of clientSignals.slice(0, 2)) reasons.push(signal);
+    return {
+      subtype: 'bad_bot',
+      label: client.antiDetectBrowser
+        ? 'Anti-Detect Browser'
+        : client.stealthPluginDetected
+        ? 'Puppeteer / Playwright Stealth'
+        : 'HeadlessChrome / CDP Automation',
+      provider: client.antiDetectBrowser
+        ? 'Anti-Detect Browser'
+        : client.stealthPluginDetected
+        ? 'Stealth Automation (Puppeteer/Playwright)'
+        : 'Chromium',
+      category: 'Automation',
+      confidence: 0.94,
+      reasons: reasons.length > 0 ? reasons : ['Hard automation artifact reported by client'],
+    };
+  }
+
   for (const rule of GOOD_BOT_UA_RULES) {
     if (!rule.pattern.test(ua)) continue;
     if (rule.network.test(networkHaystack)) {
@@ -1555,30 +1611,8 @@ function classifyBotTraffic(
     };
   }
 
-  // Stealth plugins erase the WebDriver flag, so the patching side effects reported by the
-  // page are the only client-side evidence left. They are proof of automation, not suspicion.
-  if (client.stealthPluginDetected || client.cdpRuntimeLeak) {
-    const reasons: string[] = [];
-    if (client.cdpRuntimeLeak) {
-      reasons.push('CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked)');
-    }
-    if (client.stealthPluginDetected) {
-      reasons.push('Stealth plugin artifacts (rewritten native getters / iframe identity leak)');
-    }
-    for (const signal of clientSignals.slice(0, 2)) reasons.push(signal);
-    return {
-      subtype: 'bad_bot',
-      label: client.stealthPluginDetected
-        ? 'Puppeteer / Playwright Stealth'
-        : 'HeadlessChrome / CDP Automation',
-      provider: client.stealthPluginDetected
-        ? 'Stealth Automation (Puppeteer/Playwright)'
-        : 'Chromium',
-      category: 'Automation',
-      confidence: 0.94,
-      reasons,
-    };
-  }
+  // Stealth / anti-detect artifacts are resolved by the hard-automation gate at the top of this
+  // function so they cannot be downgraded by any UA rule below.
 
   const isDesktopChromeOrSafari =
     /chrome\/|crios\/|safari\//i.test(ua) && !/mobile|android|iphone|ipad/i.test(ua);
@@ -5000,7 +5034,32 @@ function sanitizeAndReinforceSecuritySignals(
   const botSignals = safeStrArray(raw?.botSignals);
   const clientAutomationDetected = Boolean(raw?.isBot || webdriver || cdpDetected);
 
-  const botClassification: BotClassification =
+  // Hard automation artifacts — the exact same set classifyBotTraffic gates on. One source of
+  // truth for the tile score, the composite, the echoed signals and the subtype escalation.
+  const antiDetectBrowser = Boolean(raw?.tamperingDetails?.anti_detect_browser);
+  const tamperingMlScore =
+    typeof raw?.tamperingMlScore === 'number' && Number.isFinite(raw.tamperingMlScore)
+      ? raw.tamperingMlScore
+      : 0;
+  const mlTampering = tamperingMlScore >= 0.5;
+  const stealthAutomation = Boolean(
+    raw?.stealthPluginDetected || raw?.cdpRuntimeLeak || antiDetectBrowser || mlTampering
+  );
+  const hardAutomationReasons: string[] = [];
+  if (raw?.cdpRuntimeLeak) {
+    hardAutomationReasons.push('CDP Runtime.enable serialization leak');
+  }
+  if (raw?.stealthPluginDetected) {
+    hardAutomationReasons.push('Stealth plugin artifacts (non-native getters / iframe leak)');
+  }
+  if (antiDetectBrowser) {
+    hardAutomationReasons.push('Anti-detect browser footprint (tamperingDetails)');
+  }
+  if (mlTampering) {
+    hardAutomationReasons.push(`Browser tampering ML score ${tamperingMlScore.toFixed(3)}`);
+  }
+
+  const rawBotClassification: BotClassification =
     requestContext.botClassification ??
     classifyBotTraffic(
       requestContext.headers,
@@ -5013,8 +5072,28 @@ function sanitizeAndReinforceSecuritySignals(
         botSignals,
         cdpRuntimeLeak: Boolean(raw?.cdpRuntimeLeak),
         stealthPluginDetected: Boolean(raw?.stealthPluginDetected),
+        antiDetectBrowser,
+        tamperingMlScore,
       }
     );
+  // Defensive escalation: even if an older caller supplied a human / good-bot classification,
+  // a hard automation artifact can never be rendered as "Verified Human".
+  const botClassification: BotClassification =
+    stealthAutomation && rawBotClassification.subtype !== 'bad_bot'
+      ? {
+          subtype: 'bad_bot',
+          label: antiDetectBrowser ? 'Anti-Detect Browser' : 'Stealth / CDP Automation',
+          provider: antiDetectBrowser
+            ? 'Anti-Detect Browser'
+            : 'Stealth Automation (Puppeteer/Playwright)',
+          category: 'Automation',
+          confidence: 0.94,
+          reasons:
+            hardAutomationReasons.length > 0
+              ? hardAutomationReasons
+              : ['Hard automation artifact reported by client'],
+        }
+      : rawBotClassification;
   const botSubtype: BotSubtype = botClassification.subtype;
   const spoofedCrawler =
     botClassification.subtype === 'bad_bot' && botClassification.label === 'Spoofed Crawler';
@@ -5117,14 +5196,18 @@ function sanitizeAndReinforceSecuritySignals(
   );
 
   // A commercial VPN provider is not the same claim as a cloud/datacenter egress. Only a
-  // provider match (or an explicit relay signal) may set `public_vpn`; a bare AWS/Azure/
-  // Alibaba/DO address stays a datacenter result so the dashboard never says "You are using
-  // a VPN" to someone on a plain cloud host.
+  // provider-owned VPN brand/ASN match may set `public_vpn`; generic hosting operators such as
+  // M247, Datacamp/CDNEXT, Tzulo, Cloudflare, AWS/GCP/Azure/Alibaba or Hetzner rent capacity to
+  // VPN services but are not VPN providers themselves, so they stay a datacenter result.
+  // Crucially this uses the BASE (pre-override) ISP classification: applyNetworkOverrides() can
+  // promote a residential line with a timezone mismatch to `VPN / Proxy Relay`, and that must
+  // never be reported as a commercial VPN.
   const networkHaystackForVpn = `${location.isp} ${location.org}`;
   const commercialVpnProvider =
-    !classification.isConsumerBroadband &&
+    !baseClassification.isConsumerBroadband &&
+    baseClassification.networkType === 'VPN / Proxy Relay' &&
     VPN_PROXY_PATTERN.test(networkHaystackForVpn) &&
-    !/\bcloud\b|\bhosting\b|\bdatacenter\b|\bdata center\b/i.test(networkHaystackForVpn);
+    !HOSTING_EGRESS_PATTERN.test(networkHaystackForVpn);
   const vpnMethods = {
     timezone_mismatch: hasTzMismatch,
     public_vpn: commercialVpnProvider,
@@ -5307,15 +5390,17 @@ function sanitizeAndReinforceSecuritySignals(
   const spoofedImpostor =
     aiAgent?.agentId === 'impostor-spoof' ||
     (botSubtype === 'bad_bot' && spoofedCrawler);
-  // Calibrated scale: a spoofed impostor is 10, stealth automation is 9, plain automation and a
-  // named AI agent are 7, a verified crawler is 2. Only 9-10 means confirmed active deception.
-  const stealthAutomation = Boolean(raw?.stealthPluginDetected || raw?.cdpRuntimeLeak);
+  // Calibrated scale: a spoofed impostor is 10, hard automation artifacts (stealth plugins,
+  // CDP leak, anti-detect browser, ML score >= 0.5) are 9, plain automation and a named AI
+  // agent are 7, a verified crawler is 2. Only 9-10 means confirmed active deception. The
+  // hard-automation check comes first so a stale human / good-bot / agent classification can
+  // never suppress the escalation on the tile.
   const botScore = spoofedImpostor
     ? 10
+    : stealthAutomation
+    ? 9
     : botSubtype === 'bad_bot'
-    ? stealthAutomation
-      ? 9
-      : 7
+    ? 7
     : botSubtype === 'ai_agent'
     ? 7
     : botSubtype === 'good_bot'
@@ -5323,7 +5408,7 @@ function sanitizeAndReinforceSecuritySignals(
     : 0;
   const botStatus = spoofedImpostor
     ? 'Spoofed AI Impostor'
-    : botSubtype === 'bad_bot'
+    : stealthAutomation || botSubtype === 'bad_bot'
     ? 'Bot / Automated'
     : aiAgent?.detected && aiAgent.agentName
     ? aiAgent.agentName
@@ -5340,8 +5425,9 @@ function sanitizeAndReinforceSecuritySignals(
           aiAgent.evidence[0] || 'agent identity attributed from request headers'
         }`
       : '';
-  const botDetail =
-    botSubtype === 'human' && !aiAgent?.detected
+  const botDetail = stealthAutomation
+    ? `${hardAutomationReasons.join('; ') || 'Stealth / anti-detect automation runtime detected'} — hard automation artifact, never a verified human`
+    : botSubtype === 'human' && !aiAgent?.detected
       ? 'Verified human interactive session'
       : aiAgentDetail
       ? aiAgentDetail
@@ -5562,10 +5648,22 @@ function sanitizeAndReinforceSecuritySignals(
   const maxCardScore = Math.max(0, ...cardScores);
   const elevatedCardCount = cardScores.filter((score) => score >= 4).length;
   const synergyBonus = elevatedCardCount >= 3 ? 2 : elevatedCardCount === 2 ? 1 : 0;
-  const suspectScore = Math.min(
-    10,
-    Math.max(weightedCompositeScore, maxCardScore + synergyBonus)
+  // 9-10 are reserved for active deception (stealth / anti-detect, tampering, replay, a
+  // confirmed Tor exit or a spoofed impostor). The card-floor synergy alone must never promote
+  // a plain headless / cloud-VM / timezone-relay session to a critical headline — cap the
+  // non-deception path at 8 so those combinations cannot saturate at 10.
+  const criticalDeception = Boolean(
+    stealthAutomation ||
+      spoofedImpostor ||
+      tamperDetected ||
+      raw?.tampering ||
+      integrityViolation ||
+      torExitNode
   );
+  const cardFloorScore = Math.max(weightedCompositeScore, maxCardScore + synergyBonus);
+  const suspectScore = criticalDeception
+    ? Math.min(10, cardFloorScore)
+    : Math.min(8, cardFloorScore);
   const riskLevel: SecuritySignals['riskLevel'] = tierFor(suspectScore);
   const riskBadgeText = `${riskLevel} Risk • ${suspectScore}/10`;
 
@@ -6648,6 +6746,17 @@ app.post('/api/visitor/identify', async (req, res) => {
     const fullRequestUserAgent = headerCarriesBotSignature
       ? headerRequestUserAgent
       : envelopeRequestUserAgent || headerRequestUserAgent;
+    // Hard automation artifacts reach BOTH this first classification (which drives the final
+    // bot_info / bot_type / history verdict) and the sanitizer's per-tile escalation. Omitting
+    // them here used to leave the final classification as "Verified Human" even when the bot
+    // tile was escalated — the two paths now read the exact same client fields.
+    const hardAutomationSignals = Boolean(
+      rawSecuritySignals?.cdpRuntimeLeak ||
+        rawSecuritySignals?.stealthPluginDetected ||
+        rawSecuritySignals?.tamperingDetails?.anti_detect_browser ||
+        (typeof rawSecuritySignals?.tamperingMlScore === 'number' &&
+          rawSecuritySignals.tamperingMlScore >= 0.5)
+    );
     const botClassification = classifyBotTraffic(
       { ...rawRequestHeaders, 'user-agent': fullRequestUserAgent },
       { org: location.org, isp: location.isp, asn: location.asn },
@@ -6663,6 +6772,13 @@ app.post('/api/visitor/identify', async (req, res) => {
         botSignals: Array.isArray(rawSecuritySignals?.botSignals)
           ? rawSecuritySignals.botSignals
           : [],
+        cdpRuntimeLeak: Boolean(rawSecuritySignals?.cdpRuntimeLeak),
+        stealthPluginDetected: Boolean(rawSecuritySignals?.stealthPluginDetected),
+        antiDetectBrowser: Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
+        tamperingMlScore:
+          typeof rawSecuritySignals?.tamperingMlScore === 'number'
+            ? rawSecuritySignals.tamperingMlScore
+            : 0,
       }
     );
 
@@ -6773,7 +6889,14 @@ app.post('/api/visitor/identify', async (req, res) => {
             reasons: aiAgent.evidence.slice(0, 3),
           }
         : null;
-    const effectiveBotClassification = attributedBotClassification ?? botClassification;
+    // A hard automation artifact always wins the final verdict: it must reach bot_info,
+    // bot_type and the history rows, not just the per-tile score. An AI-agent attribution is
+    // still preserved on `securitySignals.aiAgent`, and its impostor-spoof bad_bot verdict is
+    // compatible with the escalation, so only a non-bot attribution is overridden here.
+    const effectiveBotClassification: BotClassification =
+      hardAutomationSignals && attributedBotClassification?.subtype !== 'bad_bot'
+        ? botClassification
+        : attributedBotClassification ?? botClassification;
 
     // Only cryptographic tampering (modified signed payload) and nonce replay poison the IP
     // ledger. A User-Agent header mismatch is deliberately excluded: edge proxies can rewrite
@@ -6834,6 +6957,55 @@ app.post('/api/visitor/identify', async (req, res) => {
         botClassification: effectiveBotClassification,
       }
     );
+
+    // Server-verified identity — header-resolved UA / client hints outrank the client payload.
+    // `serverVerifiedBrowser` / `serverVerifiedOs` carry the full resolved identity; the
+    // `headerMismatch` verdict is a tolerant FAMILY comparison (not a string equality check) so
+    // harmless version / vendor suffix differences never fire a false mismatch.
+    const serverVerifiedBrowser =
+      uaIdentity.browserName && uaIdentity.browserName !== 'Unknown'
+        ? `${uaIdentity.browserName}${
+            uaIdentity.browserFullVersion ? ` ${uaIdentity.browserFullVersion}` : ''
+          }`
+        : browserDevice.browser;
+    const serverVerifiedOs =
+      uaIdentity.os && uaIdentity.os !== 'Unknown'
+        ? `${uaIdentity.os}${uaIdentity.osVersion ? ` ${uaIdentity.osVersion}` : ''}`
+        : browserDevice.os;
+    const osFamilyKey = (value: string): string => {
+      const text = String(value || '').toLowerCase();
+      if (!text || text === 'unknown') return '';
+      if (/mac os x|macos|macintosh|\bmac\b/.test(text)) return 'macos';
+      if (/iphone|ipad|ipod|ipados|\bios\b/.test(text)) return 'ios';
+      if (/android/.test(text)) return 'android';
+      if (/windows|win32|win64/.test(text)) return 'windows';
+      if (/linux|ubuntu|fedora|debian|chrome ?os/.test(text)) return 'linux';
+      return text.replace(/[^a-z0-9]/g, '');
+    };
+    const browserFamilyKey = (value: string): string => {
+      const text = String(value || '').toLowerCase();
+      if (!text || text === 'unknown') return '';
+      if (/edg(e|a|ios)?\b|edge/.test(text)) return 'edge';
+      if (/opera|\bopr\b/.test(text)) return 'opera';
+      if (/firefox|fxios/.test(text)) return 'firefox';
+      if (/crios|chrome|chromium/.test(text)) return 'chrome';
+      if (/safari/.test(text)) return 'safari';
+      return text.replace(/[^a-z0-9]/g, '');
+    };
+    const serverOsFamily = osFamilyKey(serverVerifiedOs);
+    const clientOsFamily = osFamilyKey(browserDevice.os);
+    const serverBrowserFamily = browserFamilyKey(serverVerifiedBrowser);
+    const clientBrowserFamily = browserFamilyKey(browserDevice.browser);
+    const headerMismatch = Boolean(
+      (serverOsFamily && clientOsFamily && serverOsFamily !== clientOsFamily) ||
+        (serverBrowserFamily && clientBrowserFamily && serverBrowserFamily !== clientBrowserFamily)
+    );
+    securitySignals.serverVerifiedBrowser = serverVerifiedBrowser;
+    securitySignals.serverVerifiedOs = serverVerifiedOs;
+    securitySignals.headerMismatch = headerMismatch;
+    securitySignals.headerMismatchReason = headerMismatch
+      ? `Server headers report ${serverVerifiedBrowser} on ${serverVerifiedOs}, but the client reported ${browserDevice.browser} on ${browserDevice.os}`
+      : '';
 
     // Phase 2 — SQLite velocity windows, device rarity and the calibrated 0–100 Suspect Score.
     // These are additive to the 0–10 per-tile grid: the tiles keep their own calibrated scale
@@ -6906,11 +7078,12 @@ app.post('/api/visitor/identify', async (req, res) => {
     // Every history row always carries suspectScore / riskLevel / recognitionSource so the UI
     // never renders `undefined`. Stored per-visit risk data is used when present; the current
     // visit falls back to the just-computed security signals; legacy rows use safe defaults.
-    const currentBotName =
-      (aiAgent?.detected ? aiAgent.agentName : '') ||
-      (effectiveBotClassification.subtype !== 'human'
-        ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim()
-        : '');
+    const currentBotName = hardAutomationSignals
+      ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim()
+      : (aiAgent?.detected ? aiAgent.agentName : '') ||
+        (effectiveBotClassification.subtype !== 'human'
+          ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim()
+          : '');
 
     const visitHistory = rawVisits.map((r) => {
       // Task 2b — legacy rows stored per-visit scores on a 0..100 scale; values above 10 are
@@ -7029,7 +7202,18 @@ app.post('/api/visitor/identify', async (req, res) => {
     let botType: string | null = null;
     let botVerdict = 'not_detected';
 
-    if (robodexResult.detected && robodexResult.botInfo) {
+    if (hardAutomationSignals) {
+      // A stealth / anti-detect runtime is always an automation verdict — never let a crawler
+      // directory match or an AI-agent attribution report this session as human / good.
+      botInfo = {
+        category: 'browser_automation',
+        provider: effectiveBotClassification.provider || 'Unknown',
+        name: effectiveBotClassification.label || 'Automated Tool',
+        identity: 'unknown',
+      };
+      botType = 'browser_automation';
+      botVerdict = 'bad';
+    } else if (robodexResult.detected && robodexResult.botInfo) {
       botInfo = robodexResult.botInfo;
       botType = robodexResult.botType;
       // An unverified or spoofed claim is never a "good" bot. Verified crawlers and

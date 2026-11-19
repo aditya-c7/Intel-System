@@ -259,6 +259,16 @@ export interface SecuritySignals {
   cdpDetected?: boolean;
   isOsTampered?: boolean;
 
+  /* Server-verified identity — headers outrank the client payload. */
+  /** Browser name + full version resolved from Sec-CH-UA / UA-CH / User-Agent. */
+  serverVerifiedBrowser?: string;
+  /** OS family + version resolved from Sec-CH-UA / UA-CH / User-Agent. */
+  serverVerifiedOs?: string;
+  /** True when the client-reported browser / OS family conflicts with the header identity. */
+  headerMismatch?: boolean;
+  /** Human-readable evidence for `headerMismatch`. */
+  headerMismatchReason?: string;
+
   /* Phase 1 — bot / AI-agent subtype classification (server-computed) */
   botSubtype?: BotSubtype;
   botProvider?: string;
