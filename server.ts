@@ -3604,11 +3604,12 @@ function lookupSuspiciousIp(ip: string): { blocklisted: boolean; reasons: string
 /* Phase 4 — sealed request envelope verification                             */
 /* -------------------------------------------------------------------------- */
 
-// A signed payload may only be replayed inside the nonce window; anything older is stale.
-// The window is deliberately generous (5 minutes) so a visitor whose system clock drifted
-// (dead CMOS battery, wrong timezone offset, throttled VM clock) or a serverless cold start
-// is never labelled as tampered. Manual button clicks stay well inside it.
-const ENVELOPE_FRESHNESS_WINDOW_MS = 300_000;
+// A signed payload may only be replayed inside a short freshness window; anything older is
+// stale. The envelope is minted immediately before the identify request, so 65 seconds is
+// ample for slow page loads while closing the window in which a captured signed payload can
+// be reused with a fresh nonce. Future timestamps keep a wider tolerance for client clock drift.
+const ENVELOPE_MAX_AGE_MS = 65_000;
+const ENVELOPE_MAX_FUTURE_SKEW_MS = 300_000;
 const NONCE_TTL_MS = 15 * 60 * 1000;
 const NONCE_CACHE_MAX_ENTRIES = 5000;
 const seenEnvelopeNonces = new Map<string, number>();
@@ -3715,12 +3716,14 @@ function verifySecurityEnvelope(args: {
     }
   }
 
-  // Freshness: a timestamp-less payload is unverifiable, not tampered. A signed payload is
-  // only rejected when it is far outside the clock tolerance, so ordinary client clock drift
-  // never produces a tamper verdict; the nonce cache below covers replays inside the window.
-  if (timestamp > 0 && Math.abs(nowMs - timestamp) > ENVELOPE_FRESHNESS_WINDOW_MS) {
+  // Freshness: a timestamp-less payload is unverifiable, not tampered. A signed payload older
+  // than 65 seconds is expired; a client clock ahead by up to five minutes is tolerated.
+  if (timestamp > 0 && nowMs - timestamp > ENVELOPE_MAX_AGE_MS) {
     tamperedRequest = true;
-    reasons.push('Expired or replayed payload timestamp (>5m)');
+    reasons.push('Expired or replayed payload timestamp (>65s)');
+  } else if (timestamp > 0 && timestamp - nowMs > ENVELOPE_MAX_FUTURE_SKEW_MS) {
+    tamperedRequest = true;
+    reasons.push('Payload timestamp too far in the future');
   }
 
   // Replay: a nonce may be used exactly once inside the 15-minute window.
