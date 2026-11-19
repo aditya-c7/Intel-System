@@ -391,7 +391,7 @@ export function CpuActivityPanel() {
             const epochMs = convertRecordTimeToEpochMs(rec.time);
             const displayLevel = PRESSURE_MAP[rec.state];
             console.log(
-              `[CPU Pressure] Record: source=${rec.source}, state=${rec.state} (${displayLevel}), rawTime=${rec.time}, timestamp=${new Date(epochMs).toISOString()}`
+              `[CPU Pressure] Record: source=${rec.source}, state=${rec.state} · ${displayLevel}, rawTime=${rec.time}, timestamp=${new Date(epochMs).toISOString()}`
             );
             return {
               id: ++sampleCounterRef.current,
@@ -883,7 +883,7 @@ export function CpuActivityPanel() {
               CPU State
             </span>
             <span
-              className="text-xs sm:text-sm font-semibold text-zinc-900 dark:text-zinc-100 mt-0.5 block truncate"
+              className="text-[11px] sm:text-xs font-semibold text-zinc-900 dark:text-zinc-100 mt-0.5 block whitespace-nowrap"
               title={errorDetail || renderCurrentLoadValue()}
             >
               {renderCurrentLoadValue()}
@@ -1096,7 +1096,8 @@ export function CpuActivityPanel() {
                 <div className="flex items-center justify-between gap-4 mt-1.5">
                   <span className="text-zinc-500 dark:text-zinc-400">CPU state</span>
                   <span className="font-mono tabular-nums font-semibold text-zinc-900 dark:text-zinc-100">
-                    {activeTooltipSample.displayLevel} ({activeTooltipSample.rawState})
+                    {activeTooltipSample.displayLevel} ·{' '}
+                    {PRESSURE_QUALIFIER[activeTooltipSample.rawState]}
                   </span>
                 </div>
               </div>

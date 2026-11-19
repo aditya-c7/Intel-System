@@ -473,27 +473,44 @@ export function NetworkStabilityPanel() {
   const failureRatePercent =
     totalCount > 0 ? Number(((failedCount / totalCount) * 100).toFixed(1)) : 0;
 
-  // Derived connection status — measured probes are authoritative; navigator.onLine is
-  // consulted only as a last resort before any probe has completed.
+  // Trailing failure streak taken from the measured samples inside the rolling window. The
+  // `consecutiveFailures` React state only exists for the probe loop's backoff bookkeeping and
+  // can lag behind (a stale `>= 2` used to outrank a fresh successful probe and pin the badge
+  // to "Offline" while RTT/loss clearly showed success), so it must not decide the badge.
+  const tailFailures = (() => {
+    let count = 0;
+    for (let i = visibleSamples.length - 1; i >= 0; i -= 1) {
+      if (!visibleSamples[i].failed) break;
+      count += 1;
+    }
+    return count;
+  })();
+
+  // Derived connection status — the measured in-window samples are authoritative and
+  // navigator.onLine is consulted only when no probe has completed yet, because the browser
+  // flag is frequently wrong (headless / virtualised network namespaces report offline while
+  // HTTP probes succeed). A current successful RTT measurement therefore always wins.
   //
-  //   Online   : a completed probe with a measured RTT and fewer than two consecutive failures.
-  //              A successful HTTP round trip is proof of reachability, so a slow RTT or a
-  //              single lost sample can never render the panel "Offline" while 0% of probes fail.
-  //   Degraded : probes exist but the latest one failed once, or no RTT is measured yet
-  //   Offline  : two consecutive probe failures, or no probes while the browser is offline
+  //   Online   : probes > 0, no trailing failures, RTT measured, RTT <= 500 ms, loss < 15%
+  //   Degraded : probes > 0, RTT > 500 ms, loss >= 15%, or a non-fatal failure tail
+  //   Offline  : two trailing probe failures, or no probes yet while the browser is offline
   //   Probing… : no probes yet and the browser is not explicitly offline
-  const totalProbes = samples.length;
+  const totalProbes = visibleSamples.length;
   const navigatorOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+  const slowRtt = currentLatencyMs !== null && currentLatencyMs > 500;
+  const highLoss = failureRatePercent >= 15;
   const connectionStatus: 'Offline' | 'Probing...' | 'Degraded' | 'Online' =
-    totalProbes > 0 && consecutiveFailures < 2 && currentLatencyMs !== null
+    totalProbes === 0
+      ? navigatorOffline
+        ? 'Offline'
+        : 'Probing...'
+      : tailFailures >= 2
+      ? 'Offline'
+      : currentLatencyMs !== null && tailFailures === 0 && !slowRtt && !highLoss
       ? 'Online'
-      : totalProbes > 0 && consecutiveFailures >= 2
-      ? 'Offline'
-      : totalProbes > 0
+      : slowRtt || highLoss || tailFailures > 0
       ? 'Degraded'
-      : navigatorOffline
-      ? 'Offline'
-      : 'Probing...';
+      : 'Online';
 
   // Responsive 1:1 SVG Chart Geometry (never shrinks or squeezes on mobile screens)
   const isCompactMobile = chartWidth < 420;
