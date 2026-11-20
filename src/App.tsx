@@ -28,10 +28,6 @@ import {
   SWIFTSHADER_LABEL,
 } from './components/canonical';
 import {
-  VerdictBannerPanel,
-  NetworkAxesPanel,
-} from './components/CanonicalTelemetryPanel';
-import {
   Copy,
   Check,
   RefreshCw,
@@ -2356,14 +2352,6 @@ export default function App() {
             </div>
 
           </section>
-        )}
-
-        {/* Phase 7 canonical telemetry: one envelope, no recomputed scores. */}
-        {data && (
-          <div className="space-y-6">
-            <VerdictBannerPanel view={canonical} />
-            <NetworkAxesPanel view={canonical} />
-          </div>
         )}
 
         {/* Network Stability & System CPU Pressure (Responsive Side-by-Side Grid) */}
