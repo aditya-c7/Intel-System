@@ -1618,7 +1618,6 @@ export function detectVmAndIntegrity(
       label: 'Microsoft Hyper-V Remote Display Adapter',
     },
     { pattern: /citrix|xen/, label: 'Citrix / Xen Virtual GPU' },
-    { pattern: /swiftshader/, label: 'Google SwiftShader Software Renderer' },
     {
       pattern: /llvmpipe|softpipe|mesa offscreen|software rasterizer/,
       label: 'Mesa / LLVMpipe Software Rasterizer',
@@ -1737,7 +1736,10 @@ export function detectVmAndIntegrity(
       isMaskedOrUnavailableGpu(vendor, renderer) ||
       /^unknown$/i.test(vendor) ||
       /^unknown$/i.test(renderer);
-    const softwareRenderer = SOFTWARE_RENDERER_PATTERN.test(signature);
+    // SwiftShader / LLVMpipe are ordinary software-rendered graphics (f7d6900), never hard VM
+    // proof on their own. Only a datacenter ASN may still promote a masked GPU to a cloud VM.
+    const softwareRenderer =
+      SOFTWARE_RENDERER_PATTERN.test(signature) && !/swiftshader|llvmpipe/i.test(signature);
     if (maskedGpu && (context?.datacenterAsn === true || softwareRenderer)) {
       isVirtualMachine = true;
       vmReason =
@@ -2400,7 +2402,16 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
   // no languages, software GPU), which a real window never is.
   const runtimeHost = detectAutomationEnvironment(ua, gpuRenderer);
   const human = measureHumanCorroboration(gpuRenderer);
-  const developerTools = stealth.cdpRuntimeLeak || runtimeHost.environment === 'ide_webview';
+  // A bare CDP Runtime binding is protocol attachment, NOT a visible DevTools frontend — the
+  // envelope reports that as automation_protocol_attached (cdp_attached:true,
+  // developer_tools:false) via classifyInspectorState. Only a known IDE webview host or a genuine
+  // docked layout (large outer/inner viewport delta) counts as real DevTools evidence here.
+  const dockedDevToolsLayout =
+    typeof window !== 'undefined' &&
+    window.outerHeight > 0 &&
+    window.innerHeight > 0 &&
+    window.outerHeight - window.innerHeight > 200;
+  const developerTools = runtimeHost.environment === 'ide_webview' || dockedDevToolsLayout;
   const headlessShapedCdp =
     stealth.cdpRuntimeLeak && human.score < 0.34 && (zeroGeometry || emptyLanguages || softwareGpu);
   // Research-backed corroboration rule (incolumitas / Fingerprint Pro): patch artifacts from

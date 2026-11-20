@@ -5615,7 +5615,8 @@ function sanitizeAndReinforceSecuritySignals(
     datacenterVm:
       Boolean(raw?.isVirtualMachine) &&
       (baseClassification.isDatacenterOrHosting || isGpuMaskedOrUnavailable),
-    vpnSuspected: Boolean(raw?.vpnSuspected) || timezoneMismatch,
+    // A timezone mismatch is its own orthogonal axis, never a commercial VPN signal.
+    vpnSuspected: Boolean(raw?.vpnSuspected),
   });
 
   const isCloudOrDatacenterNetwork =
@@ -5688,8 +5689,15 @@ function sanitizeAndReinforceSecuritySignals(
     relay: Boolean(torExitNode),
     ml_prediction: Boolean(raw?.vpnSuspected) && !commercialVpnProvider && !hasTzMismatch,
   };
+  // The umbrella VPN verdict counts only concrete VPN/anonymity methods. timezone_mismatch stays
+  // an orthogonal axis in vpnMethods (and in the telemetry/network panel) and never promotes a
+  // residential line to a commercial VPN on its own.
   const vpnSuspected =
-    Object.values(vpnMethods).some(Boolean) || (datacenterAsn && botSubtype !== 'good_bot');
+    vpnMethods.public_vpn ||
+    vpnMethods.relay ||
+    vpnMethods.ml_prediction ||
+    vpnMethods.os_mismatch ||
+    (datacenterAsn && botSubtype !== 'good_bot');
 
   const tamperDetected = Boolean(raw?.tamperDetected || requestContext.tamperedRequest);
   const tamperReasons = safeStrArray(raw?.tamperReasons);
@@ -7953,7 +7961,7 @@ app.post('/api/visitor/identify', async (req, res) => {
     } catch {
       // Identity persistence is additive: a failure must never fail the visitor response.
     }
-    const visitorFound = Boolean(existingVisitor) || !resolvedIdentity.is_new;
+    let visitorFound = Boolean(existingVisitor) || !resolvedIdentity.is_new;
 
     const identityConfidence = scoreConfidence({
       match_mode: resolvedIdentity.match_mode,
@@ -8035,6 +8043,63 @@ app.post('/api/visitor/identify', async (req, res) => {
       query: simhash512(identityProfile as unknown as Record<string, unknown>),
       candidates: retrieveLshCandidates(db, identityProfile as unknown as Record<string, unknown>),
     });
+
+    // A probabilistic fuzzy match must supply the final visitor ID. When a screen/DPR change makes
+    // blockKeysFor miss, an earlier lookup mints a fresh ID while the envelope still reports
+    // "Probabilistic Fuzzy Match". Adopt the matched hardware anchor's canonical visitor so the
+    // returned identity agrees with its telemetry. The locked distinct_storage_seeds_count < 2
+    // guard is preserved: a single-seed anchor is safe, while a multi-seed (shared hardware class)
+    // anchor can never become canonical through this path.
+    if (
+      identityStage.stage === 'lsh_fuzzy' &&
+      identityStage.matchLabel &&
+      identityStage.matchLabel !== visitorId
+    ) {
+      try {
+        const fuzzyAnchor = db
+          .prepare(
+            'SELECT visitor_id, distinct_storage_seeds_count FROM hardware_anchors WHERE hardware_id = ?'
+          )
+          .get(identityStage.matchLabel) as
+          | { visitor_id: string; distinct_storage_seeds_count: number }
+          | undefined;
+        if (
+          fuzzyAnchor?.visitor_id &&
+          fuzzyAnchor.visitor_id !== visitorId &&
+          Number(fuzzyAnchor.distinct_storage_seeds_count ?? 0) < 2
+        ) {
+          // The visit row was already inserted under the freshly minted ID earlier in this
+          // request. Re-key it to the recovered visitor so history/velocity and the response
+          // agree; otherwise the dashboard shows a new ID with an empty visit history.
+          const provisionalVisitorId = visitorId;
+          visitorId = String(fuzzyAnchor.visitor_id);
+          visitorToken = signVisitorId(visitorId);
+          isReturning = true;
+          visitorFound = true;
+          try {
+            db.prepare(
+              'UPDATE visits SET visitor_id = ? WHERE visitor_id = ? AND page_load_id = ?'
+            ).run(visitorId, provisionalVisitorId, safePageLoadId);
+            db.prepare(
+              `UPDATE visitors
+               SET hardware_id = ?, active_session_id = ?, last_activity_utc = ?, updated_at_utc = ?
+               WHERE visitor_id = ?`
+            ).run(hardwareId, currentSessionId, nowUtc, nowUtc, visitorId);
+          } catch {
+            // Best-effort re-key: the response still reports the recovered identity.
+          }
+          resolvedIdentity = {
+            ...resolvedIdentity,
+            visitor_id: visitorId,
+            is_new: false,
+            isNew: false,
+          };
+        }
+      } catch {
+        // Best effort: a failed anchor lookup must never fail or change the visitor response.
+      }
+    }
+
     const identityConfidenceHonest = computeHonestIdentityConfidence({
       labeledPairs: Number(rawExtras.calibrationLabeledPairs ?? 0),
       heldOutEce: Number(rawExtras.calibrationHeldOutEce ?? 1),

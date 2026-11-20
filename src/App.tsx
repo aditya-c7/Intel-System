@@ -29,10 +29,7 @@ import {
 } from './components/canonical';
 import {
   VerdictBannerPanel,
-  RiskLedgerPanel,
   NetworkAxesPanel,
-  ProximityRarityConfidencePanel,
-  CapabilityAvailabilityPanel,
 } from './components/CanonicalTelemetryPanel';
 import {
   Copy,
@@ -997,14 +994,16 @@ export default function App() {
   const serverSmartSignals = data?.smartSignals ?? data?.securitySignals?.smartSignals ?? null;
   const signalRows = buildSignalRows(serverSmartSignals);
 
-  // The 0-100 ledger is the canonical risk truth. The 0-10 figures survive only as
-  // explicitly labelled per-card scores inside the Smart Signals grid.
-  const displayedSuspectScore = canonical.risk.score_0_100;
-  const riskTier = canonical.risk.tier;
-  const riskIsHigh = riskTier === 'High' || riskTier === 'Critical';
-  const riskIsElevated = riskTier === 'Elevated';
+  // User-visible risk stays on the 0-10 suspect-score scale. The normalizer converts any
+  // legacy 0-100 mirror back to 0-10; the tier follows that same displayed score.
+  const displayedSuspectScore = normalizeLegacyScore(
+    data?.suspectScore ?? data?.securitySignals?.suspectScore
+  );
+  const riskTier = resolveRiskTier(displayedSuspectScore);
+  const riskIsHigh = riskTier === 'High';
+  const riskIsElevated = riskTier === 'Medium';
   const riskTone = riskIsHigh ? 'text-rose-700' : riskIsElevated ? 'text-amber-700' : 'text-emerald-700';
-  const riskBadgeText = `${riskTier} Risk • ${displayedSuspectScore}/100`;
+  const riskBadgeText = `${riskTier} Risk • ${displayedSuspectScore}/10`;
 
   // Whenever the canonical tampering axis reports reasons, the header must say so.
   const tamperingDetected = canonical.tamperingReasons.length > 0;
@@ -1044,6 +1043,7 @@ export default function App() {
     const isHostingNetwork = Boolean(s.datacenterAsn ?? s.isDatacenterOrHosting) && !publicVpn;
     const firstVisitMs = Date.parse(data.visitHistory[0]?.visitedAtUtc || '') || Date.now();
     const deviceType = data.browserDevice.deviceType;
+    const activeCallSupported = Boolean(data.activeCallSupported ?? s.activeCallSupported);
     const fallbackIdentity = normalizeIdentity({
       userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
       platform: typeof navigator !== 'undefined' ? navigator.platform : '',
@@ -1139,7 +1139,9 @@ export default function App() {
         device: deviceType,
         ...phoneDetails,
       },
-      active_call: Boolean(data.activeCall ?? s.activeCall),
+      // Only report call state when the runtime can actually observe it — never print a
+      // fabricated "unavailable" capability as if it were a measured signal.
+      ...(activeCallSupported ? { active_call: Boolean(data.activeCall ?? s.activeCall) } : {}),
       bot: data.bot ?? (s.botSubtype === 'bad_bot' || s.botSubtype === 'ai_agent' ? 'bad' : 'not_detected'),
       bot_type:
         data.bot_type ??
@@ -1241,17 +1243,6 @@ export default function App() {
       // Everything below is the single canonical envelope, identical to the DOM panels.
       canonical: {
         source: canonical.source,
-        risk: {
-          score_0_100: canonical.risk.score_0_100,
-          raw_score: canonical.risk.raw_score,
-          tier: canonical.risk.tier,
-          automation: canonical.risk.automation,
-          tampering: canonical.risk.tampering,
-          network: canonical.risk.network,
-          environment: canonical.risk.environment,
-          velocity: canonical.risk.velocity,
-          evidence_ledger: canonical.risk.evidence_ledger,
-        },
         verdict_tier: canonical.verdictTier,
         browser_tampering: tamperingDetected ? 'Detected' : 'Not detected',
         human_corroboration: canonical.humanCorroboration,
@@ -1282,19 +1273,6 @@ export default function App() {
           proxy_rotation: canonical.network?.proxy ? 'Detected' : 'Not detected',
           timezone_discrepancy: canonical.network?.timezone_mismatch ? 'Detected' : 'Not detected',
         },
-        proximity: { status: canonical.proximity.status, label: canonical.proximity.label },
-        rarity: {
-          corpus_n: canonical.rarity.corpus_n,
-          status: canonical.rarity.status,
-          percentile: canonical.rarity.percentile,
-          label: canonical.rarity.label,
-        },
-        capabilities: {
-          active_call: 'Unavailable in Web Browser',
-          ja3_ja4t: 'Unavailable - requires Cloudflare Bot Management / not observable on Workers',
-          tcp_syn_os_mismatch:
-            'Unavailable - requires Cloudflare Bot Management / not observable on Workers',
-        },
         software_renderer: swiftShader ? SWIFTSHADER_LABEL : null,
       },
       // Tri-layer identity evidence from the server resolver + calibrated confidence v2.0.
@@ -1303,13 +1281,21 @@ export default function App() {
     };
   }, [data, displayedSuspectScore, canonical, spoofedSpecs, tamperingDetected, swiftShader]);
 
-  // Tor / AI attribution surface — rendered above the Smart Signals grid whenever any
-  // first-party anonymity or agent identity was resolved for this visit.
-  const activeAiAgent = data?.securitySignals?.aiAgent ?? null;
+  // Tor / automation attribution surface above the Smart Signals grid. Agent identity is
+  // named only from verified canonical automation proof — a network/ASN label (e.g. a cloud
+  // provider) is network information and must never become an agent identity.
   const torExitDetected = Boolean(data?.securitySignals?.torExitNode);
   const torBrowserClient = Boolean(data?.securitySignals?.isTorBrowserClient);
+  const canonicalAutomation = canonical.automation;
+  const headlessAutomation = canonicalAutomation?.automation_environment === 'headless_shell';
+  const automationOperator =
+    canonicalAutomation &&
+    canonicalAutomation.operator_verification_method !== 'none' &&
+    canonicalAutomation.named_operator
+      ? canonicalAutomation.named_operator
+      : 'unknown';
   const showAttributionBanner = Boolean(
-    data && (torExitDetected || torBrowserClient || activeAiAgent?.detected)
+    data && (torExitDetected || torBrowserClient || headlessAutomation)
   );
 
   return (
@@ -1354,7 +1340,7 @@ export default function App() {
       </header>
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-6 py-4 sm:py-7 space-y-6">
-        {/* Top-centered Risk Meter: canonical 0-100 orthogonal ledger */}
+        {/* Top-centered Risk Meter: 0-10 suspect score */}
         <section className="w-full max-w-2xl mx-auto flex flex-col items-center justify-center text-center pt-4 pb-2 px-4">
           <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-slate-500">
             Device Intelligence
@@ -1392,7 +1378,7 @@ export default function App() {
                   ? 'bg-[#F9AB00]'
                   : 'bg-[#81C995]'
               }`}
-              style={{ width: `${Math.max(2, displayedSuspectScore)}%` }}
+              style={{ width: `${Math.max(2, displayedSuspectScore * 10)}%` }}
             />
           </div>
           <div className="mt-3 flex items-center justify-center gap-3">
@@ -1593,14 +1579,20 @@ export default function App() {
                 <p className="text-xs sm:text-[13px] text-slate-500 mt-1">
                   Real-time browser identity, hardware fingerprint, and live connection telemetry.
                 </p>
-                {data.identification || canonical.identity ? (
+                {data.identification ? (
                   <div className="mt-2 flex items-center gap-1.5 flex-wrap">
                     <span
-                      className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-700"
-                      title={`Categorical confidence tier · ${canonical.calibrationStatus}`}
+                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+                        data.identification.confidence.score >= 0.9
+                          ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                          : data.identification.confidence.score >= 0.7
+                          ? 'border-amber-200 bg-amber-50 text-amber-700'
+                          : 'border-rose-200 bg-rose-50 text-rose-700'
+                      }`}
+                      title="Calibrated identification confidence (v2.0)"
                     >
-                      {canonical.confidenceTier} ·{' '}
-                      {canonical.calibrationStatus === 'calibrated' ? 'Calibrated' : 'Uncalibrated'}
+                      Confidence {(data.identification.confidence.score * 100).toFixed(1)}% · v
+                      {data.identification.confidence.version}
                     </span>
                     {tamperingDetected && (
                       <span className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[10px] font-semibold text-rose-700">
@@ -1610,10 +1602,10 @@ export default function App() {
                     {data.identity_layers ? (
                       <span
                         className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-600"
-                        title={`Match score ${data.identity_layers.match_score}/100`}
+                        title={`Match score ${data.identity_layers.match_score}`}
                       >
                         {data.identity_layers.match_mode === 'exact'
-                          ? 'Exact match'
+                          ? 'Matching browser profile'
                           : data.identity_layers.match_mode === 'cross_browser'
                           ? 'Cross-browser match'
                           : data.identity_layers.match_mode === 'hardware'
@@ -2293,32 +2285,13 @@ export default function App() {
                         </div>
                       </div>
                     )}
-                    {activeAiAgent?.detected && (
+                    {headlessAutomation && (
                       <div className="flex items-start gap-2.5 rounded-xl border border-indigo-200 bg-indigo-50/70 px-3 py-2.5">
                         <Bot className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
                         <div className="min-w-0 flex-1">
                           <span className="block text-xs font-semibold text-indigo-700">
-                            {activeAiAgent.agentId === 'impostor-spoof'
-                              ? 'Spoofed AI Agent (Unverified)'
-                              : 'AI Agent Attribution'}
+                            Headless browser automation · Operator {automationOperator}
                           </span>
-                          <span className="block text-[11px] leading-relaxed text-indigo-700/80 break-words">
-                            {[
-                              activeAiAgent.agentName,
-                              activeAiAgent.operator,
-                              activeAiAgent.executionMode,
-                              `${activeAiAgent.confidence}${
-                                activeAiAgent.verified ? ' (verified)' : ''
-                              }`,
-                            ]
-                              .filter(Boolean)
-                              .join(' · ')}
-                          </span>
-                          {activeAiAgent.evidence[0] && (
-                            <span className="block text-[11px] leading-relaxed text-indigo-700/70 font-mono break-words">
-                              {activeAiAgent.evidence[0]}
-                            </span>
-                          )}
                         </div>
                       </div>
                     )}
@@ -2377,7 +2350,7 @@ export default function App() {
                       {data.visitHistory.length} {data.visitHistory.length === 1 ? 'record' : 'records'} persisted
                     </span>
                   </div>
-                  <SmartSignalsGrid data={data} view={canonical} />
+                  <SmartSignalsGrid data={data} />
                 </div>
               </div>
             </div>
@@ -2389,10 +2362,7 @@ export default function App() {
         {data && (
           <div className="space-y-6">
             <VerdictBannerPanel view={canonical} />
-            <RiskLedgerPanel view={canonical} />
             <NetworkAxesPanel view={canonical} />
-            <ProximityRarityConfidencePanel view={canonical} />
-            <CapabilityAvailabilityPanel />
           </div>
         )}
 

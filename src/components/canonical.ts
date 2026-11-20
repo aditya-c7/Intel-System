@@ -24,11 +24,6 @@ import type {
 import { riskTier } from '../lib/telemetryContract';
 import type { IntelVisitorResponse } from '../types/visitor';
 
-/** Capability that no client-side browser can observe on Cloudflare Workers. */
-export const WORKER_UNAVAILABLE =
-  'Unavailable - requires Cloudflare Bot Management / not observable on Workers';
-export const ACTIVE_CALL_UNAVAILABLE = 'Unavailable in Web Browser';
-export const LOCATION_PERMISSION_REQUIRED = 'Location Permission Required';
 export const SWIFTSHADER_LABEL = 'Software-Rendered Graphics (SwiftShader)';
 
 const VERDICT_TIERS: readonly string[] = [
@@ -57,22 +52,6 @@ function clampScore(value: number): number {
   return Math.max(0, Math.min(100, Math.round(value)));
 }
 
-export interface ProximityView {
-  status: 'granted' | 'permission_required' | 'unavailable';
-  /** Human label. Never contains IP coordinates. */
-  label: string;
-  /** True when the browser granted precise location. */
-  granted: boolean;
-}
-
-export interface RarityView {
-  corpus_n: number;
-  status: 'suppressed' | 'insufficient' | 'published';
-  percentile: null | 'p95' | 'p99_plus';
-  /** Human label; never claims >p99 below a 1,000-visit corpus. */
-  label: string;
-}
-
 export interface CanonicalView {
   /** True when the backend supplied canonical axes at all. */
   present: boolean;
@@ -86,8 +65,6 @@ export interface CanonicalView {
   tampering: TamperingAxes | null;
   network: NetworkAxes | null;
   environment: EnvironmentAxes | null;
-  proximity: ProximityView;
-  rarity: RarityView;
   confidenceTier: string;
   confidenceScore: number | null;
   calibrationStatus: 'uncalibrated' | 'calibrated';
@@ -132,8 +109,6 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
   const tamperingRaw = asRecord(env?.tampering);
   const networkRaw = asRecord(env?.network);
   const environmentRaw = asRecord(env?.environment);
-  const proximityRaw = asRecord(env?.proximity);
-  const rarityRaw = asRecord(env?.rarity);
 
   // The 0-100 ledger is canonical. Before it lands, the server's own
   // `suspectScore100` is the only acceptable server-provided fallback — never a
@@ -202,46 +177,6 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
   const calibrationStatus: 'uncalibrated' | 'calibrated' =
     identityRaw?.calibration_status === 'calibrated' ? 'calibrated' : 'uncalibrated';
 
-  const proximityStatus =
-    proximityRaw?.status === 'granted' ||
-    proximityRaw?.status === 'permission_required' ||
-    proximityRaw?.status === 'unavailable'
-      ? proximityRaw.status
-      : 'permission_required';
-  const proximity: ProximityView = {
-    status: proximityStatus,
-    granted: proximityStatus === 'granted',
-    // Coordinates are deliberately never part of this label.
-    label: proximityStatus === 'granted' ? 'Permission Granted (zone only)' : LOCATION_PERMISSION_REQUIRED,
-  };
-
-  const corpusN = Math.max(0, Math.floor(finiteNumber(rarityRaw?.corpus_n)));
-  let rarityStatus: RarityView['status'] =
-    rarityRaw?.status === 'published' ||
-    rarityRaw?.status === 'insufficient' ||
-    rarityRaw?.status === 'suppressed'
-      ? rarityRaw.status
-      : 'suppressed';
-  let percentile: RarityView['percentile'] =
-    rarityRaw?.percentile === 'p95' || rarityRaw?.percentile === 'p99_plus'
-      ? rarityRaw.percentile
-      : null;
-  // Operational gate: never advertise >p99 below N=1,000 and suppress below N=250.
-  if (corpusN < 250) {
-    rarityStatus = 'suppressed';
-    percentile = null;
-  } else if (corpusN < 1000 && percentile === 'p99_plus') {
-    percentile = 'p95';
-  }
-  const rarityLabel =
-    rarityStatus === 'suppressed'
-      ? `Corpus Warmup (${corpusN.toLocaleString()} / 1,000)`
-      : rarityStatus === 'insufficient'
-      ? `Insufficient corpus (${corpusN.toLocaleString()} / 1,000)`
-      : percentile === 'p99_plus'
-      ? '>p99'
-      : 'p95';
-
   return {
     present: source === 'canonical',
     source,
@@ -254,8 +189,6 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     tampering,
     network,
     environment,
-    proximity,
-    rarity: { corpus_n: corpusN, status: rarityStatus, percentile, label: rarityLabel },
     confidenceTier,
     confidenceScore,
     calibrationStatus,
@@ -286,11 +219,6 @@ export function quarantineAttributes(raw: unknown, blocked: boolean): unknown {
     return out;
   }
   return quarantineClaim(raw, true);
-}
-
-/** Human tier label for the canonical 0-100 ledger. */
-export function riskTierLabel(view: CanonicalView): string {
-  return view.risk.tier;
 }
 
 /** Stable network provenance strings derived only from canonical axes. */

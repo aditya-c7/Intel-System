@@ -1,6 +1,5 @@
 import type { IntelVisitorResponse } from '../types/visitor';
-import type { CanonicalView } from './canonical';
-import { ACTIVE_CALL_UNAVAILABLE, LOCATION_PERMISSION_REQUIRED } from './canonical';
+import { isSwiftShader, SWIFTSHADER_LABEL } from './canonical';
 
 /**
  * Smart Signals grid.
@@ -62,10 +61,7 @@ function botStatus(data: IntelVisitorResponse): { status: string; triggered: boo
   return { status: 'You are a bot', triggered: true, detail: signals.botReason };
 }
 
-export function buildSmartSignalRows(
-  data: IntelVisitorResponse,
-  view?: CanonicalView | null
-): SmartSignalRowData[] {
+export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRowData[] {
   const signals = data.securitySignals;
   const rows: SmartSignalRowData[] = [];
 
@@ -127,8 +123,7 @@ export function buildSmartSignalRows(
     detail: vpnMethodCount > 1 ? `${vpnMethodCount} matching network methods` : signals.vpnReasons?.[0],
   });
 
-  const tampering =
-    Boolean(view?.tamperingReasons?.length) || Boolean(data.tampering ?? signals.tampering);
+  const tampering = Boolean(data.tampering ?? signals.tampering);
   rows.push({
     key: 'tampering',
     label: 'Browser Tampering',
@@ -141,7 +136,14 @@ export function buildSmartSignalRows(
       : data.tamperingDetails?.reasons?.[0],
   });
 
-  const developerTools = Boolean(signals.developerTools);
+  // DevTools is reported only when the canonical inspector state verifies an actively docked
+  // debugger. A bare CDP bridge (automation_protocol_attached) is informational, not proof.
+  const envelopeAutomation = (
+    data as unknown as {
+      envelope?: { automation?: { inspector_state?: string } };
+    }
+  ).envelope?.automation;
+  const developerTools = envelopeAutomation?.inspector_state === 'devtools_active_verified';
   rows.push({
     key: 'developerTools',
     label: 'Developer Tools',
@@ -149,15 +151,23 @@ export function buildSmartSignalRows(
     triggered: developerTools,
   });
 
+  // A software rasterizer is not proof of a VM: SwiftShader is reported honestly as
+  // software-rendered graphics instead of being stretched into a "Yes" VM verdict.
+  const swiftShader = isSwiftShader(data.hardwareSignals?.gpuRenderer);
   const virtualMachine = Boolean(
     signals.isVirtualMachine || signals.cloudOrMaskedGpu || signals.emulatorDetected
   );
   rows.push({
     key: 'virtualMachine',
     label: 'Virtual Machine',
-    status: virtualMachine ? 'Yes' : 'Not detected',
-    triggered: virtualMachine,
-    detail: signals.emulatorReason || signals.vmReason,
+    status: swiftShader
+      ? 'Software-rendered (not proven VM)'
+      : virtualMachine
+      ? 'Yes'
+      : 'Not detected',
+    triggered: !swiftShader && virtualMachine,
+    tone: swiftShader ? 'neutral' : undefined,
+    detail: swiftShader ? SWIFTSHADER_LABEL : signals.emulatorReason || signals.vmReason,
   });
 
   const privacySettings = Boolean(
@@ -214,21 +224,24 @@ export function buildSmartSignalRows(
     label: 'Rare Device',
     status: rare ? 'Yes' : 'Not detected',
     triggered: rare,
-    detail: view?.rarity.label ?? undefined,
+    detail: data.rareDevicePercentileBucket
+      ? `Hardware rarity ${data.rareDevicePercentileBucket}`
+      : undefined,
   });
 
-  // Active call state is observable only in native/mobile runtimes. On a web browser the
-  // capability is reported honestly instead of being silently pruned from the grid.
+  // Active call state is observable only in runtimes that expose it; otherwise the row is
+  // pruned from the grid entirely instead of advertising an unmeasurable capability.
   const activeCallSupported = Boolean(data.activeCallSupported ?? signals.activeCallSupported);
-  const activeCall = Boolean(data.activeCall ?? signals.activeCall);
-  rows.push({
-    key: 'activeCall',
-    label: 'Active Call Detection',
-    status: activeCallSupported ? (activeCall ? 'Yes' : 'Not detected') : ACTIVE_CALL_UNAVAILABLE,
-    triggered: activeCallSupported && activeCall,
-    tone: activeCallSupported ? undefined : 'neutral',
-    detail: activeCallSupported ? signals.activeCallReasons?.[0] : undefined,
-  });
+  if (activeCallSupported) {
+    const activeCall = Boolean(data.activeCall ?? signals.activeCall);
+    rows.push({
+      key: 'activeCall',
+      label: 'Active Call Detection',
+      status: activeCall ? 'Yes' : 'Not detected',
+      triggered: activeCall,
+      detail: signals.activeCallReasons?.[0],
+    });
+  }
 
   const velocity = data.velocity;
   const velocityStatus = velocity
@@ -246,29 +259,33 @@ export function buildSmartSignalRows(
     tone: 'clean',
   });
 
-  // The canonical 0-100 ledger is the only risk score on the dashboard. The four core
-  // cards above keep their own explicitly labelled 0-10 scale; no value is recomputed here.
-  const ledgerScore = view?.risk.score_0_100 ?? data.suspectScore100 ?? 0;
+  const suspectScore = Math.max(
+    0,
+    Math.min(10, Number(data.suspectScore ?? data.securitySignals?.suspectScore ?? 0) || 0)
+  );
   rows.push({
     key: 'suspectScore',
-    label: 'Canonical Risk Score (0-100)',
-    status: `${ledgerScore}/100 · ${view?.risk.tier ?? 'Low'}`,
-    triggered: ledgerScore >= 50,
-    tone: ledgerScore >= 50 ? 'trigger' : ledgerScore > 0 ? 'neutral' : 'clean',
+    label: 'Suspect Score',
+    status: `${suspectScore}/10`,
+    triggered: suspectScore >= 5,
+    tone: suspectScore >= 5 ? 'trigger' : suspectScore > 0 ? 'neutral' : 'clean',
   });
 
   // Fix 5 — the server always computes the metro-zone geohash synchronously, so this tile
-  // never waits on a browser geolocation callback and never says "Collecting location...".
-  // Proximity is gated on browser geolocation permission. IP coordinates are never printed
-  // in this panel; the map tile separately renders an IP Geolocation Estimate.
-  const proximityLabel = view?.proximity.label ?? LOCATION_PERMISSION_REQUIRED;
-  const proximityGranted = Boolean(view?.proximity.granted);
+  // never waits on a browser geolocation callback. IP coordinates are never printed here;
+  // the tile reports an IP-only zone estimate when no finer metro zone was resolved.
+  const proximityResolved = Boolean(data.proximity?.resolved);
+  const proximityStatus =
+    data.proximity?.zone_label ||
+    (data.location.isLocationVerified
+      ? `${city || region || country || 'Verified zone'}`
+      : 'Zone Unresolved (IP-only)');
   rows.push({
     key: 'proximity',
     label: 'Proximity Detection',
-    status: proximityLabel,
+    status: proximityStatus,
     triggered: false,
-    tone: proximityGranted ? 'clean' : 'neutral',
+    tone: proximityResolved ? 'clean' : 'neutral',
   });
 
   rows.push({
@@ -283,14 +300,8 @@ export function buildSmartSignalRows(
   return rows;
 }
 
-export function SmartSignalsGrid({
-  data,
-  view,
-}: {
-  data: IntelVisitorResponse;
-  view?: CanonicalView | null;
-}) {
-  const rows = buildSmartSignalRows(data, view);
+export function SmartSignalsGrid({ data }: { data: IntelVisitorResponse }) {
+  const rows = buildSmartSignalRows(data);
 
   return (
     <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-2">

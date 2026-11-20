@@ -8302,7 +8302,8 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     isTorBrowserClient: clientTorBrowser,
     aiAgentDetected: Boolean(requestContext.aiAgent?.detected),
     datacenterVm: Boolean(raw?.isVirtualMachine) && (baseClassification.isDatacenterOrHosting || isGpuMaskedOrUnavailable),
-    vpnSuspected: Boolean(raw?.vpnSuspected) || timezoneMismatch
+    // A timezone mismatch is its own orthogonal axis, never a commercial VPN signal.
+    vpnSuspected: Boolean(raw?.vpnSuspected)
   });
   const isCloudOrDatacenterNetwork = classification.isDatacenterOrHosting || Boolean(location.isVpnOrHosting);
   const datacenterAsn = classification.isConsumerBroadband ? false : isCloudOrDatacenterNetwork;
@@ -8337,7 +8338,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     relay: Boolean(torExitNode),
     ml_prediction: Boolean(raw?.vpnSuspected) && !commercialVpnProvider && !hasTzMismatch
   };
-  const vpnSuspected = Object.values(vpnMethods).some(Boolean) || datacenterAsn && botSubtype !== "good_bot";
+  const vpnSuspected = vpnMethods.public_vpn || vpnMethods.relay || vpnMethods.ml_prediction || vpnMethods.os_mismatch || datacenterAsn && botSubtype !== "good_bot";
   const tamperDetected = Boolean(raw?.tamperDetected || requestContext.tamperedRequest);
   const tamperReasons = safeStrArray(raw?.tamperReasons);
   if (requestContext.tamperedRequest && requestContext.requestIntegrityReason && !tamperReasons.includes(requestContext.requestIntegrityReason)) {
@@ -9701,7 +9702,7 @@ app.post("/api/visitor/identify", async (req, res) => {
       }
     } catch {
     }
-    const visitorFound = Boolean(existingVisitor) || !resolvedIdentity.is_new;
+    let visitorFound = Boolean(existingVisitor) || !resolvedIdentity.is_new;
     const identityConfidence = scoreConfidence({
       match_mode: resolvedIdentity.match_mode,
       match_score: resolvedIdentity.match_score,
@@ -9761,6 +9762,38 @@ app.post("/api/visitor/identify", async (req, res) => {
       query: simhash512(identityProfile),
       candidates: retrieveLshCandidates(db, identityProfile)
     });
+    if (identityStage.stage === "lsh_fuzzy" && identityStage.matchLabel && identityStage.matchLabel !== visitorId) {
+      try {
+        const fuzzyAnchor = db.prepare(
+          "SELECT visitor_id, distinct_storage_seeds_count FROM hardware_anchors WHERE hardware_id = ?"
+        ).get(identityStage.matchLabel);
+        if (fuzzyAnchor?.visitor_id && fuzzyAnchor.visitor_id !== visitorId && Number(fuzzyAnchor.distinct_storage_seeds_count ?? 0) < 2) {
+          const provisionalVisitorId = visitorId;
+          visitorId = String(fuzzyAnchor.visitor_id);
+          visitorToken = signVisitorId(visitorId);
+          isReturning = true;
+          visitorFound = true;
+          try {
+            db.prepare(
+              "UPDATE visits SET visitor_id = ? WHERE visitor_id = ? AND page_load_id = ?"
+            ).run(visitorId, provisionalVisitorId, safePageLoadId);
+            db.prepare(
+              `UPDATE visitors
+               SET hardware_id = ?, active_session_id = ?, last_activity_utc = ?, updated_at_utc = ?
+               WHERE visitor_id = ?`
+            ).run(hardwareId, currentSessionId, nowUtc, nowUtc, visitorId);
+          } catch {
+          }
+          resolvedIdentity = {
+            ...resolvedIdentity,
+            visitor_id: visitorId,
+            is_new: false,
+            isNew: false
+          };
+        }
+      } catch {
+      }
+    }
     const identityConfidenceHonest = computeHonestIdentityConfidence({
       labeledPairs: Number(rawExtras.calibrationLabeledPairs ?? 0),
       heldOutEce: Number(rawExtras.calibrationHeldOutEce ?? 1),
