@@ -2384,6 +2384,9 @@ interface AiAgentResolverClient {
   screenResolution?: string;
   platform?: string;
   botSignals?: string[];
+  /** Authoritative automation verdict from the handler (hard / stealth artifacts). */
+  hardAutomationSignals?: boolean;
+  automationTargetedTampering?: boolean;
 }
 
 interface AiAgentResolverInput {
@@ -2487,6 +2490,25 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
         directoryHint.trigger ? `Agent trigger: ${directoryHint.trigger}` : '',
       ].filter(Boolean)
     : [];
+
+  // An authoritative automation verdict OWNS the label. A stealth / headless Chromium session
+  // must never be attributed to a named cloud agent (e.g. "Google Gemini / Cloud Agent (GCP VM)")
+  // from a cloud ASN plus masked-GPU / SwiftShader telemetry: that is a runtime observation, not
+  // an identity. Only a cryptographically signed RFC 9421 agent keeps its real attribution; the
+  // identify handler maps every other authoritative automation session to neutral stealth labels.
+  const authoritativeAutomation = Boolean(
+    input.client.hardAutomationSignals ||
+      input.client.automationTargetedTampering ||
+      input.client.webdriver ||
+      input.client.cdpDetected ||
+      (input.client.isBot && input.client.isHeadless) ||
+      (input.client.botSignals || []).some((signal) =>
+        /stealth|headless|chromium|puppeteer|playwright|webdriver/i.test(signal)
+      )
+  );
+  if (authoritativeAutomation && !webBotAuth.present) {
+    return NO_AI_AGENT;
+  }
 
   /* ---------- Rule 0 — remote browser / computer-use harnesses -------------- */
   // Scraping and agent harnesses (Firecrawl, Browser Use, Skyvern, MultiOn, Steel, Airtop,
@@ -6034,28 +6056,37 @@ function sanitizeAndReinforceSecuritySignals(
     baseClassification.networkType === 'VPN / Proxy Relay' &&
     VPN_PROXY_PATTERN.test(networkHaystackForVpn) &&
     !HOSTING_EGRESS_PATTERN.test(networkHaystackForVpn);
+  // Concrete tunnel evidence only. Verified proxy-chain headers (Via / Proxy-Authorization /
+  // RFC 7239 Forwarded / a >=3-hop public XFF chain) are first-party relay proof — the XFF rule
+  // also covers a genuine rotating-proxy chain. A hosting ASN and a timezone mismatch are NOT
+  // tunnel evidence and never appear in this set.
+  const verifiedProxyRelay = detectProxyHeaders(requestContext.headers, location.publicIp).detected;
+  const concreteVpnEvidence =
+    commercialVpnProvider ||
+    Boolean(requestContext.torExitNode || requestContext.torRelay) ||
+    verifiedProxyRelay;
   const vpnMethods = {
     timezone_mismatch: hasTzMismatch,
     public_vpn: commercialVpnProvider,
     auxiliary_mobile: false,
     os_mismatch: Boolean(raw?.isOsTampered),
     relay: Boolean(torExitNode),
-    // Require concrete hosting/proxy evidence so a legacy `vpnSuspected` born of a timezone-only
-    // mismatch — even one the server canonicalizes as an equivalent timezone — cannot be
-    // resurrected as an ML VPN verdict.
-    ml_prediction:
-      Boolean(raw?.vpnSuspected) && !commercialVpnProvider && !hasTzMismatch && datacenterAsn,
+    // A client ML verdict is accepted ONLY when an independent, concrete relay signal
+    // corroborates it (provider-owned VPN, Tor relay or verified proxy chain). Never ASN alone,
+    // never timezone alone — both are orthogonal axes, not tunnels.
+    ml_prediction: Boolean(raw?.vpnSuspected) && concreteVpnEvidence,
   };
   // The umbrella VPN verdict counts only concrete VPN/anonymity methods. timezone_mismatch stays
   // an orthogonal axis in vpnMethods (and in the telemetry/network panel) and never promotes a
-  // residential line to a commercial VPN on its own. The raw client `vpnSuspected` is neutralized
-  // above (network relabel) and here (ML path), so it cannot resurrect a timezone-only verdict.
+  // residential line to a commercial VPN on its own. A cloud/datacenter ASN is network ownership,
+  // not a tunnel, so it is reported honestly by the network tile/ledger and never sets
+  // `vpnSuspected`. The raw client `vpnSuspected` is neutralized above (network relabel) and here
+  // (ML path), so it cannot resurrect a timezone-only or hosting-ASN verdict.
   const vpnSuspected =
     vpnMethods.public_vpn ||
     vpnMethods.relay ||
     vpnMethods.ml_prediction ||
-    vpnMethods.os_mismatch ||
-    (datacenterAsn && botSubtype !== 'good_bot');
+    vpnMethods.os_mismatch;
 
   // A timezone / timezone-mismatch note is an orthogonal network axis. It must never be
   // reported as tampering or spoofing evidence, even when a legacy client files it here.
@@ -6075,7 +6106,19 @@ function sanitizeAndReinforceSecuritySignals(
     tamperReasons.splice(10);
   }
 
-  const incognitoLikely = Boolean(raw?.incognitoLikely);
+  // Only the collector's stable high-confidence private-mode verdict is accepted. The client
+  // emits an 'high' | 'low' label and already pins `incognitoLikely` false whenever confidence
+  // is 'low'. A low-confidence probe, a new/cleared profile, or a touch/geometry change is never
+  // incognito proof on the server either. (Legacy numeric >= 0.9 is treated as high.)
+  const rawIncognitoConfidence: unknown = (
+    raw as (Partial<SecuritySignals> & { incognitoConfidence?: unknown }) | null | undefined
+  )?.incognitoConfidence;
+  const incognitoConfidenceHigh =
+    rawIncognitoConfidence === 'high' ||
+    (typeof rawIncognitoConfidence === 'number' && rawIncognitoConfidence >= 0.9);
+  const incognitoLikely = incognitoConfidenceHigh && Boolean(raw?.incognitoLikely);
+  // Echo the same stable label the collector emits; 'low' never reads as incognito downstream.
+  const incognitoConfidenceLabel: 'high' | 'low' = incognitoConfidenceHigh ? 'high' : 'low';
   const storageQuotaMb =
     typeof raw?.storageQuotaMb === 'number' &&
     Number.isFinite(raw.storageQuotaMb) &&
@@ -6102,7 +6145,9 @@ function sanitizeAndReinforceSecuritySignals(
       ? raw.privacyDetail.trim().slice(0, 200)
       : '';
   const canvasFarblingDetected = Boolean(raw?.canvasFarblingDetected);
-  const isVirtualMachine = Boolean(raw?.isVirtualMachine);
+  // Raw client claim only — re-verified against host-level proof in the VM tile before it is
+  // allowed to reach `securitySignals.isVirtualMachine` or the envelope.
+  const clientReportedVm = Boolean(raw?.isVirtualMachine);
   const isOsTampered = Boolean(raw?.isOsTampered);
   const vmReason =
     typeof raw?.vmReason === 'string' && raw.vmReason.trim()
@@ -6332,6 +6377,12 @@ function sanitizeAndReinforceSecuritySignals(
   // plain datacenter IP is never presented as a commercial VPN.
   // 10/10 is reserved for active deception (tampering, replay, spoofed impostor).
   // A genuine Tor exit + RFP client is an anonymity/network reputation result, capped at 9.
+  // The tile's "VPN" language is reserved for the corrected concrete tunnel verdict. A bare
+  // hosting ASN is reported as network ownership and a timezone mismatch as an orthogonal locale
+  // axis — neither is a tunnel, even though both still carry a small network-reputation weight.
+  const concreteTunnelVerdict = Boolean(
+    vpnMethods.public_vpn || vpnMethods.relay || vpnMethods.ml_prediction
+  );
   const vpnScore = torAnonymity
     ? 9
     : ipBlocklisted
@@ -6342,6 +6393,8 @@ function sanitizeAndReinforceSecuritySignals(
     ? 6
     : aiAgent?.detected
     ? 7
+    : concreteTunnelVerdict
+    ? 6
     : isDatacenterAsn && hasTzMismatch
     ? 4
     : isDatacenterAsn
@@ -6363,10 +6416,12 @@ function sanitizeAndReinforceSecuritySignals(
     ? 'Tor Relay (Non-Exit)'
     : aiAgent?.detected
     ? 'AI Agent Cloud Network'
+    : concreteTunnelVerdict
+    ? 'VPN / Proxy Relay'
     : isDatacenterAsn
-    ? 'VPN / Datacenter Proxy'
+    ? 'Datacenter / Hosting Network'
     : hasTzMismatch
-    ? 'VPN / Timezone Relay'
+    ? 'Timezone Mismatch (Orthogonal)'
     : 'Standard ISP';
   const vpnDetail = torAnonymity
     ? `${torExitNode ? 'Confirmed active Tor exit relay' : 'Tor Browser fingerprint (Gecko RFP + letterboxing)'} (${
@@ -6382,6 +6437,12 @@ function sanitizeAndReinforceSecuritySignals(
     ? `Tor relay network (${torOperatorLabel || asnOrOrg}) — part of the Tor network but not an exit egress`
     : aiAgent?.detected
     ? `${aiAgent.agentName} (${aiAgent.operator}) — ${aiAgent.executionMode || 'AI agent'} traffic from ${ispBrand}${asnSuffix}`
+    : concreteTunnelVerdict
+    ? vpnMethods.public_vpn
+      ? `Verified commercial VPN provider on ${ispBrand}${asnSuffix}`
+      : vpnMethods.relay
+      ? `Tor relay / anonymity infrastructure (${torOperatorLabel || asnOrOrg})`
+      : `Verified proxy-chain / relay evidence on ${ispBrand}${asnSuffix}`
     : isDatacenterAsn && hasTzMismatch
     ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})`
     : isDatacenterAsn
@@ -6401,13 +6462,38 @@ function sanitizeAndReinforceSecuritySignals(
   };
 
   // Tile 4 — Virtual Machine, Emulator & OS Integrity (10 replayed or tampered payload /
-  // 8 emulator / 6 cloud VM, masked GPU or spoofed environment / 0 physical hardware)
-  const isVm = isVirtualMachine;
+  // 8 emulator / 6 genuine hypervisor host or spoofed environment / 0 physical hardware).
+  // A cloud/datacenter ASN is NETWORK OWNERSHIP, not a hypervisor. A missing / masked GPU string
+  // or SwiftShader software rendering is likewise not VM proof (f7d6900 / f851c63). The VM
+  // verdict therefore requires at least one INDEPENDENT host-level proof: a hypervisor-specific
+  // GPU signature (VirtualBox / VMware / QEMU / VirtIO / Hyper-V guest / Parallels / Xen), a
+  // genuine emulator verdict, or host CPU / SMBIOS virtualization evidence reported by the
+  // collector. Sealed-envelope tampering / replay is escalated below and never needs the network.
+  const HYPERVISOR_GPU_PATTERN =
+    /virtualbox|\bvbox\b|vmware|svga3d|\bqemu\b|virtio|virgl|\bbochs\b|hyper-?v|microsoft remote display|parallels|citrix|\bxen\b/i;
+  const gpuSignatureText = `${hardwareSignals.gpuVendor || ''} ${hardwareSignals.gpuRenderer || ''}`;
+  const hypervisorGpuProof = HYPERVISOR_GPU_PATTERN.test(gpuSignatureText);
+  // The collector's "masked GPU on a datacenter ASN (cloud container)" verdict is a network
+  // observation, never a hypervisor signature — it alone must never carry the VM tile.
+  const cloudContainerVmReason = /cloud container|datacenter asn|masked webgl|software renderer/i.test(
+    vmReason
+  );
+  const hostVirtualizationProof =
+    hypervisorGpuProof ||
+    (clientReportedVm && !cloudContainerVmReason && !isGpuMaskedOrUnavailable);
+  // Emulators are reported as their own tier and never double-counted as a desktop hypervisor.
+  const isVm = hostVirtualizationProof && !emulatorDetected;
+  const vmReasonVerdict = isVm
+    ? vmReason && !cloudContainerVmReason
+      ? vmReason
+      : hypervisorGpuProof
+      ? 'Hypervisor-specific GPU signature detected in the WebGL vendor / renderer'
+      : 'Host-level virtualization evidence detected'
+    : '';
   const isTampered = isOsTampered;
-  const cloudContainerVm = datacenterAsn && (isGpuMaskedOrUnavailable || cloudOrMaskedGpu);
-  const vmLike = isVm || cloudContainerVm;
-  // Table: a cloud VM or masked WebGL on a datacenter ASN is 6, an emulator is 8 and
-  // cryptographic tampering stays 10.
+  const vmLike = isVm;
+  // Table: a genuine hypervisor host or spoofed environment is 6, an emulator is 8 and
+  // cryptographic tampering stays 10. A bare cloud egress scores 0 on this tile.
   const vmScore = tamperedRequest || replayDetected
     ? 10
     : emulatorDetected
@@ -6431,10 +6517,7 @@ function sanitizeAndReinforceSecuritySignals(
       : emulatorDetected
       ? emulatorReason || vmReason || 'Mobile emulator / simulator runtime detected'
       : vmLike
-      ? vmReason ||
-        (cloudContainerVm
-          ? `Cloud container on ${ispBrand}${asnSuffix} exposed an unavailable / masked GPU`
-          : 'Hypervisor CPUID / virtualised GPU footprint detected')
+      ? vmReasonVerdict
       : isTampered
       ? vmReason || tamperReasons[0] || 'Operating-system / User-Agent tampering detected'
       : 'Unmasked physical GPU & consistent OS platform verified';
@@ -6630,20 +6713,15 @@ function sanitizeAndReinforceSecuritySignals(
       adBlockerDetected: false,
       devToolsOpen: false,
       canvasFarblingDetected,
-      isVirtualMachine,
-      vmReason,
+      // Corrected verdicts only: a cloud ASN / masked GPU never reaches these host-level fields.
+      isVirtualMachine: isVm,
+      vmReason: vmReasonVerdict,
       isOsTampered,
       incognitoOrCleared,
-      // Client-side composite private-browsing probe (confidence 0..1 + evidence)
-      incognitoConfidence: Math.max(
-        0,
-        Math.min(
-          1,
-          typeof raw?.incognitoConfidence === 'number' && Number.isFinite(raw.incognitoConfidence)
-            ? raw.incognitoConfidence
-            : 0
-        )
-      ),
+      // Client-side private-browsing probe. The collector emits a stable 'high' | 'low' label;
+      // preserve it verbatim so 'low' can never be mistaken for an incognito verdict. The cast
+      // bridges the legacy numeric type declaration while the shared type migrates to the label.
+      incognitoConfidence: incognitoConfidenceLabel as unknown as number,
       incognitoDetail:
         typeof raw?.incognitoDetail === 'string' ? raw.incognitoDetail.trim().slice(0, 240) : '',
       // Final 4-signal upgrade — private browsing, bot, network, VM integrity
@@ -6811,6 +6889,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       isIncognito?: boolean;
       privateMode?: boolean;
       incognitoMethod?: string;
+      /** Stable high/low probe label (new clients); a low label is never incognito. */
+      incognitoConfidence?: 'high' | 'low' | number | null;
       idbDurabilityRatio?: number | null;
       opfsFlushMs?: number | null;
       browserInfo?: { incognito?: boolean; isIncognito?: boolean } | null;
@@ -7523,7 +7603,17 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
 
     // Accept every incognito spelling this app (and its legacy payloads) can post:
     // top-level, browserInfo.*, telemetry.*, securitySignals.* and any alias.
-    const clientReportedIncognito = Boolean(
+    // The collector emits a stable 'high' | 'low' confidence label and pins its incognito verdict
+    // false whenever the label is 'low'. Volatile context (a new / cleared profile, touch or
+    // geometry changes) never reaches 'high', so gate every client spelling on that label before
+    // it can become an incognito verdict. Legacy numeric confidence >= 0.9 is treated as high.
+    const rawIncognitoConfidence: unknown = (
+      rawSecuritySignals as (Partial<SecuritySignals> & { incognitoConfidence?: unknown }) | null | undefined
+    )?.incognitoConfidence ?? requestBody.incognitoConfidence;
+    const incognitoConfidenceHigh =
+      rawIncognitoConfidence === 'high' ||
+      (typeof rawIncognitoConfidence === 'number' && rawIncognitoConfidence >= 0.9);
+    const clientReportedIncognito = incognitoConfidenceHigh && Boolean(
       requestBody.incognito ?? requestBody.isIncognito ?? requestBody.privateMode ??
       requestBody.browserInfo?.incognito ?? requestBody.browserInfo?.isIncognito ??
       requestBody.telemetry?.incognito ?? requestBody.telemetry?.isIncognito ??
@@ -7758,6 +7848,10 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         botSignals: Array.isArray(rawSecuritySignals?.botSignals)
           ? rawSecuritySignals.botSignals
           : [],
+        // A hard / stealth automation verdict must suppress cloud-VM agent attribution
+        // (verified RFC 9421 signed agents remain exempt inside the resolver).
+        hardAutomationSignals,
+        automationTargetedTampering,
       },
     });
 
@@ -8314,6 +8408,34 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       botVerdict = 'bad';
     }
 
+    // Final label authority: if any attribution engine / directory still produced a Gemini or
+    // generic "Cloud Agent" label on a session the automation verdict owns, replace it with a
+    // neutral stealth / headless automation identity everywhere it is serialized. A verified
+    // RFC 9421 signed agent is the sole exemption and keeps its real attribution.
+    const signedAgentIdentity = Boolean(
+      aiAgent?.verified && /signed/i.test(String(aiAgent.executionMode || ''))
+    );
+    const lingeringCloudAgentLabel =
+      aiAgent?.agentId === 'gemini' || /google gemini|cloud agent/i.test(botInfo?.name || '');
+    if (
+      lingeringCloudAgentLabel &&
+      !signedAgentIdentity &&
+      (hardAutomationSignals ||
+        botVerdict === 'bad' ||
+        /stealth|headless|chromium/i.test(String(botType || '')))
+    ) {
+      securitySignals.aiAgent = null;
+      const headlessVariant = /headless|chromium/i.test(String(botType || ''));
+      botInfo = {
+        category: 'browser_automation',
+        provider: 'Stealth Automation',
+        name: headlessVariant ? 'Headless Automation' : 'Stealth Automation',
+        identity: 'unknown',
+      };
+      botType = headlessVariant ? 'headless_automation' : 'stealth_automation';
+      botVerdict = 'bad';
+    }
+
     if (botInfo) {
       securitySignals.botInfo = botInfo;
     }
@@ -8328,14 +8450,12 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     );
 
     // The composite incognito confidence lives on securitySignals, but the dashboard reads the
-    // hardware-truth object. Mirror the same clamped value there so both views agree.
-    (hardwareSignals as ExtendedHardwareSignals).incognitoConfidence =
-      typeof securitySignals.incognitoConfidence === 'number'
-        ? securitySignals.incognitoConfidence
-        : typeof rawSecuritySignals?.incognitoConfidence === 'number' &&
-          Number.isFinite(rawSecuritySignals.incognitoConfidence)
-        ? Math.max(0, Math.min(1, rawSecuritySignals.incognitoConfidence))
-        : 0;
+    // hardware-truth object. Mirror the same stable 'high' | 'low' label there so both views
+    // agree; 'low' (or an unknown value) never reads as an incognito verdict. The cast bridges
+    // the legacy numeric type declaration during the shared-type migration.
+    (hardwareSignals as ExtendedHardwareSignals).incognitoConfidence = (incognitoConfidenceHigh
+      ? 'high'
+      : 'low') as unknown as number;
 
     /* ------------------------------------------------------------------ */
     /* Tri-layer identity resolution + calibrated confidence (v2.0)        */

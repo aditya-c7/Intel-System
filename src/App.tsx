@@ -18,6 +18,7 @@ import { normalizeIdentity } from './shared/normalization/uaNormalizer';
 import { SmartSignalsGrid } from './components/SmartSignalsGrid';
 import {
   CursorAttributionOverlay,
+  resolveAutomationLabel,
   resolveCursorIdentity,
 } from './components/CursorAttributionOverlay';
 import {
@@ -932,6 +933,12 @@ export default function App() {
   // The single canonical envelope. Every panel and the Event JSON below read this object —
   // no client code recomputes a composite score, tier, verdict or quarantine decision.
   const canonical = useMemo(() => resolveCanonical(data), [data]);
+  // One server-authoritative automation label. The semantic bot_type (mirrored into the
+  // canonical envelope) outranks any stale aiAgent / Gemini field, so the cursor pill, the
+  // attribution banner and the Event JSON can never disagree or name a stealth session as a
+  // signed cloud agent.
+  const displayBotType = data?.bot_type ?? canonical.automation?.bot_type ?? null;
+  const automationDisplayLabel = resolveAutomationLabel(displayBotType);
   const spoofedSpecs = Boolean(
     data?.tamperingDetails?.anti_detect_browser ||
       data?.tamperingDetails?.devtools_device_emulation ||
@@ -1039,6 +1046,8 @@ export default function App() {
   const cursorIdentity = resolveCursorIdentity({
     botSubtype: data?.securitySignals.botSubtype ?? null,
     isBot: Boolean(data?.securitySignals.isBot),
+    // Server-authoritative semantic bot type outranks any stale aiAgent / Gemini claim.
+    botType: displayBotType,
     agentId: data?.securitySignals.aiAgent?.agentId ?? null,
     agentName: data?.securitySignals.aiAgent?.agentName ?? null,
   });
@@ -1188,24 +1197,42 @@ export default function App() {
         (Boolean(s.isBot) || s.botSubtype === 'bad_bot' || s.botSubtype === 'ai_agent'
           ? 'bad'
           : 'not_detected'),
+      // Mirror the canonical bot_type verbatim. Only when no server bot_type exists do the
+      // legacy fallbacks apply, and an automation label can never fall through to `ai_agent`
+      // from a stale aiAgent field.
       bot_type:
-        data.bot_type ??
+        displayBotType ??
         (s.botSubtype && s.botSubtype !== 'human'
           ? s.botSubtype
           : s.aiAgent?.detected
           ? 'ai_agent'
           : null),
-      bot_info: data.bot_info ?? (s.aiAgent?.detected ? {
-        category: 'ai_agent',
-        provider: s.aiAgent.operator || 'Unknown',
-        name: s.aiAgent.agentName,
-        identity: s.aiAgent.verified ? 'verified' : 'unknown',
-      } : null),
-      // Developer tools = a real docked DevTools UI / IDE webview. A bare CDP runtime binding is
-      // reported separately as cdp_attached so it can never contradict `developer_tools: false`.
-      developer_tools: Boolean(s.developerTools),
-      cdp_attached: Boolean(s.cdpDetected || s.cdpRuntimeLeak),
+      bot_info:
+        data.bot_info && !automationDisplayLabel
+          ? data.bot_info
+          : automationDisplayLabel
+          ? {
+              category: 'browser_automation',
+              provider: data.bot_info?.provider ?? 'Unknown',
+              name: automationDisplayLabel,
+              identity: 'unknown',
+            }
+          : s.aiAgent?.detected
+          ? {
+              category: 'ai_agent',
+              provider: s.aiAgent.operator || 'Unknown',
+              name: s.aiAgent.agentName,
+              identity: s.aiAgent.verified ? 'verified' : 'unknown',
+            }
+          : null,
+      // Developer tools = a real docked DevTools UI / IDE webview, proved ONLY by the
+      // canonical envelope's inspector_state. A bare CDP binding / cdpRuntimeLeak /
+      // automation_protocol_attached is reported separately and never sets this true.
+      developer_tools: canonical.automation?.inspector_state === 'devtools_active_verified',
+      cdp_attached:
+        canonical.automation?.cdp_attached ?? Boolean(s.cdpDetected || s.cdpRuntimeLeak),
       inspector_state:
+        canonical.automation?.inspector_state ??
         (s as { inspectorState?: string }).inspectorState ??
         (s.cdpDetected || s.cdpRuntimeLeak
           ? 'automation_protocol_attached'
@@ -1354,7 +1381,16 @@ export default function App() {
       identity_layers: data.identity_layers ?? null,
       consistency: data.consistency ?? null,
     };
-  }, [data, displayedSuspectScore, canonical, spoofedSpecs, tamperingDetected, swiftShader]);
+  }, [
+    data,
+    displayedSuspectScore,
+    canonical,
+    displayBotType,
+    automationDisplayLabel,
+    spoofedSpecs,
+    tamperingDetected,
+    swiftShader,
+  ]);
 
   // Tor / automation attribution surface above the Smart Signals grid. Agent identity is
   // named only from verified canonical automation proof — a network/ASN label (e.g. a cloud
@@ -1362,7 +1398,11 @@ export default function App() {
   const torExitDetected = Boolean(data?.securitySignals?.torExitNode);
   const torBrowserClient = Boolean(data?.securitySignals?.isTorBrowserClient);
   const canonicalAutomation = canonical.automation;
-  const headlessAutomation = canonicalAutomation?.automation_environment === 'headless_shell';
+  const headlessAutomation =
+    automationDisplayLabel === 'Headless Browser Automation' ||
+    canonicalAutomation?.automation_environment === 'headless_shell';
+  const automationBannerLabel =
+    automationDisplayLabel ?? (headlessAutomation ? 'Headless Browser Automation' : null);
   const automationOperator =
     canonicalAutomation &&
     canonicalAutomation.operator_verification_method !== 'none' &&
@@ -1370,7 +1410,7 @@ export default function App() {
       ? canonicalAutomation.named_operator
       : 'unknown';
   const showAttributionBanner = Boolean(
-    data && (torExitDetected || torBrowserClient || headlessAutomation)
+    data && (torExitDetected || torBrowserClient || automationBannerLabel)
   );
 
   return (
@@ -2365,12 +2405,15 @@ export default function App() {
                         </div>
                       </div>
                     )}
-                    {headlessAutomation && (
+                    {automationBannerLabel && (
                       <div className="flex items-start gap-2.5 rounded-xl border border-indigo-200 bg-indigo-50/70 px-3 py-2.5">
                         <Bot className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
                         <div className="min-w-0 flex-1">
                           <span className="block text-xs font-semibold text-indigo-700">
-                            Headless browser automation · Operator {automationOperator}
+                            {automationBannerLabel}
+                            {automationOperator !== 'unknown'
+                              ? ` · Operator ${automationOperator}`
+                              : ''}
                           </span>
                         </div>
                       </div>

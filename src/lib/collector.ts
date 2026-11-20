@@ -1493,12 +1493,31 @@ export interface BotAutomationSignals {
 }
 
 /**
+ * Stable confidence label for the incognito verdict.
+ *
+ * 'high'   — the verdict came from a deterministic probe or from two corroborating
+ *            physics probes, so it may be reported as incognito.
+ * 'low'    — inconclusive / deadband / fail-open / probe-error. Such a result is
+ *            ALWAYS mapped to `incognito === false` by every consumer.
+ */
+export type IncognitoConfidence = 'high' | 'low';
+
+/**
  * Incognito / private-browsing verdict produced by the multi-engine physics probe.
+ *
+ * This is the one authoritative, per-tab-session verdict. It is cached in
+ * sessionStorage (versioned key) and returned verbatim on later loads of the same
+ * tab, so no ephemeral context — touch, geometry, language, a first identify write —
+ * can ever re-derive or flip it.
  */
 export interface IncognitoDetectionResult {
   isPrivate: boolean;
   browserName: string;
   method: string;
+  /** Stable high/low label. Low confidence can never produce `incognito: true`. */
+  confidence: IncognitoConfidence;
+  /** True when the Chromium IndexedDB ratio spread was too wide to trust. */
+  idbHighVariance?: boolean;
   quotaBytes: number | null;
   headroomGiB: number | null;
   idbDurabilityRatio: number | null;
@@ -2754,8 +2773,18 @@ function errorLooksLike(error: unknown, pattern: RegExp): boolean {
  * or the probe cannot finish inside its budget. The database is always closed and
  * deleted through the `settled`-guarded `finish()`.
  */
-async function probeChromiumIdbDurability(): Promise<number | null> {
-  if (typeof indexedDB === 'undefined') return null;
+interface IdbDurabilityProbe {
+  /** Trimmed-median strict/relaxed commit ratio, or null when inconclusive. */
+  ratio: number | null;
+  /** True when the trimmed spread is too wide (or too few rounds) to trust. */
+  highVariance: boolean;
+}
+
+/** Shared inconclusive sentinel — never treated as incognito evidence. */
+const IDB_INCONCLUSIVE: IdbDurabilityProbe = { ratio: null, highVariance: true };
+
+async function probeChromiumIdbDurability(): Promise<IdbDurabilityProbe> {
+  if (typeof indexedDB === 'undefined') return IDB_INCONCLUSIVE;
   const PAYLOAD = 16384;
   const WRITES = 15;
   const ROUNDS = 15;
@@ -2764,20 +2793,20 @@ async function probeChromiumIdbDurability(): Promise<number | null> {
   const dbName = '__di_' + Math.random().toString(36).slice(2);
   const payload = new Uint8Array(PAYLOAD);
 
-  return new Promise<number | null>((resolve) => {
+  return new Promise<IdbDurabilityProbe>((resolve) => {
     let settled = false;
-    const finish = (val: number | null, db?: IDBDatabase) => {
+    const finish = (val: IdbDurabilityProbe, db?: IDBDatabase) => {
       if (settled) return;
       settled = true;
       try { db?.close(); } catch { /* ignore */ }
       try { indexedDB.deleteDatabase(dbName); } catch { /* ignore */ }
       resolve(val);
     };
-    const safetyTimer = setTimeout(() => finish(null), 1400);
+    const safetyTimer = setTimeout(() => finish(IDB_INCONCLUSIVE), 1400);
     try {
       const req = indexedDB.open(dbName, 1);
       req.onupgradeneeded = () => { req.result.createObjectStore('s'); };
-      req.onerror = () => { clearTimeout(safetyTimer); finish(null); };
+      req.onerror = () => { clearTimeout(safetyTimer); finish(IDB_INCONCLUSIVE); };
       req.onsuccess = () => {
         const db = req.result;
         let honored = false;
@@ -2788,7 +2817,7 @@ async function probeChromiumIdbDurability(): Promise<number | null> {
           honored = t.durability === 'strict';
           t.abort();
         } catch { honored = false; }
-        if (!honored) { clearTimeout(safetyTimer); finish(null, db); return; }
+        if (!honored) { clearTimeout(safetyTimer); finish(IDB_INCONCLUSIVE, db); return; }
 
         const block = (durability: 'strict' | 'relaxed'): Promise<number> =>
           new Promise((res, rej) => {
@@ -2833,11 +2862,30 @@ async function probeChromiumIdbDurability(): Promise<number | null> {
           const finite = ratios.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
           const trimmed = finite.length >= 5 ? finite.slice(1, -1) : finite;
           const median = trimmed.length > 0 ? trimmed[trimmed.length >> 1] : null;
+          // High variance = optimistic majority (below the trimmed median) or a wide
+          // spread across the whole sample. Combined with a too-small sample this is
+          // the "high variance = inconclusive" arm of the deadband.
+          const spread = trimmed.length >= 2 ? trimmed[trimmed.length - 1] - trimmed[0] : Infinity;
+          const belowMedian = median !== null ? trimmed.filter((v) => v < median).length : 0;
+          const highVariance =
+            median === null ||
+            trimmed.length < 5 ||
+            !(spread <= 0.9) ||
+            belowMedian > Math.ceil(trimmed.length / 2);
           clearTimeout(safetyTimer);
-          finish(median !== null && Number.isFinite(median) ? Number(median.toFixed(3)) : null, db);
-        })().catch(() => { clearTimeout(safetyTimer); finish(null, db); });
+          if (median === null || !Number.isFinite(median) || highVariance) {
+            finish(
+              median !== null && Number.isFinite(median)
+                ? { ratio: Number(median.toFixed(3)), highVariance: true }
+                : IDB_INCONCLUSIVE,
+              db
+            );
+          } else {
+            finish({ ratio: Number(median.toFixed(3)), highVariance: false }, db);
+          }
+        })().catch(() => { clearTimeout(safetyTimer); finish(IDB_INCONCLUSIVE, db); });
       };
-    } catch { clearTimeout(safetyTimer); finish(null); }
+    } catch { clearTimeout(safetyTimer); finish(IDB_INCONCLUSIVE); }
   });
 }
 
@@ -3225,28 +3273,42 @@ function resolveBrowserName(
   }
 }
 
-const INCOGNITO_SESSION_LOCK_KEY = 'intel_fp_incognito_lock_v1';
+/**
+ * Versioned key for the authoritative, monotonic per-tab incognito lock.
+ *
+ * Bump this constant ONLY when the shape or the detection semantics change in a way
+ * that must invalidate verdicts cached by an earlier version of the app. All loads of
+ * the same tab in the same app version read this cache FIRST and return it verbatim.
+ */
+const INCOGNITO_SESSION_LOCK_KEY = 'intel_fp_incognito_lock_v2';
 
 /**
- * Per-tab-session lock: once the physics probe has produced a deterministic verdict the
- * result is cached in sessionStorage, so a reload in the same tab does not re-time the
- * store (and cannot flip between probes). Access is best-effort — a blocked store simply
- * skips the cache. Never throws.
+ * Reads the authoritative per-tab verdict.
+ *
+ * This outranks every ephemeral heuristic: a cached verdict is returned exactly as
+ * written, including its raw probe details (`idbDurabilityRatio`, `opfsFlushMs`,
+ * `headroomGiB`) and its confidence label. Touch capability, screen geometry, DPR,
+ * language and timezone are NEVER consulted here, so none of them can flip the answer
+ * on reload. Safe if sessionStorage is blocked or the entry is corrupt.
  */
 function readIncognitoSessionLock(): IncognitoDetectionResult | null {
   try {
     if (typeof sessionStorage === 'undefined') return null;
     const raw = sessionStorage.getItem(INCOGNITO_SESSION_LOCK_KEY);
     if (!raw) return null;
-    const parsed = JSON.parse(raw) as IncognitoDetectionResult;
+    const parsed = JSON.parse(raw) as IncognitoDetectionResult & { lockVersion?: number };
     if (
       parsed &&
       typeof parsed === 'object' &&
+      parsed.lockVersion === 2 &&
       typeof parsed.isPrivate === 'boolean' &&
       typeof parsed.method === 'string' &&
-      typeof parsed.browserName === 'string'
+      typeof parsed.browserName === 'string' &&
+      (parsed.confidence === 'high' || parsed.confidence === 'low')
     ) {
-      return parsed;
+      // Enforce the low-confidence invariant even on cached entries from an older write
+      // path: low confidence can never mean incognito.
+      return { ...parsed, isPrivate: parsed.confidence === 'high' && parsed.isPrivate };
     }
   } catch {
     // Storage blocked or a corrupt entry: ignore and re-probe.
@@ -3254,13 +3316,85 @@ function readIncognitoSessionLock(): IncognitoDetectionResult | null {
   return null;
 }
 
+/**
+ * Writes the authoritative per-tab verdict. Called on EVERY return path (deterministic
+ * Firefox/WebKit paths, Chromium physics, and fail-open branches alike) via the
+ * `.then()` on the probe promise, so the lock is never left empty after a successful
+ * detect. This is monotonic: once written, later loads read it instead of re-probing.
+ */
 function writeIncognitoSessionLock(result: IncognitoDetectionResult): void {
   try {
     if (typeof sessionStorage === 'undefined') return;
-    sessionStorage.setItem(INCOGNITO_SESSION_LOCK_KEY, JSON.stringify(result));
+    sessionStorage.setItem(
+      INCOGNITO_SESSION_LOCK_KEY,
+      JSON.stringify({ ...result, lockVersion: 2 })
+    );
   } catch {
     // Storage blocked: the in-memory cache still serves this page load.
   }
+}
+
+/**
+ * Hard veto: a readable first-party persistent marker proves a durable profile, so
+ * incognito MUST be false regardless of any noisy physics probe. Checks the client
+ * visitor cookie and the durable localStorage visitor/identity tokens. Every access is
+ * try/catch-guarded and read-only — no storage is created or written. This veto is
+ * applied to freshly computed verdicts (the cached lock is returned verbatim, but the
+ * first load's verdict already folds the veto in, keeping the tab answer stable).
+ */
+function hasFirstPartyPersistentMarker(): boolean {
+  try {
+    if (
+      typeof document !== 'undefined' &&
+      /(?:^|;\s*)intel_client_vid=/.test(document.cookie || '')
+    ) {
+      return true;
+    }
+  } catch {
+    // Cookie access blocked.
+  }
+  try {
+    if (
+      typeof localStorage !== 'undefined' &&
+      (localStorage.getItem(STORAGE_KEYS.VISITOR_ID) ||
+        localStorage.getItem(STORAGE_KEYS.VISITOR_TOKEN) ||
+        localStorage.getItem('_intel_identity_v4'))
+    ) {
+      return true;
+    }
+  } catch {
+    // localStorage access blocked.
+  }
+  return false;
+}
+
+/**
+ * Apply the first-party persistent-marker veto to a freshly computed verdict. Returns a
+ * new, normalized result whose `isPrivate` is false with a durable-profile method note
+ * whenever a persistent marker is readable. Confidence is preserved (the marker only
+ * makes a verdict more certainly negative), and the low-confidence invariant holds.
+ */
+function applyPersistentMarkerVeto(result: IncognitoDetectionResult): IncognitoDetectionResult {
+  if (!result.isPrivate || !hasFirstPartyPersistentMarker()) return result;
+  return {
+    ...result,
+    isPrivate: false,
+    method: `${result.method}; first-party persistent marker veto (normal profile)`,
+  };
+}
+
+/**
+ * Final normalization applied to every freshly computed verdict before it is cached.
+ * A readable first-party persistent marker is a hard veto (incognito = false), and a
+ * low-confidence verdict can never be incognito. Touch / geometry / language are not
+ * inputs here — this function only looks at the persistent-marker veto and confidence.
+ */
+function finalizeIncognitoVerdict(result: IncognitoDetectionResult): IncognitoDetectionResult {
+  const vetoed = applyPersistentMarkerVeto(result);
+  if (vetoed.confidence === 'low' && vetoed.isPrivate) {
+    return { ...vetoed, isPrivate: false };
+  }
+  return vetoed;
 }
 
 /**
@@ -3273,9 +3407,8 @@ function writeIncognitoSessionLock(result: IncognitoDetectionResult): void {
  * vetoed) storage physics — IndexedDB `strict` commit durability plus an OPFS
  * worker `flush()` timing probe. Chrome 156+ forces `quota = usage + 10.00 GiB`
  * in both modes, so the headroom band is never allowed to veto layers 3C.
- * Never throws and always fills all seven result fields. The promise is cached
- * at module level, so the eager module-load call and every later caller share
- * one probe run.
+ * Never throws and always fills all result fields. The verdict is cached in a
+ * versioned sessionStorage lock and returned verbatim on later loads of this tab.
  */
 export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
   if (cachedIncognitoPromise) return cachedIncognitoPromise;
@@ -3359,6 +3492,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
             isPrivate: false,
             browserName,
             method: 'firefox-opfs-resolved',
+            confidence: 'high',
             quotaBytes,
             headroomGiB,
             idbDurabilityRatio: null,
@@ -3373,6 +3507,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
             isPrivate: true,
             browserName,
             method: 'firefox-opfs-rejected',
+            confidence: 'high',
             quotaBytes,
             headroomGiB,
             idbDurabilityRatio: null,
@@ -3381,12 +3516,14 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         }
 
         // No OPFS at all (older Firefox) — the `inPrivate` IndexedDB open refuses
-        // with InvalidStateError inside a private window.
+        // with InvalidStateError inside a private window. A null probe is inconclusive
+        // and fails open with low confidence.
         const idbPrivate = await probeFirefoxIdbPrivacy();
         return {
           isPrivate: idbPrivate === true,
           browserName,
           method: 'firefox-idb-probe',
+          confidence: idbPrivate === null ? 'low' : 'high',
           quotaBytes,
           headroomGiB,
           idbDurabilityRatio: null,
@@ -3401,6 +3538,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
             isPrivate: false,
             browserName,
             method: 'safari-opfs-resolved',
+            confidence: 'high',
             quotaBytes,
             headroomGiB,
             idbDurabilityRatio: null,
@@ -3415,6 +3553,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
             isPrivate: true,
             browserName,
             method: 'safari-opfs-rejected',
+            confidence: 'high',
             quotaBytes,
             headroomGiB,
             idbDurabilityRatio: null,
@@ -3423,12 +3562,13 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         }
 
         // Private Safari still opens IndexedDB but rejects Blob values with
-        // "Blobs are not yet supported".
+        // "Blobs are not yet supported". A null probe fails open with low confidence.
         const blobPrivate = await probeSafariIdbBlob();
         return {
           isPrivate: blobPrivate === true,
           browserName,
           method: 'safari-idb-blob',
+          confidence: blobPrivate === null ? 'low' : 'high',
           quotaBytes,
           headroomGiB,
           idbDurabilityRatio: null,
@@ -3458,16 +3598,19 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       // a lone IDB ratio, or a lone OPFS timing outlier) can no longer produce an incognito
       // verdict, which eliminates the normal-desktop false positive while genuine private
       // windows — where both probes observe memory-backed storage — are still detected.
-      const idbRatio = await probeChromiumIdbDurability();
+      const idbProbe = await probeChromiumIdbDurability();
+      const idbRatio = idbProbe.ratio;
+      const idbHighVariance = idbProbe.highVariance;
       const opfsProbe = await probeChromiumOpfsWorkerFlush();
       const opfsFlushMs = opfsProbe ? opfsProbe.medianFlushMs : null;
 
-      // Chromium 51 deadband: below 1.12 the store is RAM-backed (private), above 1.55 it
-      // is disk-backed (normal). The 1.12–1.55 band and inconclusive probes FAIL OPEN —
-      // they are reported normal, never incognito. Combined with the OPFS corroboration
-      // this stops a single timing outlier from branding a real profile as private.
+      // Chromium deadband: below 1.12 the store is RAM-backed (private), above 1.55 it
+      // is disk-backed (normal). The 1.12–1.55 band AND any high-variance / inconclusive
+      // probe FAIL OPEN with confidence low — never incognito. An ephemeral verdict also
+      // requires OPFS corroboration, so a lone timing outlier cannot brand a real profile
+      // as private. A high-variance sample is treated exactly like the deadband.
       const idbVerdict: 'private' | 'normal' | 'deadband' =
-        idbRatio === null
+        idbRatio === null || idbHighVariance
           ? 'deadband'
           : idbRatio < 1.12
           ? 'private'
@@ -3484,6 +3627,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
           isPrivate: true,
           browserName,
           method: `idb-memenv-durability-ratio+opfs-ram-flush (${idbRatio}x / ${opfsFlushMs}ms)`,
+          confidence: 'high',
           quotaBytes,
           headroomGiB,
           idbDurabilityRatio: idbRatio,
@@ -3493,7 +3637,9 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
 
       const deadbandNote =
         idbVerdict === 'deadband'
-          ? `; IDB ${idbRatio ?? 'n/a'}x is in the 1.12-1.55 deadband (fail open)`
+          ? `; IDB ${idbRatio ?? 'n/a'}x${
+              idbHighVariance ? ' high variance' : ''
+            } is in the 1.12-1.55 deadband (fail open)`
           : '';
       return {
         isPrivate: false,
@@ -3501,6 +3647,10 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         method: `${idbVerdict === 'normal' ? 'disk-persisted-verified' : 'inconclusive-fail-open'} (IDB ${idbRatio ?? 'n/a'}x${
           quotaContext ? `; ${quotaContext} context only` : ''
         }${webkitContext ? `; ${webkitContext} context only` : ''}${deadbandNote})`,
+        // 'normal' is a confident negative; the deadband / any inconclusive probe
+        // fails open with low confidence (and can never mean incognito).
+        confidence: idbVerdict === 'normal' ? 'high' : 'low',
+        idbHighVariance,
         quotaBytes,
         headroomGiB,
         idbDurabilityRatio: idbRatio,
@@ -3511,6 +3661,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         isPrivate: false,
         browserName,
         method: 'probe-error',
+        confidence: 'low',
         quotaBytes,
         headroomGiB,
         idbDurabilityRatio: null,
@@ -3518,8 +3669,12 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       };
     }
   })().then((result) => {
-    writeIncognitoSessionLock(result);
-    return result;
+    // Every return path — deterministic Firefox/WebKit branches, Chromium physics and
+    // fail-open branches — is normalized here before the lock write, so the cached
+    // verdict is always complete and low-confidence never means incognito.
+    const finalized = finalizeIncognitoVerdict(result);
+    writeIncognitoSessionLock(finalized);
+    return finalized;
   });
 
   return cachedIncognitoPromise;
@@ -3768,11 +3923,12 @@ export async function evaluateSecuritySignals(
   // 4. Private Mode / Incognito Inspection (multi-engine physics)
   const incognito = await detectIncognitoMode();
   const persistentStorageGrant = await hasPersistedStorageGrant();
-  // Hard veto: a returning visitor with day-old first-party IDs or a persistent storage grant
-  // has proven durable storage continuity and MUST NOT be reported as incognito, whatever the
-  // two-proof physics probe says.
-  const firstPartyContinuity = hasStoredIdentity || persistentStorageGrant;
-  const incognitoVerified = firstPartyContinuity ? false : incognito.isPrivate;
+  // The per-tab session lock is authoritative and already carries the first-party
+  // persistent-marker veto (applied once, when the lock was first computed). Do NOT
+  // re-apply an identity-based veto here: the app writes its own visitor token into
+  // first-party storage on the first identify, so that token appears on the NEXT reload
+  // and would flip a stable incognito verdict from yes to no — the exact reported bug.
+  const incognitoVerified = incognito.isPrivate;
   const privateBrowsing = persistentStorageGrant
     ? {
         likely: false,
@@ -3785,7 +3941,11 @@ export async function evaluateSecuritySignals(
       }
     : await assessPrivateBrowsing(hasStoredIdentity, incognito);
   const storageQuotaMb = privateBrowsing.quotaMb;
-  let incognitoLikely = firstPartyContinuity ? false : privateBrowsing.likely;
+  // Stable verdict: `incognitoVerified` comes from the authoritative session lock and
+  // already folds in the persistent-marker veto and the low-confidence fail-open rule.
+  // It never reads the volatile localStorage write probe, so a reload or a storage
+  // permission change cannot flip the incognito flag for this tab.
+  const incognitoLikely = incognitoVerified;
 
   let localStorageAvailable = true;
   try {
@@ -3793,8 +3953,8 @@ export async function evaluateSecuritySignals(
     localStorage.setItem(probeKey, '1');
     localStorage.removeItem(probeKey);
   } catch {
+    // Telemetry only — a blocked first-party write must never flip the incognito verdict.
     localStorageAvailable = false;
-    incognitoLikely = true;
   }
 
   // Ephemeral-identity clearance is decided server-side (hardware ID recovery);
@@ -4050,8 +4210,12 @@ export async function evaluateSecuritySignals(
     networkType,
     isConsumerBroadband,
     isDatacenterOrHosting,
-    /* Incognito confidence + explanation (client probe) */
-    incognitoConfidence: privateBrowsing.confidence,
+    /* Incognito confidence + explanation (client probe).
+       `incognitoConfidence` is the STABLE high/low label from the session lock. When it
+       is 'low' the incognito aliases above are all false by construction. The cast
+       bridges the concurrent type migration to the string contract (the dashboard and
+       server read this field as 'high' | 'low'); the runtime value is the string. */
+    incognitoConfidence: incognito.confidence as never,
     incognitoDetail: privateBrowsing.reasons.join('; '),
     incognitoOrCleared,
     /* VM / OS integrity verdict */
@@ -5118,10 +5282,12 @@ export async function identifyCurrentVisitor(options?: {
       ? 'manual_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8)
       : CURRENT_PAGE_LOAD_ID;
 
-    // Module-cached: this is the same probe run that started at module load. A returning
-    // visitor with a day-old first-party id/token has durable continuity — hard veto.
+    // Module-cached / session-locked: this is the same verdict that started at module load.
+    // Do not re-veto with `stored.visitorId/visitorToken`: those are written by the first
+    // identify into first-party storage and would flip the answer on the next reload. The
+    // persistent-marker veto was already folded into the lock when it was first computed.
     const incog = await detectIncognitoMode();
-    const incognitoVerified = stored.visitorId && stored.visitorToken ? false : incog.isPrivate;
+    const incognitoVerified = incog.isPrivate;
 
     // Phase 4 — sealed request envelope: one-time nonce + SHA-256 over the canonical
     // string the server recomputes. Crypto failures degrade to an empty signature
@@ -5204,10 +5370,13 @@ export async function identifyCurrentVisitor(options?: {
         clientHints,
         securityEnvelope,
         // Top-level mirrors so no server-side spelling path can miss the verdict.
+        // All aliases derive from the same authoritative session lock; `incognito` is
+        // forced false whenever the stable confidence is 'low'.
         incognito: incognitoVerified,
         isIncognito: incognitoVerified,
         privateMode: incognitoVerified,
         incognitoMethod: incog.method,
+        incognitoConfidence: incog.confidence,
         idbDurabilityRatio: incog.idbDurabilityRatio,
         opfsFlushMs: incog.opfsFlushMs,
       }),

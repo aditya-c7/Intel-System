@@ -14,6 +14,7 @@ import { useEffect, useRef, useState } from 'react';
 
 export type CursorIdentityKind =
   | 'automated'
+  | 'automation'
   | 'cloud'
   | 'firecrawl'
   | 'browseruse'
@@ -39,6 +40,7 @@ export interface CursorIdentity {
 
 const PILL_STYLES: Record<CursorIdentityKind, string> = {
   automated: 'bg-[#FCE8E6] border-[#F6AEA9] text-[#A50E0E]',
+  automation: 'bg-[#FCE8E6] border-[#F6AEA9] text-[#A50E0E]',
   cloud: 'bg-[#F1F3F4] border-[#DADCE0] text-[#3C4043]',
   firecrawl: 'bg-[#FFF1E5] border-[#FFCC9B] text-[#B33C00]',
   browseruse: 'bg-[#E8F0FE] border-[#D2E3FC] text-[#174EA6]',
@@ -58,7 +60,7 @@ const PILL_STYLES: Record<CursorIdentityKind, string> = {
 };
 
 function CursorEmblem({ kind }: { kind: CursorIdentityKind }) {
-  if (kind === 'automated' || kind === 'cloud') {
+  if (kind === 'automated' || kind === 'automation' || kind === 'cloud') {
     return (
       <svg viewBox="0 0 16 16" className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden="true">
         <circle cx="8" cy="3.5" r="1.8" fill="currentColor" stroke="none" />
@@ -195,6 +197,38 @@ function remoteBrowserIdentity(name: string): CursorIdentity | null {
   return null;
 }
 
+/** Semantic `bot_type` values that denote browser automation, never a signed agent. */
+const AUTOMATION_BOT_TYPES = new Set([
+  'automation',
+  'browser_automation',
+  'stealth_automation',
+  'chromium_automation',
+  'chromium',
+  'cdp_automation',
+  'playwright',
+  'puppeteer',
+  'selenium',
+  'ai_browser',
+]);
+
+/** True only for a server-authoritative automation bot_type (never `ai_agent` / a crawler). */
+export function isAutomationBotType(botType: string | null | undefined): boolean {
+  const type = (botType || '').trim().toLowerCase();
+  if (!type || type === 'ai_agent' || type === 'human' || type === 'ai_crawler') return false;
+  return type.startsWith('headless') || AUTOMATION_BOT_TYPES.has(type);
+}
+
+/**
+ * The one canonical display label for an automation verdict, shared by the cursor pill,
+ * the attribution banner and the Event JSON so they can never disagree. Returns `null`
+ * for humans, genuine signed agents and verified crawlers.
+ */
+export function resolveAutomationLabel(botType: string | null | undefined): string | null {
+  const type = (botType || '').trim().toLowerCase();
+  if (!isAutomationBotType(type)) return null;
+  return type.startsWith('headless') ? 'Headless Browser Automation' : 'Stealth Automation';
+}
+
 /**
  * Maps a resolved visitor verdict onto the pill the overlay renders.
  *
@@ -204,9 +238,25 @@ function remoteBrowserIdentity(name: string): CursorIdentity | null {
 export function resolveCursorIdentity(input: {
   botSubtype?: string | null;
   isBot?: boolean;
+  botType?: string | null;
   agentId?: string | null;
   agentName?: string | null;
 }): CursorIdentity | null {
+  // An automation verdict outranks every signed-agent claim. A stale aiAgent / Gemini field
+  // must never name a stealth Playwright session as a signed cloud agent.
+  const automationLabel = resolveAutomationLabel(input.botType);
+  const automationVerdict =
+    Boolean(input.isBot) ||
+    input.botSubtype === 'bad_bot' ||
+    input.botSubtype === 'ai_agent';
+  if (automationLabel && automationVerdict) {
+    return { kind: 'automation', label: automationLabel };
+  }
+  if (automationLabel) {
+    // bot_type is authoritative even when a stale bot mirror lags: still no agent label.
+    return { kind: 'automation', label: 'Automated' };
+  }
+
   const agent = (input.agentId || '').toLowerCase();
   const agentName = (input.agentName || '').toLowerCase();
 

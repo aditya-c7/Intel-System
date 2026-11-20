@@ -6316,6 +6316,14 @@ async function resolveAiAgentIdentity(input) {
     directoryHint.clientName ? `Agent directory client_name: ${directoryHint.clientName}` : "",
     directoryHint.trigger ? `Agent trigger: ${directoryHint.trigger}` : ""
   ].filter(Boolean) : [];
+  const authoritativeAutomation = Boolean(
+    input.client.hardAutomationSignals || input.client.automationTargetedTampering || input.client.webdriver || input.client.cdpDetected || input.client.isBot && input.client.isHeadless || (input.client.botSignals || []).some(
+      (signal) => /stealth|headless|chromium|puppeteer|playwright|webdriver/i.test(signal)
+    )
+  );
+  if (authoritativeAutomation && !webBotAuth.present) {
+    return NO_AI_AGENT;
+  }
   const remoteBrowserUa = /firecrawl|browserbase|browser[-_ ]?use|skyvern|multion|hyperbrowser|steel[-_ ]?browser|airtop|\bnotte\b|lightpanda|browserless|scrapingbee|scrapfly|zenrows|brightdata|oxylabs|\bzyte\b/i;
   if (remoteBrowserUa.test(ua)) {
     const remoteOperator = /firecrawl/i.test(ua) ? "Firecrawl" : /browserbase/i.test(ua) ? "Browserbase" : /browser[-_ ]?use/i.test(ua) ? "Browser Use" : /skyvern/i.test(ua) ? "Skyvern" : /multion/i.test(ua) ? "MultiOn" : /hyperbrowser/i.test(ua) ? "Hyperbrowser" : /steel[-_ ]?browser/i.test(ua) ? "Steel" : /airtop/i.test(ua) ? "Airtop" : /notte/i.test(ua) ? "Notte" : /lightpanda/i.test(ua) ? "Lightpanda" : /browserless/i.test(ua) ? "Browserless" : /scrapingbee/i.test(ua) ? "ScrapingBee" : /scrapfly/i.test(ua) ? "Scrapfly" : /zenrows/i.test(ua) ? "ZenRows" : /brightdata/i.test(ua) ? "Bright Data" : /oxylabs/i.test(ua) ? "Oxylabs" : "Zyte";
@@ -8580,18 +8588,20 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   );
   const networkHaystackForVpn = `${location.isp} ${location.org}`;
   const commercialVpnProvider = !baseClassification.isConsumerBroadband && baseClassification.networkType === "VPN / Proxy Relay" && VPN_PROXY_PATTERN.test(networkHaystackForVpn) && !HOSTING_EGRESS_PATTERN.test(networkHaystackForVpn);
+  const verifiedProxyRelay = detectProxyHeaders(requestContext.headers, location.publicIp).detected;
+  const concreteVpnEvidence = commercialVpnProvider || Boolean(requestContext.torExitNode || requestContext.torRelay) || verifiedProxyRelay;
   const vpnMethods = {
     timezone_mismatch: hasTzMismatch,
     public_vpn: commercialVpnProvider,
     auxiliary_mobile: false,
     os_mismatch: Boolean(raw?.isOsTampered),
     relay: Boolean(torExitNode),
-    // Require concrete hosting/proxy evidence so a legacy `vpnSuspected` born of a timezone-only
-    // mismatch — even one the server canonicalizes as an equivalent timezone — cannot be
-    // resurrected as an ML VPN verdict.
-    ml_prediction: Boolean(raw?.vpnSuspected) && !commercialVpnProvider && !hasTzMismatch && datacenterAsn
+    // A client ML verdict is accepted ONLY when an independent, concrete relay signal
+    // corroborates it (provider-owned VPN, Tor relay or verified proxy chain). Never ASN alone,
+    // never timezone alone — both are orthogonal axes, not tunnels.
+    ml_prediction: Boolean(raw?.vpnSuspected) && concreteVpnEvidence
   };
-  const vpnSuspected = vpnMethods.public_vpn || vpnMethods.relay || vpnMethods.ml_prediction || vpnMethods.os_mismatch || datacenterAsn && botSubtype !== "good_bot";
+  const vpnSuspected = vpnMethods.public_vpn || vpnMethods.relay || vpnMethods.ml_prediction || vpnMethods.os_mismatch;
   const rawTamperReasons = safeStrArray(raw?.tamperReasons);
   const timezoneOnlyTamper = rawTamperReasons.length > 0 && rawTamperReasons.every((reason) => isTimezoneMismatchReason(reason));
   const tamperDetected = Boolean(
@@ -8602,14 +8612,17 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     tamperReasons.unshift(requestContext.requestIntegrityReason);
     tamperReasons.splice(10);
   }
-  const incognitoLikely = Boolean(raw?.incognitoLikely);
+  const rawIncognitoConfidence = raw?.incognitoConfidence;
+  const incognitoConfidenceHigh = rawIncognitoConfidence === "high" || typeof rawIncognitoConfidence === "number" && rawIncognitoConfidence >= 0.9;
+  const incognitoLikely = incognitoConfidenceHigh && Boolean(raw?.incognitoLikely);
+  const incognitoConfidenceLabel = incognitoConfidenceHigh ? "high" : "low";
   const storageQuotaMb = typeof raw?.storageQuotaMb === "number" && Number.isFinite(raw.storageQuotaMb) && raw.storageQuotaMb > 0 ? Math.round(raw.storageQuotaMb) : null;
   const webrtcCandidateIp = typeof raw?.webrtcCandidateIp === "string" && raw.webrtcCandidateIp.trim() ? raw.webrtcCandidateIp.trim().slice(0, 64) : null;
   const webrtcDetail = typeof raw?.webrtcDetail === "string" && raw.webrtcDetail.trim() ? raw.webrtcDetail.trim().slice(0, 200) : "";
   const privacyProtected = Boolean(raw?.privacyProtected);
   const privacyDetail = typeof raw?.privacyDetail === "string" && raw.privacyDetail.trim() ? raw.privacyDetail.trim().slice(0, 200) : "";
   const canvasFarblingDetected = Boolean(raw?.canvasFarblingDetected);
-  const isVirtualMachine = Boolean(raw?.isVirtualMachine);
+  const clientReportedVm = Boolean(raw?.isVirtualMachine);
   const isOsTampered = Boolean(raw?.isOsTampered);
   const vmReason = typeof raw?.vmReason === "string" && raw.vmReason.trim() ? raw.vmReason.trim().slice(0, 200) : "";
   const incognitoMethod = typeof raw?.incognitoMethod === "string" && raw.incognitoMethod.trim() ? raw.incognitoMethod.trim().slice(0, 120) : "";
@@ -8686,9 +8699,12 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const torRelayNetwork = requestContext.torVerdict === "relay" || requestContext.torRelay === true;
   const torAnonymity = torExitNode || torBrowserClient;
   const torOperatorLabel = requestContext.torOperator ?? describeTorRelay(location.publicIp) ?? null;
-  const vpnScore = torAnonymity ? 9 : ipBlocklisted ? 9 : verifiedCrawlerNetwork ? 2 : torRelayNetwork ? 6 : aiAgent?.detected ? 7 : isDatacenterAsn && hasTzMismatch ? 4 : isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0;
-  const vpnStatus = torAnonymity ? torExitNode && torBrowserClient ? "Tor Exit Node & Tor Browser" : torExitNode ? "Tor Exit Node" : "Tor Browser (Onion Routing / RFP)" : ipBlocklisted ? "Blocklisted IP" : verifiedCrawlerNetwork ? "Verified Crawler Network" : torRelayNetwork ? "Tor Relay (Non-Exit)" : aiAgent?.detected ? "AI Agent Cloud Network" : isDatacenterAsn ? "VPN / Datacenter Proxy" : hasTzMismatch ? "VPN / Timezone Relay" : "Standard ISP";
-  const vpnDetail = torAnonymity ? `${torExitNode ? "Confirmed active Tor exit relay" : "Tor Browser fingerprint (Gecko RFP + letterboxing)"} (${location.publicIp} \xB7 ${torOperatorLabel || asnOrOrg})${torOperatorHint ? " \u2014 DNSEL unreachable, operator attribution used" : ""}${torExitNode && torBrowserClient ? " \xB7 server exit IP and client RFP both matched" : ""}` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : verifiedCrawlerNetwork ? `${botClassification.provider} crawler operating from its own ${ispBrand}${asnSuffix} \u2014 crawler infrastructure, not a consumer proxy` : torRelayNetwork ? `Tor relay network (${torOperatorLabel || asnOrOrg}) \u2014 part of the Tor network but not an exit egress` : aiAgent?.detected ? `${aiAgent.agentName} (${aiAgent.operator}) \u2014 ${aiAgent.executionMode || "AI agent"} traffic from ${ispBrand}${asnSuffix}` : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
+  const concreteTunnelVerdict = Boolean(
+    vpnMethods.public_vpn || vpnMethods.relay || vpnMethods.ml_prediction
+  );
+  const vpnScore = torAnonymity ? 9 : ipBlocklisted ? 9 : verifiedCrawlerNetwork ? 2 : torRelayNetwork ? 6 : aiAgent?.detected ? 7 : concreteTunnelVerdict ? 6 : isDatacenterAsn && hasTzMismatch ? 4 : isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0;
+  const vpnStatus = torAnonymity ? torExitNode && torBrowserClient ? "Tor Exit Node & Tor Browser" : torExitNode ? "Tor Exit Node" : "Tor Browser (Onion Routing / RFP)" : ipBlocklisted ? "Blocklisted IP" : verifiedCrawlerNetwork ? "Verified Crawler Network" : torRelayNetwork ? "Tor Relay (Non-Exit)" : aiAgent?.detected ? "AI Agent Cloud Network" : concreteTunnelVerdict ? "VPN / Proxy Relay" : isDatacenterAsn ? "Datacenter / Hosting Network" : hasTzMismatch ? "Timezone Mismatch (Orthogonal)" : "Standard ISP";
+  const vpnDetail = torAnonymity ? `${torExitNode ? "Confirmed active Tor exit relay" : "Tor Browser fingerprint (Gecko RFP + letterboxing)"} (${location.publicIp} \xB7 ${torOperatorLabel || asnOrOrg})${torOperatorHint ? " \u2014 DNSEL unreachable, operator attribution used" : ""}${torExitNode && torBrowserClient ? " \xB7 server exit IP and client RFP both matched" : ""}` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : verifiedCrawlerNetwork ? `${botClassification.provider} crawler operating from its own ${ispBrand}${asnSuffix} \u2014 crawler infrastructure, not a consumer proxy` : torRelayNetwork ? `Tor relay network (${torOperatorLabel || asnOrOrg}) \u2014 part of the Tor network but not an exit egress` : aiAgent?.detected ? `${aiAgent.agentName} (${aiAgent.operator}) \u2014 ${aiAgent.executionMode || "AI agent"} traffic from ${ispBrand}${asnSuffix}` : concreteTunnelVerdict ? vpnMethods.public_vpn ? `Verified commercial VPN provider on ${ispBrand}${asnSuffix}` : vpnMethods.relay ? `Tor relay / anonymity infrastructure (${torOperatorLabel || asnOrOrg})` : `Verified proxy-chain / relay evidence on ${ispBrand}${asnSuffix}` : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
   const vpnSignal = {
     id: "vpn",
     title: "VPN / Proxy & Network Type",
@@ -8698,13 +8714,20 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     level: levelFor(vpnScore),
     detail: vpnDetail
   };
-  const isVm = isVirtualMachine;
+  const HYPERVISOR_GPU_PATTERN = /virtualbox|\bvbox\b|vmware|svga3d|\bqemu\b|virtio|virgl|\bbochs\b|hyper-?v|microsoft remote display|parallels|citrix|\bxen\b/i;
+  const gpuSignatureText = `${hardwareSignals.gpuVendor || ""} ${hardwareSignals.gpuRenderer || ""}`;
+  const hypervisorGpuProof = HYPERVISOR_GPU_PATTERN.test(gpuSignatureText);
+  const cloudContainerVmReason = /cloud container|datacenter asn|masked webgl|software renderer/i.test(
+    vmReason
+  );
+  const hostVirtualizationProof = hypervisorGpuProof || clientReportedVm && !cloudContainerVmReason && !isGpuMaskedOrUnavailable;
+  const isVm = hostVirtualizationProof && !emulatorDetected;
+  const vmReasonVerdict = isVm ? vmReason && !cloudContainerVmReason ? vmReason : hypervisorGpuProof ? "Hypervisor-specific GPU signature detected in the WebGL vendor / renderer" : "Host-level virtualization evidence detected" : "";
   const isTampered = isOsTampered;
-  const cloudContainerVm = datacenterAsn && (isGpuMaskedOrUnavailable || cloudOrMaskedGpu);
-  const vmLike = isVm || cloudContainerVm;
+  const vmLike = isVm;
   const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : vmLike || isTampered ? 6 : 0;
   const vmStatus = tamperedRequest || replayDetected ? "Tampered / Replayed" : emulatorDetected ? "Mobile Emulator" : vmLike ? "Virtual Machine / VM" : isTampered ? "Spoofed Environment" : "Physical Hardware";
-  const vmDetail = tamperedRequest || replayDetected ? requestIntegrityReason || "Sealed request envelope failed verification" : emulatorDetected ? emulatorReason || vmReason || "Mobile emulator / simulator runtime detected" : vmLike ? vmReason || (cloudContainerVm ? `Cloud container on ${ispBrand}${asnSuffix} exposed an unavailable / masked GPU` : "Hypervisor CPUID / virtualised GPU footprint detected") : isTampered ? vmReason || tamperReasons[0] || "Operating-system / User-Agent tampering detected" : "Unmasked physical GPU & consistent OS platform verified";
+  const vmDetail = tamperedRequest || replayDetected ? requestIntegrityReason || "Sealed request envelope failed verification" : emulatorDetected ? emulatorReason || vmReason || "Mobile emulator / simulator runtime detected" : vmLike ? vmReasonVerdict : isTampered ? vmReason || tamperReasons[0] || "Operating-system / User-Agent tampering detected" : "Unmasked physical GPU & consistent OS platform verified";
   const vmSignal = {
     id: "vm",
     title: "Virtual Machine & OS Integrity",
@@ -8836,18 +8859,15 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       adBlockerDetected: false,
       devToolsOpen: false,
       canvasFarblingDetected,
-      isVirtualMachine,
-      vmReason,
+      // Corrected verdicts only: a cloud ASN / masked GPU never reaches these host-level fields.
+      isVirtualMachine: isVm,
+      vmReason: vmReasonVerdict,
       isOsTampered,
       incognitoOrCleared,
-      // Client-side composite private-browsing probe (confidence 0..1 + evidence)
-      incognitoConfidence: Math.max(
-        0,
-        Math.min(
-          1,
-          typeof raw?.incognitoConfidence === "number" && Number.isFinite(raw.incognitoConfidence) ? raw.incognitoConfidence : 0
-        )
-      ),
+      // Client-side private-browsing probe. The collector emits a stable 'high' | 'low' label;
+      // preserve it verbatim so 'low' can never be mistaken for an incognito verdict. The cast
+      // bridges the legacy numeric type declaration while the shared type migrates to the label.
+      incognitoConfidence: incognitoConfidenceLabel,
       incognitoDetail: typeof raw?.incognitoDetail === "string" ? raw.incognitoDetail.trim().slice(0, 240) : "",
       // Final 4-signal upgrade — private browsing, bot, network, VM integrity
       isIncognito,
@@ -9426,7 +9446,9 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const bodyVisitorId = storageVerified ? storedVisitorId ?? null : null;
     const historyBackupValid = Boolean(validBackupForStats);
     const hadPersistentClientState = Boolean(cookieVid || bodyVisitorId || historyBackupValid);
-    const clientReportedIncognito = Boolean(
+    const rawIncognitoConfidence = rawSecuritySignals?.incognitoConfidence ?? requestBody.incognitoConfidence;
+    const incognitoConfidenceHigh = rawIncognitoConfidence === "high" || typeof rawIncognitoConfidence === "number" && rawIncognitoConfidence >= 0.9;
+    const clientReportedIncognito = incognitoConfidenceHigh && Boolean(
       requestBody.incognito ?? requestBody.isIncognito ?? requestBody.privateMode ?? requestBody.browserInfo?.incognito ?? requestBody.browserInfo?.isIncognito ?? requestBody.telemetry?.incognito ?? requestBody.telemetry?.isIncognito ?? rawSecuritySignals?.isIncognito ?? rawSecuritySignals?.incognito ?? rawSecuritySignals?.privateMode ?? rawSecuritySignals?.incognitoLikely
     );
     let crossSessionEphemeral = false;
@@ -9568,7 +9590,11 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         idbDurabilityRatio: rawSecuritySignals?.idbDurabilityRatio ?? null,
         screenResolution: browserDevice.screenResolution,
         platform: browserDevice.platform,
-        botSignals: Array.isArray(rawSecuritySignals?.botSignals) ? rawSecuritySignals.botSignals : []
+        botSignals: Array.isArray(rawSecuritySignals?.botSignals) ? rawSecuritySignals.botSignals : [],
+        // A hard / stealth automation verdict must suppress cloud-VM agent attribution
+        // (verified RFC 9421 signed agents remain exempt inside the resolver).
+        hardAutomationSignals,
+        automationTargetedTampering
       }
     });
     const attributedBotClassification = aiAgent.detected && aiAgent.agentId === "impostor-spoof" ? {
@@ -9952,6 +9978,22 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       botType = "stealth_automation";
       botVerdict = "bad";
     }
+    const signedAgentIdentity = Boolean(
+      aiAgent?.verified && /signed/i.test(String(aiAgent.executionMode || ""))
+    );
+    const lingeringCloudAgentLabel = aiAgent?.agentId === "gemini" || /google gemini|cloud agent/i.test(botInfo?.name || "");
+    if (lingeringCloudAgentLabel && !signedAgentIdentity && (hardAutomationSignals || botVerdict === "bad" || /stealth|headless|chromium/i.test(String(botType || "")))) {
+      securitySignals.aiAgent = null;
+      const headlessVariant = /headless|chromium/i.test(String(botType || ""));
+      botInfo = {
+        category: "browser_automation",
+        provider: "Stealth Automation",
+        name: headlessVariant ? "Headless Automation" : "Stealth Automation",
+        identity: "unknown"
+      };
+      botType = headlessVariant ? "headless_automation" : "stealth_automation";
+      botVerdict = "bad";
+    }
     if (botInfo) {
       securitySignals.botInfo = botInfo;
     }
@@ -9961,7 +10003,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       { isBot: canonicalIsBot, securitySignalsIsBot: securitySignals.isBot, envelopeBot: botVerdict },
       botVerdict
     );
-    hardwareSignals.incognitoConfidence = typeof securitySignals.incognitoConfidence === "number" ? securitySignals.incognitoConfidence : typeof rawSecuritySignals?.incognitoConfidence === "number" && Number.isFinite(rawSecuritySignals.incognitoConfidence) ? Math.max(0, Math.min(1, rawSecuritySignals.incognitoConfidence)) : 0;
+    hardwareSignals.incognitoConfidence = incognitoConfidenceHigh ? "high" : "low";
     const rawIdentityProfile = requestBody.identityProfile && typeof requestBody.identityProfile === "object" ? requestBody.identityProfile : null;
     const fallbackIdentityProfile = {
       hardwareFingerprint: hardwareId,
