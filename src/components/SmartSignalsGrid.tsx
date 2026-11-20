@@ -140,15 +140,30 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   // debugger. A bare CDP bridge (automation_protocol_attached) is informational, not proof.
   const envelopeAutomation = (
     data as unknown as {
-      envelope?: { automation?: { inspector_state?: string } };
+      envelope?: { automation?: { inspector_state?: string; cdp_attached?: boolean } };
     }
   ).envelope?.automation;
+  // Developer tools stays tied strictly to a docked/verified inspector — unchanged.
   const developerTools = envelopeAutomation?.inspector_state === 'devtools_active_verified';
   rows.push({
     key: 'developerTools',
     label: 'Developer Tools',
     status: developerTools ? 'Yes' : 'Not detected',
     triggered: developerTools,
+  });
+
+  // CDP / Automation Protocol is a separate, informational axis. A bare automation-protocol
+  // binding (cdp_attached / automation_protocol_attached) is never promoted to DevTools proof.
+  const cdpAttached =
+    Boolean(envelopeAutomation?.cdp_attached) ||
+    envelopeAutomation?.inspector_state === 'automation_protocol_attached';
+  rows.push({
+    key: 'cdpAutomation',
+    label: 'CDP / Automation Protocol',
+    status: cdpAttached ? 'Attached' : 'Not detected',
+    triggered: false,
+    tone: cdpAttached ? 'neutral' : 'clean',
+    detail: cdpAttached ? envelopeAutomation?.inspector_state : undefined,
   });
 
   // A software rasterizer is not proof of a VM: SwiftShader is reported honestly as

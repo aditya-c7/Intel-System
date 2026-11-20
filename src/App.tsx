@@ -942,6 +942,36 @@ export default function App() {
   );
   const spoofedSpecTag = spoofedSpecs ? ' (Spoofed / Unverified)' : '';
 
+  // A browser-vs-IP timezone gap is a NETWORK context signal, never a JS lie. Keep the raw
+  // browser timezone visible and annotate the discrepancy on the network axis only.
+  const browserTimezoneLabel = data?.browserDevice?.timezone || 'Unavailable';
+  const ipTimezoneLabel =
+    typeof data?.securitySignals?.ipTimezone === 'string' &&
+    data.securitySignals.ipTimezone &&
+    data.securitySignals.ipTimezone !== 'Unavailable'
+      ? data.securitySignals.ipTimezone
+      : null;
+  const timezoneMismatchContextual = Boolean(canonical.network?.timezone_mismatch);
+
+  // Emulated / spoofed OS is blocked from display: show the real hardware OS and label the
+  // claimed one. Silicon truth comes from the additive hardware signals on the response.
+  const hardwareTruth = data?.hardwareSignals as unknown as Record<string, unknown> | undefined;
+  const spoofedOsClaim =
+    selectedVisitIndex === 0 &&
+    (Boolean(data?.tamperingDetails?.devtools_device_emulation) ||
+      Boolean(hardwareTruth?.archUaMismatch) ||
+      Boolean(hardwareTruth?.osUaMismatch))
+      ? data?.browserDevice?.os || ''
+      : '';
+  const spoofedOsBlocked = Boolean(spoofedOsClaim && spoofedOsClaim !== 'Unavailable');
+  const hardwareOsTruth =
+    typeof hardwareTruth?.hostOs === 'string' && hardwareTruth.hostOs !== 'unknown'
+      ? hardwareTruth.hostOs
+      : null;
+  const hardwareOsLabel = hardwareOsTruth
+    ? { linux: 'Linux', macos: 'macOS', windows: 'Windows' }[hardwareOsTruth] ?? hardwareOsTruth
+    : null;
+
   // Server-verified UA-CH identity for the current session. `browserDevice.browser/os` is read
   // from mutable JS APIs and is spoofable, so the summary tiles prefer the request's own
   // Sec-CH-UA* headers. A selected past visit keeps its own recorded browser / OS values.
@@ -1023,6 +1053,8 @@ export default function App() {
   const eventJson = useMemo(() => {
     if (!data) return null;
     const s = data.securitySignals;
+    // Optional silicon-truth fields are additive: older responses simply omit them.
+    const hw = (data.hardwareSignals ?? {}) as unknown as Record<string, unknown>;
     // Canonical network identity is derived only from server-side IP geolocation and the
     // server's ISP classification. The JS `browserDevice` object is spoofable and must never
     // leak into `ip_info` (it used to print a browser timezone inside `geolocation.timezone`).
@@ -1105,6 +1137,17 @@ export default function App() {
       identification: {
         visitor_id: data.visitorId,
         hardware_id: data.hardwareId,
+        // Silicon-grounded truth. A UA/UA-CH architecture is only ever a claim; the hardware
+        // anchor comes from the runtime probe and arch_ua_mismatch records a disagreement.
+        hardware_arch: hw.architecture ?? null,
+        hardware_arch_source: hw.architectureSource ?? null,
+        claimed_arch: hw.claimedArchitecture ?? null,
+        arch_ua_mismatch: Boolean(hw.archUaMismatch),
+        host_os: hw.hostOs ?? null,
+        engine: hw.engine ?? null,
+        canvas_noise: Boolean(hw.canvasNoise),
+        audio_noise: Boolean(hw.audioNoise),
+        canvas_coarse_hash: hw.canvasCoarseHash ?? null,
         // Categorical tier only; no numeric confidence is invented on the client and an
         // unseen profile keeps confidence_score null.
         confidence: {
@@ -1138,7 +1181,13 @@ export default function App() {
       // Only report call state when the runtime can actually observe it — never print a
       // fabricated "unavailable" capability as if it were a measured signal.
       ...(activeCallSupported ? { active_call: Boolean(data.activeCall ?? s.activeCall) } : {}),
-      bot: data.bot ?? (s.botSubtype === 'bad_bot' || s.botSubtype === 'ai_agent' ? 'bad' : 'not_detected'),
+      // `isBot` and `bot` are one source of truth on the server. The fallback mirrors the same
+      // derivation so a legacy response can never print bot:"not_detected" next to isBot:true.
+      bot:
+        data.bot ??
+        (Boolean(s.isBot) || s.botSubtype === 'bad_bot' || s.botSubtype === 'ai_agent'
+          ? 'bad'
+          : 'not_detected'),
       bot_type:
         data.bot_type ??
         (s.botSubtype && s.botSubtype !== 'human'
@@ -1152,7 +1201,17 @@ export default function App() {
         name: s.aiAgent.agentName,
         identity: s.aiAgent.verified ? 'verified' : 'unknown',
       } : null),
-      developer_tools: Boolean(s.developerTools ?? s.cdpRuntimeLeak),
+      // Developer tools = a real docked DevTools UI / IDE webview. A bare CDP runtime binding is
+      // reported separately as cdp_attached so it can never contradict `developer_tools: false`.
+      developer_tools: Boolean(s.developerTools),
+      cdp_attached: Boolean(s.cdpDetected || s.cdpRuntimeLeak),
+      inspector_state:
+        (s as { inspectorState?: string }).inspectorState ??
+        (s.cdpDetected || s.cdpRuntimeLeak
+          ? 'automation_protocol_attached'
+          : s.developerTools
+          ? 'devtools_active_verified'
+          : 'none'),
       automation_environment: s.automationEnvironment ?? 'none',
       human_corroboration: canonical.humanCorroboration,
       ip_blocklist: {
@@ -1186,6 +1245,8 @@ export default function App() {
       proxy: Boolean(canonical?.network?.proxy ?? (s as unknown as { proxyDetected?: boolean }).proxyDetected ?? false),
       proxy_confidence: canonical?.network?.proxy ? 'high' : 'low',
       incognito: Boolean(s.isIncognito ?? s.incognito ?? s.privateMode),
+      incognito_confidence:
+        (s as { incognitoConfidence?: 'high' | 'low' }).incognitoConfidence ?? null,
       privacy_settings: Boolean(
         (s as { privacySettings?: boolean }).privacySettings || s.isTorBrowserClient
       ),
@@ -1215,17 +1276,35 @@ export default function App() {
         ml_prediction: Boolean(s.vpnMethods?.ml_prediction),
       },
       high_activity_device: Boolean(data.highActivityDevice ?? s.highActivityDevice),
+      high_activity_threshold_mode:
+        (data as { highActivityThresholdMode?: string }).highActivityThresholdMode ?? null,
+      // Reconciled display: a spoofed / emulated OS claim is blocked and the verified host OS
+      // is shown. No emulated iOS / Android value is ever presented as the underlying truth.
+      reconciled_display: {
+        os: spoofedOsBlocked
+          ? hardwareOsLabel ?? 'Underlying OS verified'
+          : currentOsLabel || data.browserDevice.os,
+        claimed_os: spoofedOsBlocked ? spoofedOsClaim : null,
+        spoofed_os_blocked: spoofedOsBlocked,
+      },
+      timezone_display: {
+        browser: browserTimezoneLabel,
+        ip_geo: ipTimezoneLabel,
+        mismatch_contextual_only: timezoneMismatchContextual,
+      },
       rare_device: Boolean(data.rareDevice ?? s.rareDevice),
       rare_device_percentile_bucket:
         data.rareDevicePercentileBucket ?? s.rareDevicePercentileBucket ?? '<p95',
-      // Spoof quarantine: client-reported browser / timezone / font / canvas / WebGL claims
-      // are blocked when the session is tampered. Server-verified browser / OS above stay
-      // authoritative, so "Headless Chrome <full_version>" is surfaced consistently.
+      // Spoof quarantine: client-reported browser / font / canvas / WebGL claims are blocked
+      // when the session is tampered. Timezone is NEVER quarantined here: a browser-vs-IP
+      // timezone difference is a network-context axis (timezone_mismatch), not a JS lie.
       spoof_quarantine: spoofedSpecs
         ? {
             status: 'Quarantined - Tampered Session',
             client_claimed_browser: quarantineClaim(claimedBrowser, true),
-            client_claimed_timezone: quarantineClaim(claimedTimezone, true),
+            client_claimed_timezone: claimedTimezone,
+            timezone_discrepancy: canonical.network?.timezone_mismatch ? 'Detected' : 'Not detected',
+            timezone_discrepancy_scope: 'network_axis_only',
             font: quarantineClaim(claimedFont, true),
             canvas: quarantineClaim(claimedCanvas, true),
             webgl: quarantineClaim(claimedWebgl, true),
@@ -1911,7 +1990,9 @@ export default function App() {
                             <span className="block text-[10px] sm:text-[11px] text-slate-500 leading-snug">
                               {torBrowserClient && !data.browserDevice.reportedModel
                                 ? 'Model hidden by Tor Browser'
-                                : `${displayOs} • ${activeVisit?.deviceType || data.browserDevice.deviceType}`}
+                                : `${spoofedOsBlocked ? hardwareOsLabel ?? 'Underlying OS verified' : displayOs} • ${
+                                    activeVisit?.deviceType || data.browserDevice.deviceType
+                                  }`}
                             </span>
                           </>
                         ) : (
@@ -1921,8 +2002,17 @@ export default function App() {
                               activeVisit?.deviceType || data.browserDevice.deviceType
                             }`}
                           >
-                            {displayOs} •{' '}
-                            {activeVisit?.deviceType || data.browserDevice.deviceType}
+                            {spoofedOsBlocked
+                              ? hardwareOsLabel
+                                ? `${hardwareOsLabel} (verified)`
+                                : 'Underlying OS verified'
+                              : displayOs}{' '}
+                            • {activeVisit?.deviceType || data.browserDevice.deviceType}
+                          </span>
+                        )}
+                        {spoofedOsBlocked && (
+                          <span className="mt-0.5 inline-flex w-fit items-center rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[9px] font-semibold text-amber-800">
+                            Spoofed / Emulated OS Blocked: claimed {spoofedOsClaim}
                           </span>
                         )}
                       </div>
@@ -1958,14 +2048,16 @@ export default function App() {
                         </span>
                         <span
                           className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"
-                          title={`${data.browserDevice.language} • ${String(
-                            quarantineClaim(data.browserDevice.timezone, spoofedSpecs)
-                          )}`}
+                          title={`${data.browserDevice.language} • ${browserTimezoneLabel}`}
                         >
-                          {data.browserDevice.language} • {String(
-                            quarantineClaim(data.browserDevice.timezone, spoofedSpecs)
-                          )}
+                          {data.browserDevice.language} • {browserTimezoneLabel}
                         </span>
+                        {timezoneMismatchContextual && ipTimezoneLabel && (
+                          <span className="mt-0.5 block text-[9px] leading-snug text-slate-500">
+                            Timezone mismatch: browser {browserTimezoneLabel} vs IP{' '}
+                            {ipTimezoneLabel} — contextual signal only
+                          </span>
+                        )}
                       </div>
                     </div>
 

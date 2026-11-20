@@ -44,6 +44,29 @@ export interface HardwareSignals {
   hdrSupported: boolean;
   colorGamut: 'P3' | 'sRGB' | 'Rec2020';
   architecture: string;
+  /* --- Silicon-grounded truth (additive, optional — older payloads stay valid) ------- */
+  /** How `architecture` was determined: 'webgl-silicon' | 'nan-sign-bit' | 'unavailable'. */
+  architectureSource?: string;
+  /** The UA/UA-CH architecture claim kept beside the silicon truth. */
+  claimedArchitecture?: string;
+  /** True when the silicon arch family contradicts the claimed UA/UA-CH arch. */
+  archUaMismatch?: boolean;
+  /** True when the `Math.tanh(0.8)` host-OS probe contradicts the claimed UA OS. */
+  osUaMismatch?: boolean;
+  /** Host OS family resolved from the libm ULP probe: windows | macos | linux | unknown. */
+  hostOs?: string;
+  /** JS engine family from the `(-1).toFixed(-1)` RangeError length. */
+  engine?: string;
+  /** Raw RangeError message length (51 V8, 25 SpiderMonkey, 43/44 JavaScriptCore). */
+  engineErrorLength?: number;
+  /** WebGL-derived CPU family: x86 | arm | software | unknown. */
+  gpuArchFamily?: string;
+  /** True when two reads of the same static canvas produced different pixels. */
+  canvasNoise?: boolean;
+  /** True when two renders of the same offline audio graph produced different sums. */
+  audioNoise?: boolean;
+  /** 8x8 coarse-quantized canvas digest (structural, collision-resistant anchor). */
+  canvasCoarseHash?: string | null;
 }
 
 export type RiskLevel = 'Low' | 'Medium' | 'High';
@@ -183,6 +206,9 @@ export interface SecurityEnvelope {
 export interface SecuritySignals {
   isBot: boolean;
   botSignals: string[];
+  /** Parity assertion between the single authoritative bot verdict and the evidence gate. */
+  botVerdictParity?: boolean;
+  botVerdictAssertion?: string;
   vpnSuspected: boolean;
   timezoneMismatch: boolean;
   browserTimezone: string;

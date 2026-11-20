@@ -187,6 +187,52 @@ export function decideLshFuzzyMatch(input: FuzzyDecisionInput): FuzzyDecision {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Structural-anchor fallback                                                   */
+/* -------------------------------------------------------------------------- */
+
+export interface StructuralAnchorInput {
+  /** 8x8 coarse-quantized canvas digest (stable across farbling noise). */
+  canvasCoarseHash?: string | null;
+  /** Silicon architecture anchor from the hardware-truth probe. */
+  architecture?: string | null;
+  gpuVendor?: string | null;
+  gpuRenderer?: string | null;
+}
+
+/**
+ * Features for the structural anchor: coarse (quantized) canvas geometry plus silicon
+ * GPU/architecture. These deliberately exclude the fine canvas hash and the raw audio
+ * sum, which drift under Brave/Safari/Tor farbling, so a privacy-hardened or noisy
+ * visitor can still be recovered through the existing LSH fuzzy matcher.
+ */
+export function structuralAnchorFeatures(anchor: StructuralAnchorInput): Record<string, unknown> {
+  return {
+    canvas_coarse: (anchor.canvasCoarseHash || '').trim() || 'na',
+    arch: (anchor.architecture || '').trim() || 'na',
+    gpu_vendor: (anchor.gpuVendor || '').trim() || 'na',
+    gpu_renderer: (anchor.gpuRenderer || '').trim() || 'na',
+  };
+}
+
+/** SimHash of the structural anchor, fed to `decideLshFuzzyMatch` as the query. */
+export function structuralAnchorHash(anchor: StructuralAnchorInput): bigint {
+  return simhash512(structuralAnchorFeatures(anchor));
+}
+
+/**
+ * Fallback resolution when the exact hardware id is unavailable (e.g. the hardware seed
+ * changed after canvas/audio were excluded, or storage was wiped). The collision-density
+ * guard is unchanged — `LSH_THRESHOLDS.maxCollisionDensity` is 2 and `decideLshFuzzyMatch`
+ * rejects `>= 2`, so an accepted match always has density < 2.
+ */
+export function resolveStructuralAnchor(
+  anchor: StructuralAnchorInput,
+  candidates: readonly LshCandidate[]
+): FuzzyDecision {
+  return decideLshFuzzyMatch({ query: structuralAnchorHash(anchor), candidates });
+}
+
+/* -------------------------------------------------------------------------- */
 /* Five-stage resolver                                                         */
 /* -------------------------------------------------------------------------- */
 
@@ -201,6 +247,8 @@ export interface IdentityResolutionInput {
   privacyHardened?: boolean;
   query?: bigint;
   candidates?: readonly LshCandidate[];
+  /** Optional structural-anchor fallback used when no explicit query is supplied. */
+  structuralAnchor?: StructuralAnchorInput;
 }
 
 export interface IdentityResolution {
@@ -242,9 +290,16 @@ export function resolveIdentityStage(input: IdentityResolutionInput = {}): Ident
     };
   }
 
-  // 3. LSH fuzzy (only when a query and candidates are supplied).
-  if (input.query !== undefined && input.candidates && input.candidates.length > 0) {
-    const fuzzy = decideLshFuzzyMatch({ query: input.query, candidates: input.candidates });
+  // 3. LSH fuzzy (only when a query and candidates are supplied). An explicit query wins;
+  //    otherwise the structural-anchor fallback provides one (with the same collision guard).
+  const query =
+    input.query !== undefined
+      ? input.query
+      : input.structuralAnchor
+      ? structuralAnchorHash(input.structuralAnchor)
+      : undefined;
+  if (query !== undefined && input.candidates && input.candidates.length > 0) {
+    const fuzzy = decideLshFuzzyMatch({ query, candidates: input.candidates });
     if (fuzzy.match && fuzzy.bestHardwareId) {
       return {
         stage: 'lsh_fuzzy',

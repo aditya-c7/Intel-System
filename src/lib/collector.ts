@@ -11,6 +11,8 @@ import type {
   SignedHistoryBackup,
 } from '../types/visitor';
 import { detectBrowserTampering } from './tamperingDetector';
+import { deriveBotVerdict } from './verdict';
+import { probeEngineLength, resolveHardwareTruth } from './hardwareTruth';
 import { detectBotD19Signals } from './aiBotDirectory';
 import {
   collectAllSignals,
@@ -552,19 +554,35 @@ function inspectWebGlGpu(): {
   }
 }
 
+/** Canvas probe result: the stable SHA-256 signature plus structural/noise metadata. */
+interface CanvasSignatureResult {
+  signature: string;
+  /** 8x8 coarse-quantized luminance digest (structural anchor, farbling-resistant). */
+  coarseHash: string | null;
+  /** True when two reads of the same static bitmap differ. */
+  noise: boolean;
+}
+
 /**
  * 2. Native Canvas 2D Signature:
  * Renders custom geometry, gradients, and multi-font text onto an offscreen <canvas>
  * and hashes the data URL via SHA-256 into a compact 16-char hex signature.
+ *
+ * The bitmap is deliberately read twice: a farbling browser (Brave / Safari / Tor RFP)
+ * returns different pixels on each read, which is recorded as `noise` rather than being
+ * allowed to mint a new hardware id. An 8x8 quantized luminance grid gives a coarse,
+ * noise-tolerant structural digest used by the LSH structural-anchor fallback.
  */
-async function computeCanvas2dSignature(): Promise<string> {
-  if (typeof document === 'undefined') return 'unavailable';
+async function computeCanvas2dSignature(): Promise<CanvasSignatureResult> {
+  if (typeof document === 'undefined') {
+    return { signature: 'unavailable', coarseHash: null, noise: false };
+  }
   try {
     const canvas = document.createElement('canvas');
     canvas.width = 260;
     canvas.height = 64;
     const ctx = canvas.getContext('2d');
-    if (!ctx) return 'unavailable';
+    if (!ctx) return { signature: 'unavailable', coarseHash: null, noise: false };
 
     ctx.textBaseline = 'alphabetic';
     const grad = ctx.createLinearGradient(0, 0, 260, 64);
@@ -597,64 +615,120 @@ async function computeCanvas2dSignature(): Promise<string> {
     ctx.bezierCurveTo(75, 12, 165, 58, 244, 18);
     ctx.stroke();
 
-    const dataUrl = canvas.toDataURL('image/png');
-    const fullHex = await sha256Hex(dataUrl);
-    return fullHex.slice(0, 16);
+    // Dual read of the SAME static bitmap — no repaint between reads.
+    const first = canvas.toDataURL('image/png');
+    const second = canvas.toDataURL('image/png');
+    const noise = first !== second;
+
+    // 8x8 coarse quantized digest: average luminance per cell, bucketed to 4 bits.
+    let coarseHash: string | null = null;
+    try {
+      const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const width = canvas.width;
+      const height = canvas.height;
+      const cells: string[] = [];
+      for (let gy = 0; gy < 8; gy += 1) {
+        const y0 = Math.floor((gy * height) / 8);
+        const y1 = Math.floor(((gy + 1) * height) / 8);
+        for (let gx = 0; gx < 8; gx += 1) {
+          const x0 = Math.floor((gx * width) / 8);
+          const x1 = Math.floor(((gx + 1) * width) / 8);
+          let sum = 0;
+          let count = 0;
+          for (let y = y0; y < y1; y += 1) {
+            for (let x = x0; x < x1; x += 1) {
+              const i = (y * width + x) * 4;
+              // Integer luminance (Rec. 601), alpha-weighted so transparent cells stay dark.
+              const alpha = data[i + 3] / 255;
+              sum += Math.round((data[i] * 77 + data[i + 1] * 150 + data[i + 2] * 29) / 256) * alpha;
+              count += 1;
+            }
+          }
+          const avg = count > 0 ? Math.round(sum / count) : 0;
+          cells.push(Math.max(0, Math.min(15, avg >> 4)).toString(16));
+        }
+      }
+      coarseHash = (await sha256Hex(cells.join(''))).slice(0, 16);
+    } catch {
+      coarseHash = null;
+    }
+
+    const fullHex = await sha256Hex(first);
+    return { signature: fullHex.slice(0, 16), coarseHash, noise };
   } catch {
-    return 'restricted';
+    return { signature: 'restricted', coarseHash: null, noise: false };
   }
+}
+
+/** Audio probe result: the stable SHA-256 signature plus a dual-render noise flag. */
+interface AudioSignatureResult {
+  signature: string;
+  noise: boolean;
 }
 
 /**
  * 3. Native Web Audio Signature:
  * Uses OfflineAudioContext with a triangle OscillatorNode and DynamicsCompressorNode
  * to render a short in-memory buffer, sums channel data samples, and hashes via SHA-256.
+ *
+ * The graph is rendered twice with identical parameters. A farbling browser injects
+ * different noise into each render, recorded as `noise` instead of minting a new id.
  */
-async function computeWebAudioSignature(): Promise<string> {
-  if (typeof window === 'undefined') return 'unavailable';
+async function computeWebAudioSignature(): Promise<AudioSignatureResult> {
+  if (typeof window === 'undefined') return { signature: 'unavailable', noise: false };
   try {
     const OfflineCtx =
       window.OfflineAudioContext ||
       (window as unknown as { webkitOfflineAudioContext?: typeof OfflineAudioContext })
         .webkitOfflineAudioContext;
-    if (!OfflineCtx) return 'unsupported';
+    if (!OfflineCtx) return { signature: 'unsupported', noise: false };
 
-    const context = new OfflineCtx(1, 4500, 44100);
-    const oscillator = context.createOscillator();
-    oscillator.type = 'triangle';
-    oscillator.frequency.setValueAtTime(10000, context.currentTime);
+    const renderOnce = async (): Promise<string | null> => {
+      try {
+        const context = new OfflineCtx(1, 4500, 44100);
+        const oscillator = context.createOscillator();
+        oscillator.type = 'triangle';
+        oscillator.frequency.setValueAtTime(10000, context.currentTime);
 
-    const compressor = context.createDynamicsCompressor();
-    compressor.threshold.setValueAtTime(-50, context.currentTime);
-    compressor.knee.setValueAtTime(40, context.currentTime);
-    compressor.ratio.setValueAtTime(12, context.currentTime);
-    compressor.attack.setValueAtTime(0, context.currentTime);
-    compressor.release.setValueAtTime(0.25, context.currentTime);
+        const compressor = context.createDynamicsCompressor();
+        compressor.threshold.setValueAtTime(-50, context.currentTime);
+        compressor.knee.setValueAtTime(40, context.currentTime);
+        compressor.ratio.setValueAtTime(12, context.currentTime);
+        compressor.attack.setValueAtTime(0, context.currentTime);
+        compressor.release.setValueAtTime(0.25, context.currentTime);
 
-    oscillator.connect(compressor);
-    compressor.connect(context.destination);
-    oscillator.start(0);
+        oscillator.connect(compressor);
+        compressor.connect(context.destination);
+        oscillator.start(0);
 
-    const renderedBuffer = await Promise.race([
-      context.startRendering(),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
-    ]);
+        const renderedBuffer = await Promise.race([
+          context.startRendering(),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 500)),
+        ]);
+        if (!renderedBuffer) return null;
 
-    if (!renderedBuffer) return 'timeout';
+        const channelData = renderedBuffer.getChannelData(0);
+        let sampleSum = 0;
+        const quantizedSamples: string[] = [];
+        for (let i = 450; i < channelData.length; i += 50) {
+          const val = channelData[i];
+          sampleSum += Math.abs(val);
+          quantizedSamples.push(val.toFixed(6));
+        }
+        return `${sampleSum.toFixed(8)}|${quantizedSamples.join(',')}`;
+      } catch {
+        return null;
+      }
+    };
 
-    const channelData = renderedBuffer.getChannelData(0);
-    let sampleSum = 0;
-    const quantizedSamples: string[] = [];
-    for (let i = 450; i < channelData.length; i += 50) {
-      const val = channelData[i];
-      sampleSum += Math.abs(val);
-      quantizedSamples.push(val.toFixed(6));
-    }
-    const fingerprintPayload = `${sampleSum.toFixed(8)}|${quantizedSamples.join(',')}`;
-    const fullHex = await sha256Hex(fingerprintPayload);
-    return fullHex.slice(0, 16);
+    const first = await renderOnce();
+    if (first === null) return { signature: 'timeout', noise: false };
+    const second = await renderOnce();
+    const noise = second !== null && second !== first;
+    const fullHex = await sha256Hex(first);
+    return { signature: fullHex.slice(0, 16), noise };
   } catch {
-    return 'restricted';
+    return { signature: 'restricted', noise: false };
   }
 }
 
@@ -1214,11 +1288,13 @@ export function collectClientHints(): Promise<ClientHintsPayload | null> {
 export async function collectHardwareSignals(
   browserDevice: BrowserDeviceInfo
 ): Promise<HardwareSignals> {
-  const [{ gpuVendor, gpuRenderer, maxTextureSize }, canvasHash, audioHash] = await Promise.all([
+  const [{ gpuVendor, gpuRenderer, maxTextureSize }, canvas, audio] = await Promise.all([
     Promise.resolve(inspectWebGlGpu()),
     computeCanvas2dSignature(),
     computeWebAudioSignature(),
   ]);
+  const canvasHash = canvas.signature;
+  const audioHash = audio.signature;
 
   const nav = typeof navigator !== 'undefined' ? navigator : undefined;
   const rawCores = nav && typeof nav.hardwareConcurrency === 'number' ? nav.hardwareConcurrency : null;
@@ -1253,7 +1329,9 @@ export async function collectHardwareSignals(
     }
   }
 
-  let architecture = browserDevice.platform || 'Standard';
+  // UA-CH is a *claim* now. It is kept beside the silicon truth for the mismatch flag,
+  // but it no longer anchors the hardware id (a device preset can rewrite it freely).
+  let claimedArchitecture = '';
   const uaData =
     nav ? ((nav as unknown as { userAgentData?: NavigatorUAData }).userAgentData ?? null) : null;
   if (uaData && typeof uaData.getHighEntropyValues === 'function') {
@@ -1263,15 +1341,37 @@ export async function collectHardwareSignals(
         new Promise<null>((resolve) => setTimeout(() => resolve(null), 120)),
       ]);
       if (entropy?.architecture) {
-        architecture = entropy.bitness
+        claimedArchitecture = entropy.bitness
           ? `${entropy.architecture} (${entropy.bitness}-bit)`
           : entropy.architecture;
       }
     } catch {
-      // Keep platform fallback
+      // Keep the empty claim; silicon truth still resolves.
     }
   }
 
+  // Silicon-grounded truth: GPU family + IEEE754 NaN sign-bit + libm ULP + engine probe.
+  const truth = resolveHardwareTruth({
+    gpuVendor,
+    gpuRenderer,
+    claimedArchitecture,
+    claimedPlatform: browserDevice.platform,
+    claimedOs: browserDevice.os,
+    userAgent: (() => {
+      try {
+        return typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+      } catch {
+        return '';
+      }
+    })(),
+  });
+  const architecture = truth.architecture;
+
+  // The seed deliberately EXCLUDES the UA/UA-CH claim and the raw canvas/audio hashes.
+  // Canvas and audio drift under Brave/Safari/Tor farbling; the UA is spoofable. The
+  // silicon architecture, GPU silicon, core/memory topology and colour physics are the
+  // stable anchors. Fine canvas/audio remain telemetry and feed the structural-anchor
+  // (coarse canvas) LSH fallback for returning visitors.
   const fingerprintSeed = [
     gpuVendor,
     gpuRenderer,
@@ -1282,8 +1382,6 @@ export async function collectHardwareSignals(
     String(cpuCores ?? 'na'),
     String(deviceMemoryGb ?? 'na'),
     colorGamut,
-    canvasHash,
-    audioHash,
     architecture,
   ].join('||');
 
@@ -1310,6 +1408,17 @@ export async function collectHardwareSignals(
     hdrSupported,
     colorGamut,
     architecture,
+    architectureSource: truth.architectureSource,
+    claimedArchitecture: truth.claimedArchitecture,
+    archUaMismatch: truth.archUaMismatch,
+    osUaMismatch: truth.osUaMismatch,
+    hostOs: truth.hostOs,
+    engine: truth.engine,
+    engineErrorLength: truth.engineErrorLength,
+    gpuArchFamily: truth.gpuArchFamily,
+    canvasNoise: canvas.noise,
+    audioNoise: audio.noise,
+    canvasCoarseHash: canvas.coarseHash,
   };
 }
 
@@ -1413,14 +1522,9 @@ const GIB_BYTES = 1024 * 1024 * 1024;
  * 51 = V8, 25 = SpiderMonkey, 44/43 = JavaScriptCore.
  */
 function getEngineErrorLength(): number {
-  try {
-    return parseInt('-1', 10).toFixed(-1).length;
-  } catch (error) {
-    if (error instanceof Error) {
-      return error.message.length;
-    }
-    return 0;
-  }
+  // Delegated to the shared `(-1).toFixed(-1)` probe (51 V8 / 25 SpiderMonkey /
+  // 43-44 JavaScriptCore). Kept as a thin wrapper so every caller shares one path.
+  return probeEngineLength();
 }
 
 /**
@@ -2708,14 +2812,27 @@ async function probeChromiumIdbDurability(): Promise<number | null> {
           await block('relaxed');
           await block('strict'); // warm-up discarded
           const ratios: number[] = [];
+          // Interleave the measurement order so a monotonic IO/clock drift cannot bias
+          // the ratio: even rounds relax→strict, odd rounds strict→relax.
           for (let r = 0; r < ROUNDS; r++) {
-            const rel = await block('relaxed');
-            const str = await block('strict');
+            let rel: number;
+            let str: number;
+            if (r % 2 === 0) {
+              rel = await block('relaxed');
+              str = await block('strict');
+            } else {
+              str = await block('strict');
+              rel = await block('relaxed');
+            }
             ratios.push(rel > 0 ? str / rel : Infinity);
             if (ratios.length >= MIN_ROUNDS && performance.now() - start >= CAP_MS) break;
           }
-          ratios.sort((a, b) => a - b);
-          const median = ratios.length > 0 ? ratios[ratios.length >> 1] : null;
+          // Trimmed median: drop one fastest and one slowest round before taking the
+          // median, so a single scheduler hiccup cannot move the verdict across the
+          // deadband. This is the interleaved trimmed-median gate used on Chromium 51.
+          const finite = ratios.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+          const trimmed = finite.length >= 5 ? finite.slice(1, -1) : finite;
+          const median = trimmed.length > 0 ? trimmed[trimmed.length >> 1] : null;
           clearTimeout(safetyTimer);
           finish(median !== null && Number.isFinite(median) ? Number(median.toFixed(3)) : null, db);
         })().catch(() => { clearTimeout(safetyTimer); finish(null, db); });
@@ -3108,6 +3225,44 @@ function resolveBrowserName(
   }
 }
 
+const INCOGNITO_SESSION_LOCK_KEY = 'intel_fp_incognito_lock_v1';
+
+/**
+ * Per-tab-session lock: once the physics probe has produced a deterministic verdict the
+ * result is cached in sessionStorage, so a reload in the same tab does not re-time the
+ * store (and cannot flip between probes). Access is best-effort — a blocked store simply
+ * skips the cache. Never throws.
+ */
+function readIncognitoSessionLock(): IncognitoDetectionResult | null {
+  try {
+    if (typeof sessionStorage === 'undefined') return null;
+    const raw = sessionStorage.getItem(INCOGNITO_SESSION_LOCK_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as IncognitoDetectionResult;
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof parsed.isPrivate === 'boolean' &&
+      typeof parsed.method === 'string' &&
+      typeof parsed.browserName === 'string'
+    ) {
+      return parsed;
+    }
+  } catch {
+    // Storage blocked or a corrupt entry: ignore and re-probe.
+  }
+  return null;
+}
+
+function writeIncognitoSessionLock(result: IncognitoDetectionResult): void {
+  try {
+    if (typeof sessionStorage === 'undefined') return;
+    sessionStorage.setItem(INCOGNITO_SESSION_LOCK_KEY, JSON.stringify(result));
+  } catch {
+    // Storage blocked: the in-memory cache still serves this page load.
+  }
+}
+
 /**
  * Multi-engine private-browsing detection (3 layers, no quota veto).
  *
@@ -3125,6 +3280,13 @@ function resolveBrowserName(
 export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
   if (cachedIncognitoPromise) return cachedIncognitoPromise;
 
+  // Deterministic per-session lock: reuse the verdict computed earlier in this tab.
+  const locked = readIncognitoSessionLock();
+  if (locked) {
+    cachedIncognitoPromise = Promise.resolve(locked);
+    return cachedIncognitoPromise;
+  }
+
   cachedIncognitoPromise = (async (): Promise<IncognitoDetectionResult> => {
     const nav = typeof navigator !== 'undefined' ? navigator : undefined;
     let ua = '';
@@ -3135,19 +3297,27 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
     }
     const feid = getEngineErrorLength();
 
-    const isV8 = feid === 51 || /Chrome|Chromium|Edg|OPR|Brave/i.test(ua);
     const isSpiderMonkey = feid === 25 || /Firefox/i.test(ua);
     const isJSC =
       feid === 44 || feid === 43 || (/Safari/i.test(ua) && !/Chrome|Chromium|Edg|OPR/i.test(ua));
 
+    // The `(-1).toFixed(-1)` RangeError length is the deterministic engine oracle:
+    // Firefox 25, WebKit 43/44 and Chromium 51 are authoritative when the probe works.
+    // UA strings are only a fallback for engines that hide/change the message length.
     let engine: 'chromium' | 'firefox' | 'safari';
-    if (isV8) {
+    if (feid === 25) {
+      engine = 'firefox';
+    } else if (feid === 43 || feid === 44) {
+      engine = 'safari';
+    } else if (feid === 51) {
       engine = 'chromium';
     } else if (isSpiderMonkey) {
       engine = 'firefox';
     } else if (isJSC) {
       engine = 'safari';
     } else {
+      // Unknown engine length and no UA hint: default to the Chromium physics path,
+      // which fails open rather than abstaining on the strict OPFS/IDB probes.
       engine = 'chromium';
     }
 
@@ -3292,7 +3462,19 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       const opfsProbe = await probeChromiumOpfsWorkerFlush();
       const opfsFlushMs = opfsProbe ? opfsProbe.medianFlushMs : null;
 
-      const idbIndicatesIncognito = idbRatio !== null && idbRatio < 1.3;
+      // Chromium 51 deadband: below 1.12 the store is RAM-backed (private), above 1.55 it
+      // is disk-backed (normal). The 1.12–1.55 band and inconclusive probes FAIL OPEN —
+      // they are reported normal, never incognito. Combined with the OPFS corroboration
+      // this stops a single timing outlier from branding a real profile as private.
+      const idbVerdict: 'private' | 'normal' | 'deadband' =
+        idbRatio === null
+          ? 'deadband'
+          : idbRatio < 1.12
+          ? 'private'
+          : idbRatio > 1.55
+          ? 'normal'
+          : 'deadband';
+      const idbIndicatesIncognito = idbVerdict === 'private';
       const opfsIndicatesIncognito =
         opfsProbe !== null &&
         (opfsProbe.medianFlushMs < 0.12 || opfsProbe.flushToWriteRatio < 0.85);
@@ -3309,12 +3491,16 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         };
       }
 
+      const deadbandNote =
+        idbVerdict === 'deadband'
+          ? `; IDB ${idbRatio ?? 'n/a'}x is in the 1.12-1.55 deadband (fail open)`
+          : '';
       return {
         isPrivate: false,
         browserName,
-        method: `disk-persisted-verified (IDB ${idbRatio ?? 'n/a'}x${
+        method: `${idbVerdict === 'normal' ? 'disk-persisted-verified' : 'inconclusive-fail-open'} (IDB ${idbRatio ?? 'n/a'}x${
           quotaContext ? `; ${quotaContext} context only` : ''
-        }${webkitContext ? `; ${webkitContext} context only` : ''})`,
+        }${webkitContext ? `; ${webkitContext} context only` : ''}${deadbandNote})`,
         quotaBytes,
         headroomGiB,
         idbDurabilityRatio: idbRatio,
@@ -3331,7 +3517,10 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         opfsFlushMs: null,
       };
     }
-  })();
+  })().then((result) => {
+    writeIncognitoSessionLock(result);
+    return result;
+  });
 
   return cachedIncognitoPromise;
 }
@@ -3721,6 +3910,23 @@ export async function evaluateSecuritySignals(
     }
   }
 
+  // Single bot verdict with parity assertion. Deterministic automation artifacts found by
+  // the tampering probe (CDP/Playwright/CDC bindings, a forged webdriver getter) are hard
+  // bot evidence, so they are promoted into the one authoritative verdict here. Everything
+  // downstream reads `isBot` from that single derivation — no second opinion can flip it.
+  const hardAutomationEvidence = tampering.tampering_details.hardAutomationEvidence ?? [];
+  const authoritativeIsBot = botAssessment.isBot || hardAutomationEvidence.length > 0;
+  const botVerdict = deriveBotVerdict({
+    isBot: authoritativeIsBot,
+    reasonIds: authoritativeIsBot
+      ? [...botSignals, ...hardAutomationEvidence.map((reason) => `cdc.${reason}`)]
+      : [],
+  });
+  const isBot = botVerdict.isBot;
+  if (hardAutomationEvidence.length > 0) {
+    botSignals.unshift(...hardAutomationEvidence);
+  }
+
   // Active call — WebRTC audio transceivers, navigator.audioSession, voice-routed AudioContext.
   const activeCall = detectActiveCall();
 
@@ -3748,7 +3954,7 @@ export async function evaluateSecuritySignals(
     riskFactors.push(`Private / ephemeral storage (+4 card): ${storageDetail}`);
   }
 
-  const botScore = botAssessment.isBot ? 9 : 0;
+  const botScore = isBot ? 9 : 0;
   if (botScore > 0) {
     riskFactors.push(
       `Automation / headless runtime (+9 card): ${
@@ -3795,7 +4001,7 @@ export async function evaluateSecuritySignals(
   // Weighted composite (unchanged physics): automation 3, network 2, VM 2, incognito 1.
   const weightedCompositeScore = Math.min(
     10,
-    (botAssessment.isBot ? 3 : 0) +
+    (isBot ? 3 : 0) +
       (vpnSuspected ? 2 : 0) +
       (vmStatus.isVirtualMachine || cloudOrMaskedGpu ? 2 : 0) +
       (incognitoLikely ? 1 : 0)
@@ -3813,8 +4019,10 @@ export async function evaluateSecuritySignals(
     suspectScore >= 7 ? 'High' : suspectScore >= 3 ? 'Medium' : 'Low';
 
   return {
-    isBot: botAssessment.isBot,
+    isBot,
     botSignals,
+    botVerdictParity: botVerdict.parity,
+    botVerdictAssertion: botVerdict.assertion,
     vpnSuspected,
     timezoneMismatch,
     browserTimezone,

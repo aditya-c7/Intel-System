@@ -51,6 +51,15 @@ const HARD_REASONS: ReadonlySet<string> = new Set([
   'page.platform.cloudflare-workers',
   'launch.ipc-flooding-switch',
   'bot.webdriver-getter-tampered-cdp',
+  // Automation getter tampering, Playwright/CDC bindings and CDP-level tamper are all
+  // deterministic artifacts of a driven runtime. A plain CDP attachment stays in the
+  // developer_tools tier (see DEVELOPER_TOOLS_REASONS / the `cdp.` prefix rule); only a
+  // *tampered* CDP surface is hard evidence here.
+  'bot.webdriver-getter-tampered',
+  'bot.automation-getter-tampered',
+  'bot.cdp-tampered',
+  'bot.playwright-binding',
+  'cdc.global.binding',
 ]);
 
 /**
@@ -91,6 +100,8 @@ const WEAK_REASONS: ReadonlySet<string> = new Set([
   'launch.no-speech-voices',
   'kinematics.zero_pointer_trail',
   'kinematics.screenshot_offset',
+  // A real mouse reports pressure 0.5 while a button is active, so this stays weak even
+  // though the generic `playwright.` prefix below is now hard evidence (exact set wins).
   'playwright.mcp.pressure',
   'chatgpt.badge.active',
   'chatgpt.badge.overlay',
@@ -102,12 +113,15 @@ const WEAK_REASONS: ReadonlySet<string> = new Set([
   'bot.zero-geometry',
   'bot.rtt-zero',
   'bot.plugins-empty',
-  'bot.webdriver-getter-tampered',
 ]);
 
 /** Prefix rules evaluated after the exact sets (first match wins). */
 const PREFIX_RULES: ReadonlyArray<{ prefix: string; weight: ReasonWeight }> = [
   { prefix: 'cdp.', weight: 'developer_tools' },
+  // Playwright / CDC bindings are hard automation evidence. Exact-set entries are
+  // checked first, so the weak `playwright.mcp.pressure` quirk keeps its soft weight.
+  { prefix: 'playwright.', weight: 'hard' },
+  { prefix: 'cdc.', weight: 'hard' },
   { prefix: 'ua.headless', weight: 'hard' },
   { prefix: 'selenium.', weight: 'hard' },
   { prefix: 'webdriver.', weight: 'hard' },
@@ -180,6 +194,49 @@ export function gateAutomationEvidence(reasons: ReadonlyArray<string>): GatedAut
   }
 
   return { verdict, hardReasons, mediumReasons, weakReasons, developerToolsReasons };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Single-verdict bot derivation with a parity assertion                       */
+/* -------------------------------------------------------------------------- */
+
+export interface BotVerdictInput {
+  /** The one authoritative boolean verdict produced by the runtime detector. */
+  isBot: boolean;
+  /** Reason ids emitted by that same detector (used only for the parity check). */
+  reasonIds: ReadonlyArray<string>;
+}
+
+export interface BotVerdict {
+  /** The single derived verdict — every downstream consumer reads this one field. */
+  isBot: boolean;
+  verdict: AutomationVerdict;
+  gated: GatedAutomationEvidence;
+  /** True when the gated evidence tier agrees with the authoritative verdict. */
+  parity: boolean;
+  assertion: string;
+}
+
+/**
+ * Derive the bot verdict exactly once from the single authoritative signal, then assert
+ * that the weighted evidence gate agrees. `isBot` is the runtime detector's verdict —
+ * the gate is an independent cross-check, not a second opinion that can silently flip
+ * the result. A disagreement is reported in `assertion` (and surfaced as telemetry) but
+ * never throws: identify must remain total.
+ */
+export function deriveBotVerdict(input: BotVerdictInput): BotVerdict {
+  const gated = gateAutomationEvidence(input.reasonIds || []);
+  const verdictIsBot = gated.verdict === 'automated';
+  const parity = verdictIsBot === input.isBot;
+  return {
+    isBot: input.isBot,
+    verdict: gated.verdict,
+    gated,
+    parity,
+    assertion: parity
+      ? 'verdict parity ok'
+      : `verdict parity mismatch: gated=${gated.verdict} raw=${input.isBot}`,
+  };
 }
 
 /* -------------------------------------------------------------------------- */

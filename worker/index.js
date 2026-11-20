@@ -179,7 +179,23 @@ export class VisitorStore extends DurableObject {
 
 export default {
   async fetch(request, env) {
-    const { pathname } = new URL(request.url);
+    const url = new URL(request.url);
+    const { pathname } = url;
+
+    // Canonicalize the apex before any asset or API handling: `www` is 301'd to the single
+    // HTTPS host and plaintext HTTP is upgraded in place, preserving path + query string.
+    // Loopback is exempt so local `wrangler dev` / test-worker HTTP requests keep working.
+    if (url.hostname === 'www.intel.adityahq.me') {
+      const canonical = new URL(url.pathname + url.search, 'https://intel.adityahq.me');
+      return Response.redirect(canonical.toString(), 301);
+    }
+    const isLoopback =
+      /^(?:localhost|127(?:\.\d{1,3}){3}|\[?::1\]?)$/i.test(url.hostname);
+    if (url.protocol === 'http:' && !isLoopback) {
+      const secure = new URL(url.pathname + url.search, `https://${url.host}`);
+      return Response.redirect(secure.toString(), 301);
+    }
+
     if (pathname !== '/api' && !pathname.startsWith('/api/')) {
       const asset = await env.ASSETS.fetch(request);
       const result = new Response(asset.body, asset);
@@ -192,6 +208,33 @@ export default {
       );
       return result;
     }
+
+    // Optional edge rate limiting for identity writes. The Cloudflare ratelimit binding is
+    // optional: deployments without it simply skip limiting instead of failing the request.
+    if (
+      env.IDENTIFY_RATE_LIMIT &&
+      request.method === 'POST' &&
+      pathname.startsWith('/api/visitor/')
+    ) {
+      const key = request.headers.get('cf-connecting-ip') || 'unknown';
+      try {
+        const verdict = await env.IDENTIFY_RATE_LIMIT.limit({ key });
+        if (!verdict.success) {
+          const resetMs = typeof verdict.reset === 'number' ? verdict.reset : Date.now() + 60_000;
+          const retryAfter = Math.max(0, Math.ceil((resetMs - Date.now()) / 1000));
+          return apiResponse(
+            Response.json(
+              { error: 'Too many identification requests. Please retry later.' },
+              { status: 429, headers: { 'Retry-After': String(retryAfter) } }
+            )
+          );
+        }
+      } catch (error) {
+        // A limiter outage must never take the identification path down; fail open.
+        console.error('IDENTIFY_RATE_LIMIT failure:', error);
+      }
+    }
+
     if (!env.VISITOR_HMAC_SECRET || env.VISITOR_HMAC_SECRET.length < 32) {
       return apiResponse(Response.json({ error: 'Configure VISITOR_HMAC_SECRET with at least 32 characters.' }, { status: 503 }));
     }

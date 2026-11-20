@@ -2191,6 +2191,23 @@ function heuristicAsnType(name) {
   if (MOBILE_NAME_HINTS.some((hint) => text.includes(hint))) return { type: "mobile", datacenter: false };
   return { type: "isp", datacenter: false };
 }
+function subnetOf(ip) {
+  const text = String(ip ?? "").trim();
+  const ipv4 = parseIpv4(text);
+  if (ipv4 !== null) {
+    const octets = [
+      ipv4 >>> 24 & 255,
+      ipv4 >>> 16 & 255,
+      ipv4 >>> 8 & 255,
+      ipv4 & 255
+    ];
+    return `${octets[0]}.${octets[1]}.${octets[2]}/24`;
+  }
+  const groups = expandIpv6Groups(text);
+  if (!groups) return "";
+  const firstFour = groups.slice(0, 4).map((value) => value.toString(16)).join(":");
+  return `${firstFour}::/64`;
+}
 function ipv4ReverseOctets(ip) {
   const value = parseIpv4(ip);
   if (value === null) return [];
@@ -4491,6 +4508,17 @@ function decideLshFuzzyMatch(input) {
     stage: match ? "lsh_fuzzy" : "new_enrollment"
   };
 }
+function structuralAnchorFeatures(anchor) {
+  return {
+    canvas_coarse: (anchor.canvasCoarseHash || "").trim() || "na",
+    arch: (anchor.architecture || "").trim() || "na",
+    gpu_vendor: (anchor.gpuVendor || "").trim() || "na",
+    gpu_renderer: (anchor.gpuRenderer || "").trim() || "na"
+  };
+}
+function structuralAnchorHash(anchor) {
+  return simhash512(structuralAnchorFeatures(anchor));
+}
 function resolveIdentityStage(input = {}) {
   if (input.storageValid && input.storageVisitorId) {
     return {
@@ -4511,8 +4539,9 @@ function resolveIdentityStage(input = {}) {
       confidenceTier: "High-Agreement Hardware Match"
     };
   }
-  if (input.query !== void 0 && input.candidates && input.candidates.length > 0) {
-    const fuzzy = decideLshFuzzyMatch({ query: input.query, candidates: input.candidates });
+  const query = input.query !== void 0 ? input.query : input.structuralAnchor ? structuralAnchorHash(input.structuralAnchor) : void 0;
+  if (query !== void 0 && input.candidates && input.candidates.length > 0) {
+    const fuzzy = decideLshFuzzyMatch({ query, candidates: input.candidates });
     if (fuzzy.match && fuzzy.bestHardwareId) {
       return {
         stage: "lsh_fuzzy",
@@ -4597,6 +4626,61 @@ function createInMemoryDbAdapter() {
       const normalized = sql.replace(/\s+/g, " ").trim();
       return {
         get: (...params) => {
+          if (normalized.includes("AS events_24h") && normalized.includes("FROM visits WHERE visitor_id = ?")) {
+            const vid = String(params[12] || "");
+            const cutoffs = [String(params[0] || ""), String(params[1] || ""), String(params[2] || "")];
+            const rows = visitsList.filter((v) => v.visitor_id === vid);
+            const inWindow = (cutoff) => rows.filter((v) => v.visited_at_utc >= cutoff);
+            const distinct = (cutoff, pick) => new Set(inWindow(cutoff).map(pick)).size;
+            return {
+              ip_5m: distinct(cutoffs[0], (v) => v.public_ip),
+              ip_1h: distinct(cutoffs[1], (v) => v.public_ip),
+              ip_24h: distinct(cutoffs[2], (v) => v.public_ip),
+              linked_5m: distinct(cutoffs[0], (v) => v.session_id),
+              linked_1h: distinct(cutoffs[1], (v) => v.session_id),
+              linked_24h: distinct(cutoffs[2], (v) => v.session_id),
+              country_5m: distinct(cutoffs[0], (v) => v.country),
+              country_1h: distinct(cutoffs[1], (v) => v.country),
+              country_24h: distinct(cutoffs[2], (v) => v.country),
+              events_5m: inWindow(cutoffs[0]).length,
+              events_1h: inWindow(cutoffs[1]).length,
+              events_24h: inWindow(cutoffs[2]).length
+            };
+          }
+          if (normalized.includes("AS ip_events_24h")) {
+            const cutoffs = [String(params[0] || ""), String(params[1] || ""), String(params[2] || "")];
+            const publicIp = String(params[4] || "");
+            const rows = visitsList.filter((v) => v.public_ip === publicIp);
+            const inWindow = (cutoff) => rows.filter((v) => v.visited_at_utc >= cutoff);
+            return {
+              ip_events_5m: inWindow(cutoffs[0]).length,
+              ip_events_1h: inWindow(cutoffs[1]).length,
+              ip_events_24h: inWindow(cutoffs[2]).length,
+              ip_visitors_24h: new Set(inWindow(cutoffs[2]).map((v) => v.visitor_id)).size
+            };
+          }
+          if (normalized.includes("AS linked_ips_5m")) {
+            const cutoffs = [String(params[0] || ""), String(params[1] || ""), String(params[2] || "")];
+            const sessionId = String(params[6] || "");
+            const rows = visitsList.filter((v) => v.session_id === sessionId);
+            const inWindow = (cutoff) => rows.filter((v) => v.visited_at_utc >= cutoff);
+            const distinct = (cutoff, pick) => new Set(inWindow(cutoff).map(pick)).size;
+            return {
+              linked_ips_5m: distinct(cutoffs[0], (v) => v.public_ip),
+              linked_ips_1h: distinct(cutoffs[1], (v) => v.public_ip),
+              linked_ips_24h: distinct(cutoffs[2], (v) => v.public_ip),
+              linked_visitors_5m: distinct(cutoffs[0], (v) => v.visitor_id),
+              linked_visitors_1h: distinct(cutoffs[1], (v) => v.visitor_id),
+              linked_visitors_24h: distinct(cutoffs[2], (v) => v.visitor_id)
+            };
+          }
+          if (normalized.includes("intel:dailyhardware")) {
+            const cutoff = String(params[0] || "");
+            const activeHardware = new Set(
+              Array.from(visitorsMap.values()).filter((v) => v.updated_at_utc >= cutoff && v.hardware_id).map((v) => v.hardware_id)
+            );
+            return { n: activeHardware.size };
+          }
           if (normalized.includes("FROM hardware_anchors WHERE hardware_id = ?")) {
             return hardwareAnchorsMap.get(String(params[0] || ""));
           }
@@ -4671,6 +4755,20 @@ function createInMemoryDbAdapter() {
           return void 0;
         },
         all: (...params) => {
+          if (normalized.includes("intel:subnets24h")) {
+            const vid = String(params[0] || "");
+            const cutoff = String(params[1] || "");
+            return visitsList.filter((v) => v.visitor_id === vid && v.visited_at_utc >= cutoff).map((v) => ({ public_ip: v.public_ip }));
+          }
+          if (normalized.includes("intel:dailyevents")) {
+            const cutoff = String(params[0] || "");
+            const counts = /* @__PURE__ */ new Map();
+            for (const visit of visitsList) {
+              if (visit.visited_at_utc < cutoff) continue;
+              counts.set(visit.visitor_id, (counts.get(visit.visitor_id) || 0) + 1);
+            }
+            return Array.from(counts, ([visitor_id, events]) => ({ visitor_id, events }));
+          }
           if (normalized.includes("FROM identity_lsh_bands WHERE band_idx = ?")) {
             const idx = Number(params[0]);
             const bandHash = typeof params[1] === "string" ? params[1] : null;
@@ -5015,6 +5113,63 @@ function rememberPassiveVisit(entry) {
     if (oldest) corroborationLedger.delete(oldest);
   }
   corroborationLedger.set(entry.eventId, entry);
+}
+var RATE_LIMIT_WINDOW_MS = 6e4;
+var RATE_LIMIT_MAX_REQUESTS = 60;
+var RATE_LIMIT_MAX_KEYS = 5e3;
+var rateLimitBuckets = /* @__PURE__ */ new Map();
+function isLoopbackAddress(candidate) {
+  const ip = normalizeIpCandidate(candidate);
+  if (!ip) return false;
+  if (ip === "::1" || ip === "0:0:0:0:0:0:0:1" || ip === "::" || ip === "0:0:0:0:0:0:0:0") {
+    return true;
+  }
+  return /^127\./.test(ip) || ip === "127.0.0.1" || ip.toLowerCase() === "localhost";
+}
+function rateLimitClientKey(req) {
+  const { ip: routedIp } = extractVisitorIp(req);
+  if (routedIp && routedIp !== "Unavailable") return `ip:${routedIp}`;
+  const socketIp = normalizeIpCandidate(req.socket?.remoteAddress);
+  return socketIp ? `socket:${socketIp}` : "unknown";
+}
+function identifyRateLimit(req, res, next) {
+  if (process.env.INTEL_DISABLE_RATE_LIMIT === "1") {
+    next();
+    return;
+  }
+  const forwarded = readRequestHeader(req.headers, "x-forwarded-for");
+  const directCandidates = [
+    req.socket?.remoteAddress,
+    req.ip,
+    forwarded.split(",")[0],
+    readRequestHeader(req.headers, "x-real-ip")
+  ];
+  if (directCandidates.some((candidate) => isLoopbackAddress(candidate)) && !isPublicRoutableIp(normalizeIpCandidate(forwarded.split(",")[0]))) {
+    next();
+    return;
+  }
+  const key = rateLimitClientKey(req);
+  const now = Date.now();
+  const recent = (rateLimitBuckets.get(key) ?? []).filter(
+    (timestamp) => now - timestamp < RATE_LIMIT_WINDOW_MS
+  );
+  if (recent.length >= RATE_LIMIT_MAX_REQUESTS) {
+    const oldest = recent[0] ?? now;
+    const retryAfter = Math.max(1, Math.ceil((oldest + RATE_LIMIT_WINDOW_MS - now) / 1e3));
+    res.setHeader("Retry-After", String(retryAfter));
+    res.status(429).json({
+      error: "Too Many Requests",
+      retry_after_seconds: retryAfter
+    });
+    return;
+  }
+  recent.push(now);
+  if (rateLimitBuckets.size >= RATE_LIMIT_MAX_KEYS) {
+    const oldestKey = rateLimitBuckets.keys().next().value;
+    if (oldestKey) rateLimitBuckets.delete(oldestKey);
+  }
+  rateLimitBuckets.set(key, recent);
+  next();
 }
 function signVisitorId(visitorId) {
   return crypto.createHmac("sha256", HMAC_SECRET).update(visitorId).digest("hex");
@@ -5688,9 +5843,16 @@ function classifyBotTraffic(headers, network, client) {
   const secFetchDest = readRequestHeader(headers, "sec-fetch-dest");
   const networkHaystack = [network.org, network.isp, network.asn].filter((part) => typeof part === "string" && part.trim().length > 0).join(" ");
   const clientSignals = Array.isArray(client.botSignals) ? client.botSignals.filter((s) => typeof s === "string" && s.trim().length > 0) : [];
-  const hardAutomation = Boolean(client.stealthPluginDetected || client.antiDetectBrowser);
+  const hardAutomation = Boolean(
+    client.stealthPluginDetected || client.antiDetectBrowser || client.automationTargetedTampering
+  );
   if (hardAutomation) {
     const reasons = [];
+    if (client.automationTargetedTampering) {
+      reasons.push(
+        `Automation-targeted tampering artifacts (${(client.automationTamperingReasons || []).slice(0, 2).join("; ") || "webdriver / playwright / CDC / CDP getter wrappers"})`
+      );
+    }
     if (client.stealthPluginDetected) {
       reasons.push("Stealth plugin artifacts (rewritten native getters / iframe identity leak)");
     }
@@ -5703,8 +5865,8 @@ function classifyBotTraffic(headers, network, client) {
     for (const signal of clientSignals.slice(0, 2)) reasons.push(signal);
     return {
       subtype: "bad_bot",
-      label: client.antiDetectBrowser ? "Anti-Detect Browser" : client.stealthPluginDetected ? "Puppeteer / Playwright Stealth" : "HeadlessChrome / CDP Automation",
-      provider: client.antiDetectBrowser ? "Anti-Detect Browser" : client.stealthPluginDetected ? "Stealth Automation (Puppeteer/Playwright)" : "Chromium",
+      label: client.automationTargetedTampering ? "Stealth Automation" : client.antiDetectBrowser ? "Anti-Detect Browser" : client.stealthPluginDetected ? "Puppeteer / Playwright Stealth" : "HeadlessChrome / CDP Automation",
+      provider: client.automationTargetedTampering ? "Stealth Automation" : client.antiDetectBrowser ? "Anti-Detect Browser" : client.stealthPluginDetected ? "Stealth Automation (Puppeteer/Playwright)" : "Chromium",
       category: "Automation",
       confidence: 0.94,
       reasons: reasons.length > 0 ? reasons : ["Hard automation artifact reported by client"]
@@ -7403,6 +7565,24 @@ function computeVelocitySignals(db2, visitorId, publicIp, sessionId) {
       dayCutoff,
       sessionId
     );
+    const dailyHardwareRow = db2.prepare(
+      `/* intel:dailyhardware */ SELECT COUNT(DISTINCT hardware_id) AS n FROM visitors WHERE updated_at_utc >= ?`
+    ).get(dayCutoff);
+    const subnetRows = db2.prepare(
+      `/* intel:subnets24h */ SELECT public_ip FROM visits WHERE visitor_id = ? AND visited_at_utc >= ?`
+    ).all(visitorId, dayCutoff);
+    const dailyEventRows = db2.prepare(
+      `/* intel:dailyevents */ SELECT visitor_id, COUNT(*) AS events FROM visits WHERE visited_at_utc >= ? GROUP BY visitor_id`
+    ).all(dayCutoff);
+    const eventValues = dailyEventRows.map((entry) => Number(entry.events)).filter((value) => Number.isFinite(value) && value > 0).sort((a, b) => a - b);
+    const p98Events24h = eventValues.length > 0 ? eventValues[Math.max(
+      0,
+      Math.min(eventValues.length - 1, Math.ceil(eventValues.length * 0.98) - 1)
+    )] : 0;
+    const distinctSubnets24h = new Set(
+      subnetRows.map((entry) => subnetOf(String(entry.public_ip || ""))).filter((bucket) => bucket.length > 0)
+    ).size;
+    const distinctDailyHardware = Math.max(0, Number(dailyHardwareRow?.n ?? 0));
     const velocity = row ? {
       distinct_ip: {
         "5_minutes": num(row.ip_5m),
@@ -7443,10 +7623,22 @@ function computeVelocitySignals(db2, visitorId, publicIp, sessionId) {
     return {
       velocity,
       events24h: velocity.events["24_hours"],
-      distinctIps24h: velocity.distinct_ip["24_hours"]
+      events1h: velocity.events["1_hour"],
+      distinctIps24h: velocity.distinct_ip["24_hours"],
+      distinctSubnets24h,
+      distinctDailyHardware,
+      p98Events24h
     };
   } catch {
-    return { velocity: { ...EMPTY_VELOCITY }, events24h: 0, distinctIps24h: 0 };
+    return {
+      velocity: { ...EMPTY_VELOCITY },
+      events24h: 0,
+      events1h: 0,
+      distinctIps24h: 0,
+      distinctSubnets24h: 0,
+      distinctDailyHardware: 0,
+      p98Events24h: 0
+    };
   }
 }
 function computeDeviceRarity(db2, browserDevice) {
@@ -8174,6 +8366,8 @@ function normalizeServerTimezoneId(tz) {
 }
 function sanitizeHardwareSignals(raw, browserDevice) {
   const safeStr = (val, fallback, maxLen = 140) => typeof val === "string" && val.trim().length > 0 ? val.trim().slice(0, maxLen) : fallback;
+  const safeNullableStr = (val, maxLen = 120) => typeof val === "string" && val.trim().length > 0 ? val.trim().slice(0, maxLen) : null;
+  const rawHardwareExtras = raw ?? {};
   const rawHwId = safeStr(raw?.hardwareId, "", 40);
   const validHwId = /^hwid_[0-9a-f]{16,32}$/i.test(rawHwId) ? rawHwId.toLowerCase() : "hwid_" + crypto.createHash("sha256").update(
     `${browserDevice.os}|${browserDevice.screenResolution}|${browserDevice.pixelRatio}|${safeStr(raw?.gpuRenderer, "gpu")}|${safeStr(raw?.canvasHash, "canvas")}`
@@ -8196,12 +8390,51 @@ function sanitizeHardwareSignals(raw, browserDevice) {
     maxTouchPoints,
     hdrSupported: Boolean(raw?.hdrSupported),
     colorGamut: raw?.colorGamut === "Rec2020" || raw?.colorGamut === "P3" || raw?.colorGamut === "sRGB" ? raw.colorGamut : "sRGB",
-    architecture: safeStr(raw?.architecture, browserDevice.os, 80)
+    architecture: safeStr(raw?.architecture, browserDevice.os, 80),
+    // Silicon-grounded truth: runtime-probed architecture / host OS plus the UA claim and its
+    // mismatch verdicts. These are pass-through only — never derived from the User-Agent here.
+    architectureSource: safeStr(rawHardwareExtras.architectureSource, "", 80),
+    claimedArchitecture: safeStr(rawHardwareExtras.claimedArchitecture, "", 80),
+    hostOs: safeStr(rawHardwareExtras.hostOs, "", 120),
+    engine: safeStr(rawHardwareExtras.engine, "", 120),
+    engineErrorLength: typeof rawHardwareExtras.engineErrorLength === "number" && Number.isFinite(rawHardwareExtras.engineErrorLength) ? Math.max(0, Math.min(512, Math.round(rawHardwareExtras.engineErrorLength))) : void 0,
+    gpuArchFamily: safeStr(rawHardwareExtras.gpuArchFamily, "", 40),
+    canvasNoise: Boolean(rawHardwareExtras.canvasNoise),
+    audioNoise: Boolean(rawHardwareExtras.audioNoise),
+    canvasCoarseHash: safeNullableStr(rawHardwareExtras.canvasCoarseHash, 40),
+    archUaMismatch: Boolean(rawHardwareExtras.archUaMismatch),
+    osUaMismatch: Boolean(rawHardwareExtras.osUaMismatch)
   };
 }
+var AUTOMATION_TAMPERING_REASON_PATTERN = /\b(webdriver[\w$-]*|playwright[\w$-]*|puppeteer[\w$-]*|selenium[\w$-]*|cdc_[a-z0-9_$]+|cdc\b|__webdriver[\w$]*|__playwright[\w$]*|__pwInitscripts[\w$]*|__puppeteer[\w$]*|getter[\s._-]*(?:cdp|devtools|tamper|wrapper)|(?:cdp|devtools)[\s._-]*getter)\b/i;
+function detectAutomationTargetedTampering(reasons, botSignals) {
+  const collect = (value) => Array.isArray(value) ? value.filter(
+    (item) => typeof item === "string" && item.trim().length > 0 && AUTOMATION_TAMPERING_REASON_PATTERN.test(item)
+  ).map((item) => item.trim().slice(0, 180)).slice(0, 8) : [];
+  const matched = Array.from(/* @__PURE__ */ new Set([...collect(reasons), ...collect(botSignals)]));
+  return { detected: matched.length > 0, reasons: matched };
+}
+function isTimezoneMismatchReason(reason) {
+  return /\btime[\s_-]?zone\b/i.test(reason);
+}
+function isBotFromVerdict(botVerdict) {
+  return Boolean(botVerdict) && botVerdict !== "not_detected";
+}
+function assertBotVerdictParity(serialized, botVerdict) {
+  const expected = isBotFromVerdict(botVerdict);
+  const mirrors = [serialized.isBot, serialized.securitySignalsIsBot].filter(
+    (value) => typeof value === "boolean"
+  );
+  const parity = mirrors.every((value) => value === expected) && (!serialized.envelopeBot || serialized.envelopeBot === botVerdict);
+  if (!parity) {
+    console.error("[invariant] isBot / botVerdict parity violation", { serialized, botVerdict, expected });
+  }
+  return parity;
+}
 function hasIndependentAutomationProof(raw, requestContext) {
+  const rawExtras = raw ?? {};
   return Boolean(
-    raw?.stealthPluginDetected || raw?.webdriver || raw?.cdpDetected || raw?.isBot || raw?.canvasFarblingDetected || raw?.replayDetected || raw?.tamperedRequest || requestContext?.tamperedRequest || requestContext?.replayDetected
+    raw?.stealthPluginDetected || raw?.webdriver || raw?.cdpDetected || raw?.isBot || raw?.canvasFarblingDetected || raw?.replayDetected || raw?.tamperedRequest || rawExtras.automationTargetedTampering || detectAutomationTargetedTampering(rawExtras.tamperingReasons ?? raw?.tamperingDetails?.reasons, raw?.botSignals).detected || requestContext?.tamperedRequest || requestContext?.replayDetected
   );
 }
 function isConfirmedTorRfpClient(raw, requestContext) {
@@ -8234,6 +8467,14 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const rawBotReason = typeof raw?.botReason === "string" && raw.botReason.trim() ? raw.botReason.trim().slice(0, 200) : "";
   const botSignals = safeStrArray(raw?.botSignals);
   const clientAutomationDetected = Boolean(raw?.isBot || webdriver || cdpDetected);
+  const automationTampering = detectAutomationTargetedTampering(
+    [
+      ...raw?.tamperingReasons ?? [],
+      ...tamperingDetailsResponse?.reasons ?? []
+    ],
+    botSignals
+  );
+  const automationTargetedTampering = Boolean(requestContext.automationTargetedTampering) || automationTampering.detected;
   const antiDetectBrowser = rfpExempt ? false : Boolean(raw?.tamperingDetails?.anti_detect_browser);
   const tamperingMlScore = typeof raw?.tamperingMlScore === "number" && Number.isFinite(raw.tamperingMlScore) ? raw.tamperingMlScore : 0;
   const mlTampering = rfpExempt ? false : tamperingMlScore >= 0.5;
@@ -8241,12 +8482,17 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     raw?.developerTools || raw?.cdpRuntimeLeak || raw?.automationEnvironment === "electron" || raw?.automationEnvironment === "ide_webview"
   );
   const stealthAutomation = Boolean(
-    raw?.stealthPluginDetected || antiDetectBrowser
+    raw?.stealthPluginDetected || antiDetectBrowser || automationTargetedTampering
   );
   const activeDeception = Boolean(
-    raw?.stealthPluginDetected || antiDetectBrowser
+    raw?.stealthPluginDetected || antiDetectBrowser || automationTargetedTampering
   );
   const hardAutomationReasons = [];
+  if (automationTargetedTampering) {
+    hardAutomationReasons.push(
+      `Automation-targeted tampering (${automationTampering.reasons.slice(0, 2).join("; ") || "webdriver / playwright / CDC / CDP getter wrappers"})`
+    );
+  }
   if (raw?.cdpRuntimeLeak) {
     hardAutomationReasons.push("CDP Runtime.enable serialization leak");
   }
@@ -8274,7 +8520,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       automationEnvironment: raw?.automationEnvironment,
       humanCorroboration: raw?.humanCorroboration,
       antiDetectBrowser,
-      tamperingMlScore
+      tamperingMlScore,
+      automationTargetedTampering,
+      automationTamperingReasons: automationTampering.reasons
     }
   );
   const botClassification = stealthAutomation && rawBotClassification.subtype !== "bad_bot" ? {
@@ -8288,7 +8536,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const botSubtype = botClassification.subtype;
   const botReason = (botSubtype === "bad_bot" || botSubtype === "ai_agent") && (!rawBotReason || /verified human|native dom/i.test(rawBotReason)) ? hardAutomationReasons[0] || botClassification.reasons[0] || "Automation runtime detected" : rawBotReason;
   const spoofedCrawler = botClassification.subtype === "bad_bot" && botClassification.label === "Spoofed Crawler";
-  const isBot = botSubtype === "bad_bot" || botSubtype === "ai_agent";
+  const isBot = requestContext.botVerdict ? isBotFromVerdict(requestContext.botVerdict) : botSubtype === "bad_bot" || botSubtype === "ai_agent";
   const browserTimezone = typeof raw?.browserTimezone === "string" && raw.browserTimezone.trim() ? raw.browserTimezone.trim().slice(0, 80) : browserDevice.timezone || "UTC";
   const ipTimezone = ipTimezoneHint || (typeof raw?.ipTimezone === "string" && raw.ipTimezone.trim() && raw.ipTimezone !== "Unavailable" ? raw.ipTimezone.trim().slice(0, 80) : "Unavailable");
   const normBrowserTz = normalizeServerTimezoneId(browserTimezone);
@@ -8344,8 +8592,12 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     ml_prediction: Boolean(raw?.vpnSuspected) && !commercialVpnProvider && !hasTzMismatch && datacenterAsn
   };
   const vpnSuspected = vpnMethods.public_vpn || vpnMethods.relay || vpnMethods.ml_prediction || vpnMethods.os_mismatch || datacenterAsn && botSubtype !== "good_bot";
-  const tamperDetected = Boolean(raw?.tamperDetected || requestContext.tamperedRequest);
-  const tamperReasons = safeStrArray(raw?.tamperReasons);
+  const rawTamperReasons = safeStrArray(raw?.tamperReasons);
+  const timezoneOnlyTamper = rawTamperReasons.length > 0 && rawTamperReasons.every((reason) => isTimezoneMismatchReason(reason));
+  const tamperDetected = Boolean(
+    !timezoneOnlyTamper && raw?.tamperDetected || requestContext.tamperedRequest
+  );
+  const tamperReasons = rawTamperReasons.filter((reason) => !isTimezoneMismatchReason(reason));
   if (requestContext.tamperedRequest && requestContext.requestIntegrityReason && !tamperReasons.includes(requestContext.requestIntegrityReason)) {
     tamperReasons.unshift(requestContext.requestIntegrityReason);
     tamperReasons.splice(10);
@@ -8612,6 +8864,8 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       // Protocol-level and stealth-plugin evidence reaches the payload, the grid and the JSON.
       cdpRuntimeLeak: Boolean(raw?.cdpRuntimeLeak),
       stealthPluginDetected: Boolean(raw?.stealthPluginDetected),
+      automationTargetedTampering,
+      automationTamperingReasons: automationTampering.reasons,
       // The single source of truth for `vpn_methods`: the UI derives its count from this object.
       vpnMethods,
       smartSignals,
@@ -8684,7 +8938,7 @@ function mergeRequestClientHints(headers, body) {
     wow64: typeof b?.wow64 === "boolean" ? b.wow64 : void 0
   };
 }
-app.post("/api/visitor/identify", async (req, res) => {
+app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
   try {
     void refreshTorBulkList();
     const requestBody = req.body || {};
@@ -9226,8 +9480,18 @@ app.post("/api/visitor/identify", async (req, res) => {
     const developerToolsSignals = Boolean(
       rawSecuritySignals?.developerTools || rawSecuritySignals?.cdpRuntimeLeak || rawSecuritySignals?.automationEnvironment === "electron" || rawSecuritySignals?.automationEnvironment === "ide_webview"
     );
-    const hardAutomationSignals = !rfpExemptRequest && Boolean(
-      rawSecuritySignals?.stealthPluginDetected || rawSecuritySignals?.tamperingDetails?.anti_detect_browser
+    const handlerAutomationTampering = detectAutomationTargetedTampering(
+      [
+        ...rawSecuritySignals?.tamperingDetails?.reasons ?? [],
+        ...rawSecuritySignals?.tamperReasons ?? []
+      ],
+      rawSecuritySignals?.botSignals
+    );
+    const automationTargetedTampering = handlerAutomationTampering.detected || Boolean(
+      rawSecuritySignals?.automationTargetedTampering
+    );
+    const hardAutomationSignals = (!rfpExemptRequest || automationTargetedTampering) && Boolean(
+      automationTargetedTampering || rawSecuritySignals?.stealthPluginDetected || rawSecuritySignals?.tamperingDetails?.anti_detect_browser
     );
     const botClassification = classifyBotTraffic(
       { ...rawRequestHeaders, "user-agent": fullRequestUserAgent },
@@ -9246,7 +9510,9 @@ app.post("/api/visitor/identify", async (req, res) => {
         automationEnvironment: rawSecuritySignals?.automationEnvironment,
         humanCorroboration: rawSecuritySignals?.humanCorroboration,
         antiDetectBrowser: rfpExemptRequest ? false : Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
-        tamperingMlScore: rfpExemptRequest ? 0 : typeof rawSecuritySignals?.tamperingMlScore === "number" ? rawSecuritySignals.tamperingMlScore : 0
+        tamperingMlScore: rfpExemptRequest ? 0 : typeof rawSecuritySignals?.tamperingMlScore === "number" ? rawSecuritySignals.tamperingMlScore : 0,
+        automationTargetedTampering,
+        automationTamperingReasons: handlerAutomationTampering.reasons
       }
     );
     const torLookupTarget = location.publicIp.trim().toLowerCase();
@@ -9370,7 +9636,8 @@ app.post("/api/visitor/identify", async (req, res) => {
         aiAgent,
         ipBlocklisted: blocklist.blocklisted,
         ipBlocklistReasons: blocklist.reasons,
-        botClassification: effectiveBotClassification
+        botClassification: effectiveBotClassification,
+        automationTargetedTampering
       }
     );
     const serverVerifiedBrowser = uaIdentity.browserName && uaIdentity.browserName !== "Unknown" ? `${uaIdentity.browserName}${uaIdentity.browserFullVersion ? ` ${uaIdentity.browserFullVersion}` : ""}` : browserDevice.browser;
@@ -9413,8 +9680,21 @@ app.post("/api/visitor/identify", async (req, res) => {
       currentSessionId
     );
     const rarityReport = computeDeviceRarity(db, browserDevice);
-    const highActivityDevice = velocityReport.events24h >= 20;
-    const clientTampering = rawSecuritySignals?.tampering ?? null;
+    const SMALL_CORPUS_DAILY_HARDWARE_LIMIT = 100;
+    const FIXED_HIGH_ACTIVITY_EVENTS_24H = 12;
+    const FIXED_HIGH_ACTIVITY_EVENTS_1H = 8;
+    const FIXED_HIGH_ACTIVITY_DISTINCT_SUBNETS = 3;
+    const highActivityThresholdMode = velocityReport.distinctDailyHardware < SMALL_CORPUS_DAILY_HARDWARE_LIMIT ? "fixed_small_corpus" : "p98";
+    const highActivityThreshold = highActivityThresholdMode === "fixed_small_corpus" ? FIXED_HIGH_ACTIVITY_EVENTS_24H : Math.max(1, velocityReport.p98Events24h);
+    const highActivityDevice = highActivityThresholdMode === "fixed_small_corpus" ? velocityReport.events24h >= FIXED_HIGH_ACTIVITY_EVENTS_24H || velocityReport.events1h >= FIXED_HIGH_ACTIVITY_EVENTS_1H || velocityReport.distinctSubnets24h >= FIXED_HIGH_ACTIVITY_DISTINCT_SUBNETS : velocityReport.events24h >= highActivityThreshold;
+    const rawTamperingReasons = Array.isArray(rawSecuritySignals?.tamperingDetails?.reasons) ? rawSecuritySignals.tamperingDetails.reasons.filter(
+      (reason) => typeof reason === "string" && reason.trim().length > 0
+    ) : [];
+    const nonTimezoneTamperingReasons = rawTamperingReasons.filter(
+      (reason) => !isTimezoneMismatchReason(reason)
+    );
+    const timezoneOnlyTampering = rawTamperingReasons.length > 0 && nonTimezoneTamperingReasons.length === 0 && Boolean(securitySignals.timezoneMismatch);
+    const clientTampering = timezoneOnlyTampering ? false : rawSecuritySignals?.tampering ?? null;
     const rfpExemptResponse = isConfirmedTorRfpClient(rawSecuritySignals, {
       clientTorBrowser: Boolean(rawSecuritySignals?.isTorBrowserClient),
       tamperedRequest: envelopeVerdict.tamperedRequest,
@@ -9424,11 +9704,18 @@ app.post("/api/visitor/identify", async (req, res) => {
       tampering: rfpExemptResponse ? false : Boolean(clientTampering),
       confidence: rawSecuritySignals?.tamperingConfidence || "high",
       mlScore: rfpExemptResponse ? 24e-4 : typeof rawSecuritySignals?.tamperingMlScore === "number" ? rawSecuritySignals.tamperingMlScore : 24e-4,
-      details: rfpExemptResponse ? rfpExemptTamperingDetails(rawSecuritySignals) : rawSecuritySignals?.tamperingDetails ?? {
-        anomaly_score: 0,
-        anti_detect_browser: false,
-        devtools_device_emulation: false,
-        reasons: []
+      details: rfpExemptResponse ? {
+        ...rfpExemptTamperingDetails(rawSecuritySignals),
+        reasons: nonTimezoneTamperingReasons.filter(
+          (reason) => !RFP_DEVICE_WIDTH_REASON.test(reason)
+        )
+      } : {
+        ...rawSecuritySignals?.tamperingDetails ?? {
+          anomaly_score: 0,
+          anti_detect_browser: false,
+          devtools_device_emulation: false
+        },
+        reasons: nonTimezoneTamperingReasons
       }
     };
     const activeCallSupported = Boolean(rawSecuritySignals?.activeCallSupported);
@@ -9611,7 +9898,7 @@ app.post("/api/visitor/identify", async (req, res) => {
         name: effectiveBotClassification.label || "Automated Tool",
         identity: "unknown"
       };
-      botType = "browser_automation";
+      botType = automationTargetedTampering ? "stealth_automation" : "browser_automation";
       botVerdict = "bad";
     } else if (robodexResult.detected && robodexResult.botInfo) {
       botInfo = robodexResult.botInfo;
@@ -9636,6 +9923,15 @@ app.post("/api/visitor/identify", async (req, res) => {
       };
       botType = "browser_automation";
       botVerdict = "bad";
+    } else if (effectiveBotClassification.subtype === "ai_agent") {
+      botInfo = {
+        category: "ai_agent",
+        provider: effectiveBotClassification.provider || "AI Agent",
+        name: effectiveBotClassification.label || "AI Agent",
+        identity: "unknown"
+      };
+      botType = "ai_agent";
+      botVerdict = "bad";
     } else if (effectiveBotClassification.subtype === "good_bot") {
       botInfo = {
         category: "ai_crawler",
@@ -9646,9 +9942,26 @@ app.post("/api/visitor/identify", async (req, res) => {
       botType = "ai_crawler";
       botVerdict = "good";
     }
+    if (automationTargetedTampering) {
+      botInfo = {
+        category: "browser_automation",
+        provider: effectiveBotClassification.provider || "Stealth Automation",
+        name: effectiveBotClassification.label || "Stealth Automation",
+        identity: "unknown"
+      };
+      botType = "stealth_automation";
+      botVerdict = "bad";
+    }
     if (botInfo) {
       securitySignals.botInfo = botInfo;
     }
+    const canonicalIsBot = isBotFromVerdict(botVerdict);
+    securitySignals.isBot = canonicalIsBot;
+    assertBotVerdictParity(
+      { isBot: canonicalIsBot, securitySignalsIsBot: securitySignals.isBot, envelopeBot: botVerdict },
+      botVerdict
+    );
+    hardwareSignals.incognitoConfidence = typeof securitySignals.incognitoConfidence === "number" ? securitySignals.incognitoConfidence : typeof rawSecuritySignals?.incognitoConfidence === "number" && Number.isFinite(rawSecuritySignals.incognitoConfidence) ? Math.max(0, Math.min(1, rawSecuritySignals.incognitoConfidence)) : 0;
     const rawIdentityProfile = requestBody.identityProfile && typeof requestBody.identityProfile === "object" ? requestBody.identityProfile : null;
     const fallbackIdentityProfile = {
       hardwareFingerprint: hardwareId,
@@ -9856,6 +10169,8 @@ app.post("/api/visitor/identify", async (req, res) => {
       },
       automation: {
         bot: botVerdict === "not_detected" ? "not_detected" : botVerdict,
+        // Derived from the exact same verdict as the top-level / securitySignals mirrors.
+        isBot: canonicalIsBot,
         bot_type: botType,
         named_operator: rfc9421SignedAgent ? aiAgent?.operator || null : null,
         operator_verification_method: agentProofMethod,
@@ -9956,6 +10271,12 @@ app.post("/api/visitor/identify", async (req, res) => {
       suspectScore100,
       velocity: velocityReport.velocity,
       highActivityDevice,
+      highActivityThresholdMode,
+      highActivityThreshold,
+      // Single-source-of-truth bot flag + inspector axes mirrored from the canonical envelope.
+      isBot: canonicalIsBot,
+      cdp_attached: inspectorFlags.cdp_attached,
+      inspector_state: inspectorState,
       rareDevice: rarityReport.rareDevice,
       rareDevicePercentileBucket: rarityReport.bucket,
       tampering: tamperingAssessment?.tampering ?? false,
@@ -10010,7 +10331,7 @@ app.post("/api/visitor/identify", async (req, res) => {
     res.status(500).json({ error: "Unable to process visitor identification request." });
   }
 });
-app.post("/api/visitor/corroborate", (req, res) => {
+app.post("/api/visitor/corroborate", identifyRateLimit, (req, res) => {
   try {
     const body = req.body || {};
     const eventId = typeof body.event_id === "string" ? body.event_id.trim().slice(0, 80) : "";

@@ -30,6 +30,9 @@ export interface TamperingDetails {
    * Brave shields, Safari 26 ATFP). Such browsers are exempt from anti-detect/tamper. */
   privacy_hardened: boolean;
   reasons: string[];
+  /** Deterministic automation artifacts (CDP/Playwright/CDC/getter tamper). Each one is
+   * hard evidence on its own and is promoted to the bot gate by the verdict module. */
+  hardAutomationEvidence?: string[];
 }
 
 export interface TamperingAssessment {
@@ -65,6 +68,50 @@ function readNavigatorString(getter: () => unknown): string {
   } catch {
     return '';
   }
+}
+
+/** Bindings that only exist when a CDP/Playwright/CDC/Selenium driver owns the page. */
+const AUTOMATION_GLOBAL_PATTERN =
+  /^cdc_|^\$cdc_|^__\$webdriver|^__webdriverAsyncExecutor|^__selenium|^__fxdriver|^__playwright|^__pwInitScripts|^_phantom|^callPhantom|^domAutomation/i;
+
+/**
+ * Deterministic automation artifacts that are hard evidence rather than environment
+ * quirks: injected driver globals and a `navigator.webdriver` getter that was rewritten
+ * to report a controlled session. A privacy extension that merely wraps the getter but
+ * still returns `false` is deliberately not flagged. Never throws.
+ */
+function detectAutomationTamper(): string[] {
+  const evidence: string[] = [];
+  for (const target of [
+    typeof window !== 'undefined' ? (window as unknown as Record<string, unknown>) : null,
+    typeof document !== 'undefined' ? (document as unknown as Record<string, unknown>) : null,
+  ]) {
+    if (!target) continue;
+    try {
+      for (const key of Object.keys(target)) {
+        if (AUTOMATION_GLOBAL_PATTERN.test(key)) {
+          evidence.push(`automation driver binding '${key}' injected into the page`);
+        }
+      }
+    } catch {
+      // A hostile global proxy is not evidence.
+    }
+  }
+  try {
+    const proto = typeof Navigator !== 'undefined' ? Navigator.prototype : undefined;
+    const descriptor =
+      (proto && Object.getOwnPropertyDescriptor(proto, 'webdriver')) ||
+      (typeof navigator !== 'undefined' ? Object.getOwnPropertyDescriptor(navigator, 'webdriver') : undefined);
+    if (descriptor && typeof descriptor.get === 'function') {
+      const source = Function.prototype.toString.call(descriptor.get);
+      if (!/\[native code\]/.test(source) && Boolean(navigator.webdriver)) {
+        evidence.push('patched navigator.webdriver getter reports a controlled session');
+      }
+    }
+  } catch {
+    // Ignore hostile proxies.
+  }
+  return evidence;
 }
 
 function detectEngine(): { evalLen: number; isV8: boolean } {
@@ -173,6 +220,7 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
   const screenWidth =
     typeof window !== 'undefined' && window.screen ? Number(window.screen.width) || 0 : 0;
   const reasons: string[] = [];
+  const hardAutomationEvidence = detectAutomationTamper();
   let anomalyPoints = 0;
   let devtoolsEmulation = false;
   let antiDetect = false;
@@ -288,6 +336,16 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     reasons.push('JS navigator.userAgent differs from the HTTP User-Agent header');
   }
 
+  // 9. Deterministic automation artifacts (CDP / Playwright / CDC bindings and a forged
+  //    webdriver getter) are hard evidence, not environment quirks. Privacy-hardened
+  //    runtimes (Tor/RFP, Firefox FPP, Brave shields, Safari ATFP) stay exempt: their
+  //    entropy reductions must never become an automation verdict.
+  if (hardAutomationEvidence.length > 0 && !privacyHardened) {
+    antiDetect = true;
+    anomalyPoints += 45;
+    reasons.push(...hardAutomationEvidence);
+  }
+
   const clampedScore = Math.min(1, Number((anomalyPoints / 100).toFixed(4)));
   // A privacy-hardened runtime keeps only hard device-emulation evidence; anti-detect
   // points are suppressed so an intentional defence never becomes a tamper verdict.
@@ -306,6 +364,7 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
       devtools_device_emulation: devtoolsEmulation,
       privacy_hardened: privacyHardened,
       reasons,
+      hardAutomationEvidence: privacyHardened ? [] : hardAutomationEvidence,
     },
   };
 }
