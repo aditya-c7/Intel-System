@@ -26,7 +26,7 @@
  *   weak   — never sufficient alone; kept for telemetry/attribution only
  */
 
-export type ReasonWeight = 'hard' | 'medium' | 'weak';
+export type ReasonWeight = 'hard' | 'medium' | 'weak' | 'developer_tools';
 
 export type AutomationVerdict = 'human' | 'uncertain' | 'automated';
 
@@ -35,13 +35,13 @@ export interface GatedAutomationEvidence {
   hardReasons: string[];
   mediumReasons: string[];
   weakReasons: string[];
+  /** CDP / DevTools bridge evidence — reported separately, never flips the verdict. */
+  developerToolsReasons: string[];
 }
 
 /** Reason ids that are, by themselves, proof of an automated runtime. */
 const HARD_REASONS: ReadonlySet<string> = new Set([
   'navigator.webdriver',
-  'cdp.runtime.enable.empty_source',
-  'cdp.network.enable.pre_load_message',
   'cdp.ua_override.empty_brands',
   'ua.headless-chrome',
   'ua.automation-signature',
@@ -49,6 +49,17 @@ const HARD_REASONS: ReadonlySet<string> = new Set([
   'page.platform.cloudflare-workers',
   'launch.ipc-flooding-switch',
   'bot.webdriver-getter-tampered-cdp',
+]);
+
+/**
+ * Developer-tools evidence. A CDP Runtime / Network session is attached to the page by
+ * DevTools, an Electron shell or an IDE webview — a real person is often still driving it.
+ * Fingerprint Pro reports this as `developer_tools`, not `bot`, and so do we.
+ */
+const DEVELOPER_TOOLS_REASONS: ReadonlySet<string> = new Set([
+  'cdp.runtime.enable.empty_source',
+  'cdp.network.enable.pre_load_message',
+  'bot.cdp-runtime-leak',
 ]);
 
 /** Reason ids that need a corroborating companion before an agent verdict. */
@@ -94,7 +105,7 @@ const WEAK_REASONS: ReadonlySet<string> = new Set([
 
 /** Prefix rules evaluated after the exact sets (first match wins). */
 const PREFIX_RULES: ReadonlyArray<{ prefix: string; weight: ReasonWeight }> = [
-  { prefix: 'cdp.', weight: 'hard' },
+  { prefix: 'cdp.', weight: 'developer_tools' },
   { prefix: 'ua.headless', weight: 'hard' },
   { prefix: 'selenium.', weight: 'hard' },
   { prefix: 'webdriver.', weight: 'hard' },
@@ -113,6 +124,7 @@ export function classifyReasonId(reasonId: string): ReasonWeight {
   const id = (reasonId || '').trim().toLowerCase();
   if (!id) return 'weak';
   if (HARD_REASONS.has(id)) return 'hard';
+  if (DEVELOPER_TOOLS_REASONS.has(id)) return 'developer_tools';
   if (MEDIUM_REASONS.has(id)) return 'medium';
   if (WEAK_REASONS.has(id)) return 'weak';
   for (const rule of PREFIX_RULES) {
@@ -133,6 +145,7 @@ export function gateAutomationEvidence(reasons: ReadonlyArray<string>): GatedAut
   const hardReasons: string[] = [];
   const mediumReasons: string[] = [];
   const weakReasons: string[] = [];
+  const developerToolsReasons: string[] = [];
 
   for (const reason of reasons || []) {
     const id = (reason || '').trim();
@@ -143,6 +156,9 @@ export function gateAutomationEvidence(reasons: ReadonlyArray<string>): GatedAut
         break;
       case 'medium':
         mediumReasons.push(id);
+        break;
+      case 'developer_tools':
+        developerToolsReasons.push(id);
         break;
       default:
         weakReasons.push(id);
@@ -161,5 +177,5 @@ export function gateAutomationEvidence(reasons: ReadonlyArray<string>): GatedAut
     verdict = 'uncertain';
   }
 
-  return { verdict, hardReasons, mediumReasons, weakReasons };
+  return { verdict, hardReasons, mediumReasons, weakReasons, developerToolsReasons };
 }

@@ -213,6 +213,10 @@ export interface SecuritySignals {
   /* Automation depth — protocol-level leaks and stealth-plugin artifacts */
   cdpRuntimeLeak?: boolean;
   stealthPluginDetected?: boolean;
+  /** Host runtime of the page: `none`, `electron`, `ide_webview`, `headless_shell`, `vm`. */
+  automationEnvironment?: string;
+  /** 0–1 confidence that a real person is driving this runtime. */
+  humanCorroboration?: number;
 
   /* Network anonymity methods — the single source of truth for the VPN tile count */
   /** True only for a real commercial VPN provider, never for plain hosting/datacenter. */
