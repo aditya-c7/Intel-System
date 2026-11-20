@@ -22,6 +22,10 @@ import {
 import { loadStoredIdentity, persistIdentity, getSessionId } from '../client/storage/identityStore';
 import { normalizeIdentity } from '../shared/normalization/uaNormalizer';
 import {
+  createIsolatedFontMeasurer,
+  FONT_MEASURE_TEST_STRING,
+} from '../client/signals/fontPreferences';
+import {
   classifyGenuineDevice,
   detectInAppBrowser,
   extractAndroidModelFromUA,
@@ -1373,6 +1377,10 @@ export interface BotAutomationSignals {
   automationEnvironment?: AutomationEnvironment;
   /** 0–1 confidence that a real person is driving this runtime (geometry, inputs, GPU). */
   humanCorroboration?: number;
+  /** Passive isTrusted physical-interaction evidence (pointer/touch/scroll/keyboard). */
+  interactionEvidence?: string[];
+  /** Passive inspector probe results — informational input for `inspector_state`. */
+  inspectorProbes?: InspectorProbes;
 }
 
 /**
@@ -1806,6 +1814,76 @@ let trustedKeyEvents = 0;
 let trustedInputTrackerInstalled = false;
 let lastTrustedInputAt = 0;
 
+/**
+ * Phase 2 interaction gate. Purely passive `isTrusted` physical-interaction evidence:
+ * pointer kinematics, touch, scroll, keyboard cadence and Playwright mark-target touches.
+ * None of it blocks identify — the collector fires on load and this data accumulates in
+ * the background for later verdict refinement inside the locked 65 s envelope window.
+ */
+interface InteractionCounters {
+  pointerMoves: number;
+  pointerDowns: number;
+  touchStarts: number;
+  scrolls: number;
+  keyDowns: number;
+  keyIntervalsMs: number[];
+  playwrightMarkTargets: number;
+  frameworkGlobals: string[];
+  firstInteractionAt: number;
+  lastInteractionAt: number;
+}
+const interactionCounters: InteractionCounters = {
+  pointerMoves: 0,
+  pointerDowns: 0,
+  touchStarts: 0,
+  scrolls: 0,
+  keyDowns: 0,
+  keyIntervalsMs: [],
+  playwrightMarkTargets: 0,
+  frameworkGlobals: [],
+  firstInteractionAt: 0,
+  lastInteractionAt: 0,
+};
+let lastKeyDownAt = 0;
+
+/** Passive inspector probes. Results are reported for `inspector_state`, never bot proof. */
+export interface InspectorProbes {
+  errorPrototypeNamePreviewReads: number;
+  crossRealmGetterSourceMismatch: boolean;
+  crossRealmNativeDescriptor: boolean;
+  inspectorProbeError: string;
+}
+export const inspectorProbes: InspectorProbes = {
+  errorPrototypeNamePreviewReads: 0,
+  crossRealmGetterSourceMismatch: false,
+  crossRealmNativeDescriptor: false,
+  inspectorProbeError: '',
+};
+
+/** Snapshot of accumulated physical-interaction evidence (non-blocking, never mutates). */
+export function getInteractionEvidence(): string[] {
+  const evidence: string[] = [];
+  if (interactionCounters.pointerMoves >= 3) {
+    evidence.push(`pointer-kinematics:${interactionCounters.pointerMoves}`);
+  }
+  if (interactionCounters.touchStarts > 0) evidence.push(`touch:${interactionCounters.touchStarts}`);
+  if (interactionCounters.scrolls > 0) evidence.push(`scroll:${interactionCounters.scrolls}`);
+  if (interactionCounters.keyDowns > 0) evidence.push(`keyboard:${interactionCounters.keyDowns}`);
+  const cadence = interactionCounters.keyIntervalsMs.filter((ms) => ms > 0 && ms < 2000);
+  if (cadence.length >= 2) evidence.push(`keyboard-cadence:${cadence.length}`);
+  if (interactionCounters.playwrightMarkTargets > 0) {
+    evidence.push(`playwright-mark-target:${interactionCounters.playwrightMarkTargets}`);
+  }
+  if (interactionCounters.frameworkGlobals.length > 0) {
+    evidence.push(`framework-globals:${interactionCounters.frameworkGlobals.join(',')}`);
+  }
+  return evidence;
+}
+
+/** Framework globals scanned passively (presence only — no tampering with their values). */
+const FRAMEWORK_GLOBAL_PATTERN =
+  /^(__playwright|__pwInitScripts|__puppeteer|__selenium|__webdriver|cdc_|callPhantom|_phantom)/i;
+
 const IDE_WEBVIEW_UA_PATTERN =
   /(?:^|[\s(])(?:Code|Cursor|OpenCode|Windsurf|VSCodium|vscode-webview)\/[\d.]+/i;
 
@@ -1861,20 +1939,74 @@ export function detectAutomationEnvironment(
 export function installTrustedInputTracker(): void {
   if (trustedInputTrackerInstalled || typeof window === 'undefined') return;
   trustedInputTrackerInstalled = true;
+  const options: AddEventListenerOptions = { capture: true, passive: true };
+  const stamp = (): number => {
+    const now = Date.now();
+    if (interactionCounters.firstInteractionAt === 0) interactionCounters.firstInteractionAt = now;
+    interactionCounters.lastInteractionAt = now;
+    lastTrustedInputAt = now;
+    return now;
+  };
   try {
-    const onPointer = (event: Event): void => {
+    const onPointerDown = (event: Event): void => {
       if (!(event as PointerEvent).isTrusted) return;
       trustedPointerEvents += 1;
-      lastTrustedInputAt = Date.now();
+      interactionCounters.pointerDowns += 1;
+      stamp();
+    };
+    const onPointerMove = (event: Event): void => {
+      if (!(event as PointerEvent).isTrusted) return;
+      interactionCounters.pointerMoves += 1;
+      stamp();
+    };
+    const onTouchStart = (event: Event): void => {
+      if (!(event as TouchEvent).isTrusted) return;
+      interactionCounters.touchStarts += 1;
+      stamp();
+    };
+    const onScroll = (event: Event): void => {
+      if (!event.isTrusted) return;
+      interactionCounters.scrolls += 1;
+      stamp();
     };
     const onKey = (event: Event): void => {
       if (!(event as KeyboardEvent).isTrusted) return;
       trustedKeyEvents += 1;
-      lastTrustedInputAt = Date.now();
+      interactionCounters.keyDowns += 1;
+      const now = Date.now();
+      if (lastKeyDownAt > 0) {
+        const interval = now - lastKeyDownAt;
+        if (interval > 0 && interval < 2000) {
+          interactionCounters.keyIntervalsMs.push(interval);
+          if (interactionCounters.keyIntervalsMs.length > 32) interactionCounters.keyIntervalsMs.shift();
+        }
+      }
+      lastKeyDownAt = now;
+      stamp();
     };
-    window.addEventListener('pointerdown', onPointer, { capture: true, passive: true });
-    window.addEventListener('pointermove', onPointer, { capture: true, passive: true });
-    window.addEventListener('keydown', onKey, { capture: true, passive: true });
+    // Passive Playwright mark-target listeners on BOTH document and window plus a
+    // one-shot scan for framework globals. Presence is evidence only; nothing is patched.
+    const onMarkTarget = (event: Event): void => {
+      if (event.isTrusted === false) return;
+      interactionCounters.playwrightMarkTargets += 1;
+      stamp();
+    };
+    window.addEventListener('pointerdown', onPointerDown, options);
+    window.addEventListener('pointermove', onPointerMove, options);
+    window.addEventListener('keydown', onKey, options);
+    window.addEventListener('touchstart', onTouchStart, options);
+    window.addEventListener('scroll', onScroll, options);
+    document.addEventListener('touchstart', onTouchStart, options);
+    document.addEventListener('scroll', onScroll, options);
+    document.addEventListener('__playwright_mark_target__', onMarkTarget, options);
+    window.addEventListener('__playwright_mark_target__', onMarkTarget, options);
+    for (const scope of [window, document] as unknown as Array<Record<string, unknown>>) {
+      for (const key of Object.keys(scope)) {
+        if (FRAMEWORK_GLOBAL_PATTERN.test(key) && !interactionCounters.frameworkGlobals.includes(key)) {
+          interactionCounters.frameworkGlobals.push(key);
+        }
+      }
+    }
   } catch {
     // A blocked listener is not evidence.
   }
@@ -1950,36 +2082,53 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
     return { cdpRuntimeLeak: false, stealthPluginDetected: false, stealthReasons: [] };
   }
 
-  // C2 / Rebrowser: with the CDP Runtime domain enabled, `console.debug` of an Error is
-  // serialized through V8 and invokes `Error.prepareStackTrace`. A plain page never does.
+  // Inspector probes. Two independent, non-blocking side-effect checks:
+  //  (1) CDP Runtime.debug eagerly serialises an Error and invokes
+  //      `Error.prepareStackTrace` — the protocol-level leak the suite pins.
+  //  (2) V8 previews `Error.prototype.name` while serialising. We install a temporary
+  //      getter on the PROTOTYPE (never an own Error instance / own Error.stack) and
+  //      count reads; the result is reported under `inspector_probes` and is
+  //      informational only. A human with DevTools open is NEVER branded a bot here
+  //      (Agent 2 owns the inspector_state state machine).
   try {
     const errorCtor = Error as unknown as { prepareStackTrace?: unknown };
     const originalPrepare = errorCtor.prepareStackTrace;
-    let invoked = false;
+    const errorProto = Error.prototype as unknown as Record<string, unknown>;
+    const originalNameDescriptor = Object.getOwnPropertyDescriptor(Error.prototype, 'name');
+    let prepareInvoked = false;
+    let namePreviewReads = 0;
+
     errorCtor.prepareStackTrace = (error: unknown, stack: unknown) => {
-      invoked = true;
+      prepareInvoked = true;
       return typeof originalPrepare === 'function'
         ? (originalPrepare as (e: unknown, s: unknown) => string)(error, stack)
         : '';
     };
+    Object.defineProperty(Error.prototype, 'name', {
+      configurable: true,
+      enumerable: false,
+      get() {
+        namePreviewReads += 1;
+        return originalNameDescriptor && typeof originalNameDescriptor.value === 'string'
+          ? originalNameDescriptor.value
+          : 'Error';
+      },
+    });
+
     try {
-      const probe = new Error('intel-cdp-probe');
-      let nameReads = 0;
-      try {
-        Object.defineProperty(probe, 'name', {
-          configurable: true,
-          get() {
-            nameReads += 1;
-            return 'intel-cdp-probe';
-          },
-        });
-      } catch {
-        // Frozen Error instances still exercise the prepareStackTrace path.
-      }
-      console.debug(probe);
-      // Serialization reads the accessor more than once; local code does not touch it.
-      if (nameReads > 1) invoked = true;
+      console.debug(new Error('intel-cdp-probe'));
+    } catch {
+      /* console may be restricted — inconclusive */
     } finally {
+      if (originalNameDescriptor) {
+        Object.defineProperty(Error.prototype, 'name', originalNameDescriptor);
+      } else {
+        try {
+          delete errorProto.name;
+        } catch {
+          /* leave the probe getter; still harmless */
+        }
+      }
       if (originalPrepare === undefined) {
         try {
           delete errorCtor.prepareStackTrace;
@@ -1990,47 +2139,71 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
         errorCtor.prepareStackTrace = originalPrepare;
       }
     }
-    if (invoked) {
+
+    inspectorProbes.errorPrototypeNamePreviewReads = namePreviewReads;
+    if (prepareInvoked || namePreviewReads > 1) {
       cdpRuntimeLeak = true;
-      reasons.push('CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked on console.debug)');
+      reasons.push(
+        prepareInvoked
+          ? 'CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked on console.debug)'
+          : 'CDP Runtime.debug preview read Error.prototype.name (inspector probe)'
+      );
     }
-  } catch {
-    // A hostile console proxy is not evidence on its own.
+  } catch (error) {
+    inspectorProbes.inspectorProbeError = String(error);
   }
 
-  // Stealth plugin artifact: a same-origin iframe whose contentWindow is the parent window,
-  // or whose navigator disagrees with the parent while sharing an origin.
+  // Cross-realm descriptor audit in a SHORT-LIVED hidden iframe. Only property descriptors
+  // and native SOURCE STRINGS are compared — NEVER cross-realm getter object identity and
+  // NEVER `instanceof PluginArray` / `PluginArray.prototype` identity (those break across
+  // realms and produce false anti-detect verdicts). The frame is removed immediately.
   try {
     const frame = document.createElement('iframe');
-    frame.style.position = 'absolute';
-    frame.style.left = '-9999px';
-    frame.style.width = '1px';
-    frame.style.height = '1px';
-    frame.style.opacity = '0';
+    frame.style.cssText =
+      'position:absolute;left:-9999px;top:0;width:1px;height:1px;border:0;opacity:0;';
+    frame.setAttribute('aria-hidden', 'true');
     frame.src = 'about:blank';
     document.body.appendChild(frame);
     try {
       const childWindow = frame.contentWindow as (Window & typeof globalThis) | null;
-      if (childWindow === (window as unknown as Window & typeof globalThis)) {
-        definitive = true;
-        reasons.push('iframe.contentWindow resolves to the parent window (stealth plugin artifact)');
-      } else if (childWindow) {
-        const childUa = String(childWindow.navigator?.userAgent || '');
-        if (childUa && childUa !== String(navigator.userAgent || '')) {
-          // A content-script / privacy extension can rewrite the iframe UA while the
-          // top-level identity stays genuine. Record it, but do not call it definitive.
-          reasons.push('User-Agent differs between the top window and a same-origin iframe');
-        }
-        const childTouch = Number(childWindow.navigator?.maxTouchPoints ?? 0);
-        if (childTouch !== Number(navigator.maxTouchPoints ?? 0)) {
-          reasons.push('maxTouchPoints differs between the top window and a same-origin iframe');
+      if (childWindow) {
+        const sourceOf = (getter: unknown): string => {
+          try {
+            return typeof getter === 'function' ? Function.prototype.toString.call(getter) : '';
+          } catch {
+            return '';
+          }
+        };
+        const protoDescriptor = (
+          target: object | undefined,
+          key: string
+        ): PropertyDescriptor | undefined => {
+          try {
+            if (!target) return undefined;
+            return Object.getOwnPropertyDescriptor(Object.getPrototypeOf(target), key);
+          } catch {
+            return undefined;
+          }
+        };
+        const childNavProto = childWindow.navigator
+          ? Object.getPrototypeOf(childWindow.navigator)
+          : undefined;
+        const parentNavProto = Object.getPrototypeOf(navigator);
+        const childSource = sourceOf(protoDescriptor(childNavProto, 'userAgent')?.get);
+        const parentSource = sourceOf(protoDescriptor(parentNavProto, 'userAgent')?.get);
+        inspectorProbes.crossRealmNativeDescriptor = /\[native code\]/.test(childSource);
+        if (childSource && parentSource && childSource !== parentSource) {
+          inspectorProbes.crossRealmGetterSourceMismatch = true;
+          reasons.push('Cross-realm navigator.userAgent getter source differs from the top window');
+        } else if (childSource && !/\[native code\]/.test(childSource)) {
+          reasons.push('Cross-realm navigator.userAgent getter replaced by a non-native function');
         }
       }
     } finally {
       frame.remove();
     }
   } catch {
-    // Blocked iframes are not evidence.
+    // Blocked iframes are inconclusive; never a verdict.
   }
 
   // Patched native accessors across the properties stealth plugins forge.
@@ -2054,36 +2227,63 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
     reasons.push('Function.prototype.toString is unreadable (stealth wrapper)');
   }
 
-  // Chrome runtime integrity: a Chromium UA without window.chrome is a stripped build.
+  // Desktop-Chromium-only integrity checks. Firefox, Safari, Android and iOS never expose
+  // window.chrome or the WHATWG PDF plugin set, so these rules must NEVER run on them.
+  let desktopChromium = false;
   try {
     const ua = String(navigator.userAgent || '');
-    const claimsChromium = /Chrome\/|Chromium\/|Edg\//i.test(ua);
-    const chromeObject = (window as unknown as { chrome?: { runtime?: unknown } }).chrome;
-    if (claimsChromium && (!chromeObject || typeof chromeObject !== 'object')) {
-      reasons.push('Chromium user-agent without a window.chrome object');
+    desktopChromium =
+      /Chrome\/|Chromium\/|Edg\/|OPR\//i.test(ua) &&
+      !/Firefox\/|FxiOS\/|Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+    if (desktopChromium) {
+      const chromeObject = (window as unknown as { chrome?: { runtime?: unknown } }).chrome;
+      if (!chromeObject || typeof chromeObject !== 'object') {
+        reasons.push('Chromium user-agent without a window.chrome object');
+      }
     }
   } catch {
     // Ignore.
   }
 
-  // Plugin array prototype integrity: faked plugin lists are plain arrays, not PluginArray.
-  try {
-    const plugins = navigator.plugins as unknown;
-    if (plugins && typeof PluginArray !== 'undefined' && !(plugins instanceof PluginArray)) {
-      reasons.push('navigator.plugins is not a native PluginArray instance');
-    }
-    if (plugins && typeof PluginArray !== 'undefined') {
-      const proto = Object.getPrototypeOf(plugins);
-      if (proto !== PluginArray.prototype) {
-        reasons.push('navigator.plugins prototype chain was replaced');
+  // Plugin / MIME integrity uses DESCRIPTOR + SOURCE checks only. `instanceof PluginArray`
+  // and getter-object identity are realm-sensitive and are deliberately never used here.
+  if (desktopChromium) {
+    try {
+      const nativeSourceOf = (getter: unknown): string => {
+        try {
+          return typeof getter === 'function' ? Function.prototype.toString.call(getter) : '';
+        } catch {
+          return '';
+        }
+      };
+      const navProto = typeof Navigator !== 'undefined' ? Navigator.prototype : undefined;
+      const pluginsDescriptor = navProto
+        ? Object.getOwnPropertyDescriptor(navProto, 'plugins')
+        : undefined;
+      const mimeDescriptor = navProto
+        ? Object.getOwnPropertyDescriptor(navProto, 'mimeTypes')
+        : undefined;
+      if (pluginsDescriptor && !/\[native code\]/.test(nativeSourceOf(pluginsDescriptor.get))) {
+        reasons.push('navigator.plugins getter is not native (source check)');
       }
+      if (mimeDescriptor && !/\[native code\]/.test(nativeSourceOf(mimeDescriptor.get))) {
+        reasons.push('navigator.mimeTypes getter is not native (source check)');
+      }
+      // WHATWG desktop Chromium baseline: 5 PDF viewer plugins, 2 PDF MIME types and
+      // pdfViewerEnabled === true. Only a consistent ALL-WRONG shape counts as a spoof.
+      const pluginCount = Number(navigator.plugins?.length ?? 0);
+      const mimeCount = Number(navigator.mimeTypes?.length ?? 0);
+      const pdfMimeCount = Array.from(navigator.mimeTypes ?? []).filter((mime) =>
+        /pdf/i.test(mime.type)
+      ).length;
+      const pdfViewerEnabled = (navigator as unknown as { pdfViewerEnabled?: boolean })
+        .pdfViewerEnabled;
+      if (pluginCount < 5 && mimeCount < 2 && pdfMimeCount === 0 && pdfViewerEnabled === false) {
+        reasons.push('Desktop Chromium PDF plugin/MIME/pdfViewerEnabled baseline missing');
+      }
+    } catch {
+      // Ignore.
     }
-    const mimeTypes = navigator.mimeTypes as unknown;
-    if (mimeTypes && typeof MimeTypeArray !== 'undefined' && !(mimeTypes instanceof MimeTypeArray)) {
-      reasons.push('navigator.mimeTypes is not a native MimeTypeArray instance');
-    }
-  } catch {
-    // Ignore.
   }
 
   // A software rasterizer is a VM/headless signal, NOT evidence of a stealth plugin. Counting
@@ -2282,6 +2482,8 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
     developerTools,
     automationEnvironment: runtimeHost.environment,
     humanCorroboration: human.score,
+    interactionEvidence: getInteractionEvidence(),
+    inspectorProbes: { ...inspectorProbes },
   };
 }
 
@@ -3247,6 +3449,34 @@ export async function detectPrivateBrowsing(
 }
 
 /**
+ * Privacy-hardened classifier. Tor Browser (RFP), Firefox FPP/RFP, Brave shields and
+ * Safari 26 ATFP deliberately reduce or randomise entropy. Those are privacy defences,
+ * never anti-detect browser evidence. Used to exempt such runtimes from tampering rules.
+ */
+export function isPrivacyHardenedRuntime(
+  userAgent: string,
+  torConfirmed: boolean,
+  browserLabel = ''
+): boolean {
+  if (torConfirmed) return true;
+  const ua = userAgent || browserLabel || '';
+  if (/Firefox\/|FxiOS\//i.test(ua)) return true;
+  // Safari 26+ Automatic Transparent Fingerprinting Protection.
+  if (/Version\/2[6-9](?:\.|$)/.test(ua) && /Safari\//i.test(ua) && !/Chrome|Chromium|Edg|OPR/i.test(ua)) {
+    return true;
+  }
+  try {
+    const brave = (navigator as unknown as {
+      brave?: { isBrave?: unknown };
+    }).brave;
+    if (brave && typeof brave.isBrave === 'function') return true;
+  } catch {
+    // A hostile navigator proxy is not evidence.
+  }
+  return false;
+}
+
+/**
  * Evaluates First-Party Security & Anomaly Signals ("Smart Signals") and computes an
  * explainable Suspect & Risk Score (0-10).
  */
@@ -3396,9 +3626,15 @@ export async function evaluateSecuritySignals(
   const canvasNoiseDetected = Boolean(
     (rawDeviceAttributes as ({ canvas?: { noise?: boolean } } | null))?.canvas?.noise
   );
+  const privacyHardened = isPrivacyHardenedRuntime(
+    typeof navigator !== 'undefined' ? navigator.userAgent || '' : '',
+    torBrowserClient.confirmed,
+    browserDevice.browser
+  );
   const tampering = detectBrowserTampering({
     webglVendor: hardwareSignals.gpuVendor,
     webglRenderer: hardwareSignals.gpuRenderer,
+    privacyHardened,
   });
 
   // The genuine-device gate adds hard evidence the generic detector cannot see:
@@ -3964,75 +4200,57 @@ const PROBE_FONT_FAMILIES: Array<[font: string, generic: 'serif' | 'sans-serif' 
 export async function collectRawDeviceAttributes(): Promise<RawDeviceAttributes | null> {
   if (typeof document === 'undefined' || typeof window === 'undefined') return null;
 
-  const makeSpan = (text: string, style: string): HTMLSpanElement | null => {
-    try {
-      const span = document.createElement('span');
-      span.textContent = text;
-      span.style.position = 'absolute';
-      span.style.left = '-9999px';
-      span.style.top = '0';
-      span.style.visibility = 'hidden';
-      span.style.whiteSpace = 'nowrap';
-      span.style.fontSize = '72px';
-      if (style) span.style.fontFamily = style;
-      document.body.appendChild(span);
-      return span;
-    } catch {
-      return null;
-    }
-  };
-
-  const measure = (span: HTMLSpanElement | null): number => {
-    if (!span) return 0;
-    try {
-      const width = span.getBoundingClientRect().width;
-      return Number.isFinite(width) ? Number(width.toFixed(6)) : 0;
-    } catch {
-      return 0;
-    }
-  };
+  // All font/emoji box measurements happen inside ONE short-lived, hidden 16px
+  // iframe with the locked probe string. This keeps host-page CSS out of the
+  // metrics and removes the container immediately after the reads.
+  const measurer = createIsolatedFontMeasurer();
+  const round = (value: number): number => (Number.isFinite(value) ? Number(value.toFixed(6)) : 0);
+  const measure = (family: string): number =>
+    measurer ? round(measurer.width(FONT_MEASURE_TEST_STRING, family)) : 0;
 
   const fontPreferences: Record<string, number> = {};
   for (const [key, family] of Object.entries(FONT_PROFILES)) {
-    const span = makeSpan('mmmmmmmmmmlli', family);
-    fontPreferences[key] = measure(span);
-    span?.remove();
+    fontPreferences[key] = measure(family);
   }
 
-  const detectedFonts: string[] = [];
-  const genericBaselines: Record<string, number> = {
-    serif: measure(makeSpan('mmmmmmmmmmlli', 'serif')),
-    'sans-serif': measure(makeSpan('mmmmmmmmmmlli', 'sans-serif')),
-    monospace: measure(makeSpan('mmmmmmmmmmlli', 'monospace')),
+  // Measure ALL THREE generic baselines. On Linux, fontconfig aliases make Arial /
+  // Times New Roman render with Liberation Sans / Liberation Serif metrics; comparing
+  // only against one generic falsely reports those aliases as installed. A candidate
+  // identical to ANY baseline is therefore excluded.
+  const genericBaselines: Record<'serif' | 'sans-serif' | 'monospace', number> = {
+    serif: measure('serif'),
+    'sans-serif': measure('sans-serif'),
+    monospace: measure('monospace'),
   };
+  const baselineWidths = [
+    genericBaselines.serif,
+    genericBaselines['sans-serif'],
+    genericBaselines.monospace,
+  ];
+  const detectedFonts: string[] = [];
   for (const [family, generic] of PROBE_FONT_FAMILIES) {
-    const withFamily = makeSpan('mmmmmmmmmmlli', `"${family}", ${generic}`);
-    const diff = Math.abs(measure(withFamily) - genericBaselines[generic]);
-    withFamily?.remove();
-    if (diff > 0.1) detectedFonts.push(family);
+    const withFamily = measure(`"${family}", ${generic}`);
+    const matchesOwnBaseline = Math.abs(withFamily - genericBaselines[generic]) <= 0.1;
+    const matchesAnyBaseline = baselineWidths.some((width) => Math.abs(withFamily - width) <= 0.1);
+    if (!matchesOwnBaseline && !matchesAnyBaseline) detectedFonts.push(family);
   }
 
   let emoji: RawDeviceAttributes['emoji'] = null;
-  const emojiSpan = makeSpan('😀', 'serif');
-  if (emojiSpan) {
-    try {
-      const rect = emojiSpan.getBoundingClientRect();
-      emoji = {
-        font: 'serif',
-        width: Number(rect.width.toFixed(6)),
-        height: Number(rect.height.toFixed(6)),
-        top: Number(rect.top.toFixed(6)),
-        bottom: Number(rect.bottom.toFixed(6)),
-        left: Number(rect.left.toFixed(6)),
-        right: Number(rect.right.toFixed(6)),
-        x: Number(rect.x.toFixed(6)),
-        y: Number(rect.y.toFixed(6)),
-      };
-    } catch {
-      emoji = null;
-    }
-    emojiSpan.remove();
+  const emojiRect = measurer?.rect('😀', 'serif') ?? null;
+  if (emojiRect) {
+    emoji = {
+      font: 'serif',
+      width: round(emojiRect.width),
+      height: round(emojiRect.height),
+      top: round(emojiRect.top),
+      bottom: round(emojiRect.bottom),
+      left: round(emojiRect.left),
+      right: round(emojiRect.right),
+      x: round(emojiRect.x),
+      y: round(emojiRect.y),
+    };
   }
+  measurer?.dispose();
 
   // Canvas: one isolated canvas per probe so no composite mode or sub-path from the geometry
   // pass can contaminate the text pass, and the two stability reads happen on the SAME static

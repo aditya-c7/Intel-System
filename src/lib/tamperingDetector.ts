@@ -26,6 +26,9 @@ export interface TamperingDetails {
   anomaly_score: number;
   anti_detect_browser: boolean;
   devtools_device_emulation: boolean;
+  /** True when the runtime is a confirmed privacy-hardened browser (Tor/RFP, Firefox FPP,
+   * Brave shields, Safari 26 ATFP). Such browsers are exempt from anti-detect/tamper. */
+  privacy_hardened: boolean;
   reasons: string[];
 }
 
@@ -43,6 +46,9 @@ export interface TamperingInput {
   webglRenderer?: string;
   /** The raw HTTP `User-Agent` header as seen by the server proxy, when available. */
   serverHeaderUA?: string;
+  /** Confirmed privacy-hardened runtime. Suppresses anti-detect/tamper rules that are
+   * intentional defences (RFP device-width drift, getter wrappers, UA reduction). */
+  privacyHardened?: boolean;
 }
 
 /** Desktop-only platform strings. A real handheld never reports one. */
@@ -170,6 +176,13 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
   let anomalyPoints = 0;
   let devtoolsEmulation = false;
   let antiDetect = false;
+  // Confirmed privacy hardening (Tor/RFP, Firefox FPP, Brave shields, Safari 26 ATFP) is
+  // an intentional defence, not active spoofing. Suppress ONLY the rules whose evidence is
+  // a known anti-fingerprinting measure; hard device-emulation evidence still stands.
+  const privacyHardened = input.privacyHardened === true;
+  if (privacyHardened) {
+    reasons.push('Privacy-hardened browser (RFP/FPP/farbling/ATFP) — anti-detect rules exempt');
+  }
 
   const claimsIOS = /iPhone|iPad|iPod/i.test(ua);
   const claimsAndroid = /Android/i.test(ua);
@@ -226,7 +239,12 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
   // 6a. Cross-path media-query check (anti-detect browsers spoofing `screen.width`).
   //     A ±1–2 px band absorbs browser zoom / fractional DPI rounding, so a normal window
   //     never trips this; only a real spoof moves `screen.width` outside the band.
-  if (typeof window !== 'undefined' && screenWidth > 0 && typeof window.matchMedia === 'function') {
+  if (
+    !privacyHardened &&
+    typeof window !== 'undefined' &&
+    screenWidth > 0 &&
+    typeof window.matchMedia === 'function'
+  ) {
     try {
       if (!deviceWidthQueryMatches(screenWidth)) {
         antiDetect = true;
@@ -243,7 +261,7 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
   //     it must never set `anti_detect_browser` or cross the tampering threshold. Only a
   //     value that actually contradicts another source (rule 8 below) is proof.
   const hookedGetters = hookedNavigatorGetters();
-  if (hookedGetters.length > 0) {
+  if (hookedGetters.length > 0 && !privacyHardened) {
     anomalyPoints += 10;
     reasons.push(
       `Navigator getter decorated by a non-native wrapper (${hookedGetters.join(', ')}) — value verified independently`
@@ -264,14 +282,18 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
   // 8. The JS user-agent must equal the HTTP User-Agent header the server observed. Edge
   //    proxies truncate long headers, so a prefix relationship is a truncation, not a spoof.
   const headerUA = (input.serverHeaderUA || '').trim();
-  if (userAgentContradictsHeader(headerUA, ua)) {
+  if (userAgentContradictsHeader(headerUA, ua) && !privacyHardened) {
     antiDetect = true;
     anomalyPoints += 40;
     reasons.push('JS navigator.userAgent differs from the HTTP User-Agent header');
   }
 
   const clampedScore = Math.min(1, Number((anomalyPoints / 100).toFixed(4)));
-  const isTampered = devtoolsEmulation || antiDetect || anomalyPoints >= 40;
+  // A privacy-hardened runtime keeps only hard device-emulation evidence; anti-detect
+  // points are suppressed so an intentional defence never becomes a tamper verdict.
+  const isTampered = privacyHardened
+    ? devtoolsEmulation
+    : devtoolsEmulation || antiDetect || anomalyPoints >= 40;
 
   return {
     tampering: isTampered,
@@ -279,9 +301,10 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     tampering_confidence: isTampered ? (anomalyPoints >= 70 ? 'high' : 'medium') : 'high',
     tampering_ml_score: isTampered ? Math.max(0.842, clampedScore) : 0.0024,
     tampering_details: {
-      anomaly_score: Number((Math.min(100, anomalyPoints) / 100).toFixed(2)),
-      anti_detect_browser: antiDetect,
+      anomaly_score: privacyHardened && !isTampered ? 0 : Number((Math.min(100, anomalyPoints) / 100).toFixed(2)),
+      anti_detect_browser: privacyHardened ? false : antiDetect,
       devtools_device_emulation: devtoolsEmulation,
+      privacy_hardened: privacyHardened,
       reasons,
     },
   };

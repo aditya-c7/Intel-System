@@ -48,6 +48,8 @@ export interface NormalizedIdentity {
   architecture: string;
   bitness: string;
   platformFamily: PlatformFamily;
+  /** True when the selected browser came from the HeadlessChrome UA-CH brand. */
+  is_headless_brand?: boolean;
 }
 
 export interface NormalizeIdentityInput {
@@ -62,9 +64,11 @@ export interface NormalizeIdentityInput {
 /* Internal helpers — parsing                                                  */
 /* -------------------------------------------------------------------------- */
 
-interface BrandEntry {
+export interface BrandEntry {
   brand: string;
   version: string;
+  /** True when this entry is the `HeadlessChrome` UA-CH brand. */
+  is_headless_brand?: boolean;
 }
 
 interface SecChHints {
@@ -80,20 +84,163 @@ interface SecChHints {
 }
 
 /** GREASE brand filter, per UA-CH spec ('Not.A/Brand', 'Not/A)Brand', …). */
-const GREASE_RE = /not.?a.?brand/i;
+export const GREASE_RE = /not.?a.?brand/i;
 
 const CHROMIUM_PLACEHOLDER = 'chromium';
 
-/** Parses `"Chromium";v="153", "Google Chrome";v="153"` style brand lists. */
-function parseBrandList(raw: string): BrandEntry[] {
+/** Splits an RFC 9651 list on commas that are OUTSIDE quoted strings. */
+function splitStructuredList(raw: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  let escaped = false;
+  for (const ch of raw) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\' && inQuotes) {
+      current += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      current += ch;
+      continue;
+    }
+    if (ch === ',' && !inQuotes) {
+      parts.push(current);
+      current = '';
+      continue;
+    }
+    current += ch;
+  }
+  parts.push(current);
+  return parts;
+}
+
+/** Parses one RFC 9651 parameterised list member (bare item + `;name=value` parameters). */
+function parseStructuredMember(member: string): { value: string; params: Map<string, string> } | null {
+  const text = member.trim();
+  if (!text) return null;
+  let i = 0;
+  let value = '';
+
+  if (text[i] === '"') {
+    // Quoted string (the normal UA-CH brand form).
+    i += 1;
+    let escaped = false;
+    let closed = false;
+    while (i < text.length) {
+      const ch = text[i];
+      if (escaped) {
+        value += ch;
+        escaped = false;
+        i += 1;
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+        i += 1;
+        continue;
+      }
+      if (ch === '"') {
+        closed = true;
+        i += 1;
+        break;
+      }
+      value += ch;
+      i += 1;
+    }
+    if (!closed) return null;
+  } else {
+    // Token form — tolerated for non-conformant emitters.
+    while (i < text.length && !/[\s;]/.test(text[i])) {
+      value += text[i];
+      i += 1;
+    }
+    if (!value) return null;
+  }
+
+  const params = new Map<string, string>();
+  while (i < text.length) {
+    while (i < text.length && /\s/.test(text[i])) i += 1;
+    if (i >= text.length) break;
+    if (text[i] !== ';') return null;
+    i += 1;
+    while (i < text.length && /\s/.test(text[i])) i += 1;
+    let key = '';
+    while (i < text.length && /[!#$%&'*+\-.^_`|~0-9A-Za-z]/.test(text[i])) {
+      key += text[i];
+      i += 1;
+    }
+    if (!key) return null;
+    while (i < text.length && /\s/.test(text[i])) i += 1;
+    let paramValue = '';
+    if (i < text.length && text[i] === '=') {
+      i += 1;
+      while (i < text.length && /\s/.test(text[i])) i += 1;
+      if (text[i] === '"') {
+        i += 1;
+        let escaped = false;
+        let closed = false;
+        while (i < text.length) {
+          const ch = text[i];
+          if (escaped) {
+            paramValue += ch;
+            escaped = false;
+            i += 1;
+            continue;
+          }
+          if (ch === '\\') {
+            escaped = true;
+            i += 1;
+            continue;
+          }
+          if (ch === '"') {
+            closed = true;
+            i += 1;
+            break;
+          }
+          paramValue += ch;
+          i += 1;
+        }
+        if (!closed) return null;
+      } else {
+        while (i < text.length && !/[\s;]/.test(text[i])) {
+          paramValue += text[i];
+          i += 1;
+        }
+      }
+    }
+    params.set(key.toLowerCase(), paramValue);
+  }
+
+  return { value, params };
+}
+
+/**
+ * Canonical RFC 9651 structured-field parser for `Sec-CH-UA` /
+ * `Sec-CH-UA-Full-Version-List` brand lists, e.g.
+ * `"Chromium";v="126", "Not/A)Brand";v="24", "Google Chrome";v="126"`.
+ *
+ * This is the ONE brand-list parser in the project: the Express client-hints
+ * middleware re-exports it. Never use a bare regex where structured fields are
+ * available — commas and escaped quotes inside brand names break those.
+ */
+export function parseBrandList(raw: string): BrandEntry[] {
   const out: BrandEntry[] = [];
-  if (!raw) return out;
-  const re = /"([^"]*)"\s*;\s*v\s*=\s*"([^"]*)"/g;
-  let m: RegExpExecArray | null = re.exec(raw);
-  while (m !== null) {
-    const brand = (m[1] ?? '').trim();
-    if (brand) out.push({ brand, version: (m[2] ?? '').trim() });
-    m = re.exec(raw);
+  if (typeof raw !== 'string' || !raw.trim()) return out;
+  for (const member of splitStructuredList(raw)) {
+    const parsed = parseStructuredMember(member);
+    if (!parsed) continue;
+    const brand = parsed.value.trim();
+    if (!brand) continue;
+    const entry: BrandEntry = { brand, version: (parsed.params.get('v') ?? '').trim() };
+    if (brand.toLowerCase() === 'headlesschrome') entry.is_headless_brand = true;
+    out.push(entry);
   }
   return out;
 }
@@ -226,16 +373,42 @@ function firstMatch(token: RegExp, ua: string): string | null {
 }
 
 /**
- * Picks the first spec matching a brand list (case-insensitive) in priority
- * order. Returns null when no brand maps to a known browser.
+ * Deterministic brand precedence for UA-CH brand lists. HeadlessChrome is
+ * checked FIRST (it maps to 'Headless Chrome' and carries
+ * `is_headless_brand: true`), then Edge, Brave, Opera, Google Chrome and
+ * Chromium. Firefox / Safari do not emit UA-CH and remain UA-only fallbacks;
+ * the agent tokens (Cursor / Manus) and Samsung Internet follow the listed
+ * browsers. This ordering is independent of the UA-regex chain below.
+ */
+const BRAND_PRECEDENCE: readonly string[] = [
+  'Headless Chrome',
+  'Microsoft Edge',
+  'Brave',
+  'Opera',
+  'Google Chrome',
+  'Chromium',
+  'Cursor',
+  'Manus',
+  'Samsung Internet',
+  'Firefox',
+  'Safari',
+];
+
+/**
+ * Picks the spec matching a brand list (case-insensitive) in the canonical
+ * BRAND_PRECEDENCE order. Returns null when no brand maps to a known browser.
  */
 function brandToSpec(brands: BrandEntry[]): BrowserSpec | null {
-  for (const spec of BROWSER_SPECS) {
-    for (const entry of brands) {
-      if (spec.brands.indexOf(entry.brand.toLowerCase()) !== -1) return spec;
-    }
-  }
-  return null;
+  const matched = BROWSER_SPECS.filter((spec) =>
+    brands.some((entry) => spec.brands.indexOf(entry.brand.toLowerCase()) !== -1)
+  );
+  if (matched.length === 0) return null;
+  matched.sort((a, b) => {
+    const ai = BRAND_PRECEDENCE.indexOf(a.name);
+    const bi = BRAND_PRECEDENCE.indexOf(b.name);
+    return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
+  });
+  return matched[0];
 }
 
 /** UA-only fallback: scan the specs' tokens in priority order. */
@@ -273,6 +446,7 @@ interface BrowserResolution {
   name: string;
   full: string;
   major: string;
+  is_headless_brand?: boolean;
 }
 
 /**
@@ -301,20 +475,26 @@ function resolveBrowser(
     const entry = candidate.brands.find(
       (b) => spec.brands.indexOf(b.brand.toLowerCase()) !== -1,
     );
+    const headlessBrand = Boolean(entry?.is_headless_brand) || spec.name === 'Headless Chrome';
     let version = entry ? entry.version : '';
     /* Backfill a major-only brand version from the UA token. */
     if (version && version.indexOf('.') === -1) {
       version = pickFullerVersion(version, findUaVersion(spec, ua));
     }
     if (!version) version = findUaVersion(spec, ua) ?? '';
-    return { name: spec.name, full: version, major: majorOf(version) };
+    return { name: spec.name, full: version, major: majorOf(version), is_headless_brand: headlessBrand };
   }
 
   /* No usable brand lists — UA token scan. */
   const uaSpec = ua ? uaToSpec(ua) : null;
   if (uaSpec) {
     const version = findUaVersion(uaSpec, ua) ?? '';
-    return { name: uaSpec.name, full: version, major: majorOf(version) };
+    return {
+      name: uaSpec.name,
+      full: version,
+      major: majorOf(version),
+      is_headless_brand: uaSpec.name === 'Headless Chrome',
+    };
   }
 
   /* uaFullVersion without a recognizable brand: report major version only. */
@@ -712,6 +892,7 @@ export function normalizeIdentity(input: NormalizeIdentityInput): NormalizedIden
       bitness: archRes.bitness,
       platformFamily: osRes.platformFamily,
     };
+    if (browser.is_headless_brand) identity.is_headless_brand = true;
 
     /* Self-check: a version source exists but the major came out empty — walk
      * the fallback chain until a non-empty major is found. */
@@ -778,6 +959,8 @@ export interface NormalizedUserAgent {
   architecture: string;
   bitness: string;
   model: string;
+  /** True when the resolved browser came from the HeadlessChrome UA-CH brand. */
+  is_headless_brand?: boolean;
 }
 
 const BLANK_USER_AGENT: NormalizedUserAgent = {
@@ -925,6 +1108,7 @@ export function normalizeUserAgent(input: NormalizeUserAgentInput): NormalizedUs
       architecture: identity.architecture,
       bitness: identity.bitness,
       model: identity.device_model,
+      is_headless_brand: identity.is_headless_brand,
     };
   } catch {
     return { ...BLANK_USER_AGENT };

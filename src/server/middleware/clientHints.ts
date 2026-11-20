@@ -13,14 +13,21 @@
  */
 
 import type { NextFunction, Request, Response } from 'express';
+import { parseBrandList } from '../../shared/normalization/uaNormalizer';
 
-/** Header value advertised to browsers listing every hint we want on subsequent requests. */
+/**
+ * The single Accept-CH set consumed by BOTH the Express middleware and the Worker.
+ * Kept deliberately small: only high-entropy hints we actually act on.
+ */
 export const CLIENT_HINT_ACCEPT_CH =
-  'Sec-CH-UA, Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Model, Sec-CH-UA-Mobile';
+  'Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Model, Sec-CH-UA-Form-Factors';
 
-/** Hints the browser must attach even without an explicit permission grant (Critical-CH). */
+/** Critical-CH must be a SUBSET of Accept-CH (RFC 9652). */
 export const CLIENT_HINT_CRITICAL_CH =
-  'Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List';
+  'Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform-Version';
+
+/** Match on every hint we advertise so caches never serve a hint-blind variant. */
+export const CLIENT_HINT_VARY = 'Sec-CH-UA*';
 
 export interface ClientHintBrand {
   brand: string;
@@ -67,34 +74,6 @@ function unquote(value: string): string {
   return text.trim();
 }
 
-function unescapeToken(value: string): string {
-  return value.replace(/\\(.)/g, '$1').trim();
-}
-
-/**
- * Parses a structured-fields brand list such as
- * `"Chromium";v="126", "Not/A)Brand";v="24", "Google Chrome";v="126"`.
- * Tolerates unquoted tokens, stray whitespace and escaped characters.
- */
-function parseBrandList(raw: string): ClientHintBrand[] {
-  const brands: ClientHintBrand[] = [];
-  const text = typeof raw === 'string' ? raw.trim() : '';
-  if (!text) return brands;
-  for (const part of text.split(',')) {
-    const entry = part.trim();
-    if (!entry) continue;
-    const match =
-      /^(?:"((?:[^"\\]|\\.)*)"|([^";]*))\s*;\s*v\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^";]*))\s*$/.exec(entry);
-    if (!match) continue;
-    const brand = match[1] !== undefined ? unescapeToken(match[1]) : match[2].trim();
-    const version =
-      match[3] !== undefined ? unescapeToken(match[3]) : (match[4] ?? '').trim();
-    if (!brand) continue;
-    brands.push({ brand, version });
-  }
-  return brands;
-}
-
 function parseMobile(raw: string): string {
   const text = typeof raw === 'string' ? raw.trim() : '';
   if (!text) return '';
@@ -133,6 +112,7 @@ export function clientHintResponseHeaders(): Record<string, string> {
   return {
     'Accept-CH': CLIENT_HINT_ACCEPT_CH,
     'Critical-CH': CLIENT_HINT_CRITICAL_CH,
+    Vary: CLIENT_HINT_VARY,
   };
 }
 
@@ -144,6 +124,7 @@ export function clientHintsMiddleware(req: Request, res: Response, next: NextFun
   try {
     if (!res.getHeader('Accept-CH')) res.setHeader('Accept-CH', CLIENT_HINT_ACCEPT_CH);
     if (!res.getHeader('Critical-CH')) res.setHeader('Critical-CH', CLIENT_HINT_CRITICAL_CH);
+    if (!res.getHeader('Vary')) res.setHeader('Vary', CLIENT_HINT_VARY);
     (req as Request & { intelClientHints?: ParsedClientHints }).intelClientHints =
       parseClientHintHeaders(req.headers as ClientHintHeaderBag);
   } catch {
