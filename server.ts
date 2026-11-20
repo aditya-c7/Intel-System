@@ -51,6 +51,43 @@ import { ensureIdentitySchema, blockKeysFor, upsertBlocks, IDENTITY_SCHEMA_SQL }
 import { resolveVisitor, upsertVisitorProfile, type ResolverProfile, type ResolveVisitorResult } from './src/server/identity/resolver';
 import { scoreConfidence } from './src/server/identity/confidenceScorer';
 import type { BotInfo } from './src/types/visitor';
+import {
+  RISK_RUBRIC,
+  RISK_FAMILY_CAPS,
+  buildRiskLedger,
+  LSH_CONFIG,
+  LSH_WRITE_POLICY,
+  clopperPearsonUpperBound,
+  decideRarity,
+  isSecureRequest,
+  ENVELOPE_MAX_AGE_MS,
+  ENVELOPE_MAX_FUTURE_SKEW_MS,
+  type RiskEvidenceLine,
+  type OrthogonalRiskLedger,
+  type CanonicalTelemetryEnvelope,
+  type VerdictTier,
+} from './src/lib/telemetryContract';
+import {
+  evaluateSpecInvariants,
+  enforceTamperingInvariant,
+  classifyInspectorState,
+  inspectorFlagsForState,
+  resolvePrivacyHardened,
+} from './src/lib/specInvariants';
+import { buildGradedRiskLedger, verifyGradedRiskFixtures } from './src/lib/riskLedger';
+import {
+  computeHonestRarity,
+  computeHonestProximity,
+  computeHonestIdentityConfidence,
+} from './src/lib/rarityHonesty';
+import {
+  simhash512,
+  simhashToHex,
+  bandHashes,
+  resolveIdentityStage,
+} from './src/lib/identityEngine';
+import { decideVerdictTier } from './src/lib/verdict';
+import { resolveAgentProofMethod } from './src/lib/aiBotDirectory';
 
 dotenv.config();
 
@@ -134,10 +171,24 @@ interface DatabaseAdapter {
   exec: (sql: string) => void;
 }
 
+interface HardwareAnchorRow {
+  hardware_id: string;
+  visitor_id: string;
+  simhash: string;
+  distinct_storage_seeds_count: number;
+  first_seen_utc: string;
+  updated_at_utc: string;
+}
+
 function createInMemoryDbAdapter(): DatabaseAdapter {
   const visitorsMap = new Map<string, VisitorRow>();
   const visitsList: VisitRow[] = [];
   const geoCacheMap = new Map<string, GeoCacheRow>();
+  // Phase 4 canonical tables mirrored in the shim for rollback / forced-memory parity.
+  const hardwareAnchorsMap = new Map<string, HardwareAnchorRow>();
+  const lshBandsMap = new Map<string, { band_idx: number; band_hash: string; hardware_id: string }>();
+  const rdapPrefixMap = new Map<string, { prefix: string; org: string; asn: string; fetched_at_ms: number }>();
+  const schemaMigrations = new Set<string>();
   let autoIncrementId = 1;
 
   return {
@@ -147,6 +198,18 @@ function createInMemoryDbAdapter(): DatabaseAdapter {
 
       return {
         get: (...params: unknown[]) => {
+          if (normalized.includes('FROM hardware_anchors WHERE hardware_id = ?')) {
+            return hardwareAnchorsMap.get(String(params[0] || ''));
+          }
+          if (normalized.includes('FROM identity_lsh_bands WHERE band_idx = ? AND band_hash = ?')) {
+            return lshBandsMap.get(`${params[0]}:${params[1]}`);
+          }
+          if (normalized.includes('FROM rdap_prefix_cache WHERE prefix = ?')) {
+            return rdapPrefixMap.get(String(params[0] || ''));
+          }
+          if (normalized.includes('FROM schema_migrations WHERE version = ?')) {
+            return schemaMigrations.has(String(params[0] || '')) ? { version: String(params[0]) } : undefined;
+          }
           if (normalized.includes('FROM verified_geo_cache_v3 WHERE ip_address = ?')) {
             const ip = String(params[0] || '');
             return geoCacheMap.get(ip);
@@ -220,6 +283,16 @@ function createInMemoryDbAdapter(): DatabaseAdapter {
         },
 
         all: (...params: unknown[]) => {
+          if (normalized.includes('FROM identity_lsh_bands WHERE band_idx = ?')) {
+            const idx = Number(params[0]);
+            const bandHash = typeof params[1] === 'string' ? params[1] : null;
+            return Array.from(lshBandsMap.values()).filter(
+              (row) => row.band_idx === idx && (bandHash === null || row.band_hash === bandHash)
+            );
+          }
+          if (normalized.includes('FROM schema_migrations')) {
+            return Array.from(schemaMigrations).map((version) => ({ version }));
+          }
           if (normalized.includes('FROM visits WHERE visitor_id = ?')) {
             const vid = String(params[0] || '');
             return visitsList
@@ -231,6 +304,42 @@ function createInMemoryDbAdapter(): DatabaseAdapter {
         },
 
         run: (...params: unknown[]) => {
+          if (normalized.includes('INSERT OR REPLACE INTO hardware_anchors')) {
+            const row: HardwareAnchorRow = {
+              hardware_id: String(params[0] || ''),
+              visitor_id: String(params[1] || ''),
+              simhash: String(params[2] || ''),
+              distinct_storage_seeds_count: Number(params[3] ?? 1),
+              first_seen_utc: String(params[4] || ''),
+              updated_at_utc: String(params[5] || ''),
+            };
+            hardwareAnchorsMap.set(row.hardware_id, row);
+            return { changes: 1 };
+          }
+          if (normalized.includes('INSERT OR IGNORE INTO identity_lsh_bands')) {
+            const band_idx = Number(params[0]);
+            const band_hash = String(params[1] || '');
+            const hardware_id = String(params[2] || '');
+            const key = `${band_idx}:${band_hash}`;
+            if (lshBandsMap.has(key)) return { changes: 0 };
+            lshBandsMap.set(key, { band_idx, band_hash, hardware_id });
+            return { changes: 1 };
+          }
+          if (normalized.includes('INSERT OR REPLACE INTO rdap_prefix_cache')) {
+            rdapPrefixMap.set(String(params[0] || ''), {
+              prefix: String(params[0] || ''),
+              org: String(params[1] || ''),
+              asn: String(params[2] || ''),
+              fetched_at_ms: Number(params[3] || Date.now()),
+            });
+            return { changes: 1 };
+          }
+          if (normalized.includes('INSERT OR IGNORE INTO schema_migrations')) {
+            const version = String(params[0] || '');
+            if (schemaMigrations.has(version)) return { changes: 0 };
+            schemaMigrations.add(version);
+            return { changes: 1 };
+          }
           if (normalized.includes('INSERT OR REPLACE INTO verified_geo_cache_v3')) {
             const row: GeoCacheRow = {
               ip_address: String(params[0] || ''),
@@ -443,6 +552,35 @@ function initializeDatabase(): DatabaseAdapter {
 
       ${IDENTITY_SCHEMA_SQL}
 
+      /* Phase 4 — canonical identity tables. Old tables are intentionally kept for rollback. */
+      CREATE TABLE IF NOT EXISTS hardware_anchors (
+        hardware_id TEXT PRIMARY KEY,
+        visitor_id TEXT NOT NULL,
+        simhash TEXT NOT NULL DEFAULT '',
+        distinct_storage_seeds_count INTEGER NOT NULL DEFAULT 1,
+        first_seen_utc TEXT NOT NULL,
+        updated_at_utc TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS identity_lsh_bands (
+        band_idx INTEGER NOT NULL,
+        band_hash TEXT NOT NULL,
+        hardware_id TEXT NOT NULL,
+        PRIMARY KEY (band_idx, band_hash, hardware_id)
+      ) WITHOUT ROWID;
+
+      CREATE TABLE IF NOT EXISTS rdap_prefix_cache (
+        prefix TEXT PRIMARY KEY,
+        org TEXT NOT NULL DEFAULT '',
+        asn TEXT NOT NULL DEFAULT '',
+        fetched_at_ms INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version TEXT PRIMARY KEY,
+        applied_at_utc TEXT NOT NULL
+      );
+
       DROP TABLE IF EXISTS ai_bot_cidr_ranges;
       DROP TABLE IF EXISTS ai_bot_dns_cache;
       DROP TABLE IF EXISTS ai_bot_jwk_cache;
@@ -510,6 +648,29 @@ function initializeDatabase(): DatabaseAdapter {
 }
 
 const db = initializeDatabase();
+
+/**
+ * Lightweight, bounded corroboration ledger keyed by event_id (page load id). Identify records
+ * a passive entry here; the corroboration endpoint upgrades it to 1 only for a clean, fresh
+ * stored visit. Kept in-process so it never adds a Durable Object row write.
+ */
+interface CorroborationEntry {
+  eventId: string;
+  visitorId: string;
+  createdAtMs: number;
+  bot: string;
+  tamperingDetected: boolean;
+  corroborated: boolean;
+}
+const CORROBORATION_MAX_ENTRIES = 5000;
+const corroborationLedger = new Map<string, CorroborationEntry>();
+function rememberPassiveVisit(entry: CorroborationEntry): void {
+  if (corroborationLedger.size >= CORROBORATION_MAX_ENTRIES) {
+    const oldest = corroborationLedger.keys().next().value;
+    if (oldest) corroborationLedger.delete(oldest);
+  }
+  corroborationLedger.set(entry.eventId, entry);
+}
 
 function signVisitorId(visitorId: string): string {
   return crypto.createHmac('sha256', HMAC_SECRET).update(visitorId).digest('hex');
@@ -3646,12 +3807,8 @@ function lookupSuspiciousIp(ip: string): { blocklisted: boolean; reasons: string
 /* Phase 4 — sealed request envelope verification                             */
 /* -------------------------------------------------------------------------- */
 
-// A signed payload may only be replayed inside a short freshness window; anything older is
-// stale. The envelope is minted immediately before the identify request, so 65 seconds is
-// ample for slow page loads while closing the window in which a captured signed payload can
-// be reused with a fresh nonce. Future timestamps keep a wider tolerance for client clock drift.
-const ENVELOPE_MAX_AGE_MS = 65_000;
-const ENVELOPE_MAX_FUTURE_SKEW_MS = 300_000;
+// Freshness windows are the canonical values imported from telemetryContract.ts above
+// (ENVELOPE_MAX_AGE_MS = 65s, ENVELOPE_MAX_FUTURE_SKEW_MS = 5m). Do not redeclare them here.
 const NONCE_TTL_MS = 15 * 60 * 1000;
 const NONCE_CACHE_MAX_ENTRIES = 5000;
 const seenEnvelopeNonces = new Map<string, number>();
@@ -4001,17 +4158,21 @@ interface DeviceRarityReport {
   bucket: '<p95' | 'p95-p99' | '>p99';
   share: number;
   sampleSize: number;
+  matching: number;
+  /** Phase 6 — honest rarity with corpus_n / CI upper bound / zero suppressed contribution. */
+  honest: ReturnType<typeof computeHonestRarity>;
 }
 
 /**
- * Statistical rarity of this device configuration (screen resolution + browser + OS) over the
- * last 30 days of visits. `p95-p99` and `>p99` both mark the device as rare; the sample must
- * contain at least 20 visits before rarity is asserted.
+ * Statistical rarity of this device configuration over the canonical `visits` corpus. The
+ * published percentile now comes from decideRarity(corpusN, k) with the exact Clopper-Pearson
+ * bound; below N=250 the result is suppressed and contributes ZERO to the risk ledger.
  */
 function computeDeviceRarity(
   db: DatabaseAdapter,
   browserDevice: BrowserDeviceInfo
 ): DeviceRarityReport {
+  const honestSuppressed = computeHonestRarity(0, 0);
   try {
     const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
     const row = db
@@ -4030,57 +4191,194 @@ function computeDeviceRarity(
       ) as Record<string, unknown> | undefined;
     const total = Number(row?.total) || 0;
     const matching = Number(row?.matching) || 0;
+    const honest = computeHonestRarity(total, matching);
     if (total < 20) {
-      return { rareDevice: false, bucket: '<p95', share: 1, sampleSize: total };
+      return { rareDevice: false, bucket: '<p95', share: 1, sampleSize: total, matching, honest };
     }
     const share = matching / total;
+    // The legacy bucket mirrors the published percentile; a suppressed decision never asserts
+    // rarity, so real humans are never penalised by a tiny corpus.
     const bucket: DeviceRarityReport['bucket'] =
-      share <= 0.01 ? '>p99' : share <= 0.05 ? 'p95-p99' : '<p95';
-    return { rareDevice: bucket !== '<p95', bucket, share, sampleSize: total };
+      honest.status === 'published' && honest.percentile === 'p99_plus'
+        ? '>p99'
+        : honest.status === 'published' && honest.percentile === 'p95'
+        ? 'p95-p99'
+        : '<p95';
+    return { rareDevice: bucket !== '<p95', bucket, share, sampleSize: total, matching, honest };
   } catch {
-    return { rareDevice: false, bucket: '<p95', share: 1, sampleSize: 0 };
+    return { rareDevice: false, bucket: '<p95', share: 1, sampleSize: 0, matching: 0, honest: honestSuppressed };
   }
 }
 
 /**
- * Calibrated additive Suspect Score (0–100). Weights reproduce the reference payload:
- * incognito 6 + vpn 14 + vm 12 + privacy 8 + Tor blocklist 12 = 52, plus
- * high_activity_device 6 = 58. The score is clamped to [0, 100].
+ * Phase 5 — the 0–100 score is no longer an ad-hoc additive sum. It is the clamped total of the
+ * orthogonal graded ledger from telemetryContract.ts (via the riskLedger orchestrator). Every
+ * family is capped, raw_score is preserved, and RFC 9421 signed agents are exempt from the
+ * automation family.
  */
-function computeSuspectScore100(input: {
-  bot: boolean;
-  replayed: boolean;
-  tampering: boolean;
-  vpn: boolean;
-  vpnMethodCount: number;
-  blocklisted: boolean;
-  virtualMachine: boolean;
-  proxy: boolean;
-  simulator: boolean;
-  activeCall: boolean;
-  privacySettings: boolean;
-  incognito: boolean;
-  highActivityDevice: boolean;
-  developerTools: boolean;
-  rareDevice: boolean;
-}): number {
-  let score = 0;
-  if (input.bot) score += 45;
-  if (input.replayed) score += 35;
-  if (input.tampering) score += 25;
-  if (input.vpn) score += 10 + (input.vpnMethodCount > 1 ? 4 : 0);
-  if (input.blocklisted) score += 12;
-  if (input.virtualMachine) score += 12;
-  if (input.proxy) score += 10;
-  if (input.simulator) score += 10;
-  if (input.activeCall) score += 10;
-  if (input.privacySettings) score += 8;
-  if (input.incognito) score += 6;
-  if (input.highActivityDevice) score += 6;
-  if (input.developerTools) score += 5;
-  if (input.rareDevice) score += 4;
-  return Math.max(0, Math.min(100, Math.round(score)));
+function computeCanonicalRiskLedger(input: Parameters<typeof buildGradedRiskLedger>[0]): OrthogonalRiskLedger {
+  return buildGradedRiskLedger(input);
 }
+
+function computeSuspectScore100(input: Parameters<typeof buildGradedRiskLedger>[0]): number {
+  return computeCanonicalRiskLedger(input).score_0_100;
+}
+
+/**
+ * Phase 4 — write identity_lsh_bands ONLY when a hardware_anchors row is inserted or changed.
+ * A routine repeat visit never touches the bands table (DO daily row-write quota hygiene).
+ * Uses the locked LSH_CONFIG / LSH_WRITE_POLICY from telemetryContract.ts.
+ */
+function writeHardwareAnchorAndBands(
+  db: DatabaseAdapter,
+  hardwareId: string,
+  visitorId: string,
+  simhashHex: string,
+  nowUtc: string,
+  distinctStorageSeedsCount: number
+): boolean {
+  if (!hardwareId) return false;
+  try {
+    const existing = db
+      .prepare(
+        'SELECT simhash, distinct_storage_seeds_count, visitor_id, first_seen_utc FROM hardware_anchors WHERE hardware_id = ?'
+      )
+      .get(hardwareId) as
+      | { simhash: string; distinct_storage_seeds_count: number; visitor_id: string; first_seen_utc: string }
+      | undefined;
+    const changed =
+      !existing ||
+      existing.simhash !== simhashHex ||
+      Number(existing.distinct_storage_seeds_count) !== distinctStorageSeedsCount ||
+      existing.visitor_id !== visitorId;
+    if (!changed) return false;
+    const firstSeen = existing?.first_seen_utc || nowUtc;
+    db.prepare(
+      `INSERT OR REPLACE INTO hardware_anchors
+        (hardware_id, visitor_id, simhash, distinct_storage_seeds_count, first_seen_utc, updated_at_utc)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(hardwareId, visitorId, simhashHex, distinctStorageSeedsCount, firstSeen, nowUtc);
+    if (LSH_WRITE_POLICY.write_on_hardware_anchor_change_only) {
+      let hash: bigint;
+      try {
+        hash = BigInt(`0x${simhashHex || '0'}`);
+      } catch {
+        hash = 0n;
+      }
+      const bands = bandHashes(hash);
+      for (const band of bands.slice(0, LSH_CONFIG.bands)) {
+        db.prepare(
+          `INSERT OR IGNORE INTO identity_lsh_bands (band_idx, band_hash, hardware_id) VALUES (?, ?, ?)`
+        ).run(band.band_idx, band.band_hash, hardwareId);
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Retrieve fuzzy candidates from the canonical LSH band index. Candidate retrieval is a pure
+ * read; the collision-density guard in decideLshFuzzyMatch is deliberately independent of how
+ * many rows this function returns.
+ */
+function retrieveLshCandidates(
+  db: DatabaseAdapter,
+  profile: Record<string, unknown>
+): Array<{ hardwareId: string; simhash: bigint }> {
+  try {
+    const hash = simhash512(profile);
+    const hardwareIds = new Set<string>();
+    for (const band of bandHashes(hash)) {
+      const rows = db
+        .prepare('SELECT hardware_id FROM identity_lsh_bands WHERE band_idx = ? AND band_hash = ?')
+        .all(band.band_idx, band.band_hash) as Array<{ hardware_id: string }>;
+      for (const row of rows) if (row.hardware_id) hardwareIds.add(row.hardware_id);
+    }
+    const candidates: Array<{ hardwareId: string; simhash: bigint }> = [];
+    for (const hardwareId of hardwareIds) {
+      const anchor = db
+        .prepare('SELECT hardware_id, simhash FROM hardware_anchors WHERE hardware_id = ?')
+        .get(hardwareId) as { hardware_id: string; simhash: string } | undefined;
+      if (!anchor?.simhash) continue;
+      try {
+        candidates.push({ hardwareId, simhash: BigInt(`0x${anchor.simhash}`) });
+      } catch {
+        // A corrupt anchor hash is skipped, never a reason to fail identification.
+      }
+    }
+    return candidates;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Persist the BGP ASN and its resolved RDAP netblock organisation in the same cache row so
+ * both facts are always read back together; a reassignment mismatch is reported when the
+ * cached netblock org diverges from the live ASN org.
+ */
+function persistRdapNetblockOrg(
+  db: DatabaseAdapter,
+  asn: string,
+  org: string
+): string | null {
+  if (!asn || asn === 'Unknown' || !org || org === 'Unknown') return null;
+  try {
+    const prefix = normalizeAsnLabel(asn) || asn;
+    db.prepare(
+      `INSERT OR REPLACE INTO rdap_prefix_cache (prefix, org, asn, fetched_at_ms) VALUES (?, ?, ?, ?)`
+    ).run(prefix, org, asn, Date.now());
+    return org;
+  } catch {
+    return null;
+  }
+}
+
+/** Idempotent schema-version marker — used from the Worker's blockConcurrencyWhile-style init. */
+function markSchemaMigration(db: DatabaseAdapter, version: string): void {
+  try {
+    db.prepare('INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc) VALUES (?, ?)').run(
+      version,
+      new Date().toISOString()
+    );
+  } catch {
+    // A marker write must never fail a request.
+  }
+}
+
+/**
+ * Startup self-check (non-throwing): the four frozen tuples must still be produced by the
+ * canonical rubric. Uses the contract helpers directly so any drift is logged immediately.
+ */
+function assertFrozenRiskTuples(): void {
+  const expected: Record<string, readonly [number, number, number, number, number]> = {
+    'MCP Playwright': [45, 0, 12, 10, 0],
+    'spec fuzz': [0, 35, 0, 0, 0],
+    'drift+proxy+velocity': [35, 35, 18, 4, 12],
+    'clean human': [0, 0, 0, 0, 0],
+  };
+  for (const fixture of verifyGradedRiskFixtures()) {
+    const want = expected[fixture.name];
+    // buildRiskLedger is the single clamping source; confirm the caps are the frozen ones.
+    const capSum = Object.values(RISK_FAMILY_CAPS).reduce((sum, value) => sum + value, 0);
+    const baseline = buildRiskLedger([
+      { family: 'automation', component: 'check', points: RISK_RUBRIC.automation.tier_a_hard_proof, reason: 'check' },
+      { family: 'tampering', component: 'check', points: RISK_RUBRIC.tampering.tier_a_spec_header_or_drift, reason: 'check' },
+    ]);
+    const ok =
+      fixture.ok &&
+      Boolean(want) &&
+      baseline.automation === RISK_RUBRIC.automation.tier_a_hard_proof &&
+      baseline.tampering === RISK_RUBRIC.tampering.tier_a_spec_header_or_drift &&
+      capSum === 130;
+    if (!ok) {
+      console.error('Frozen graded-risk tuple check failed:', fixture.name, JSON.stringify(fixture.ledger), 'expected', want);
+    }
+  }
+}
+assertFrozenRiskTuples();
 
 async function lookupVerifiedGeolocation(
   visitorIp: string,
@@ -4877,6 +5175,47 @@ app.get('/api/health', async (req, res) => {
  */
 function extractEdgeGeo(req: express.Request): EdgeGeoHeaders {
   return readEdgeGeoHeaders(req.headers as EdgeHeaderBag);
+}
+
+/**
+ * All-plan Cloudflare request.cf transport fields are exposed by the Worker on the sealed
+ * `x-intel-edge-geo` header. JA3 / JA4T and raw TCP-SYN OS fingerprints are deliberately
+ * "Unavailable" without Cloudflare Bot Management — we never fabricate them.
+ */
+function readEdgeTransport(req: express.Request): {
+  tlsVersion: string;
+  tlsCipher: string;
+  clientTcpRtt: number | null;
+  httpProtocol: string;
+  colo: string;
+  ja3: 'Unavailable';
+  ja4t: 'Unavailable';
+  os_mismatch: 'Unavailable';
+} {
+  const unavailable = {
+    tlsVersion: '',
+    tlsCipher: '',
+    clientTcpRtt: null as number | null,
+    httpProtocol: '',
+    colo: '',
+  };
+  try {
+    const raw = req.headers['x-intel-edge-geo'];
+    if (typeof raw === 'string' && raw) {
+      const parsed = JSON.parse(decodeURIComponent(raw)) as Record<string, unknown>;
+      unavailable.tlsVersion = typeof parsed.tlsVersion === 'string' ? parsed.tlsVersion : '';
+      unavailable.tlsCipher = typeof parsed.tlsCipher === 'string' ? parsed.tlsCipher : '';
+      unavailable.clientTcpRtt =
+        typeof parsed.clientTcpRtt === 'number' && Number.isFinite(parsed.clientTcpRtt)
+          ? parsed.clientTcpRtt
+          : null;
+      unavailable.httpProtocol = typeof parsed.httpProtocol === 'string' ? parsed.httpProtocol : '';
+      unavailable.colo = typeof parsed.colo === 'string' ? parsed.colo : '';
+    }
+  } catch {
+    // A malformed or absent edge header is not a security signal.
+  }
+  return { ...unavailable, ja3: 'Unavailable', ja4t: 'Unavailable', os_mismatch: 'Unavailable' };
 }
 
 const SERVER_TIMEZONE_ALIAS_MAP: Record<string, string> = {
@@ -6599,7 +6938,13 @@ app.post('/api/visitor/identify', async (req, res) => {
       httpOnly: true,
       sameSite: 'lax' as const,
       path: '/',
-      secure: Boolean(process.env.VERCEL) || process.env.NODE_ENV === 'production',
+      // Cloudflare terminates TLS in front of the origin: req.secure is false there but the
+      // forwarded proto / cf-visitor header proves HTTPS. http://localhost stays insecure.
+      secure: isSecureRequest({
+        secure: req.secure,
+        xForwardedProto: req.headers['x-forwarded-proto'] as string | undefined,
+        cfVisitor: req.headers['cf-visitor'] as string | undefined,
+      }),
     };
     res.cookie('intel_http_vid', visitorId, cookieOptions);
     res.cookie('intel_http_token', visitorToken, cookieOptions);
@@ -6774,13 +7119,11 @@ app.post('/api/visitor/identify', async (req, res) => {
       edgeGeo.timezone ||
       '';
 
-    // Task 3 — visit velocity / IP rotation across the last hour. rawVisits is fetched AFTER
-    // the current visit is inserted, so the visit being logged right now is already part of
-    // the window; when the insert was deduplicated by page_load_id the current visit still
-    // counts (minimum of one), and its public IP is included in the distinct set. The cutoff
-    // `new Date(Date.now() - 3600 * 1000).toISOString()` is applied via Date.parse so rows
-    // from mixed legacy formats still compare on the same UTC instant scale.
-    const oneHourAgoMs = Date.now() - 3600 * 1000;
+    // Task 3 — visit velocity / IP rotation across the last hour. The window comes from the
+    // same canonical VELOCITY_WINDOW_MS constant used by the SQL aggregation over `visits`,
+    // so the two velocity views cannot drift apart. rawVisits is fetched AFTER the current
+    // visit is inserted, so the visit being logged right now is already part of the window.
+    const oneHourAgoMs = Date.now() - VELOCITY_WINDOW_MS['1_hour'];
     const lastHourVisitRows = rawVisits.filter((r) => {
       const visitedAtMs = Date.parse(String(r.visited_at_utc || ''));
       return Number.isFinite(visitedAtMs) && visitedAtMs >= oneHourAgoMs;
@@ -7216,38 +7559,118 @@ app.post('/api/visitor/identify', async (req, res) => {
         securitySignals.privacyProtected
     );
     const developerTools = Boolean(rawSecuritySignals?.developerTools);
-    const suspectScore100 = computeSuspectScore100({
-      bot: Boolean(securitySignals.isBot),
-      replayed: Boolean(securitySignals.replayDetected),
-      // The client DevTools probe is not the same as a sealed-envelope failure. Both must feed
-      // the 0-100 Risk Meter or a forged payload can score 10/10 on the 0-10 cards but 0/100
-      // for consumers reading `suspectScore100`.
-      tampering: Boolean(
-        tamperingAssessment?.tampering ||
-          securitySignals.tamperedRequest ||
-          securitySignals.tamperDetected
-      ),
-      vpn: Boolean(securitySignals.vpnSuspected),
-      vpnMethodCount: Array.isArray(securitySignals.vpnReasons)
-        ? securitySignals.vpnReasons.length
-        : 0,
-      blocklisted: Boolean(securitySignals.torExitNode || securitySignals.ipBlocklisted),
-      virtualMachine: Boolean(
-        securitySignals.isVirtualMachine ||
-          securitySignals.cloudOrMaskedGpu ||
-          securitySignals.emulatorDetected
-      ),
-      proxy: Boolean(
-        (securitySignals as SecuritySignals & { proxyDetected?: boolean }).proxyDetected
-      ),
-      simulator: Boolean(securitySignals.emulatorDetected),
-      activeCall,
-      privacySettings,
-      incognito: Boolean(securitySignals.isIncognito),
-      highActivityDevice,
-      developerTools,
-      rareDevice: rarityReport.rareDevice,
+    const rawExtras = (rawSecuritySignals || {}) as Record<string, unknown>;
+
+    // Phase 3 — run the eight pure spec invariants before reconciling tampering / inspector.
+    const specAssessment = evaluateSpecInvariants({
+      deviceMemoryGb: hardwareSignals.deviceMemoryGb,
+      networkRtt: typeof rawExtras.networkRtt === 'number' ? rawExtras.networkRtt : null,
+      battery:
+        (rawExtras.battery as {
+          charging?: boolean;
+          chargingTime?: number;
+          dischargingTime?: number;
+          level?: number;
+        }) || null,
+      jsHeapSizeLimit: typeof rawExtras.jsHeapSizeLimit === 'number' ? rawExtras.jsHeapSizeLimit : null,
+      expectedJsHeapSizeLimit:
+        typeof rawExtras.expectedJsHeapSizeLimit === 'number' ? rawExtras.expectedJsHeapSizeLimit : null,
+      webglRenderer: hardwareSignals.gpuRenderer,
+      osFamily: browserDevice.os,
+      deviceKind: browserDevice.deviceKind,
+      hasPdfFace: typeof rawExtras.pdfViewerEnabled === 'boolean' ? rawExtras.pdfViewerEnabled : null,
+      transport: {
+        httpPlatform: typeof rawExtras.httpPlatform === 'string' ? rawExtras.httpPlatform : '',
+        httpPlatformVersion:
+          typeof rawExtras.httpPlatformVersion === 'string' ? rawExtras.httpPlatformVersion : '',
+        jsPlatform: browserDevice.platform,
+      },
+      privacyHardened: Boolean(rfpExemptResponse),
+      userAgent: fullRequestUserAgent,
     });
+    const privacyHardened = Boolean(
+      rfpExemptResponse ||
+        specAssessment.privacy_hardened ||
+        resolvePrivacyHardened({
+          userAgent: fullRequestUserAgent,
+          torBrowser: Boolean(rawSecuritySignals?.isTorBrowserClient),
+          braveShields: Boolean(rawExtras.braveShields),
+          firefoxFpp: Boolean(rawExtras.firefoxFpp),
+          resistFingerprinting: Boolean(rawExtras.resistFingerprinting),
+          safariAtfp: Boolean(rawExtras.safariAtfp),
+        })
+    );
+    const reconciledTampering = enforceTamperingInvariant({
+      reasons: [
+        ...(tamperingAssessment?.details?.reasons || []),
+        ...specAssessment.softViolations,
+        ...specAssessment.hardViolations,
+      ],
+      hard_spec_violation: specAssessment.hard_spec_violation,
+      privacy_hardened: privacyHardened,
+      software_renderer: specAssessment.software_renderer,
+    });
+
+    // Named AI agents need RFC 9421 / signed-agent / allowlist proof; ASN alone never qualifies.
+    const agentProofMethod = resolveAgentProofMethod(rawRequestHeaders);
+    const rfc9421SignedAgent = Boolean(
+      aiAgent?.detected &&
+        (agentProofMethod === 'rfc9421' ||
+          agentProofMethod === 'signed_agent' ||
+          (aiAgent as { executionMode?: string }).executionMode === 'RFC 9421 Signed Agent')
+    );
+
+    const hostingDatacenter = Boolean(
+      securitySignals.datacenterAsn || /cloud|datacenter|hosting/i.test(networkTypeLabel)
+    );
+    const vpnOrRelay = Boolean(
+      securitySignals.vpnSuspected || securitySignals.publicVpn || isTorExit || torStatus.isRelay
+    );
+    const rotatingProxy = Boolean(
+      (securitySignals as SecuritySignals & { proxyDetected?: boolean }).proxyDetected
+    );
+    const timezoneMismatch = Boolean(securitySignals.timezoneMismatch);
+    const swiftshader = specAssessment.software_renderer;
+    const ephemeralStorage = Boolean(securitySignals.isIncognito);
+    const highActivity = highActivityDevice;
+    const extremeRotation = velocityReport.distinctIps24h >= 10;
+    const tamperingTierA = Boolean(
+      reconciledTampering.detected &&
+        (reconciledTampering.hard_spec_violation ||
+          tamperingAssessment?.tampering ||
+          securitySignals.tamperedRequest ||
+          securitySignals.replayDetected)
+    );
+    const tamperingTierB = Boolean(
+      !tamperingTierA && reconciledTampering.detected && securitySignals.tamperDetected
+    );
+    const tamperingSoft = Boolean(
+      !tamperingTierA && !tamperingTierB && specAssessment.softViolations.length > 0
+    );
+
+    const riskLedger = computeCanonicalRiskLedger({
+      automation: {
+        tierA: Boolean(securitySignals.isBot || hardAutomationSignals),
+        tierB: Boolean(!securitySignals.isBot && developerTools),
+        rfc9421SignedAgent,
+      },
+      tampering: {
+        tierA: tamperingTierA,
+        tierB: tamperingTierB,
+        soft: tamperingSoft,
+        privacyHardened,
+      },
+      network: {
+        hostingDatacenter,
+        vpnOrRelay,
+        rotatingProxy,
+        timezoneMismatch,
+        otherComponentFired: hostingDatacenter || vpnOrRelay || rotatingProxy,
+      },
+      environment: { swiftshader, ephemeralOrPrivateStorage: ephemeralStorage },
+      velocity: { high: highActivity, extreme: extremeRotation },
+    });
+    const suspectScore100 = riskLedger.score_0_100;
 
     // Every history row always carries suspectScore / riskLevel / recognitionSource so the UI
     // never renders `undefined`. Stored per-visit risk data is used when present; the current
@@ -7498,8 +7921,29 @@ app.post('/api/visitor/identify', async (req, res) => {
       // Idempotent: existing deployments get the identity tables on first request even if
       // the process booted before this schema version.
       ensureIdentitySchema(db);
+      markSchemaMigration(db, 'v4-canonical-identity');
       upsertVisitorProfile(db, visitorId, identityProfile, identityHardwareFingerprint, nowUtc);
       upsertBlocks(db, visitorId, blockKeysFor(identityProfile), nowUtc);
+      // 512-bit SimHash over the canonical identity profile. Bands are written only when the
+      // hardware anchor actually changes, never on a routine repeat visit.
+      const anchorHash = simhash512(identityProfile as unknown as Record<string, unknown>);
+      const anchorHashHex = simhashToHex(anchorHash);
+      // distinct_storage_seeds_count: a single storage seed cannot safely merge on hardware.
+      const existingAnchor = db
+        .prepare('SELECT distinct_storage_seeds_count FROM hardware_anchors WHERE hardware_id = ?')
+        .get(identityHardwareFingerprint) as { distinct_storage_seeds_count?: number } | undefined;
+      const distinctSeeds = Math.max(
+        1,
+        Number(existingAnchor?.distinct_storage_seeds_count ?? 0) + (existingVisitor || verifiedVid ? 1 : 0)
+      );
+      writeHardwareAnchorAndBands(
+        db,
+        identityHardwareFingerprint,
+        visitorId,
+        anchorHashHex,
+        nowUtc,
+        distinctSeeds
+      );
       if (existingVisitor || verifiedVid) {
         resolvedIdentity = await resolveVisitor(db, {
           profile: identityProfile,
@@ -7537,15 +7981,226 @@ app.post('/api/visitor/identify', async (req, res) => {
       ),
     };
 
-    const payload: IntelVisitorResponse = {
+    /* ------------------------------------------------------------------ */
+    /* Phase 6 — canonical telemetry envelope (one shape, no parallel math) */
+    /* ------------------------------------------------------------------ */
+    const eventId = safePageLoadId;
+    const collectorInspectorProbes =
+      rawExtras.inspectorProbes && typeof rawExtras.inspectorProbes === 'object'
+        ? (rawExtras.inspectorProbes as Record<string, unknown>)
+        : {};
+    const collectorInteractionEvidence = Array.isArray(rawExtras.interactionEvidence)
+      ? (rawExtras.interactionEvidence as unknown[])
+          .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+          .map((item) => item.trim().slice(0, 160))
+          .slice(0, 24)
+      : [];
+    rememberPassiveVisit({
+      eventId,
+      visitorId,
+      createdAtMs: Date.now(),
+      bot: botVerdict,
+      tamperingDetected: Boolean(
+        reconciledTampering.detected || securitySignals.tamperedRequest
+      ),
+      corroborated: false,
+    });
+    const edgeTransport = readEdgeTransport(req);
+    const inspectorState = classifyInspectorState({
+      cdpAttached: Boolean(rawSecuritySignals?.cdpDetected || rawSecuritySignals?.cdpRuntimeLeak),
+      devtoolsActiveVerified: Boolean(rawExtras.devtoolsActiveVerified),
+      viewportContractionNormalized: Boolean(rawExtras.viewportContractionNormalized),
+    });
+    const inspectorFlags = inspectorFlagsForState(inspectorState);
+    const automationVerdict =
+      securitySignals.isBot || botVerdict === 'bad' || hardAutomationSignals
+        ? 'automated'
+        : securitySignals.botSubtype === 'human' || botVerdict === 'not_detected'
+        ? 'human'
+        : 'uncertain';
+    // Non-blocking corroboration: identify is immediate and always starts at 0 on load. A
+    // separate lightweight endpoint may upgrade it inside the 65s freshness window.
+    const verdictState = decideVerdictTier({
+      automation: automationVerdict as 'human' | 'uncertain' | 'automated',
+      tamperingDetected: reconciledTampering.detected || Boolean(securitySignals.tamperedRequest),
+      humanCorroboration: 0,
+      hasInteractionEvidence: false,
+    });
+
+    const identityStage = resolveIdentityStage({
+      storageVisitorId: verifiedVid || storedVisitorId,
+      storageValid: Boolean(existingVisitor || verifiedVid),
+      exactHardwareId: hardwareId,
+      distinctStorageSeedsCount: existingVisitor || verifiedVid ? 2 : 1,
+      privacyHardened,
+      query: simhash512(identityProfile as unknown as Record<string, unknown>),
+      candidates: retrieveLshCandidates(db, identityProfile as unknown as Record<string, unknown>),
+    });
+    const identityConfidenceHonest = computeHonestIdentityConfidence({
+      labeledPairs: Number(rawExtras.calibrationLabeledPairs ?? 0),
+      heldOutEce: Number(rawExtras.calibrationHeldOutEce ?? 1),
+      matchStage: identityStage.stage,
+      calibratedScore: identityConfidence.score,
+    });
+
+    const networkOwnership: 'residential_isp' | 'mobile_carrier' | 'hosting_datacenter' | 'enterprise' | 'unknown' =
+      hostingDatacenter
+        ? 'hosting_datacenter'
+        : /cellular|mobile|5g|carrier/i.test(networkTypeLabel)
+        ? 'mobile_carrier'
+        : /enterprise|business/i.test(networkTypeLabel)
+        ? 'enterprise'
+        : /broadband|residential|consumer/i.test(networkTypeLabel)
+        ? 'residential_isp'
+        : 'unknown';
+    // vpn_confidence is high only for a confirmed Tor exit list hit or a verified Layer-4 relay
+    // signal. A timezone mismatch alone is contextual and can never reach high.
+    const vpnConfidence: 'low' | 'medium' | 'high' = isTorExit || torStatus.isRelay
+      ? 'high'
+      : vpnOrRelay && Array.isArray(securitySignals.vpnReasons) && securitySignals.vpnReasons.length > 1
+      ? 'medium'
+      : vpnOrRelay
+      ? 'low'
+      : 'low';
+    const asnOrg = String(normalizeAsnLabel(location.asn) || location.org || '');
+    const cachedRdapOrg = persistRdapNetblockOrg(db, String(location.asn || ''), asnOrg);
+    const rdapNetblockOrg =
+      typeof rawExtras.rdapNetblockOrg === 'string' && rawExtras.rdapNetblockOrg
+        ? rawExtras.rdapNetblockOrg
+        : cachedRdapOrg;
+    const netblockReassignmentMismatch = Boolean(
+      rdapNetblockOrg &&
+        asnOrg &&
+        rdapNetblockOrg.toLowerCase() !== asnOrg.toLowerCase() &&
+        !asnOrg.toLowerCase().includes(rdapNetblockOrg.toLowerCase())
+    );
+
+    const geolocationPermission =
+      typeof rawExtras.geolocationPermission === 'string' ? rawExtras.geolocationPermission : 'prompt';
+    const grantedCoords =
+      rawExtras.grantedGeolocation &&
+      typeof rawExtras.grantedGeolocation === 'object' &&
+      typeof (rawExtras.grantedGeolocation as Record<string, unknown>).latitude === 'number' &&
+      typeof (rawExtras.grantedGeolocation as Record<string, unknown>).longitude === 'number'
+        ? (rawExtras.grantedGeolocation as { latitude: number; longitude: number })
+        : null;
+    const honestProximity = computeHonestProximity({
+      permission: geolocationPermission,
+      accuracyM: typeof rawExtras.geolocationAccuracyM === 'number' ? rawExtras.geolocationAccuracyM : undefined,
+      grantedCoordinates: grantedCoords,
+    });
+
+    // The published rarity gates come straight from decideRarity / clopperPearsonUpperBound.
+    const rarityDecision = decideRarity(rarityReport.sampleSize, rarityReport.matching);
+    const rarityUpper = clopperPearsonUpperBound(
+      rarityReport.matching,
+      rarityReport.sampleSize,
+      0.05
+    );
+    const invariantEnvelope = {
+      event_id: eventId,
+      identity: {
+        match_stage: identityStage.stage,
+        match_label: identityStage.matchLabel,
+        collision_risk: identityStage.collisionRisk,
+        confidence_tier: identityConfidenceHonest.confidence_tier,
+        confidence_score: identityConfidenceHonest.confidence_score,
+        calibration_status: identityConfidenceHonest.calibration_status,
+      },
+      server_verified: {
+        browser: serverVerifiedBrowser,
+        os: serverVerifiedOs,
+        cf_transport: edgeTransport,
+        agent_proof_method: agentProofMethod,
+      },
+      client_claimed: {
+        browser: browserDevice.browser,
+        os: browserDevice.os,
+      },
+      reconciled_display: {
+        browser: serverVerifiedBrowser,
+        os: serverVerifiedOs,
+      },
+      automation: {
+        bot: botVerdict === 'not_detected' ? 'not_detected' : botVerdict,
+        bot_type: botType,
+        named_operator: rfc9421SignedAgent ? aiAgent?.operator || null : null,
+        operator_verification_method: agentProofMethod,
+        automation_environment: String(rawSecuritySignals?.automationEnvironment || 'none'),
+        human_corroboration: 0 as 0 | 1,
+        // Collector's passive, isTrusted interaction evidence — mirrored verbatim, never
+        // promoted to a proof by itself (corroboration stays 0 until the dedicated update).
+        interaction_evidence: collectorInteractionEvidence,
+        inspector_probes: collectorInspectorProbes,
+        inspector_state: inspectorState,
+        cdp_attached: inspectorFlags.cdp_attached,
+        // automation_protocol_attached explicitly reports developer_tools:false (CDP binding,
+        // not a docked DevTools frontend); only the docked/verified states set it true.
+        developer_tools:
+          inspectorState === 'automation_protocol_attached'
+            ? false
+            : inspectorFlags.developer_tools || developerToolsSignals,
+      },
+      tampering: {
+        detected: reconciledTampering.detected,
+        anti_detect_browser: Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
+        privacy_hardened: privacyHardened,
+        tampering_confidence: tamperingAssessment?.confidence || 'high',
+        tampering_ml_score: tamperingAssessment?.mlScore || 0,
+        spec_violations: specAssessment.hardViolations,
+        reasons: reconciledTampering.reasons,
+        hard_spec_violation: reconciledTampering.hard_spec_violation,
+      },
+      network: {
+        network_ownership: networkOwnership,
+        bgp_asn: location.asn && location.asn !== 'Unknown' ? location.asn : null,
+        bgp_asn_org: asnOrg || null,
+        rdap_netblock_org: rdapNetblockOrg,
+        netblock_reassignment_mismatch: netblockReassignmentMismatch,
+        vpn: vpnOrRelay,
+        vpn_confidence: vpnConfidence,
+        proxy: rotatingProxy,
+        proxy_type: rotatingProxy ? 'residential_rotating' : isProxyOrVpn ? 'datacenter' : 'none',
+        timezone_mismatch: timezoneMismatch,
+      },
+      environment: {
+        software_renderer: swiftshader,
+        // SwiftShader is software rendering only (f7d6900) — never hard VM proof, never tampering.
+        software_renderer_label: swiftshader
+          ? `Software-rendered: ${hardwareSignals.gpuRenderer || 'SwiftShader'}`
+          : null,
+        ephemeral_storage: ephemeralStorage,
+        virtual_machine_label: securitySignals.isVirtualMachine ? securitySignals.vmReason || 'Virtual Machine' : null,
+      },
+      proximity: honestProximity,
+      rarity: {
+        corpus_n: rarityDecision.corpus_n,
+        prevalence_ci95_upper: rarityUpper,
+        percentile: rarityDecision.percentile,
+        status: rarityDecision.status,
+      },
+      velocity: velocityReport.velocity,
+      risk: riskLedger,
+      verdict_tier: verdictState.verdict_tier,
+    } as unknown as CanonicalTelemetryEnvelope;
+
+    const payload: IntelVisitorResponse & {
+      envelope: CanonicalTelemetryEnvelope;
+      verdict_tier: VerdictTier;
+      human_corroboration: 0 | 1;
+      raw_score: number;
+      score_0_100: number;
+      evidence_ledger: OrthogonalRiskLedger['evidence_ledger'];
+    } = {
       visitorId,
       visitorToken,
       hardwareId,
       isReturning,
       recognitionSource,
       location,
-      // Fix 5 — deterministic proximity from the IP coordinates, resolved synchronously.
-      proximity: buildProximityInfo(location.latitude, location.longitude),
+      // Phase 6 — proximity is permission-gated. IP coordinates are never proximity evidence;
+      // the canonical envelope and this mirror share the same honest result.
+      proximity: honestProximity as unknown as import('./src/lib/geohash').ProximityInfo,
       // Fix 8 — structured bot & AI agent identification ("Robodex" + BotD).
       bot: botVerdict,
       bot_type: botType,
@@ -7621,12 +8276,77 @@ app.post('/api/visitor/identify', async (req, res) => {
       replayed: envelopeVerdict.replayDetected,
       tampered: envelopeVerdict.tamperedRequest,
       requestIntegrityReason: envelopeVerdict.requestIntegrityReason,
+      // Phase 3–6 canonical mirrors. The single envelope above is the source of truth; these
+      // top-level mirrors keep existing clients working without any parallel scoring math.
+      envelope: invariantEnvelope,
+      verdict_tier: verdictState.verdict_tier,
+      human_corroboration: verdictState.human_corroboration,
+      raw_score: riskLedger.raw_score,
+      score_0_100: riskLedger.score_0_100,
+      evidence_ledger: riskLedger.evidence_ledger,
     };
 
     res.json(payload);
   } catch (err) {
     console.error('Error in /api/visitor/identify:', err);
     res.status(500).json({ error: 'Unable to process visitor identification request.' });
+  }
+});
+
+/**
+ * Phase 3 — lightweight, non-blocking corroboration update tied to event_id.
+ * Upgrades human_corroboration 0 -> 1 ONLY when the stored visit is `bot === "not_detected"`,
+ * `tampering.detected === false`, the visitor token is valid, the visit row exists, and the
+ * event is still inside the 65-second sealed-envelope freshness window.
+ */
+app.post('/api/visitor/corroborate', (req, res) => {
+  try {
+    const body = (req.body || {}) as { event_id?: string; visitorId?: string; visitorToken?: string };
+    const eventId = typeof body.event_id === 'string' ? body.event_id.trim().slice(0, 80) : '';
+    const visitorId = typeof body.visitorId === 'string' ? body.visitorId.trim() : '';
+    if (!eventId || !verifyVisitorToken(visitorId, body.visitorToken)) {
+      res.status(403).json({ error: 'Forbidden', human_corroboration: 0 });
+      return;
+    }
+    const entry = corroborationLedger.get(eventId);
+    if (!entry || entry.visitorId !== visitorId) {
+      res.status(404).json({ error: 'Unknown event_id', human_corroboration: 0 });
+      return;
+    }
+    const fresh = Date.now() - entry.createdAtMs <= ENVELOPE_MAX_AGE_MS;
+    const storedVisit = db
+      .prepare('SELECT visit_id, bot_name, risk_level FROM visits WHERE visitor_id = ? AND page_load_id = ?')
+      .get(visitorId, eventId) as { visit_id: string; bot_name?: string | null; risk_level?: string | null } | undefined;
+    const eligible =
+      fresh &&
+      Boolean(storedVisit) &&
+      entry.bot === 'not_detected' &&
+      !entry.tamperingDetected &&
+      !entry.corroborated;
+    if (eligible) {
+      entry.corroborated = true;
+      res.json({
+        event_id: eventId,
+        human_corroboration: 1,
+        verdict_tier: 'Verified Human Interactive Session',
+      });
+      return;
+    }
+    res.json({
+      event_id: eventId,
+      human_corroboration: 0,
+      verdict_tier: 'Unverified / Passive Session',
+      reason: !fresh
+        ? 'outside_65s_window'
+        : !storedVisit
+        ? 'no_stored_visit'
+        : entry.bot !== 'not_detected'
+        ? 'automated'
+        : 'tampered',
+    });
+  } catch (err) {
+    console.error('Error in /api/visitor/corroborate:', err);
+    res.status(500).json({ error: 'Unable to process corroboration update.', human_corroboration: 0 });
   }
 });
 
@@ -7715,7 +8435,17 @@ app.get('/api/visitor/history/:visitorId', (req, res) => {
  */
 app.get('/api/intel/identity-ping', (req, res) => {
   res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
-  res.setHeader('Vary', 'Cookie');
+  // Merge, never replace: clientHintsMiddleware already added `Vary: Sec-CH-UA*`, and dropping
+  // it would let a shared cache serve one client's UA-CH-negotiated identity to another.
+  const existingVary = res.getHeader('Vary');
+  const varyValues =
+    typeof existingVary === 'string'
+      ? existingVary.split(',').map((item) => item.trim()).filter(Boolean)
+      : [];
+  for (const value of ['Cookie', 'Sec-CH-UA*']) {
+    if (!varyValues.some((item) => item.toLowerCase() === value.toLowerCase())) varyValues.push(value);
+  }
+  res.setHeader('Vary', varyValues.join(', '));
   const presented = typeof req.headers['if-none-match'] === 'string' ? req.headers['if-none-match'] : '';
   if (presented) {
     res.setHeader('ETag', presented);

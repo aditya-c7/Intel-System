@@ -296,6 +296,8 @@ export interface BotD19Result {
   detected: boolean;
   reasons: string[];
   signals: Record<BotDSignalName, boolean>;
+  /** Informational inspector evidence — never a verdict signal. */
+  inspector_probes: Record<string, unknown>;
 }
 
 /**
@@ -326,11 +328,11 @@ export function detectBotD19Signals(gpuRenderer?: string): BotD19Result {
   };
 
   if (typeof window === 'undefined') {
-    return { detected: false, reasons, signals };
+    return { detected: false, reasons, signals, inspector_probes: {} };
   }
 
   const nav = typeof navigator !== 'undefined' ? navigator : undefined;
-  if (!nav) return { detected: false, reasons, signals };
+  if (!nav) return { detected: false, reasons, signals, inspector_probes: {} };
 
   // 1. app_version
   try {
@@ -386,13 +388,15 @@ export function detectBotD19Signals(gpuRenderer?: string): BotD19Result {
     }
   } catch {}
 
-  // 4. error_trace
+  // 4. error_trace — RETIRED. A freshly constructed Error's own stack never contains the
+  // automation harness, and reading it can itself trigger a CDP preview read. The only safe
+  // observation is the Error.prototype.name descriptor preview, reported under
+  // inspector_probes as informational input for `inspector_state`, never as bot proof.
+  let errorPrototypeNamePreview = '';
   try {
-    const err = new Error();
-    if (err.stack && /puppeteer|playwright|selenium/i.test(err.stack)) {
-      signals.error_trace = true;
-      reasons.push('Automation harness stack in Error trace');
-    }
+    const nameDescriptor = Object.getOwnPropertyDescriptor(Error.prototype, 'name');
+    errorPrototypeNamePreview =
+      typeof nameDescriptor?.value === 'string' ? nameDescriptor.value.slice(0, 32) : '';
   } catch {}
 
   // 5. eval_length
@@ -446,22 +450,52 @@ export function detectBotD19Signals(gpuRenderer?: string): BotD19Result {
     }
   } catch {}
 
-  // 10. plugins_array
+  // 10. plugins_array — descriptor/source check only. `instanceof PluginArray` and any other
+  // prototype-identity or cross-realm getter comparison is unsafe: an iframe / ShadowRealm
+  // PluginArray is genuine but fails identity checks, branding real people as bots.
+  const nativeGetterSource = (descriptor: PropertyDescriptor | undefined): string => {
+    if (!descriptor?.get) return '';
+    try {
+      return Function.prototype.toString.call(descriptor.get);
+    } catch {
+      return '';
+    }
+  };
+  const navProto = typeof Navigator !== 'undefined' ? Navigator.prototype : undefined;
   try {
     if (/Chrome/i.test(nav.userAgent) && !/Mobile|Android/i.test(nav.userAgent)) {
-      if (!nav.plugins || !(nav.plugins instanceof PluginArray)) {
+      const plugins = (nav as unknown as { plugins?: unknown }).plugins;
+      const descriptor = navProto
+        ? Object.getOwnPropertyDescriptor(navProto, 'plugins')
+        : undefined;
+      const looksLikeCollection =
+        Boolean(plugins) &&
+        typeof plugins === 'object' &&
+        typeof (plugins as { length?: unknown }).length === 'number' &&
+        typeof (plugins as { item?: unknown }).item === 'function';
+      if (!/\[native code\]/.test(nativeGetterSource(descriptor)) || !looksLikeCollection) {
         signals.plugins_array = true;
-        reasons.push('navigator.plugins is not a PluginArray');
+        reasons.push('navigator.plugins does not expose a native PluginArray descriptor/source');
       }
     }
   } catch {}
 
-  // 11. plugins_inconsistency
+  // 11. plugins_inconsistency — compare getter SOURCES, never plugin counts or prototype
+  // identity. A privacy-hardened profile legitimately reports an empty plugins list; only a
+  // mismatch between the plugins and mimeTypes getter sources is real tampering evidence.
   try {
-    if (nav.plugins && /Chrome/i.test(nav.userAgent) && !/Mobile|Android/i.test(nav.userAgent)) {
-      if (nav.plugins.length === 0) {
+    if (/Chrome/i.test(nav.userAgent) && !/Mobile|Android/i.test(nav.userAgent)) {
+      const pluginsDescriptor = navProto
+        ? Object.getOwnPropertyDescriptor(navProto, 'plugins')
+        : undefined;
+      const mimeDescriptor = navProto
+        ? Object.getOwnPropertyDescriptor(navProto, 'mimeTypes')
+        : undefined;
+      const pluginsNative = /\[native code\]/.test(nativeGetterSource(pluginsDescriptor));
+      const mimeNative = /\[native code\]/.test(nativeGetterSource(mimeDescriptor));
+      if (pluginsNative !== mimeNative) {
         signals.plugins_inconsistency = true;
-        reasons.push('navigator.plugins is empty on desktop Chrome');
+        reasons.push('navigator.plugins / mimeTypes getter sources disagree');
       }
     }
   } catch {}
@@ -543,7 +577,16 @@ export function detectBotD19Signals(gpuRenderer?: string): BotD19Result {
   } catch {}
 
   const detected = Object.values(signals).some(Boolean);
-  return { detected, reasons, signals };
+  return {
+    detected,
+    reasons,
+    signals,
+    inspector_probes: {
+      // Informational only: a descriptor preview of Error.prototype.name, never an own-stack
+      // read and never a verdict input.
+      errorPrototypeNamePreview,
+    },
+  };
 }
 
 /**
@@ -731,3 +774,50 @@ export function formatBotInfoForApiV4(result: BotDetectionResult): {
     bot_info: result.botInfo,
   };
 }
+
+/* -------------------------------------------------------------------------- */
+/* Phase 3 — cryptographic agent proof (RFC 9421 / signed agent / allowlist)  */
+/* -------------------------------------------------------------------------- */
+
+export type AgentProofMethod = 'rfc9421' | 'signed_agent' | 'allowlist' | 'none';
+
+function headerValue(headers: Record<string, string | string[] | undefined>, name: string): string {
+  const value = headers[name];
+  if (Array.isArray(value)) return value.join(', ');
+  return typeof value === 'string' ? value : '';
+}
+
+/**
+ * Resolve the proof that backs a *named* AI agent. A bare ASN or User-Agent never upgrades
+ * identity to `verified`: only RFC 9421 HTTP Message Signatures, a signed-agent header, or a
+ * caller-supplied verified allowlist can do that (preserves the ASN-only fix, 3cbb84f).
+ */
+export function resolveAgentProofMethod(
+  headers: Record<string, string | string[] | undefined>,
+  allowlistedAgents: readonly string[] = []
+): AgentProofMethod {
+  const signatureInput = headerValue(headers, 'signature-input');
+  const signature = headerValue(headers, 'signature');
+  const signatureAgent = headerValue(headers, 'signature-agent');
+  // RFC 9421 requires a Signature-Input with a keyid and a detached Signature.
+  const rfc9421 = Boolean(signatureInput && signature && /keyid/i.test(signatureInput));
+  if (rfc9421) return 'rfc9421';
+  // Signed-agent / Web Bot Auth header pair.
+  if (signatureAgent && signature && signatureInput) return 'signed_agent';
+  if (allowlistedAgents.length > 0) {
+    const ua = headerValue(headers, 'user-agent');
+    if (allowlistedAgents.some((agent) => agent && ua.toLowerCase().includes(agent.toLowerCase()))) {
+      return 'allowlist';
+    }
+  }
+  return 'none';
+}
+
+/** True only when a named agent has real cryptographic / verified-allowlist proof. */
+export function hasVerifiedAgentProof(
+  headers: Record<string, string | string[] | undefined>,
+  allowlistedAgents: readonly string[] = []
+): boolean {
+  return resolveAgentProofMethod(headers, allowlistedAgents) !== 'none';
+}
+

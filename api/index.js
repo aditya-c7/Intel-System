@@ -635,81 +635,6 @@ function mergeLocationWithEdge(location, edge) {
   };
 }
 
-// src/lib/geohash.ts
-var GEOHASH_BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz";
-function isValidCoordinate(latitude, longitude) {
-  return typeof latitude === "number" && typeof longitude === "number" && Number.isFinite(latitude) && Number.isFinite(longitude) && Math.abs(latitude) <= 90 && Math.abs(longitude) <= 180;
-}
-function encodeGeohash(latitude, longitude, precision = 6) {
-  if (!isValidCoordinate(latitude, longitude)) return null;
-  const chars = Math.max(1, Math.min(12, Math.floor(precision)));
-  let latMin = -90;
-  let latMax = 90;
-  let lonMin = -180;
-  let lonMax = 180;
-  let hash = "";
-  let bits = 0;
-  let bitCount = 0;
-  let even = true;
-  while (hash.length < chars) {
-    if (even) {
-      const mid = (lonMin + lonMax) / 2;
-      if (longitude >= mid) {
-        bits = bits << 1 | 1;
-        lonMin = mid;
-      } else {
-        bits = bits << 1;
-        lonMax = mid;
-      }
-    } else {
-      const mid = (latMin + latMax) / 2;
-      if (latitude >= mid) {
-        bits = bits << 1 | 1;
-        latMin = mid;
-      } else {
-        bits = bits << 1;
-        latMax = mid;
-      }
-    }
-    even = !even;
-    bitCount += 1;
-    if (bitCount === 5) {
-      hash += GEOHASH_BASE32[bits];
-      bits = 0;
-      bitCount = 0;
-    }
-  }
-  return hash;
-}
-function formatCoordinatePair(latitude, longitude) {
-  if (!isValidCoordinate(latitude, longitude)) return "";
-  const lat = `${Math.abs(latitude).toFixed(2)}\xB0${latitude >= 0 ? "N" : "S"}`;
-  const lon = `${Math.abs(longitude).toFixed(2)}\xB0${longitude >= 0 ? "E" : "W"}`;
-  return `${lat}, ${lon}`;
-}
-function buildProximityInfo(latitude, longitude) {
-  const geohash = encodeGeohash(latitude, longitude, 6);
-  if (!geohash) {
-    return {
-      id: "prox_unresolved",
-      geohash: null,
-      zone_label: "Zone Unresolved (IP-only)",
-      precision_radius: 5e3,
-      confidence: 0,
-      resolved: false
-    };
-  }
-  const coords = formatCoordinatePair(latitude, longitude);
-  return {
-    id: `prox_${geohash}`,
-    geohash,
-    zone_label: `Zone ${geohash}${coords ? ` \xB7 ${coords}` : ""}`,
-    precision_radius: 5e3,
-    confidence: 0.92,
-    resolved: true
-  };
-}
-
 // src/lib/aiBotDirectory.ts
 var BOT_DIRECTORY = [
   // OpenAI - verified (CIDR/FCrDNS verified)
@@ -1048,102 +973,165 @@ function detectAiBotFromServerSignals(params) {
   }
   return { detected: false, botType: null, botInfo: null };
 }
-
-// src/server/middleware/clientHints.ts
-var CLIENT_HINT_ACCEPT_CH = "Sec-CH-UA, Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Model, Sec-CH-UA-Mobile";
-var CLIENT_HINT_CRITICAL_CH = "Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List";
-var EMPTY_HINTS = {
-  brands: [],
-  platform: "",
-  platformVersion: "",
-  architecture: "",
-  bitness: "",
-  model: "",
-  mobile: "",
-  fullVersionList: []
-};
-function readHeaderValue(headers, name) {
-  const raw = headers[name] ?? headers[name.toLowerCase()] ?? headers[name.toUpperCase()];
-  const value = Array.isArray(raw) ? raw[0] : raw;
+function headerValue2(headers, name) {
+  const value = headers[name];
+  if (Array.isArray(value)) return value.join(", ");
   return typeof value === "string" ? value : "";
 }
-function unquote(value) {
-  let text = value.trim();
-  if (text.length >= 2) {
-    const first = text[0];
-    const last = text[text.length - 1];
-    if (first === '"' && last === '"' || first === "'" && last === "'") text = text.slice(1, -1);
+function resolveAgentProofMethod(headers, allowlistedAgents = []) {
+  const signatureInput = headerValue2(headers, "signature-input");
+  const signature = headerValue2(headers, "signature");
+  const signatureAgent = headerValue2(headers, "signature-agent");
+  const rfc9421 = Boolean(signatureInput && signature && /keyid/i.test(signatureInput));
+  if (rfc9421) return "rfc9421";
+  if (signatureAgent && signature && signatureInput) return "signed_agent";
+  if (allowlistedAgents.length > 0) {
+    const ua = headerValue2(headers, "user-agent");
+    if (allowlistedAgents.some((agent) => agent && ua.toLowerCase().includes(agent.toLowerCase()))) {
+      return "allowlist";
+    }
   }
-  return text.trim();
-}
-function unescapeToken(value) {
-  return value.replace(/\\(.)/g, "$1").trim();
-}
-function parseBrandList(raw) {
-  const brands = [];
-  const text = typeof raw === "string" ? raw.trim() : "";
-  if (!text) return brands;
-  for (const part of text.split(",")) {
-    const entry = part.trim();
-    if (!entry) continue;
-    const match = /^(?:"((?:[^"\\]|\\.)*)"|([^";]*))\s*;\s*v\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^";]*))\s*$/.exec(entry);
-    if (!match) continue;
-    const brand = match[1] !== void 0 ? unescapeToken(match[1]) : match[2].trim();
-    const version = match[3] !== void 0 ? unescapeToken(match[3]) : (match[4] ?? "").trim();
-    if (!brand) continue;
-    brands.push({ brand, version });
-  }
-  return brands;
-}
-function parseMobile(raw) {
-  const text = typeof raw === "string" ? raw.trim() : "";
-  if (!text) return "";
-  const token = text.replace(/^\?/, "").trim();
-  if (token === "1") return "true";
-  if (token === "0") return "false";
-  return token;
-}
-function parseClientHintHeaders(headers) {
-  try {
-    const bag = headers ?? {};
-    const brands = parseBrandList(readHeaderValue(bag, "sec-ch-ua"));
-    const fullVersionList = parseBrandList(readHeaderValue(bag, "sec-ch-ua-full-version-list"));
-    return {
-      brands,
-      platform: unquote(readHeaderValue(bag, "sec-ch-ua-platform")),
-      platformVersion: unquote(readHeaderValue(bag, "sec-ch-ua-platform-version")),
-      architecture: unquote(readHeaderValue(bag, "sec-ch-ua-arch")),
-      bitness: unquote(readHeaderValue(bag, "sec-ch-ua-bitness")),
-      model: unquote(readHeaderValue(bag, "sec-ch-ua-model")),
-      mobile: parseMobile(readHeaderValue(bag, "sec-ch-ua-mobile")),
-      fullVersionList
-    };
-  } catch {
-    return { ...EMPTY_HINTS, brands: [], fullVersionList: [] };
-  }
-}
-function clientHintsMiddleware(req, res, next) {
-  try {
-    if (!res.getHeader("Accept-CH")) res.setHeader("Accept-CH", CLIENT_HINT_ACCEPT_CH);
-    if (!res.getHeader("Critical-CH")) res.setHeader("Critical-CH", CLIENT_HINT_CRITICAL_CH);
-    req.intelClientHints = parseClientHintHeaders(req.headers);
-  } catch {
-  }
-  next();
+  return "none";
 }
 
 // src/shared/normalization/uaNormalizer.ts
 var GREASE_RE = /not.?a.?brand/i;
 var CHROMIUM_PLACEHOLDER = "chromium";
-function parseBrandList2(raw) {
+function splitStructuredList(raw) {
+  const parts = [];
+  let current = "";
+  let inQuotes = false;
+  let escaped = false;
+  for (const ch of raw) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && inQuotes) {
+      current += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      current += ch;
+      continue;
+    }
+    if (ch === "," && !inQuotes) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  parts.push(current);
+  return parts;
+}
+function parseStructuredMember(member) {
+  const text = member.trim();
+  if (!text) return null;
+  let i = 0;
+  let value = "";
+  if (text[i] === '"') {
+    i += 1;
+    let escaped = false;
+    let closed = false;
+    while (i < text.length) {
+      const ch = text[i];
+      if (escaped) {
+        value += ch;
+        escaped = false;
+        i += 1;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        i += 1;
+        continue;
+      }
+      if (ch === '"') {
+        closed = true;
+        i += 1;
+        break;
+      }
+      value += ch;
+      i += 1;
+    }
+    if (!closed) return null;
+  } else {
+    while (i < text.length && !/[\s;]/.test(text[i])) {
+      value += text[i];
+      i += 1;
+    }
+    if (!value) return null;
+  }
+  const params = /* @__PURE__ */ new Map();
+  while (i < text.length) {
+    while (i < text.length && /\s/.test(text[i])) i += 1;
+    if (i >= text.length) break;
+    if (text[i] !== ";") return null;
+    i += 1;
+    while (i < text.length && /\s/.test(text[i])) i += 1;
+    let key = "";
+    while (i < text.length && /[!#$%&'*+\-.^_`|~0-9A-Za-z]/.test(text[i])) {
+      key += text[i];
+      i += 1;
+    }
+    if (!key) return null;
+    while (i < text.length && /\s/.test(text[i])) i += 1;
+    let paramValue = "";
+    if (i < text.length && text[i] === "=") {
+      i += 1;
+      while (i < text.length && /\s/.test(text[i])) i += 1;
+      if (text[i] === '"') {
+        i += 1;
+        let escaped = false;
+        let closed = false;
+        while (i < text.length) {
+          const ch = text[i];
+          if (escaped) {
+            paramValue += ch;
+            escaped = false;
+            i += 1;
+            continue;
+          }
+          if (ch === "\\") {
+            escaped = true;
+            i += 1;
+            continue;
+          }
+          if (ch === '"') {
+            closed = true;
+            i += 1;
+            break;
+          }
+          paramValue += ch;
+          i += 1;
+        }
+        if (!closed) return null;
+      } else {
+        while (i < text.length && !/[\s;]/.test(text[i])) {
+          paramValue += text[i];
+          i += 1;
+        }
+      }
+    }
+    params.set(key.toLowerCase(), paramValue);
+  }
+  return { value, params };
+}
+function parseBrandList(raw) {
   const out = [];
-  if (!raw) return out;
-  const re = /"([^"]*)"\s*;\s*v\s*=\s*"([^"]*)"/g;
-  let m = re.exec(raw);
-  while (m !== null) {
-    const brand = (m[1] ?? "").trim();
-    if (brand) out.push({ brand, version: (m[2] ?? "").trim() });
-    m = re.exec(raw);
+  if (typeof raw !== "string" || !raw.trim()) return out;
+  for (const member of splitStructuredList(raw)) {
+    const parsed = parseStructuredMember(member);
+    if (!parsed) continue;
+    const brand = parsed.value.trim();
+    if (!brand) continue;
+    const entry = { brand, version: (parsed.params.get("v") ?? "").trim() };
+    if (brand.toLowerCase() === "headlesschrome") entry.is_headless_brand = true;
+    out.push(entry);
   }
   return out;
 }
@@ -1152,7 +1140,7 @@ function filterBrands(brands) {
   const nonChromium = real.filter((b) => b.brand.toLowerCase() !== CHROMIUM_PLACEHOLDER);
   return nonChromium.length > 0 ? nonChromium : real;
 }
-function headerValue2(secCh, name) {
+function headerValue3(secCh, name) {
   if (!secCh) return "";
   const lower = name.toLowerCase();
   for (const key of Object.keys(secCh)) {
@@ -1163,24 +1151,24 @@ function headerValue2(secCh, name) {
   }
   return "";
 }
-function unquote2(value) {
+function unquote(value) {
   const v = value.trim();
   if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) return v.slice(1, -1);
   return v;
 }
 function parseSecCh(secCh) {
-  const fullListRaw = headerValue2(secCh, "sec-ch-ua-full-version-list");
-  const majorListRaw = headerValue2(secCh, "sec-ch-ua");
-  const brands = fullListRaw ? parseBrandList2(fullListRaw) : parseBrandList2(majorListRaw);
+  const fullListRaw = headerValue3(secCh, "sec-ch-ua-full-version-list");
+  const majorListRaw = headerValue3(secCh, "sec-ch-ua");
+  const brands = fullListRaw ? parseBrandList(fullListRaw) : parseBrandList(majorListRaw);
   return {
     brands: filterBrands(brands),
     hasFullVersionList: Boolean(fullListRaw),
-    platform: unquote2(headerValue2(secCh, "sec-ch-ua-platform")),
-    platformVersion: unquote2(headerValue2(secCh, "sec-ch-ua-platform-version")),
-    model: unquote2(headerValue2(secCh, "sec-ch-ua-model")),
-    architecture: unquote2(headerValue2(secCh, "sec-ch-ua-arch")),
-    bitness: unquote2(headerValue2(secCh, "sec-ch-ua-bitness")),
-    formFactors: unquote2(headerValue2(secCh, "sec-ch-ua-form-factors")).split(",").map((f) => unquote2(f)).filter((f) => f.length > 0)
+    platform: unquote(headerValue3(secCh, "sec-ch-ua-platform")),
+    platformVersion: unquote(headerValue3(secCh, "sec-ch-ua-platform-version")),
+    model: unquote(headerValue3(secCh, "sec-ch-ua-model")),
+    architecture: unquote(headerValue3(secCh, "sec-ch-ua-arch")),
+    bitness: unquote(headerValue3(secCh, "sec-ch-ua-bitness")),
+    formFactors: unquote(headerValue3(secCh, "sec-ch-ua-form-factors")).split(",").map((f) => unquote(f)).filter((f) => f.length > 0)
   };
 }
 var BROWSER_SPECS = [
@@ -1245,13 +1233,30 @@ function firstMatch(token, ua) {
   if (m === null) return null;
   return (m[1] ?? "").trim() || null;
 }
+var BRAND_PRECEDENCE = [
+  "Headless Chrome",
+  "Microsoft Edge",
+  "Brave",
+  "Opera",
+  "Google Chrome",
+  "Chromium",
+  "Cursor",
+  "Manus",
+  "Samsung Internet",
+  "Firefox",
+  "Safari"
+];
 function brandToSpec(brands) {
-  for (const spec of BROWSER_SPECS) {
-    for (const entry of brands) {
-      if (spec.brands.indexOf(entry.brand.toLowerCase()) !== -1) return spec;
-    }
-  }
-  return null;
+  const matched = BROWSER_SPECS.filter(
+    (spec) => brands.some((entry) => spec.brands.indexOf(entry.brand.toLowerCase()) !== -1)
+  );
+  if (matched.length === 0) return null;
+  matched.sort((a, b) => {
+    const ai = BRAND_PRECEDENCE.indexOf(a.name);
+    const bi = BRAND_PRECEDENCE.indexOf(b.name);
+    return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
+  });
+  return matched[0];
 }
 function uaToSpec(ua) {
   for (const spec of BROWSER_SPECS) {
@@ -1286,17 +1291,23 @@ function resolveBrowser(ua, uad, secCh) {
     const entry = candidate.brands.find(
       (b) => spec.brands.indexOf(b.brand.toLowerCase()) !== -1
     );
+    const headlessBrand = Boolean(entry?.is_headless_brand) || spec.name === "Headless Chrome";
     let version = entry ? entry.version : "";
     if (version && version.indexOf(".") === -1) {
       version = pickFullerVersion(version, findUaVersion(spec, ua));
     }
     if (!version) version = findUaVersion(spec, ua) ?? "";
-    return { name: spec.name, full: version, major: majorOf(version) };
+    return { name: spec.name, full: version, major: majorOf(version), is_headless_brand: headlessBrand };
   }
   const uaSpec = ua ? uaToSpec(ua) : null;
   if (uaSpec) {
     const version = findUaVersion(uaSpec, ua) ?? "";
-    return { name: uaSpec.name, full: version, major: majorOf(version) };
+    return {
+      name: uaSpec.name,
+      full: version,
+      major: majorOf(version),
+      is_headless_brand: uaSpec.name === "Headless Chrome"
+    };
   }
   const uaFull = (uad?.uaFullVersion ?? "").trim();
   if (uaFull) return { name: "Unknown", full: uaFull, major: majorOf(uaFull) };
@@ -1567,6 +1578,7 @@ function normalizeIdentity(input) {
       bitness: archRes.bitness,
       platformFamily: osRes.platformFamily
     };
+    if (browser.is_headless_brand) identity.is_headless_brand = true;
     if (versionSourceExists(ua, uad, secCh) && !identity.browser_major_version) {
       const fallback = fallbackMajorFromUa(identity.browser_name, ua);
       if (fallback.major) {
@@ -1612,15 +1624,15 @@ function readBagKey(hints, key) {
 function hintFromBag(hints, name) {
   const bag = hints;
   const structured = bag[name];
-  if (typeof structured === "string") return unquote2(structured);
+  if (typeof structured === "string") return unquote(structured);
   const headerKey = `sec-ch-ua-${name.replace(/([A-Z])/g, "-$1").toLowerCase()}`;
-  return unquote2(readBagKey(hints, headerKey));
+  return unquote(readBagKey(hints, headerKey));
 }
 function brandsFromValue(value) {
   if (Array.isArray(value)) {
     return value.filter((entry) => Boolean(entry) && typeof entry.brand === "string").map((entry) => ({ brand: entry.brand, version: String(entry.version ?? "") }));
   }
-  if (typeof value === "string") return parseBrandList2(value);
+  if (typeof value === "string") return parseBrandList(value);
   return [];
 }
 function coerceClientHints(hints) {
@@ -1686,11 +1698,78 @@ function normalizeUserAgent(input) {
       browserFullVersion: identity.browser_full_version,
       architecture: identity.architecture,
       bitness: identity.bitness,
-      model: identity.device_model
+      model: identity.device_model,
+      is_headless_brand: identity.is_headless_brand
     };
   } catch {
     return { ...BLANK_USER_AGENT };
   }
+}
+
+// src/server/middleware/clientHints.ts
+var CLIENT_HINT_ACCEPT_CH = "Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Model, Sec-CH-UA-Form-Factors";
+var CLIENT_HINT_CRITICAL_CH = "Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform-Version";
+var CLIENT_HINT_VARY = "Sec-CH-UA*";
+var EMPTY_HINTS = {
+  brands: [],
+  platform: "",
+  platformVersion: "",
+  architecture: "",
+  bitness: "",
+  model: "",
+  mobile: "",
+  fullVersionList: []
+};
+function readHeaderValue(headers, name) {
+  const raw = headers[name] ?? headers[name.toLowerCase()] ?? headers[name.toUpperCase()];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return typeof value === "string" ? value : "";
+}
+function unquote2(value) {
+  let text = value.trim();
+  if (text.length >= 2) {
+    const first = text[0];
+    const last = text[text.length - 1];
+    if (first === '"' && last === '"' || first === "'" && last === "'") text = text.slice(1, -1);
+  }
+  return text.trim();
+}
+function parseMobile(raw) {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (!text) return "";
+  const token = text.replace(/^\?/, "").trim();
+  if (token === "1") return "true";
+  if (token === "0") return "false";
+  return token;
+}
+function parseClientHintHeaders(headers) {
+  try {
+    const bag = headers ?? {};
+    const brands = parseBrandList(readHeaderValue(bag, "sec-ch-ua"));
+    const fullVersionList = parseBrandList(readHeaderValue(bag, "sec-ch-ua-full-version-list"));
+    return {
+      brands,
+      platform: unquote2(readHeaderValue(bag, "sec-ch-ua-platform")),
+      platformVersion: unquote2(readHeaderValue(bag, "sec-ch-ua-platform-version")),
+      architecture: unquote2(readHeaderValue(bag, "sec-ch-ua-arch")),
+      bitness: unquote2(readHeaderValue(bag, "sec-ch-ua-bitness")),
+      model: unquote2(readHeaderValue(bag, "sec-ch-ua-model")),
+      mobile: parseMobile(readHeaderValue(bag, "sec-ch-ua-mobile")),
+      fullVersionList
+    };
+  } catch {
+    return { ...EMPTY_HINTS, brands: [], fullVersionList: [] };
+  }
+}
+function clientHintsMiddleware(req, res, next) {
+  try {
+    if (!res.getHeader("Accept-CH")) res.setHeader("Accept-CH", CLIENT_HINT_ACCEPT_CH);
+    if (!res.getHeader("Critical-CH")) res.setHeader("Critical-CH", CLIENT_HINT_CRITICAL_CH);
+    if (!res.getHeader("Vary")) res.setHeader("Vary", CLIENT_HINT_VARY);
+    req.intelClientHints = parseClientHintHeaders(req.headers);
+  } catch {
+  }
+  next();
 }
 
 // src/server/network/asnRegistry.json
@@ -3784,6 +3863,712 @@ async function resolveVisitor(db2, input) {
   }
 }
 
+// src/lib/telemetryContract.ts
+var RISK_FAMILY_CAPS = {
+  automation: 45,
+  tampering: 35,
+  network: 25,
+  environment: 10,
+  velocity: 15
+};
+var RISK_RUBRIC = {
+  automation: {
+    tier_a_hard_proof: 45,
+    tier_b_corroborated_stealth: 35,
+    none_or_passive: 0
+  },
+  tampering: {
+    tier_a_spec_header_or_drift: 35,
+    tier_b_prototype_or_getter: 30,
+    soft_warning: 15,
+    none_or_privacy_hardened: 0
+  },
+  network: {
+    hosting_datacenter_asn: 10,
+    commercial_vpn_or_relay: 12,
+    rotating_or_residential_proxy: 18,
+    timezone_mismatch_standalone: 5,
+    timezone_mismatch_marginal: 2
+  },
+  environment: {
+    swiftshader_software_renderer: 8,
+    ephemeral_or_private_storage: 4
+  },
+  velocity: {
+    high_activity: 12,
+    extreme_rotation: 15
+  }
+};
+function riskTier(score) {
+  if (score >= 75) return "Critical";
+  if (score >= 50) return "High";
+  if (score >= 25) return "Elevated";
+  return "Low";
+}
+function buildRiskLedger(lines) {
+  const totals = {
+    automation: 0,
+    tampering: 0,
+    network: 0,
+    environment: 0,
+    velocity: 0
+  };
+  for (const line of lines) {
+    const safe = Number.isFinite(line.points) ? Math.max(0, line.points) : 0;
+    totals[line.family] = Math.min(RISK_FAMILY_CAPS[line.family], totals[line.family] + safe);
+  }
+  const rawScore = Object.values(totals).reduce((sum, value) => sum + value, 0);
+  const score = Math.min(100, Math.round(rawScore));
+  return {
+    ...totals,
+    raw_score: Math.round(rawScore),
+    score_0_100: score,
+    tier: riskTier(score),
+    evidence_ledger: lines.map((line) => ({ ...line }))
+  };
+}
+var LSH_CONFIG = {
+  bits: 512,
+  bands: 32,
+  rows: 16,
+  expected_random_similarity: 0.5
+};
+var LSH_WRITE_POLICY = {
+  write_on_hardware_anchor_change_only: true,
+  without_rowid: true,
+  primary_key: ["band_idx", "band_hash", "hardware_id"]
+};
+function clopperPearsonUpperBound(k, n, alpha = 0.05) {
+  if (n <= 0) return 1;
+  const successes = Math.max(0, Math.min(n, Math.floor(k)));
+  const cdf = (p) => {
+    if (p <= 0) return 0;
+    if (p >= 1) return 1;
+    let term = Math.exp(n * Math.log1p(-p));
+    let sum = term;
+    for (let i = 1; i <= successes; i += 1) {
+      term *= (n - i + 1) / i * (p / (1 - p));
+      sum += term;
+      if (sum > 1) return 1;
+    }
+    return Math.min(1, sum);
+  };
+  let low = 0;
+  let high = 1;
+  for (let i = 0; i < 80; i += 1) {
+    const mid = (low + high) / 2;
+    if (cdf(mid) > alpha) low = mid;
+    else high = mid;
+  }
+  return (low + high) / 2;
+}
+function decideRarity(corpusN, observedCount = 1) {
+  const n = Math.max(0, Math.floor(corpusN));
+  const upper = clopperPearsonUpperBound(observedCount, n, 0.05);
+  if (n < 250) return { status: "suppressed", percentile: null, corpus_n: n, prevalence_ci95_upper: upper };
+  if (n >= 1e3 && upper <= 0.01) {
+    return { status: "published", percentile: "p99_plus", corpus_n: n, prevalence_ci95_upper: upper };
+  }
+  if (upper <= 0.05) {
+    return { status: "published", percentile: "p95", corpus_n: n, prevalence_ci95_upper: upper };
+  }
+  return { status: "insufficient", percentile: null, corpus_n: n, prevalence_ci95_upper: upper };
+}
+function isSecureRequest(input) {
+  if (input.secure === true) return true;
+  if (typeof input.xForwardedProto === "string" && input.xForwardedProto.split(",")[0].trim().toLowerCase() === "https") {
+    return true;
+  }
+  if (typeof input.cfVisitor === "string" && /"scheme"\s*:\s*"https"/i.test(input.cfVisitor)) {
+    return true;
+  }
+  return false;
+}
+var ENVELOPE_MAX_AGE_MS = 65e3;
+var ENVELOPE_MAX_FUTURE_SKEW_MS = 3e5;
+
+// src/lib/specInvariants.ts
+function isPrivacyHardenedUserAgent(userAgent) {
+  const ua = String(userAgent || "").toLowerCase();
+  if (!ua) return false;
+  if (/\btor\b|tor browser/.test(ua)) return true;
+  if (/\bbrave\b|bravechrom/.test(ua)) return true;
+  if (/firefox/.test(ua) && /fpp|rfp|resistfingerprinting/.test(ua)) return true;
+  if (/safari/.test(ua) && /atfp|advanced.*fingerprint|version\/26/.test(ua)) return true;
+  return false;
+}
+function resolvePrivacyHardened(ctx = {}) {
+  return Boolean(
+    ctx.privacyHardened || ctx.firefoxFpp || ctx.resistFingerprinting || ctx.safariAtfp || ctx.torBrowser || ctx.braveShields || isPrivacyHardenedUserAgent(ctx.userAgent || "")
+  );
+}
+function isSwiftShaderRenderer(renderer) {
+  return /swiftshader|subzero|0x0000c0de|llvmpipe|mesa offscreen|software rasterizer/i.test(
+    String(renderer || "")
+  );
+}
+var DEVICE_MEMORY_DOMAIN = [0.25, 0.5, 1, 2, 4, 8, 16, 32];
+function checkDeviceMemory(value, context = {}) {
+  if (value === null || value === void 0) return [];
+  if (!Number.isFinite(value) || !DEVICE_MEMORY_DOMAIN.includes(value)) {
+    return [
+      {
+        id: "spec.device_memory.domain",
+        severity: context.privacyHardened ? "soft" : "hard",
+        detail: `navigator.deviceMemory ${String(value)} is outside the power-of-two domain {0.25,0.5,1,2,4,8,16,32}`
+      }
+    ];
+  }
+  return [];
+}
+function checkNetworkRtt(rtt, context = {}) {
+  if (rtt === null || rtt === void 0) return [];
+  if (!Number.isFinite(rtt) || rtt < 0) {
+    return [
+      { id: "spec.network_information.rtt_domain", severity: "hard", detail: `rtt ${String(rtt)} is not a finite non-negative number` }
+    ];
+  }
+  if (rtt === 0) return [];
+  if (Math.abs(rtt % 25) > 1e-9) {
+    return [
+      {
+        id: "spec.network_information.rtt_quantization",
+        severity: context.privacyHardened ? "soft" : "hard",
+        detail: `rtt ${rtt} is not a multiple of 25`
+      }
+    ];
+  }
+  return [];
+}
+function checkBatteryManager(battery) {
+  if (!battery) return [];
+  const charging = battery.charging;
+  const hasChargingTime = Number.isFinite(battery.chargingTime);
+  const hasDischargingTime = Number.isFinite(battery.dischargingTime);
+  const violations = [];
+  if (hasChargingTime && hasDischargingTime) {
+    violations.push({
+      id: "spec.battery_manager.mutual_exclusion",
+      severity: "hard",
+      detail: "chargingTime and dischargingTime are both finite"
+    });
+  }
+  if (charging === true && hasDischargingTime) {
+    violations.push({
+      id: "spec.battery_manager.charging_state",
+      severity: "hard",
+      detail: "a charging battery cannot report a finite dischargingTime"
+    });
+  }
+  if (charging === false && hasChargingTime) {
+    violations.push({
+      id: "spec.battery_manager.discharging_state",
+      severity: "hard",
+      detail: "a discharging battery cannot report a finite chargingTime"
+    });
+  }
+  return violations;
+}
+function checkJsHeapSizeLimit(observed, expected) {
+  if (!observed || !expected || !Number.isFinite(observed) || !Number.isFinite(expected)) return [];
+  const deviation = Math.abs(observed - expected) / Math.max(1, expected);
+  if (deviation > 0.01) {
+    return [
+      {
+        id: "spec.v8.js_heap_size_limit",
+        severity: "soft",
+        detail: `performance.memory.jsHeapSizeLimit deviates ${(deviation * 100).toFixed(2)}% from the V8 lattice (soft warning only)`
+      }
+    ];
+  }
+  return [];
+}
+function classifyWebglBackend(renderer) {
+  const text = String(renderer || "").toLowerCase();
+  if (/swiftshader|subzero|0x0000c0de/.test(text)) return "swiftshader";
+  if (/direct3d|d3d11|d3d12|\bd3d\b/.test(text)) return "direct3d";
+  if (/metal/.test(text)) return "metal";
+  if (/mesa|llvmpipe/.test(text)) return "mesa";
+  if (/vulkan/.test(text)) return "vulkan";
+  return "unknown";
+}
+function checkWebglBackendAgainstOs(renderer, osFamily, context = {}) {
+  const backend = classifyWebglBackend(renderer);
+  const os2 = String(osFamily || "").toLowerCase();
+  if (backend === "swiftshader" || backend === "vulkan" || backend === "unknown") return [];
+  const osMatches = backend === "direct3d" && /windows|win32|win64/.test(os2) || backend === "metal" && /macos|mac os|ios|ipad|iphone/.test(os2) || backend === "mesa" && /linux|ubuntu|fedora|debian|chrome ?os/.test(os2);
+  if (!osMatches) {
+    return [
+      {
+        id: "spec.webgl.backend_os_mismatch",
+        severity: context.privacyHardened ? "soft" : "hard",
+        detail: `WebGL backend ${backend} is inconsistent with OS ${osFamily || "unknown"}`
+      }
+    ];
+  }
+  return [];
+}
+function checkPdfPluginFace(deviceKind, hasPdfFace) {
+  if (deviceKind === "unknown" || hasPdfFace === null || hasPdfFace === void 0) return [];
+  const desktopWithoutPdf = deviceKind === "pc" && hasPdfFace === false;
+  const mobileWithPdf = (deviceKind === "mobile" || deviceKind === "tablet") && hasPdfFace === true;
+  if (desktopWithoutPdf || mobileWithPdf) {
+    return [
+      {
+        id: "spec.pdf_plugin.face",
+        severity: "soft",
+        detail: `PDF plugin face (${hasPdfFace}) disagrees with device kind ${deviceKind}`
+      }
+    ];
+  }
+  return [];
+}
+function checkHttpUaChReconciliation(transport, context = {}) {
+  const http = String(transport.httpPlatform || "").toLowerCase();
+  const js = String(transport.jsPlatform || "").toLowerCase();
+  if (!http || !js) return [];
+  const family = (value) => {
+    if (/win/.test(value)) return "windows";
+    if (/mac|iphone|ipad|ipod/.test(value)) return "apple";
+    if (/android/.test(value)) return "android";
+    if (/linux|cros|chrome ?os/.test(value)) return "linux";
+    return "";
+  };
+  const httpFamily = family(http);
+  const jsFamily = family(js);
+  if (httpFamily && jsFamily && httpFamily !== jsFamily) {
+    return [
+      {
+        id: "spec.transport.platform_reconciliation",
+        severity: context.privacyHardened ? "soft" : "hard",
+        detail: `HTTP/UA-CH platform ${http} disagrees with JS platform ${js}`
+      }
+    ];
+  }
+  return [];
+}
+function checkHardwareDrift(current, previous, context = {}) {
+  if (context.privacyHardened) return [];
+  const violations = [];
+  const compare = (key, label) => {
+    const a = current[key];
+    const b = previous[key];
+    if (a === void 0 || b === void 0 || a === null || b === null) return;
+    if (String(a) !== String(b)) {
+      violations.push({
+        id: `spec.hardware_drift.${label}`,
+        severity: "hard",
+        detail: `${label} drifted from ${String(b)} to ${String(a)} across loads`
+      });
+    }
+  };
+  compare("gpu", "gpu");
+  compare("cpuCores", "cpuCores");
+  compare("memoryGb", "memoryGb");
+  compare("screen", "screen");
+  compare("platform", "platform");
+  return violations;
+}
+function evaluateSpecInvariants(input = {}) {
+  const privacyHardened = resolvePrivacyHardened(input);
+  const softwareRenderer = isSwiftShaderRenderer(input.webglRenderer || "");
+  const violations = [
+    ...checkDeviceMemory(input.deviceMemoryGb, { privacyHardened }),
+    ...checkNetworkRtt(input.networkRtt, { privacyHardened }),
+    ...checkBatteryManager(input.battery),
+    ...checkJsHeapSizeLimit(input.jsHeapSizeLimit, input.expectedJsHeapSizeLimit),
+    ...checkWebglBackendAgainstOs(input.webglRenderer || "", input.osFamily || "", { privacyHardened }),
+    ...checkPdfPluginFace(input.deviceKind || "unknown", input.hasPdfFace),
+    ...checkHttpUaChReconciliation(input.transport || {}, { privacyHardened }),
+    ...checkHardwareDrift(input.currentHardware || {}, input.previousHardware || {}, { privacyHardened })
+  ];
+  const hard = violations.filter((v) => v.severity === "hard");
+  const soft = violations.filter((v) => v.severity === "soft");
+  return {
+    violations,
+    reasons: violations.map((v) => v.detail),
+    hardViolations: hard.map((v) => v.id),
+    softViolations: soft.map((v) => v.id),
+    hard_spec_violation: hard.length > 0,
+    privacy_hardened: privacyHardened,
+    software_renderer: softwareRenderer
+  };
+}
+function enforceTamperingInvariant(input) {
+  const privacy = Boolean(input.privacy_hardened);
+  const swiftshader = Boolean(input.software_renderer);
+  const rawReasons = (input.reasons || []).filter((r) => typeof r === "string" && r.trim());
+  const reasons = rawReasons.filter((reason) => {
+    if (privacy && /privacy|rfp|fpp|brave|tor|atfp|fingerprint.?protection/i.test(reason)) return false;
+    if (swiftshader && /swiftshader|software.?render|llvmpipe|mesa offscreen/i.test(reason)) return false;
+    return true;
+  });
+  const hard_spec_violation = Boolean(input.hard_spec_violation) && !privacy;
+  const detected = reasons.length > 0 || hard_spec_violation;
+  return { detected, reasons, hard_spec_violation, privacy_hardened: privacy };
+}
+function classifyInspectorState(signals = {}) {
+  if (signals.cdpAttached) return "automation_protocol_attached";
+  if (signals.devtoolsActiveVerified) return "devtools_active_verified";
+  if (signals.viewportContractionNormalized) return "devtools_docked_suspected";
+  return "closed";
+}
+function inspectorFlagsForState(state) {
+  return {
+    cdp_attached: state === "automation_protocol_attached",
+    developer_tools: state === "devtools_docked_suspected" || state === "devtools_active_verified"
+  };
+}
+
+// src/lib/riskLedger.ts
+function buildGradedRiskLedger(input = {}) {
+  const lines = [];
+  const push = (family, component, points, reason) => {
+    if (points > 0) lines.push({ family, component, points, reason });
+  };
+  const auto = input.automation || {};
+  if (!auto.rfc9421SignedAgent) {
+    if (auto.tierA) {
+      push("automation", "automation.tier_a_hard_proof", RISK_RUBRIC.automation.tier_a_hard_proof, "hard automation proof");
+    } else if (auto.tierB) {
+      push("automation", "automation.tier_b_corroborated_stealth", RISK_RUBRIC.automation.tier_b_corroborated_stealth, "corroborated stealth");
+    } else {
+      push("automation", "automation.none_or_passive", RISK_RUBRIC.automation.none_or_passive, "no automation evidence");
+    }
+  }
+  const tamper = input.tampering || {};
+  if (!tamper.privacyHardened) {
+    if (tamper.tierA) {
+      push("tampering", "tampering.tier_a_spec_header_or_drift", RISK_RUBRIC.tampering.tier_a_spec_header_or_drift, "hard spec/header/drift violation");
+    } else if (tamper.tierB) {
+      push("tampering", "tampering.tier_b_prototype_or_getter", RISK_RUBRIC.tampering.tier_b_prototype_or_getter, "prototype/getter tampering");
+    } else if (tamper.soft) {
+      push("tampering", "tampering.soft_warning", RISK_RUBRIC.tampering.soft_warning, "soft spec warning");
+    }
+  }
+  const net2 = input.network || {};
+  if (net2.hostingDatacenter && !net2.hostingAlreadyBilled) {
+    push("network", "network.hosting_datacenter_asn", RISK_RUBRIC.network.hosting_datacenter_asn, "hosting/datacenter ASN");
+  }
+  if (net2.vpnOrRelay) {
+    push("network", "network.commercial_vpn_or_relay", RISK_RUBRIC.network.commercial_vpn_or_relay, "commercial VPN / relay");
+  }
+  if (net2.rotatingProxy) {
+    push("network", "network.rotating_or_residential_proxy", RISK_RUBRIC.network.rotating_or_residential_proxy, "rotating / residential proxy");
+  }
+  if (net2.timezoneMismatch) {
+    const otherFired = net2.otherComponentFired || Boolean(net2.hostingDatacenter) || Boolean(net2.vpnOrRelay) || Boolean(net2.rotatingProxy);
+    push(
+      "network",
+      otherFired ? "network.timezone_mismatch_marginal" : "network.timezone_mismatch_standalone",
+      otherFired ? RISK_RUBRIC.network.timezone_mismatch_marginal : RISK_RUBRIC.network.timezone_mismatch_standalone,
+      otherFired ? "timezone mismatch (marginal)" : "timezone mismatch (standalone)"
+    );
+  }
+  const env = input.environment || {};
+  if (env.swiftshader) {
+    push("environment", "environment.swiftshader_software_renderer", RISK_RUBRIC.environment.swiftshader_software_renderer, "SwiftShader software renderer");
+  }
+  if (env.ephemeralOrPrivateStorage) {
+    push("environment", "environment.ephemeral_or_private_storage", RISK_RUBRIC.environment.ephemeral_or_private_storage, "ephemeral / private storage");
+  }
+  const vel = input.velocity || {};
+  if (vel.extreme) {
+    push("velocity", "velocity.extreme_rotation", RISK_RUBRIC.velocity.extreme_rotation, "extreme identity rotation");
+  } else if (vel.high) {
+    push("velocity", "velocity.high_activity", RISK_RUBRIC.velocity.high_activity, "high activity device");
+  }
+  return buildRiskLedger(lines);
+}
+var GRADED_RISK_FIXTURES = [
+  {
+    name: "MCP Playwright",
+    input: {
+      automation: { tierA: true },
+      network: { vpnOrRelay: true },
+      environment: { swiftshader: true, ephemeralOrPrivateStorage: true }
+    },
+    expected: [45, 0, 12, 10, 0]
+  },
+  {
+    name: "spec fuzz",
+    input: { tampering: { tierA: true } },
+    expected: [0, 35, 0, 0, 0]
+  },
+  {
+    name: "drift + proxy + velocity",
+    input: {
+      automation: { tierB: true },
+      tampering: { tierA: true },
+      network: { rotatingProxy: true },
+      environment: { ephemeralOrPrivateStorage: true },
+      velocity: { high: true }
+    },
+    expected: [35, 35, 18, 4, 12]
+  },
+  {
+    name: "clean human",
+    input: {},
+    expected: [0, 0, 0, 0, 0]
+  }
+];
+function verifyGradedRiskFixtures() {
+  return GRADED_RISK_FIXTURES.map((fixture) => {
+    const ledger = buildGradedRiskLedger(fixture.input);
+    const actual = [
+      ledger.automation,
+      ledger.tampering,
+      ledger.network,
+      ledger.environment,
+      ledger.velocity
+    ];
+    const ok = actual.every((value, index) => value === fixture.expected[index]);
+    return { name: fixture.name, ok, ledger };
+  });
+}
+
+// src/lib/rarityHonesty.ts
+function computeHonestRarity(corpusN, observedCount = 1) {
+  const decision = decideRarity(corpusN, observedCount);
+  return {
+    ...decision,
+    corpus_n: decision.corpus_n,
+    prevalence_ci95_upper: decision.prevalence_ci95_upper,
+    score_contribution: decision.status === "published" ? 1 : 0
+  };
+}
+function computeHonestProximity(input = {}) {
+  const permission = String(input.permission || "").toLowerCase();
+  if (permission !== "granted" || !input.grantedCoordinates) {
+    return { status: permission === "denied" ? "unavailable" : "permission_required" };
+  }
+  const result = { status: "granted" };
+  if (typeof input.accuracyM === "number" && Number.isFinite(input.accuracyM)) {
+    result.accuracy_m = input.accuracyM;
+  }
+  result.coordinates = input.grantedCoordinates;
+  return result;
+}
+var CALIBRATION_MIN_LABELED_PAIRS = 200;
+var CALIBRATION_MAX_ECE = 0.05;
+var TIER_BY_STAGE = {
+  storage_continuity: "First-Party Continuity Match",
+  exact_hardware: "High-Agreement Hardware Match",
+  lsh_fuzzy: "Probabilistic Fuzzy Match",
+  privacy_hardened: "Privacy-Hardened Profile (Reduced Entropy)",
+  new_enrollment: "New Unobserved Profile"
+};
+function computeHonestIdentityConfidence(input) {
+  const confidence_tier = TIER_BY_STAGE[input.matchStage] || "New Unobserved Profile";
+  const calibrated = input.labeledPairs >= CALIBRATION_MIN_LABELED_PAIRS && Number.isFinite(input.heldOutEce) && input.heldOutEce < CALIBRATION_MAX_ECE;
+  if (!calibrated) {
+    return { confidence_score: null, confidence_tier, calibration_status: "uncalibrated" };
+  }
+  const raw = typeof input.calibratedScore === "number" && Number.isFinite(input.calibratedScore) ? input.calibratedScore : null;
+  return {
+    confidence_score: raw === null ? null : Math.max(0, Math.min(1, raw)),
+    confidence_tier,
+    calibration_status: "calibrated"
+  };
+}
+
+// src/lib/identityEngine.ts
+var MASK64 = (1n << 64n) - 1n;
+var FNV_OFFSET = 0xcbf29ce484222325n;
+var FNV_PRIME = 0x100000001b3n;
+var SEEDS = [
+  0x9e3779b97f4a7c15n,
+  0xbf58476d1ce4e5b9n,
+  0x94d049bb133111ebn,
+  0x7f4a7c15bf58476dn,
+  0x2545f4914f6cdd1dn,
+  0xd6e8feb86659fd93n,
+  0x9e3779b185ebca87n,
+  0xa0761d6478bd642fn
+];
+function fnv64(input, seed) {
+  let h = (FNV_OFFSET ^ seed) & MASK64;
+  for (let i = 0; i < input.length; i += 1) {
+    h ^= BigInt(input.charCodeAt(i));
+    h = h * FNV_PRIME & MASK64;
+  }
+  return h;
+}
+function tokenWords(token) {
+  return SEEDS.map((seed) => fnv64(token, seed));
+}
+function simhash512(features) {
+  const tokens = [];
+  if (typeof features === "string") {
+    if (features) tokens.push(features);
+  } else {
+    for (const key of Object.keys(features || {}).sort()) {
+      const value = features[key];
+      if (value === null || value === void 0) continue;
+      tokens.push(`${key}=${typeof value === "object" ? JSON.stringify(value) : String(value)}`);
+    }
+  }
+  const weights = new Array(LSH_CONFIG.bits).fill(0);
+  for (const token of tokens) {
+    const words = tokenWords(token);
+    for (let w = 0; w < 8; w += 1) {
+      const word = words[w];
+      for (let bit = 0; bit < 64; bit += 1) {
+        const idx = w * 64 + bit;
+        weights[idx] += word >> BigInt(bit) & 1n ? 1 : -1;
+      }
+    }
+  }
+  let result = 0n;
+  for (let i = LSH_CONFIG.bits - 1; i >= 0; i -= 1) {
+    result <<= 1n;
+    if (weights[i] >= 0) result |= 1n;
+  }
+  return result & (1n << BigInt(LSH_CONFIG.bits)) - 1n;
+}
+function simhashToHex(hash) {
+  return (hash & (1n << BigInt(LSH_CONFIG.bits)) - 1n).toString(16).padStart(LSH_CONFIG.bits / 4, "0");
+}
+function hammingSimilarity512(a, b) {
+  let diff = (a ^ b) & (1n << BigInt(LSH_CONFIG.bits)) - 1n;
+  let distance = 0;
+  while (diff) {
+    distance += Number(diff & 1n);
+    diff >>= 1n;
+  }
+  return 1 - distance / LSH_CONFIG.bits;
+}
+function bandHashes(hash) {
+  const bands = [];
+  for (let idx = 0; idx < LSH_CONFIG.bands; idx += 1) {
+    const slice = hash >> BigInt(idx * LSH_CONFIG.rows) & (1n << BigInt(LSH_CONFIG.rows)) - 1n;
+    bands.push({ band_idx: idx, band_hash: slice.toString(16).padStart(LSH_CONFIG.rows / 4, "0") });
+  }
+  return bands;
+}
+var LSH_THRESHOLDS = {
+  minSimilarity: 0.88,
+  minMargin: 0.1,
+  maxCollisionDensity: 2
+};
+function decideLshFuzzyMatch(input) {
+  const candidates = (input.candidates || []).slice();
+  const candidateCount = candidates.length;
+  if (candidateCount === 0) {
+    return {
+      match: false,
+      bestHardwareId: null,
+      similarity: 0,
+      margin: 0,
+      collisionDensity: 0,
+      candidateCount,
+      reason: "no LSH candidates retrieved",
+      stage: "new_enrollment"
+    };
+  }
+  const scored = candidates.map((candidate) => ({ candidate, similarity: hammingSimilarity512(input.query, candidate.simhash) })).sort((a, b) => b.similarity - a.similarity);
+  const best = scored[0];
+  const runnerUp = scored.length > 1 ? scored[1].similarity : 0;
+  const margin = best.similarity - runnerUp;
+  const collisionDensity = scored.filter((entry) => entry.candidate.simhash === best.candidate.simhash).length;
+  let reason = "accepted";
+  let match = true;
+  if (best.similarity < LSH_THRESHOLDS.minSimilarity) {
+    match = false;
+    reason = `similarity ${best.similarity.toFixed(4)} < ${LSH_THRESHOLDS.minSimilarity}`;
+  } else if (margin < LSH_THRESHOLDS.minMargin && scored.length > 1) {
+    match = false;
+    reason = `margin ${margin.toFixed(4)} < ${LSH_THRESHOLDS.minMargin}`;
+  } else if (collisionDensity >= LSH_THRESHOLDS.maxCollisionDensity) {
+    match = false;
+    reason = `collision density ${collisionDensity} >= ${LSH_THRESHOLDS.maxCollisionDensity}`;
+  }
+  return {
+    match,
+    bestHardwareId: match ? best.candidate.hardwareId : null,
+    similarity: best.similarity,
+    margin,
+    collisionDensity,
+    candidateCount,
+    reason,
+    stage: match ? "lsh_fuzzy" : "new_enrollment"
+  };
+}
+function resolveIdentityStage(input = {}) {
+  if (input.storageValid && input.storageVisitorId) {
+    return {
+      stage: "storage_continuity",
+      matchLabel: input.storageVisitorId,
+      collisionRisk: "low",
+      confidenceTier: "First-Party Continuity Match"
+    };
+  }
+  if (input.exactHardwareId && (input.distinctStorageSeedsCount ?? 0) >= 2) {
+    return {
+      stage: "exact_hardware",
+      matchLabel: input.exactHardwareId,
+      collisionRisk: "low",
+      confidenceTier: "High-Agreement Hardware Match"
+    };
+  }
+  if (input.query !== void 0 && input.candidates && input.candidates.length > 0) {
+    const fuzzy = decideLshFuzzyMatch({ query: input.query, candidates: input.candidates });
+    if (fuzzy.match && fuzzy.bestHardwareId) {
+      return {
+        stage: "lsh_fuzzy",
+        matchLabel: fuzzy.bestHardwareId,
+        collisionRisk: fuzzy.collisionDensity >= 2 ? "high" : "low",
+        confidenceTier: "Probabilistic Fuzzy Match",
+        fuzzy
+      };
+    }
+  }
+  if (input.privacyHardened) {
+    return {
+      stage: "privacy_hardened",
+      matchLabel: "privacy-degraded",
+      collisionRisk: "high",
+      confidenceTier: "Privacy-Hardened Profile (Reduced Entropy)"
+    };
+  }
+  return {
+    stage: "new_enrollment",
+    matchLabel: "",
+    collisionRisk: "low",
+    confidenceTier: "New Unobserved Profile"
+  };
+}
+
+// src/lib/verdict.ts
+function decideVerdictTier(input) {
+  if (input.tamperingDetected) {
+    return {
+      verdict_tier: "Tampered / Spoofed Environment",
+      human_corroboration: 0,
+      label: "Tampered / Spoofed Environment"
+    };
+  }
+  if (input.automation === "automated") {
+    return {
+      verdict_tier: "Verified Automation",
+      human_corroboration: 0,
+      label: "Verified Automation"
+    };
+  }
+  if (input.humanCorroboration === 1 && input.hasInteractionEvidence !== false) {
+    return {
+      verdict_tier: "Verified Human Interactive Session",
+      human_corroboration: 1,
+      label: "Verified Human Interactive Session"
+    };
+  }
+  return {
+    verdict_tier: "Unverified / Passive Session",
+    human_corroboration: 0,
+    label: "Unverified / Passive Session"
+  };
+}
+
 // server.ts
 dotenv.config();
 var PORT = Number(process.env.PORT) || 3e3;
@@ -3797,6 +4582,10 @@ function createInMemoryDbAdapter() {
   const visitorsMap = /* @__PURE__ */ new Map();
   const visitsList = [];
   const geoCacheMap = /* @__PURE__ */ new Map();
+  const hardwareAnchorsMap = /* @__PURE__ */ new Map();
+  const lshBandsMap = /* @__PURE__ */ new Map();
+  const rdapPrefixMap = /* @__PURE__ */ new Map();
+  const schemaMigrations = /* @__PURE__ */ new Set();
   let autoIncrementId = 1;
   return {
     exec: () => {
@@ -3805,6 +4594,18 @@ function createInMemoryDbAdapter() {
       const normalized = sql.replace(/\s+/g, " ").trim();
       return {
         get: (...params) => {
+          if (normalized.includes("FROM hardware_anchors WHERE hardware_id = ?")) {
+            return hardwareAnchorsMap.get(String(params[0] || ""));
+          }
+          if (normalized.includes("FROM identity_lsh_bands WHERE band_idx = ? AND band_hash = ?")) {
+            return lshBandsMap.get(`${params[0]}:${params[1]}`);
+          }
+          if (normalized.includes("FROM rdap_prefix_cache WHERE prefix = ?")) {
+            return rdapPrefixMap.get(String(params[0] || ""));
+          }
+          if (normalized.includes("FROM schema_migrations WHERE version = ?")) {
+            return schemaMigrations.has(String(params[0] || "")) ? { version: String(params[0]) } : void 0;
+          }
           if (normalized.includes("FROM verified_geo_cache_v3 WHERE ip_address = ?")) {
             const ip = String(params[0] || "");
             return geoCacheMap.get(ip);
@@ -3867,6 +4668,16 @@ function createInMemoryDbAdapter() {
           return void 0;
         },
         all: (...params) => {
+          if (normalized.includes("FROM identity_lsh_bands WHERE band_idx = ?")) {
+            const idx = Number(params[0]);
+            const bandHash = typeof params[1] === "string" ? params[1] : null;
+            return Array.from(lshBandsMap.values()).filter(
+              (row) => row.band_idx === idx && (bandHash === null || row.band_hash === bandHash)
+            );
+          }
+          if (normalized.includes("FROM schema_migrations")) {
+            return Array.from(schemaMigrations).map((version) => ({ version }));
+          }
           if (normalized.includes("FROM visits WHERE visitor_id = ?")) {
             const vid = String(params[0] || "");
             return visitsList.filter((v) => v.visitor_id === vid).sort((a, b) => b.visited_at_utc.localeCompare(a.visited_at_utc) || b.id - a.id).slice(0, 50);
@@ -3874,6 +4685,42 @@ function createInMemoryDbAdapter() {
           return [];
         },
         run: (...params) => {
+          if (normalized.includes("INSERT OR REPLACE INTO hardware_anchors")) {
+            const row = {
+              hardware_id: String(params[0] || ""),
+              visitor_id: String(params[1] || ""),
+              simhash: String(params[2] || ""),
+              distinct_storage_seeds_count: Number(params[3] ?? 1),
+              first_seen_utc: String(params[4] || ""),
+              updated_at_utc: String(params[5] || "")
+            };
+            hardwareAnchorsMap.set(row.hardware_id, row);
+            return { changes: 1 };
+          }
+          if (normalized.includes("INSERT OR IGNORE INTO identity_lsh_bands")) {
+            const band_idx = Number(params[0]);
+            const band_hash = String(params[1] || "");
+            const hardware_id = String(params[2] || "");
+            const key = `${band_idx}:${band_hash}`;
+            if (lshBandsMap.has(key)) return { changes: 0 };
+            lshBandsMap.set(key, { band_idx, band_hash, hardware_id });
+            return { changes: 1 };
+          }
+          if (normalized.includes("INSERT OR REPLACE INTO rdap_prefix_cache")) {
+            rdapPrefixMap.set(String(params[0] || ""), {
+              prefix: String(params[0] || ""),
+              org: String(params[1] || ""),
+              asn: String(params[2] || ""),
+              fetched_at_ms: Number(params[3] || Date.now())
+            });
+            return { changes: 1 };
+          }
+          if (normalized.includes("INSERT OR IGNORE INTO schema_migrations")) {
+            const version = String(params[0] || "");
+            if (schemaMigrations.has(version)) return { changes: 0 };
+            schemaMigrations.add(version);
+            return { changes: 1 };
+          }
           if (normalized.includes("INSERT OR REPLACE INTO verified_geo_cache_v3")) {
             const row = {
               ip_address: String(params[0] || ""),
@@ -4075,6 +4922,35 @@ function initializeDatabase() {
 
       ${IDENTITY_SCHEMA_SQL}
 
+      /* Phase 4 \u2014 canonical identity tables. Old tables are intentionally kept for rollback. */
+      CREATE TABLE IF NOT EXISTS hardware_anchors (
+        hardware_id TEXT PRIMARY KEY,
+        visitor_id TEXT NOT NULL,
+        simhash TEXT NOT NULL DEFAULT '',
+        distinct_storage_seeds_count INTEGER NOT NULL DEFAULT 1,
+        first_seen_utc TEXT NOT NULL,
+        updated_at_utc TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS identity_lsh_bands (
+        band_idx INTEGER NOT NULL,
+        band_hash TEXT NOT NULL,
+        hardware_id TEXT NOT NULL,
+        PRIMARY KEY (band_idx, band_hash, hardware_id)
+      ) WITHOUT ROWID;
+
+      CREATE TABLE IF NOT EXISTS rdap_prefix_cache (
+        prefix TEXT PRIMARY KEY,
+        org TEXT NOT NULL DEFAULT '',
+        asn TEXT NOT NULL DEFAULT '',
+        fetched_at_ms INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version TEXT PRIMARY KEY,
+        applied_at_utc TEXT NOT NULL
+      );
+
       DROP TABLE IF EXISTS ai_bot_cidr_ranges;
       DROP TABLE IF EXISTS ai_bot_dns_cache;
       DROP TABLE IF EXISTS ai_bot_jwk_cache;
@@ -4128,6 +5004,15 @@ function initializeDatabase() {
   }
 }
 var db = initializeDatabase();
+var CORROBORATION_MAX_ENTRIES = 5e3;
+var corroborationLedger = /* @__PURE__ */ new Map();
+function rememberPassiveVisit(entry) {
+  if (corroborationLedger.size >= CORROBORATION_MAX_ENTRIES) {
+    const oldest = corroborationLedger.keys().next().value;
+    if (oldest) corroborationLedger.delete(oldest);
+  }
+  corroborationLedger.set(entry.eventId, entry);
+}
 function signVisitorId(visitorId) {
   return crypto.createHmac("sha256", HMAC_SECRET).update(visitorId).digest("hex");
 }
@@ -6327,8 +7212,6 @@ function lookupSuspiciousIp(ip) {
     reasons: [...suspiciousIpReasons.get(cleanIp) ?? []]
   };
 }
-var ENVELOPE_MAX_AGE_MS = 65e3;
-var ENVELOPE_MAX_FUTURE_SKEW_MS = 3e5;
 var NONCE_TTL_MS = 15 * 60 * 1e3;
 var NONCE_CACHE_MAX_ENTRIES = 5e3;
 var seenEnvelopeNonces = /* @__PURE__ */ new Map();
@@ -6564,6 +7447,7 @@ function computeVelocitySignals(db2, visitorId, publicIp, sessionId) {
   }
 }
 function computeDeviceRarity(db2, browserDevice) {
+  const honestSuppressed = computeHonestRarity(0, 0);
   try {
     const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1e3).toISOString();
     const row = db2.prepare(
@@ -6580,34 +7464,117 @@ function computeDeviceRarity(db2, browserDevice) {
     );
     const total = Number(row?.total) || 0;
     const matching = Number(row?.matching) || 0;
+    const honest = computeHonestRarity(total, matching);
     if (total < 20) {
-      return { rareDevice: false, bucket: "<p95", share: 1, sampleSize: total };
+      return { rareDevice: false, bucket: "<p95", share: 1, sampleSize: total, matching, honest };
     }
     const share = matching / total;
-    const bucket = share <= 0.01 ? ">p99" : share <= 0.05 ? "p95-p99" : "<p95";
-    return { rareDevice: bucket !== "<p95", bucket, share, sampleSize: total };
+    const bucket = honest.status === "published" && honest.percentile === "p99_plus" ? ">p99" : honest.status === "published" && honest.percentile === "p95" ? "p95-p99" : "<p95";
+    return { rareDevice: bucket !== "<p95", bucket, share, sampleSize: total, matching, honest };
   } catch {
-    return { rareDevice: false, bucket: "<p95", share: 1, sampleSize: 0 };
+    return { rareDevice: false, bucket: "<p95", share: 1, sampleSize: 0, matching: 0, honest: honestSuppressed };
   }
 }
-function computeSuspectScore100(input) {
-  let score = 0;
-  if (input.bot) score += 45;
-  if (input.replayed) score += 35;
-  if (input.tampering) score += 25;
-  if (input.vpn) score += 10 + (input.vpnMethodCount > 1 ? 4 : 0);
-  if (input.blocklisted) score += 12;
-  if (input.virtualMachine) score += 12;
-  if (input.proxy) score += 10;
-  if (input.simulator) score += 10;
-  if (input.activeCall) score += 10;
-  if (input.privacySettings) score += 8;
-  if (input.incognito) score += 6;
-  if (input.highActivityDevice) score += 6;
-  if (input.developerTools) score += 5;
-  if (input.rareDevice) score += 4;
-  return Math.max(0, Math.min(100, Math.round(score)));
+function computeCanonicalRiskLedger(input) {
+  return buildGradedRiskLedger(input);
 }
+function writeHardwareAnchorAndBands(db2, hardwareId, visitorId, simhashHex, nowUtc, distinctStorageSeedsCount) {
+  if (!hardwareId) return false;
+  try {
+    const existing = db2.prepare(
+      "SELECT simhash, distinct_storage_seeds_count, visitor_id, first_seen_utc FROM hardware_anchors WHERE hardware_id = ?"
+    ).get(hardwareId);
+    const changed = !existing || existing.simhash !== simhashHex || Number(existing.distinct_storage_seeds_count) !== distinctStorageSeedsCount || existing.visitor_id !== visitorId;
+    if (!changed) return false;
+    const firstSeen = existing?.first_seen_utc || nowUtc;
+    db2.prepare(
+      `INSERT OR REPLACE INTO hardware_anchors
+        (hardware_id, visitor_id, simhash, distinct_storage_seeds_count, first_seen_utc, updated_at_utc)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(hardwareId, visitorId, simhashHex, distinctStorageSeedsCount, firstSeen, nowUtc);
+    if (LSH_WRITE_POLICY.write_on_hardware_anchor_change_only) {
+      let hash;
+      try {
+        hash = BigInt(`0x${simhashHex || "0"}`);
+      } catch {
+        hash = 0n;
+      }
+      const bands = bandHashes(hash);
+      for (const band of bands.slice(0, LSH_CONFIG.bands)) {
+        db2.prepare(
+          `INSERT OR IGNORE INTO identity_lsh_bands (band_idx, band_hash, hardware_id) VALUES (?, ?, ?)`
+        ).run(band.band_idx, band.band_hash, hardwareId);
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+function retrieveLshCandidates(db2, profile) {
+  try {
+    const hash = simhash512(profile);
+    const hardwareIds = /* @__PURE__ */ new Set();
+    for (const band of bandHashes(hash)) {
+      const rows = db2.prepare("SELECT hardware_id FROM identity_lsh_bands WHERE band_idx = ? AND band_hash = ?").all(band.band_idx, band.band_hash);
+      for (const row of rows) if (row.hardware_id) hardwareIds.add(row.hardware_id);
+    }
+    const candidates = [];
+    for (const hardwareId of hardwareIds) {
+      const anchor = db2.prepare("SELECT hardware_id, simhash FROM hardware_anchors WHERE hardware_id = ?").get(hardwareId);
+      if (!anchor?.simhash) continue;
+      try {
+        candidates.push({ hardwareId, simhash: BigInt(`0x${anchor.simhash}`) });
+      } catch {
+      }
+    }
+    return candidates;
+  } catch {
+    return [];
+  }
+}
+function persistRdapNetblockOrg(db2, asn, org) {
+  if (!asn || asn === "Unknown" || !org || org === "Unknown") return null;
+  try {
+    const prefix = normalizeAsnLabel(asn) || asn;
+    db2.prepare(
+      `INSERT OR REPLACE INTO rdap_prefix_cache (prefix, org, asn, fetched_at_ms) VALUES (?, ?, ?, ?)`
+    ).run(prefix, org, asn, Date.now());
+    return org;
+  } catch {
+    return null;
+  }
+}
+function markSchemaMigration(db2, version) {
+  try {
+    db2.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc) VALUES (?, ?)").run(
+      version,
+      (/* @__PURE__ */ new Date()).toISOString()
+    );
+  } catch {
+  }
+}
+function assertFrozenRiskTuples() {
+  const expected = {
+    "MCP Playwright": [45, 0, 12, 10, 0],
+    "spec fuzz": [0, 35, 0, 0, 0],
+    "drift+proxy+velocity": [35, 35, 18, 4, 12],
+    "clean human": [0, 0, 0, 0, 0]
+  };
+  for (const fixture of verifyGradedRiskFixtures()) {
+    const want = expected[fixture.name];
+    const capSum = Object.values(RISK_FAMILY_CAPS).reduce((sum, value) => sum + value, 0);
+    const baseline = buildRiskLedger([
+      { family: "automation", component: "check", points: RISK_RUBRIC.automation.tier_a_hard_proof, reason: "check" },
+      { family: "tampering", component: "check", points: RISK_RUBRIC.tampering.tier_a_spec_header_or_drift, reason: "check" }
+    ]);
+    const ok = fixture.ok && Boolean(want) && baseline.automation === RISK_RUBRIC.automation.tier_a_hard_proof && baseline.tampering === RISK_RUBRIC.tampering.tier_a_spec_header_or_drift && capSum === 130;
+    if (!ok) {
+      console.error("Frozen graded-risk tuple check failed:", fixture.name, JSON.stringify(fixture.ledger), "expected", want);
+    }
+  }
+}
+assertFrozenRiskTuples();
 async function lookupVerifiedGeolocation(visitorIp, isPublic, options) {
   const empty = (verified) => ({
     publicIp: verified ? visitorIp : "Unavailable",
@@ -7142,6 +8109,28 @@ app.get("/api/health", async (req, res) => {
 });
 function extractEdgeGeo(req) {
   return readEdgeGeoHeaders(req.headers);
+}
+function readEdgeTransport(req) {
+  const unavailable = {
+    tlsVersion: "",
+    tlsCipher: "",
+    clientTcpRtt: null,
+    httpProtocol: "",
+    colo: ""
+  };
+  try {
+    const raw = req.headers["x-intel-edge-geo"];
+    if (typeof raw === "string" && raw) {
+      const parsed = JSON.parse(decodeURIComponent(raw));
+      unavailable.tlsVersion = typeof parsed.tlsVersion === "string" ? parsed.tlsVersion : "";
+      unavailable.tlsCipher = typeof parsed.tlsCipher === "string" ? parsed.tlsCipher : "";
+      unavailable.clientTcpRtt = typeof parsed.clientTcpRtt === "number" && Number.isFinite(parsed.clientTcpRtt) ? parsed.clientTcpRtt : null;
+      unavailable.httpProtocol = typeof parsed.httpProtocol === "string" ? parsed.httpProtocol : "";
+      unavailable.colo = typeof parsed.colo === "string" ? parsed.colo : "";
+    }
+  } catch {
+  }
+  return { ...unavailable, ja3: "Unavailable", ja4t: "Unavailable", os_mismatch: "Unavailable" };
 }
 var SERVER_TIMEZONE_ALIAS_MAP = {
   "asia/calcutta": "asia/kolkata",
@@ -8022,7 +9011,13 @@ app.post("/api/visitor/identify", async (req, res) => {
       httpOnly: true,
       sameSite: "lax",
       path: "/",
-      secure: Boolean(process.env.VERCEL) || process.env.NODE_ENV === "production"
+      // Cloudflare terminates TLS in front of the origin: req.secure is false there but the
+      // forwarded proto / cf-visitor header proves HTTPS. http://localhost stays insecure.
+      secure: isSecureRequest({
+        secure: req.secure,
+        xForwardedProto: req.headers["x-forwarded-proto"],
+        cfVisitor: req.headers["cf-visitor"]
+      })
     };
     res.cookie("intel_http_vid", visitorId, cookieOptions);
     res.cookie("intel_http_token", visitorToken, cookieOptions);
@@ -8150,7 +9145,7 @@ app.post("/api/visitor/identify", async (req, res) => {
       });
     }
     const ipTimezoneHint = typeof clientGeoHint?.timezone === "string" && clientGeoHint.timezone.trim() || edgeGeo.timezone || "";
-    const oneHourAgoMs = Date.now() - 3600 * 1e3;
+    const oneHourAgoMs = Date.now() - VELOCITY_WINDOW_MS["1_hour"];
     const lastHourVisitRows = rawVisits.filter((r) => {
       const visitedAtMs = Date.parse(String(r.visited_at_utc || ""));
       return Number.isFinite(visitedAtMs) && visitedAtMs >= oneHourAgoMs;
@@ -8434,32 +9429,95 @@ app.post("/api/visitor/identify", async (req, res) => {
       rawSecuritySignals?.privacySettings || rawSecuritySignals?.isTorBrowserClient || securitySignals.privacyProtected
     );
     const developerTools = Boolean(rawSecuritySignals?.developerTools);
-    const suspectScore100 = computeSuspectScore100({
-      bot: Boolean(securitySignals.isBot),
-      replayed: Boolean(securitySignals.replayDetected),
-      // The client DevTools probe is not the same as a sealed-envelope failure. Both must feed
-      // the 0-100 Risk Meter or a forged payload can score 10/10 on the 0-10 cards but 0/100
-      // for consumers reading `suspectScore100`.
-      tampering: Boolean(
-        tamperingAssessment?.tampering || securitySignals.tamperedRequest || securitySignals.tamperDetected
-      ),
-      vpn: Boolean(securitySignals.vpnSuspected),
-      vpnMethodCount: Array.isArray(securitySignals.vpnReasons) ? securitySignals.vpnReasons.length : 0,
-      blocklisted: Boolean(securitySignals.torExitNode || securitySignals.ipBlocklisted),
-      virtualMachine: Boolean(
-        securitySignals.isVirtualMachine || securitySignals.cloudOrMaskedGpu || securitySignals.emulatorDetected
-      ),
-      proxy: Boolean(
-        securitySignals.proxyDetected
-      ),
-      simulator: Boolean(securitySignals.emulatorDetected),
-      activeCall,
-      privacySettings,
-      incognito: Boolean(securitySignals.isIncognito),
-      highActivityDevice,
-      developerTools,
-      rareDevice: rarityReport.rareDevice
+    const rawExtras = rawSecuritySignals || {};
+    const specAssessment = evaluateSpecInvariants({
+      deviceMemoryGb: hardwareSignals.deviceMemoryGb,
+      networkRtt: typeof rawExtras.networkRtt === "number" ? rawExtras.networkRtt : null,
+      battery: rawExtras.battery || null,
+      jsHeapSizeLimit: typeof rawExtras.jsHeapSizeLimit === "number" ? rawExtras.jsHeapSizeLimit : null,
+      expectedJsHeapSizeLimit: typeof rawExtras.expectedJsHeapSizeLimit === "number" ? rawExtras.expectedJsHeapSizeLimit : null,
+      webglRenderer: hardwareSignals.gpuRenderer,
+      osFamily: browserDevice.os,
+      deviceKind: browserDevice.deviceKind,
+      hasPdfFace: typeof rawExtras.pdfViewerEnabled === "boolean" ? rawExtras.pdfViewerEnabled : null,
+      transport: {
+        httpPlatform: typeof rawExtras.httpPlatform === "string" ? rawExtras.httpPlatform : "",
+        httpPlatformVersion: typeof rawExtras.httpPlatformVersion === "string" ? rawExtras.httpPlatformVersion : "",
+        jsPlatform: browserDevice.platform
+      },
+      privacyHardened: Boolean(rfpExemptResponse),
+      userAgent: fullRequestUserAgent
     });
+    const privacyHardened = Boolean(
+      rfpExemptResponse || specAssessment.privacy_hardened || resolvePrivacyHardened({
+        userAgent: fullRequestUserAgent,
+        torBrowser: Boolean(rawSecuritySignals?.isTorBrowserClient),
+        braveShields: Boolean(rawExtras.braveShields),
+        firefoxFpp: Boolean(rawExtras.firefoxFpp),
+        resistFingerprinting: Boolean(rawExtras.resistFingerprinting),
+        safariAtfp: Boolean(rawExtras.safariAtfp)
+      })
+    );
+    const reconciledTampering = enforceTamperingInvariant({
+      reasons: [
+        ...tamperingAssessment?.details?.reasons || [],
+        ...specAssessment.softViolations,
+        ...specAssessment.hardViolations
+      ],
+      hard_spec_violation: specAssessment.hard_spec_violation,
+      privacy_hardened: privacyHardened,
+      software_renderer: specAssessment.software_renderer
+    });
+    const agentProofMethod = resolveAgentProofMethod(rawRequestHeaders);
+    const rfc9421SignedAgent = Boolean(
+      aiAgent?.detected && (agentProofMethod === "rfc9421" || agentProofMethod === "signed_agent" || aiAgent.executionMode === "RFC 9421 Signed Agent")
+    );
+    const hostingDatacenter = Boolean(
+      securitySignals.datacenterAsn || /cloud|datacenter|hosting/i.test(networkTypeLabel)
+    );
+    const vpnOrRelay = Boolean(
+      securitySignals.vpnSuspected || securitySignals.publicVpn || isTorExit || torStatus.isRelay
+    );
+    const rotatingProxy = Boolean(
+      securitySignals.proxyDetected
+    );
+    const timezoneMismatch = Boolean(securitySignals.timezoneMismatch);
+    const swiftshader = specAssessment.software_renderer;
+    const ephemeralStorage = Boolean(securitySignals.isIncognito);
+    const highActivity = highActivityDevice;
+    const extremeRotation = velocityReport.distinctIps24h >= 10;
+    const tamperingTierA = Boolean(
+      reconciledTampering.detected && (reconciledTampering.hard_spec_violation || tamperingAssessment?.tampering || securitySignals.tamperedRequest || securitySignals.replayDetected)
+    );
+    const tamperingTierB = Boolean(
+      !tamperingTierA && reconciledTampering.detected && securitySignals.tamperDetected
+    );
+    const tamperingSoft = Boolean(
+      !tamperingTierA && !tamperingTierB && specAssessment.softViolations.length > 0
+    );
+    const riskLedger = computeCanonicalRiskLedger({
+      automation: {
+        tierA: Boolean(securitySignals.isBot || hardAutomationSignals),
+        tierB: Boolean(!securitySignals.isBot && developerTools),
+        rfc9421SignedAgent
+      },
+      tampering: {
+        tierA: tamperingTierA,
+        tierB: tamperingTierB,
+        soft: tamperingSoft,
+        privacyHardened
+      },
+      network: {
+        hostingDatacenter,
+        vpnOrRelay,
+        rotatingProxy,
+        timezoneMismatch,
+        otherComponentFired: hostingDatacenter || vpnOrRelay || rotatingProxy
+      },
+      environment: { swiftshader, ephemeralOrPrivateStorage: ephemeralStorage },
+      velocity: { high: highActivity, extreme: extremeRotation }
+    });
+    const suspectScore100 = riskLedger.score_0_100;
     const currentBotName = hardAutomationSignals ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim() : (aiAgent?.detected ? aiAgent.agentName : "") || (effectiveBotClassification.subtype !== "human" ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim() : "");
     const visitHistory = rawVisits.map((r) => {
       const storedScore10 = typeof r.score10 === "number" && Number.isFinite(r.score10) ? Math.max(0, Math.min(10, Math.round(r.score10))) : null;
@@ -8614,8 +9672,24 @@ app.post("/api/visitor/identify", async (req, res) => {
     };
     try {
       ensureIdentitySchema(db);
+      markSchemaMigration(db, "v4-canonical-identity");
       upsertVisitorProfile(db, visitorId, identityProfile, identityHardwareFingerprint, nowUtc);
       upsertBlocks(db, visitorId, blockKeysFor(identityProfile), nowUtc);
+      const anchorHash = simhash512(identityProfile);
+      const anchorHashHex = simhashToHex(anchorHash);
+      const existingAnchor = db.prepare("SELECT distinct_storage_seeds_count FROM hardware_anchors WHERE hardware_id = ?").get(identityHardwareFingerprint);
+      const distinctSeeds = Math.max(
+        1,
+        Number(existingAnchor?.distinct_storage_seeds_count ?? 0) + (existingVisitor || verifiedVid ? 1 : 0)
+      );
+      writeHardwareAnchorAndBands(
+        db,
+        identityHardwareFingerprint,
+        visitorId,
+        anchorHashHex,
+        nowUtc,
+        distinctSeeds
+      );
       if (existingVisitor || verifiedVid) {
         resolvedIdentity = await resolveVisitor(db, {
           profile: identityProfile,
@@ -8649,6 +9723,150 @@ app.post("/api/visitor/identify", async (req, res) => {
         securitySignals.botSubtype || (securitySignals.isBot ? "automated" : "human")
       )
     };
+    const eventId = safePageLoadId;
+    const collectorInspectorProbes = rawExtras.inspectorProbes && typeof rawExtras.inspectorProbes === "object" ? rawExtras.inspectorProbes : {};
+    const collectorInteractionEvidence = Array.isArray(rawExtras.interactionEvidence) ? rawExtras.interactionEvidence.filter((item) => typeof item === "string" && item.trim().length > 0).map((item) => item.trim().slice(0, 160)).slice(0, 24) : [];
+    rememberPassiveVisit({
+      eventId,
+      visitorId,
+      createdAtMs: Date.now(),
+      bot: botVerdict,
+      tamperingDetected: Boolean(
+        reconciledTampering.detected || securitySignals.tamperedRequest
+      ),
+      corroborated: false
+    });
+    const edgeTransport = readEdgeTransport(req);
+    const inspectorState = classifyInspectorState({
+      cdpAttached: Boolean(rawSecuritySignals?.cdpDetected || rawSecuritySignals?.cdpRuntimeLeak),
+      devtoolsActiveVerified: Boolean(rawExtras.devtoolsActiveVerified),
+      viewportContractionNormalized: Boolean(rawExtras.viewportContractionNormalized)
+    });
+    const inspectorFlags = inspectorFlagsForState(inspectorState);
+    const automationVerdict = securitySignals.isBot || botVerdict === "bad" || hardAutomationSignals ? "automated" : securitySignals.botSubtype === "human" || botVerdict === "not_detected" ? "human" : "uncertain";
+    const verdictState = decideVerdictTier({
+      automation: automationVerdict,
+      tamperingDetected: reconciledTampering.detected || Boolean(securitySignals.tamperedRequest),
+      humanCorroboration: 0,
+      hasInteractionEvidence: false
+    });
+    const identityStage = resolveIdentityStage({
+      storageVisitorId: verifiedVid || storedVisitorId,
+      storageValid: Boolean(existingVisitor || verifiedVid),
+      exactHardwareId: hardwareId,
+      distinctStorageSeedsCount: existingVisitor || verifiedVid ? 2 : 1,
+      privacyHardened,
+      query: simhash512(identityProfile),
+      candidates: retrieveLshCandidates(db, identityProfile)
+    });
+    const identityConfidenceHonest = computeHonestIdentityConfidence({
+      labeledPairs: Number(rawExtras.calibrationLabeledPairs ?? 0),
+      heldOutEce: Number(rawExtras.calibrationHeldOutEce ?? 1),
+      matchStage: identityStage.stage,
+      calibratedScore: identityConfidence.score
+    });
+    const networkOwnership = hostingDatacenter ? "hosting_datacenter" : /cellular|mobile|5g|carrier/i.test(networkTypeLabel) ? "mobile_carrier" : /enterprise|business/i.test(networkTypeLabel) ? "enterprise" : /broadband|residential|consumer/i.test(networkTypeLabel) ? "residential_isp" : "unknown";
+    const vpnConfidence = isTorExit || torStatus.isRelay ? "high" : vpnOrRelay && Array.isArray(securitySignals.vpnReasons) && securitySignals.vpnReasons.length > 1 ? "medium" : vpnOrRelay ? "low" : "low";
+    const asnOrg = String(normalizeAsnLabel(location.asn) || location.org || "");
+    const cachedRdapOrg = persistRdapNetblockOrg(db, String(location.asn || ""), asnOrg);
+    const rdapNetblockOrg = typeof rawExtras.rdapNetblockOrg === "string" && rawExtras.rdapNetblockOrg ? rawExtras.rdapNetblockOrg : cachedRdapOrg;
+    const netblockReassignmentMismatch = Boolean(
+      rdapNetblockOrg && asnOrg && rdapNetblockOrg.toLowerCase() !== asnOrg.toLowerCase() && !asnOrg.toLowerCase().includes(rdapNetblockOrg.toLowerCase())
+    );
+    const geolocationPermission = typeof rawExtras.geolocationPermission === "string" ? rawExtras.geolocationPermission : "prompt";
+    const grantedCoords = rawExtras.grantedGeolocation && typeof rawExtras.grantedGeolocation === "object" && typeof rawExtras.grantedGeolocation.latitude === "number" && typeof rawExtras.grantedGeolocation.longitude === "number" ? rawExtras.grantedGeolocation : null;
+    const honestProximity = computeHonestProximity({
+      permission: geolocationPermission,
+      accuracyM: typeof rawExtras.geolocationAccuracyM === "number" ? rawExtras.geolocationAccuracyM : void 0,
+      grantedCoordinates: grantedCoords
+    });
+    const rarityDecision = decideRarity(rarityReport.sampleSize, rarityReport.matching);
+    const rarityUpper = clopperPearsonUpperBound(
+      rarityReport.matching,
+      rarityReport.sampleSize,
+      0.05
+    );
+    const invariantEnvelope = {
+      event_id: eventId,
+      identity: {
+        match_stage: identityStage.stage,
+        match_label: identityStage.matchLabel,
+        collision_risk: identityStage.collisionRisk,
+        confidence_tier: identityConfidenceHonest.confidence_tier,
+        confidence_score: identityConfidenceHonest.confidence_score,
+        calibration_status: identityConfidenceHonest.calibration_status
+      },
+      server_verified: {
+        browser: serverVerifiedBrowser,
+        os: serverVerifiedOs,
+        cf_transport: edgeTransport,
+        agent_proof_method: agentProofMethod
+      },
+      client_claimed: {
+        browser: browserDevice.browser,
+        os: browserDevice.os
+      },
+      reconciled_display: {
+        browser: serverVerifiedBrowser,
+        os: serverVerifiedOs
+      },
+      automation: {
+        bot: botVerdict === "not_detected" ? "not_detected" : botVerdict,
+        bot_type: botType,
+        named_operator: rfc9421SignedAgent ? aiAgent?.operator || null : null,
+        operator_verification_method: agentProofMethod,
+        automation_environment: String(rawSecuritySignals?.automationEnvironment || "none"),
+        human_corroboration: 0,
+        // Collector's passive, isTrusted interaction evidence — mirrored verbatim, never
+        // promoted to a proof by itself (corroboration stays 0 until the dedicated update).
+        interaction_evidence: collectorInteractionEvidence,
+        inspector_probes: collectorInspectorProbes,
+        inspector_state: inspectorState,
+        cdp_attached: inspectorFlags.cdp_attached,
+        // automation_protocol_attached explicitly reports developer_tools:false (CDP binding,
+        // not a docked DevTools frontend); only the docked/verified states set it true.
+        developer_tools: inspectorState === "automation_protocol_attached" ? false : inspectorFlags.developer_tools || developerToolsSignals
+      },
+      tampering: {
+        detected: reconciledTampering.detected,
+        anti_detect_browser: Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
+        privacy_hardened: privacyHardened,
+        tampering_confidence: tamperingAssessment?.confidence || "high",
+        tampering_ml_score: tamperingAssessment?.mlScore || 0,
+        spec_violations: specAssessment.hardViolations,
+        reasons: reconciledTampering.reasons,
+        hard_spec_violation: reconciledTampering.hard_spec_violation
+      },
+      network: {
+        network_ownership: networkOwnership,
+        bgp_asn: location.asn && location.asn !== "Unknown" ? location.asn : null,
+        bgp_asn_org: asnOrg || null,
+        rdap_netblock_org: rdapNetblockOrg,
+        netblock_reassignment_mismatch: netblockReassignmentMismatch,
+        vpn: vpnOrRelay,
+        vpn_confidence: vpnConfidence,
+        proxy: rotatingProxy,
+        proxy_type: rotatingProxy ? "residential_rotating" : isProxyOrVpn ? "datacenter" : "none",
+        timezone_mismatch: timezoneMismatch
+      },
+      environment: {
+        software_renderer: swiftshader,
+        // SwiftShader is software rendering only (f7d6900) — never hard VM proof, never tampering.
+        software_renderer_label: swiftshader ? `Software-rendered: ${hardwareSignals.gpuRenderer || "SwiftShader"}` : null,
+        ephemeral_storage: ephemeralStorage,
+        virtual_machine_label: securitySignals.isVirtualMachine ? securitySignals.vmReason || "Virtual Machine" : null
+      },
+      proximity: honestProximity,
+      rarity: {
+        corpus_n: rarityDecision.corpus_n,
+        prevalence_ci95_upper: rarityUpper,
+        percentile: rarityDecision.percentile,
+        status: rarityDecision.status
+      },
+      velocity: velocityReport.velocity,
+      risk: riskLedger,
+      verdict_tier: verdictState.verdict_tier
+    };
     const payload = {
       visitorId,
       visitorToken,
@@ -8656,8 +9874,9 @@ app.post("/api/visitor/identify", async (req, res) => {
       isReturning,
       recognitionSource,
       location,
-      // Fix 5 — deterministic proximity from the IP coordinates, resolved synchronously.
-      proximity: buildProximityInfo(location.latitude, location.longitude),
+      // Phase 6 — proximity is permission-gated. IP coordinates are never proximity evidence;
+      // the canonical envelope and this mirror share the same honest result.
+      proximity: honestProximity,
       // Fix 8 — structured bot & AI agent identification ("Robodex" + BotD).
       bot: botVerdict,
       bot_type: botType,
@@ -8731,12 +9950,57 @@ app.post("/api/visitor/identify", async (req, res) => {
       // would break the in-page Record Visit / Analyze button.
       replayed: envelopeVerdict.replayDetected,
       tampered: envelopeVerdict.tamperedRequest,
-      requestIntegrityReason: envelopeVerdict.requestIntegrityReason
+      requestIntegrityReason: envelopeVerdict.requestIntegrityReason,
+      // Phase 3–6 canonical mirrors. The single envelope above is the source of truth; these
+      // top-level mirrors keep existing clients working without any parallel scoring math.
+      envelope: invariantEnvelope,
+      verdict_tier: verdictState.verdict_tier,
+      human_corroboration: verdictState.human_corroboration,
+      raw_score: riskLedger.raw_score,
+      score_0_100: riskLedger.score_0_100,
+      evidence_ledger: riskLedger.evidence_ledger
     };
     res.json(payload);
   } catch (err) {
     console.error("Error in /api/visitor/identify:", err);
     res.status(500).json({ error: "Unable to process visitor identification request." });
+  }
+});
+app.post("/api/visitor/corroborate", (req, res) => {
+  try {
+    const body = req.body || {};
+    const eventId = typeof body.event_id === "string" ? body.event_id.trim().slice(0, 80) : "";
+    const visitorId = typeof body.visitorId === "string" ? body.visitorId.trim() : "";
+    if (!eventId || !verifyVisitorToken(visitorId, body.visitorToken)) {
+      res.status(403).json({ error: "Forbidden", human_corroboration: 0 });
+      return;
+    }
+    const entry = corroborationLedger.get(eventId);
+    if (!entry || entry.visitorId !== visitorId) {
+      res.status(404).json({ error: "Unknown event_id", human_corroboration: 0 });
+      return;
+    }
+    const fresh = Date.now() - entry.createdAtMs <= ENVELOPE_MAX_AGE_MS;
+    const storedVisit = db.prepare("SELECT visit_id, bot_name, risk_level FROM visits WHERE visitor_id = ? AND page_load_id = ?").get(visitorId, eventId);
+    const eligible = fresh && Boolean(storedVisit) && entry.bot === "not_detected" && !entry.tamperingDetected && !entry.corroborated;
+    if (eligible) {
+      entry.corroborated = true;
+      res.json({
+        event_id: eventId,
+        human_corroboration: 1,
+        verdict_tier: "Verified Human Interactive Session"
+      });
+      return;
+    }
+    res.json({
+      event_id: eventId,
+      human_corroboration: 0,
+      verdict_tier: "Unverified / Passive Session",
+      reason: !fresh ? "outside_65s_window" : !storedVisit ? "no_stored_visit" : entry.bot !== "not_detected" ? "automated" : "tampered"
+    });
+  } catch (err) {
+    console.error("Error in /api/visitor/corroborate:", err);
+    res.status(500).json({ error: "Unable to process corroboration update.", human_corroboration: 0 });
   }
 });
 app.get("/api/visitor/history/:visitorId", (req, res) => {
@@ -8787,7 +10051,12 @@ app.get("/api/visitor/history/:visitorId", (req, res) => {
 });
 app.get("/api/intel/identity-ping", (req, res) => {
   res.setHeader("Cache-Control", "private, max-age=0, must-revalidate");
-  res.setHeader("Vary", "Cookie");
+  const existingVary = res.getHeader("Vary");
+  const varyValues = typeof existingVary === "string" ? existingVary.split(",").map((item) => item.trim()).filter(Boolean) : [];
+  for (const value of ["Cookie", "Sec-CH-UA*"]) {
+    if (!varyValues.some((item) => item.toLowerCase() === value.toLowerCase())) varyValues.push(value);
+  }
+  res.setHeader("Vary", varyValues.join(", "));
   const presented = typeof req.headers["if-none-match"] === "string" ? req.headers["if-none-match"] : "";
   if (presented) {
     res.setHeader("ETag", presented);
@@ -8941,9 +10210,9 @@ function restoreOriginalApiUrl(req) {
     return;
   }
   if (pathPart === "/api/index" || pathPart === "/api/index.js") {
-    const headerValue3 = req.headers["x-vercel-original-path"] || req.headers["x-original-url"] || req.headers["x-rewrite-url"] || req.headers["x-matched-path"];
-    if (headerValue3) {
-      const original = headerValue3.startsWith("http") ? new URL(headerValue3).pathname + new URL(headerValue3).search : headerValue3;
+    const headerValue4 = req.headers["x-vercel-original-path"] || req.headers["x-original-url"] || req.headers["x-rewrite-url"] || req.headers["x-matched-path"];
+    if (headerValue4) {
+      const original = headerValue4.startsWith("http") ? new URL(headerValue4).pathname + new URL(headerValue4).search : headerValue4;
       const normalized = original.startsWith("/") ? original : `/${original}`;
       const normQIdx = normalized.indexOf("?");
       const normPath = normQIdx === -1 ? normalized : normalized.slice(0, normQIdx);

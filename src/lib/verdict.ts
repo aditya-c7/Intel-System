@@ -26,6 +26,8 @@
  *   weak   — never sufficient alone; kept for telemetry/attribution only
  */
 
+import type { VerdictTier } from './telemetryContract';
+
 export type ReasonWeight = 'hard' | 'medium' | 'weak' | 'developer_tools';
 
 export type AutomationVerdict = 'human' | 'uncertain' | 'automated';
@@ -179,3 +181,58 @@ export function gateAutomationEvidence(reasons: ReadonlyArray<string>): GatedAut
 
   return { verdict, hardReasons, mediumReasons, weakReasons, developerToolsReasons };
 }
+
+/* -------------------------------------------------------------------------- */
+/* Phase 3 — 4-tier Verdict State Machine                                     */
+/* -------------------------------------------------------------------------- */
+
+export interface VerdictStateInput {
+  /** The gated automation classification (or the server bot verdict mapped onto it). */
+  automation: AutomationVerdict;
+  /** The reconciled tampering axis. */
+  tamperingDetected: boolean;
+  /** Whether corroborating human input was actually recorded. */
+  humanCorroboration: 0 | 1;
+  /** Independent interaction evidence (typing / pointer trail) for this event. */
+  hasInteractionEvidence?: boolean;
+}
+
+export interface VerdictState {
+  verdict_tier: VerdictTier;
+  human_corroboration: 0 | 1;
+  label: string;
+}
+
+/**
+ * The 4-tier state machine. `human_corroboration` is forced to 0 on every automated,
+ * tampered and passive session — it can only be 1 on a clean session with recorded input.
+ */
+export function decideVerdictTier(input: VerdictStateInput): VerdictState {
+  if (input.tamperingDetected) {
+    return {
+      verdict_tier: 'Tampered / Spoofed Environment',
+      human_corroboration: 0,
+      label: 'Tampered / Spoofed Environment',
+    };
+  }
+  if (input.automation === 'automated') {
+    return {
+      verdict_tier: 'Verified Automation',
+      human_corroboration: 0,
+      label: 'Verified Automation',
+    };
+  }
+  if (input.humanCorroboration === 1 && input.hasInteractionEvidence !== false) {
+    return {
+      verdict_tier: 'Verified Human Interactive Session',
+      human_corroboration: 1,
+      label: 'Verified Human Interactive Session',
+    };
+  }
+  return {
+    verdict_tier: 'Unverified / Passive Session',
+    human_corroboration: 0,
+    label: 'Unverified / Passive Session',
+  };
+}
+

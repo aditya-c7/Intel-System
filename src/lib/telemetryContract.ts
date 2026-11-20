@@ -127,6 +127,8 @@ export interface AutomationAxes {
   human_corroboration: 0 | 1;
   interaction_evidence: string[];
   inspector_state: InspectorState;
+  /** Raw protocol/inspector probe observations (Error.prototype.name preview, console timing). */
+  inspector_probes: Record<string, unknown>;
   cdp_attached: boolean;
   developer_tools: boolean;
 }

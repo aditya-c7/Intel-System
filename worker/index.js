@@ -16,6 +16,17 @@ createServer(app).listen(API_PORT);
  */
 const EDGE_GEO_HEADER = 'x-intel-edge-geo';
 
+/**
+ * Client-hint response headers. Kept byte-for-byte identical to the Express
+ * constants in src/server/middleware/clientHints.ts so both targets advertise
+ * exactly one set. Critical-CH is a subset of Accept-CH (RFC 9652).
+ */
+const CLIENT_HINT_ACCEPT_CH =
+  'Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform-Version, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Model, Sec-CH-UA-Form-Factors';
+const CLIENT_HINT_CRITICAL_CH =
+  'Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform-Version';
+const CLIENT_HINT_VARY = 'Sec-CH-UA*';
+
 /** Headers a client could otherwise spoof to fake an IP or a location. */
 const UNTRUSTED_FORWARD_HEADERS = [
   'x-intel-edge-geo',
@@ -58,6 +69,15 @@ function buildEdgeGeoHeader(request) {
     postalCode: cfString(cf.postalCode),
     continent: cfString(cf.continent),
     colo: cfString(cf.colo),
+    // All-plan request.cf transport fields. JA3 / JA4T and raw TCP-SYN OS fingerprints are
+    // Bot-Management-only and deliberately omitted — the server reports them as "Unavailable".
+    tlsVersion: cfString(cf.tlsVersion),
+    tlsCipher: cfString(cf.tlsCipher),
+    clientTcpRtt:
+      typeof cf.clientTcpRtt === 'number' && Number.isFinite(cf.clientTcpRtt)
+        ? cf.clientTcpRtt
+        : null,
+    httpProtocol: cfString(cf.httpProtocol),
   };
   return encodeURIComponent(JSON.stringify(payload));
 }
@@ -86,14 +106,9 @@ function forwardApiRequest(request) {
 function apiResponse(response) {
   const result = new Response(response.body, response);
   result.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, no-transform');
-  result.headers.set(
-    'Accept-CH',
-    'Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Form-Factors, Sec-CH-UA-Full-Version-List'
-  );
-  result.headers.set(
-    'Critical-CH',
-    'Sec-CH-UA, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List'
-  );
+  result.headers.set('Accept-CH', CLIENT_HINT_ACCEPT_CH);
+  result.headers.set('Critical-CH', CLIENT_HINT_CRITICAL_CH);
+  result.headers.set('Vary', CLIENT_HINT_VARY);
   result.headers.set(
     'Permissions-Policy',
     'compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self), ch-ua-form-factors=(self)'
@@ -121,7 +136,20 @@ export class VisitorStore extends DurableObject {
     };
     this.schemaReady = false;
     this.schemaAttemptedAtMs = 0;
-    this.ensureSchema();
+    // blockConcurrencyWhile-style init: schema DDL plus the migration marker finish before any
+    // fetch is delivered. No alarms / crons are used — this is the only bootstrap path.
+    ctx.blockConcurrencyWhile(async () => {
+      this.ensureSchema(true);
+      if (this.schemaReady) {
+        try {
+          this.database
+            .prepare('INSERT OR IGNORE INTO schema_migrations (version, applied_at_utc) VALUES (?, ?)')
+            .run('v4-canonical-identity', new Date().toISOString());
+        } catch (error) {
+          console.error('VisitorStore migration marker deferred:', error);
+        }
+      }
+    });
   }
 
   /**
@@ -155,14 +183,9 @@ export default {
     if (pathname !== '/api' && !pathname.startsWith('/api/')) {
       const asset = await env.ASSETS.fetch(request);
       const result = new Response(asset.body, asset);
-      result.headers.set(
-        'Accept-CH',
-        'Sec-CH-UA, Sec-CH-UA-Mobile, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Model, Sec-CH-UA-Arch, Sec-CH-UA-Bitness, Sec-CH-UA-Form-Factors, Sec-CH-UA-Full-Version-List'
-      );
-      result.headers.set(
-        'Critical-CH',
-        'Sec-CH-UA, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List'
-      );
+      result.headers.set('Accept-CH', CLIENT_HINT_ACCEPT_CH);
+      result.headers.set('Critical-CH', CLIENT_HINT_CRITICAL_CH);
+      result.headers.set('Vary', CLIENT_HINT_VARY);
       result.headers.set(
         'Permissions-Policy',
         'compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self), ch-ua-form-factors=(self)'
