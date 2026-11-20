@@ -110,6 +110,9 @@ export const LSH_THRESHOLDS = {
 export interface LshCandidate {
   hardwareId: string;
   simhash: bigint;
+  /** Canonical visitor id for this hardware anchor, when the caller knows it. Optional so
+   *  existing retrieval code (which returns hardwareId + simhash only) stays compatible. */
+  visitorId?: string | null;
 }
 
 export interface FuzzyDecisionInput {
@@ -120,6 +123,9 @@ export interface FuzzyDecisionInput {
 export interface FuzzyDecision {
   match: boolean;
   bestHardwareId: string | null;
+  /** The matched visitor id to hand back to the caller. Falls back to the matched hardware
+   *  id when the caller did not supply candidate.visitorId (backward compatible). */
+  bestVisitorId: string | null;
   similarity: number;
   margin: number;
   /** Distinct hardware anchors sharing the best candidate's exact hash. */
@@ -137,6 +143,7 @@ export function decideLshFuzzyMatch(input: FuzzyDecisionInput): FuzzyDecision {
     return {
       match: false,
       bestHardwareId: null,
+      bestVisitorId: null,
       similarity: 0,
       margin: 0,
       collisionDensity: 0,
@@ -169,6 +176,7 @@ export function decideLshFuzzyMatch(input: FuzzyDecisionInput): FuzzyDecision {
   return {
     match,
     bestHardwareId: match ? best.candidate.hardwareId : null,
+    bestVisitorId: match ? best.candidate.visitorId || best.candidate.hardwareId : null,
     similarity: best.similarity,
     margin,
     collisionDensity,
@@ -198,6 +206,9 @@ export interface IdentityResolutionInput {
 export interface IdentityResolution {
   stage: IdentityMatchStage;
   matchLabel: string;
+  /** Matched visitor id, carried through to the caller (never just a match label). Null on
+   *  stages that cannot identify a visitor (privacy-degraded / new enrollment). */
+  visitorId: string | null;
   collisionRisk: 'low' | 'high';
   confidenceTier: IdentityAxes['confidence_tier'];
   fuzzy?: FuzzyDecision;
@@ -213,6 +224,7 @@ export function resolveIdentityStage(input: IdentityResolutionInput = {}): Ident
     return {
       stage: 'storage_continuity',
       matchLabel: input.storageVisitorId,
+      visitorId: input.storageVisitorId,
       collisionRisk: 'low',
       confidenceTier: 'First-Party Continuity Match',
     };
@@ -223,6 +235,8 @@ export function resolveIdentityStage(input: IdentityResolutionInput = {}): Ident
     return {
       stage: 'exact_hardware',
       matchLabel: input.exactHardwareId,
+      // Only a hardware id is known here; the caller's own visitor id stays canonical.
+      visitorId: null,
       collisionRisk: 'low',
       confidenceTier: 'High-Agreement Hardware Match',
     };
@@ -235,6 +249,7 @@ export function resolveIdentityStage(input: IdentityResolutionInput = {}): Ident
       return {
         stage: 'lsh_fuzzy',
         matchLabel: fuzzy.bestHardwareId,
+        visitorId: fuzzy.bestVisitorId,
         collisionRisk: fuzzy.collisionDensity >= 2 ? 'high' : 'low',
         confidenceTier: 'Probabilistic Fuzzy Match',
         fuzzy,
@@ -247,6 +262,7 @@ export function resolveIdentityStage(input: IdentityResolutionInput = {}): Ident
     return {
       stage: 'privacy_hardened',
       matchLabel: 'privacy-degraded',
+      visitorId: null,
       collisionRisk: 'high',
       confidenceTier: 'Privacy-Hardened Profile (Reduced Entropy)',
     };
@@ -256,6 +272,7 @@ export function resolveIdentityStage(input: IdentityResolutionInput = {}): Ident
   return {
     stage: 'new_enrollment',
     matchLabel: '',
+    visitorId: null,
     collisionRisk: 'low',
     confidenceTier: 'New Unobserved Profile',
   };

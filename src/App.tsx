@@ -1183,8 +1183,8 @@ export default function App() {
           datacenter_result: isHostingNetwork,
         },
       },
-      proxy: Boolean((s as unknown as { proxyDetected?: boolean }).proxyDetected),
-      proxy_confidence: 'high',
+      proxy: Boolean(canonical?.network?.proxy ?? (s as unknown as { proxyDetected?: boolean }).proxyDetected ?? false),
+      proxy_confidence: canonical?.network?.proxy ? 'high' : 'low',
       incognito: Boolean(s.isIncognito ?? s.incognito ?? s.privateMode),
       privacy_settings: Boolean(
         (s as { privacySettings?: boolean }).privacySettings || s.isTorBrowserClient
@@ -1338,9 +1338,6 @@ export default function App() {
       <main className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-6 py-4 sm:py-7 space-y-6">
         {/* Top-centered Risk Meter: 0-10 suspect score */}
         <section className="w-full max-w-2xl mx-auto flex flex-col items-center justify-center text-center pt-4 pb-2 px-4">
-          <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-slate-500">
-            Device Intelligence
-          </span>
           <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
             <span
               className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold ${
@@ -1358,12 +1355,6 @@ export default function App() {
               )}
               {riskBadgeText}
             </span>
-            {tamperingDetected && (
-              <span className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[10px] font-semibold text-rose-700">
-                <ShieldAlert className="w-3 h-3 shrink-0" />
-                Browser Tampering: Detected
-              </span>
-            )}
           </div>
           <div className="w-full max-w-md h-2.5 bg-slate-200 rounded-full overflow-hidden mt-3">
             <div
@@ -1577,24 +1568,25 @@ export default function App() {
                 </p>
                 {data.identification ? (
                   <div className="mt-2 flex items-center gap-1.5 flex-wrap">
-                    <span
-                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
-                        data.identification.confidence.score >= 0.9
-                          ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
-                          : data.identification.confidence.score >= 0.7
-                          ? 'border-amber-200 bg-amber-50 text-amber-700'
-                          : 'border-rose-200 bg-rose-50 text-rose-700'
-                      }`}
-                      title="Calibrated identification confidence (v2.0)"
-                    >
-                      Confidence {(data.identification.confidence.score * 100).toFixed(1)}% · v
-                      {data.identification.confidence.version}
-                    </span>
-                    {tamperingDetected && (
-                      <span className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[10px] font-semibold text-rose-700">
-                        Browser Tampering: Detected
-                      </span>
-                    )}
+                    {(() => {
+                      // The exported Event JSON keeps confidence_score null until calibration passes.
+                      // Never render a fabricated percentage that the JSON cannot substantiate.
+                      const numeric = canonical?.confidenceScore ?? data.identification?.confidence?.score ?? null;
+                      const label =
+                        typeof numeric === 'number' && Number.isFinite(numeric)
+                          ? `Confidence ${(numeric * 100).toFixed(1)}% · v${
+                              data.identification.confidence.version
+                            }`
+                          : `Confidence ${canonical?.confidenceTier ?? 'Unverified'}`;
+                      return (
+                        <span
+                          className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-700"
+                          title="Identification confidence"
+                        >
+                          {label}
+                        </span>
+                      );
+                    })()}
                     {data.identity_layers ? (
                       <span
                         className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-600"
@@ -2399,7 +2391,17 @@ export default function App() {
                     const rowIsp = formatValidNetworkField(visit.isp);
                     const rowOrg = formatValidNetworkField(visit.org);
                     const rowAsn = formatValidNetworkField(visit.asn);
-                    const rowIspFormatted = formatCleanIspDisplay(rowIsp, rowOrg, rowAsn);
+                    // Use the server-classified brand for rows on the current ASN so history and
+                    // the header card can never display two different operator names.
+                    const canonicalBrand =
+                      rowAsn && rowAsn === data.location.asn
+                        ? data.securitySignals?.brandName
+                        : undefined;
+                    const rowIspFormatted = formatCleanIspDisplay(
+                      canonicalBrand || rowIsp,
+                      canonicalBrand ? canonicalBrand : rowOrg,
+                      rowAsn
+                    );
                     const rowScore = normalizeLegacyScore(visit.suspectScore);
                     const rowRisk: RiskLevel =
                       visit.riskLevel === 'High' ||

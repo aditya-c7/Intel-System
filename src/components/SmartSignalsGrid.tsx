@@ -195,10 +195,14 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     detail: torNode ? signals.torOperator : blocklisted ? signals.ipBlocklistReasons?.[0] : undefined,
   });
 
-  const proxy = Boolean(
-    (signals as unknown as { proxyDetected?: boolean }).proxyDetected ||
-      (signals.networkType === 'VPN / Proxy Relay' && !signals.vpnSuspected)
-  );
+  const envelope = (data as { envelope?: { network?: { proxy?: boolean } } }).envelope;
+  // The canonical envelope is authoritative; only older responses without it use legacy flags.
+  const proxy = envelope?.network
+    ? Boolean(envelope.network.proxy)
+    : Boolean(
+        (signals as unknown as { proxyDetected?: boolean }).proxyDetected ||
+          (signals.networkType === 'VPN / Proxy Relay' && !signals.vpnSuspected)
+      );
   rows.push({
     key: 'proxy',
     label: 'Proxy Detection',
@@ -224,7 +228,7 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     label: 'Rare Device',
     status: rare ? 'Yes' : 'Not detected',
     triggered: rare,
-    detail: data.rareDevicePercentileBucket
+    detail: rare && data.rareDevicePercentileBucket
       ? `Hardware rarity ${data.rareDevicePercentileBucket}`
       : undefined,
   });

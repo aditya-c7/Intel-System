@@ -8,12 +8,16 @@
  *
  * Bucket keys (deterministic, exported via `blockKeysFor`):
  *   • `hw_hash:<fnv hex>`          — exact hardware-fingerprint bucket.
- *   • `block_gpu:<gpu>:<os>:<tz>`  — rendering family narrowed by OS + timezone.
- *   • `block_net:<subnet|asn>:<W>x<H>` — coarse network + screen envelope.
+ *   • `block_gpu:<gpu>:<os>`       — rendering family narrowed by the stable OS family.
+ *   • `block_net:<subnet|asn>`     — coarse network bucket only.
  *   • `band_0..3:<hex4>`           — 4 simhash bands over canonical feature tokens
  *                                    (Hamming-near-duplicate detection; tokens and the
  *                                    64-bit FNV-1a simhash are fully deterministic, so
  *                                    the same profile always lands in the same buckets).
+ *
+ * Screen size, device-pixel-ratio, touch capability and timezone are deliberately NOT used
+ * to build stable identity keys: they change with display scaling, monitor swaps, input
+ * devices and travel. They remain volatile context for scoring, never an anchor or block key.
  *
  * Adapter notes (see `src/server/db/types.ts`):
  *   • Schema is ensured via `exec` and is safe to call on every request.
@@ -137,12 +141,6 @@ function networkBucket(net: BlockKeyProfile['net']): string {
   return asn || 'unknown';
 }
 
-function screenBucket(screen: BlockKeyProfile['screen']): string {
-  const width = normalizeInt(screen?.width);
-  const height = normalizeInt(screen?.height);
-  return width !== null && height !== null ? `${width}x${height}` : 'unknown';
-}
-
 /* -------------------------------------------------------------------------- */
 /* Deterministic hashing (no node:crypto — Workers safe)                        */
 /* -------------------------------------------------------------------------- */
@@ -191,6 +189,10 @@ function bandHex(simhash: bigint, band: number): string {
  * Canonical, order-stable feature tokens fed to `simhash64`. Browser majors are
  * deliberately excluded (they churn monthly and would orphan the band buckets);
  * everything else that survives across browser reinstalls is included.
+ *
+ * Screen dimensions, DPR, touch and timezone are volatile context only. Screen/DPR/touch
+ * are excluded outright; the timezone token is a single low-weight context vote — it is
+ * never a hard block key (see `blockKeysFor`) so travel cannot split a visitor.
  */
 export function canonicalIdentityFeatures(profile: BlockKeyProfile): string[] {
   const tokens: string[] = [];
@@ -205,9 +207,9 @@ export function canonicalIdentityFeatures(profile: BlockKeyProfile): string[] {
     .join('|');
   if (gpu) tokens.push(`gpu:${gpu}`);
   push('os', profile.os?.family);
+  // Low-weight context only (one token); never a hard block key.
   push('tz', profile.timezone);
-  const screen = screenBucket(profile.screen);
-  if (screen !== 'unknown') tokens.push(`screen:${screen}`);
+  // screen width/height, DPR and touch are volatile: excluded from stable hashing.
   const fontsCount = normalizeInt(profile.fonts?.count);
   if (fontsCount !== null && fontsCount > 0) tokens.push(`fonts:${fontsCount}`);
   const cores = normalizeInt(profile.cpu?.cores);
@@ -246,15 +248,17 @@ export function blockKeysFor(profile: BlockKeyProfile): string[] {
     .filter(Boolean)
     .join('|');
   const osFamily = normalizeText(profile.os?.family);
-  const timezone = normalizeText(profile.timezone);
-  if (gpuText && (osFamily || timezone)) {
-    keys.add(`block_gpu:${hexHash(gpuText)}:${osFamily}:${timezone}`);
+  // OS family is the stable anchor. Timezone is deliberately excluded from this hard key:
+  // travel/TZ changes must not split a visitor.
+  if (gpuText && osFamily) {
+    keys.add(`block_gpu:${hexHash(gpuText)}:${osFamily}`);
   }
 
+  // Network bucket only — no volatile screen envelope. A larger display, 2x scaling or
+  // enabling touch no longer changes the block key and can no longer mint a new identity.
   const net = networkBucket(profile.net);
-  const screen = screenBucket(profile.screen);
-  if (net !== 'unknown' || screen !== 'unknown') {
-    keys.add(`block_net:${net}:${screen}`);
+  if (net !== 'unknown') {
+    keys.add(`block_net:${net}`);
   }
 
   const tokens = canonicalIdentityFeatures(profile);

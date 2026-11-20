@@ -2590,11 +2590,6 @@ function networkBucket(net2) {
   }
   return asn || "unknown";
 }
-function screenBucket(screen) {
-  const width = normalizeInt(screen?.width);
-  const height = normalizeInt(screen?.height);
-  return width !== null && height !== null ? `${width}x${height}` : "unknown";
-}
 var FNV_OFFSET_64 = 0xcbf29ce484222325n;
 var FNV_PRIME_64 = 0x00000100000001b3n;
 var MASK_64 = 0xffffffffffffffffn;
@@ -2635,8 +2630,6 @@ function canonicalIdentityFeatures(profile) {
   if (gpu) tokens.push(`gpu:${gpu}`);
   push("os", profile.os?.family);
   push("tz", profile.timezone);
-  const screen = screenBucket(profile.screen);
-  if (screen !== "unknown") tokens.push(`screen:${screen}`);
   const fontsCount = normalizeInt(profile.fonts?.count);
   if (fontsCount !== null && fontsCount > 0) tokens.push(`fonts:${fontsCount}`);
   const cores = normalizeInt(profile.cpu?.cores);
@@ -2657,14 +2650,12 @@ function blockKeysFor(profile) {
   if (hardware) keys.add(`hw_hash:${hexHash(hardware)}`);
   const gpuText = [normalizeText(profile.gpu?.vendor), normalizeText(profile.gpu?.renderer)].filter(Boolean).join("|");
   const osFamily = normalizeText(profile.os?.family);
-  const timezone = normalizeText(profile.timezone);
-  if (gpuText && (osFamily || timezone)) {
-    keys.add(`block_gpu:${hexHash(gpuText)}:${osFamily}:${timezone}`);
+  if (gpuText && osFamily) {
+    keys.add(`block_gpu:${hexHash(gpuText)}:${osFamily}`);
   }
   const net2 = networkBucket(profile.net);
-  const screen = screenBucket(profile.screen);
-  if (net2 !== "unknown" || screen !== "unknown") {
-    keys.add(`block_net:${net2}:${screen}`);
+  if (net2 !== "unknown") {
+    keys.add(`block_net:${net2}`);
   }
   const tokens = canonicalIdentityFeatures(profile);
   if (tokens.length >= MIN_TOKENS_FOR_BANDS) {
@@ -3762,6 +3753,7 @@ function degradedResult(db2, input, reason, nowUtc) {
   }
   return {
     visitor_id: visitorId,
+    matched_visitor_id: null,
     match_mode: "none",
     match_score: 0,
     is_new: true,
@@ -3789,6 +3781,7 @@ async function resolveVisitor(db2, input) {
           upsertBlocks(db2, storageVisitorId, keys, nowUtc);
           return {
             visitor_id: storageVisitorId,
+            matched_visitor_id: storageVisitorId,
             match_mode: "exact",
             match_score: 100,
             is_new: false,
@@ -3834,6 +3827,7 @@ async function resolveVisitor(db2, input) {
       upsertBlocks(db2, best.id, keys, nowUtc);
       return {
         visitor_id: best.id,
+        matched_visitor_id: best.id,
         match_mode: best.mode,
         match_score: best.score,
         is_new: false,
@@ -3849,6 +3843,7 @@ async function resolveVisitor(db2, input) {
     upsertBlocks(db2, visitorId, keys, nowUtc);
     return {
       visitor_id: visitorId,
+      matched_visitor_id: null,
       match_mode: "none",
       match_score: 0,
       is_new: true,
@@ -4458,6 +4453,7 @@ function decideLshFuzzyMatch(input) {
     return {
       match: false,
       bestHardwareId: null,
+      bestVisitorId: null,
       similarity: 0,
       margin: 0,
       collisionDensity: 0,
@@ -4486,6 +4482,7 @@ function decideLshFuzzyMatch(input) {
   return {
     match,
     bestHardwareId: match ? best.candidate.hardwareId : null,
+    bestVisitorId: match ? best.candidate.visitorId || best.candidate.hardwareId : null,
     similarity: best.similarity,
     margin,
     collisionDensity,
@@ -4499,6 +4496,7 @@ function resolveIdentityStage(input = {}) {
     return {
       stage: "storage_continuity",
       matchLabel: input.storageVisitorId,
+      visitorId: input.storageVisitorId,
       collisionRisk: "low",
       confidenceTier: "First-Party Continuity Match"
     };
@@ -4507,6 +4505,8 @@ function resolveIdentityStage(input = {}) {
     return {
       stage: "exact_hardware",
       matchLabel: input.exactHardwareId,
+      // Only a hardware id is known here; the caller's own visitor id stays canonical.
+      visitorId: null,
       collisionRisk: "low",
       confidenceTier: "High-Agreement Hardware Match"
     };
@@ -4517,6 +4517,7 @@ function resolveIdentityStage(input = {}) {
       return {
         stage: "lsh_fuzzy",
         matchLabel: fuzzy.bestHardwareId,
+        visitorId: fuzzy.bestVisitorId,
         collisionRisk: fuzzy.collisionDensity >= 2 ? "high" : "low",
         confidenceTier: "Probabilistic Fuzzy Match",
         fuzzy
@@ -4527,6 +4528,7 @@ function resolveIdentityStage(input = {}) {
     return {
       stage: "privacy_hardened",
       matchLabel: "privacy-degraded",
+      visitorId: null,
       collisionRisk: "high",
       confidenceTier: "Privacy-Hardened Profile (Reduced Entropy)"
     };
@@ -4534,6 +4536,7 @@ function resolveIdentityStage(input = {}) {
   return {
     stage: "new_enrollment",
     matchLabel: "",
+    visitorId: null,
     collisionRisk: "low",
     confidenceTier: "New Unobserved Profile"
   };
@@ -7451,19 +7454,12 @@ function computeDeviceRarity(db2, browserDevice) {
   try {
     const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1e3).toISOString();
     const row = db2.prepare(
-      `SELECT
-          COUNT(*) AS total,
-          SUM(CASE WHEN screen_resolution = ? AND browser = ? AND os = ? THEN 1 ELSE 0 END) AS matching
+      `SELECT COUNT(DISTINCT hardware_id) AS total
          FROM visits
-         WHERE visited_at_utc >= ?`
-    ).get(
-      browserDevice.screenResolution,
-      browserDevice.browser,
-      browserDevice.os,
-      cutoff
-    );
+         WHERE visited_at_utc >= ? AND hardware_id IS NOT NULL AND hardware_id != ''`
+    ).get(cutoff);
     const total = Number(row?.total) || 0;
-    const matching = Number(row?.matching) || 0;
+    const matching = total > 0 ? 1 : 0;
     const honest = computeHonestRarity(total, matching);
     if (total < 20) {
       return { rareDevice: false, bucket: "<p95", share: 1, sampleSize: total, matching, honest };
@@ -7521,10 +7517,14 @@ function retrieveLshCandidates(db2, profile) {
     }
     const candidates = [];
     for (const hardwareId of hardwareIds) {
-      const anchor = db2.prepare("SELECT hardware_id, simhash FROM hardware_anchors WHERE hardware_id = ?").get(hardwareId);
+      const anchor = db2.prepare("SELECT hardware_id, visitor_id, simhash FROM hardware_anchors WHERE hardware_id = ?").get(hardwareId);
       if (!anchor?.simhash) continue;
       try {
-        candidates.push({ hardwareId, simhash: BigInt(`0x${anchor.simhash}`) });
+        candidates.push({
+          hardwareId,
+          simhash: BigInt(`0x${anchor.simhash}`),
+          visitorId: anchor.visitor_id ?? null
+        });
       } catch {
       }
     }
@@ -8296,14 +8296,16 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const serverTzMismatch = Boolean(normBrowserTz && normIpTz && normBrowserTz !== normIpTz);
   const timezoneMismatch = Boolean(raw?.timezoneMismatch) || serverTzMismatch;
   const isGpuMaskedOrUnavailable = !hardwareSignals.gpuVendor || hardwareSignals.gpuVendor === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuVendor) || !hardwareSignals.gpuRenderer || hardwareSignals.gpuRenderer === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuRenderer);
+  const concreteVpnNetworkEvidence = Boolean(requestContext.torExitNode || requestContext.torRelay) || !baseClassification.isConsumerBroadband && Boolean(baseClassification.isDatacenterOrHosting || location.isVpnOrHosting);
   const classification = applyNetworkOverrides(baseClassification, {
     torExit: Boolean(requestContext.torExitNode || requestContext.torRelay),
     torOperatorHint: Boolean(requestContext.torOperatorHint),
     isTorBrowserClient: clientTorBrowser,
     aiAgentDetected: Boolean(requestContext.aiAgent?.detected),
     datacenterVm: Boolean(raw?.isVirtualMachine) && (baseClassification.isDatacenterOrHosting || isGpuMaskedOrUnavailable),
-    // A timezone mismatch is its own orthogonal axis, never a commercial VPN signal.
-    vpnSuspected: Boolean(raw?.vpnSuspected)
+    // A timezone mismatch is its own orthogonal axis, never a commercial VPN signal. The raw
+    // client `vpnSuspected` is deliberately NOT used here — only concrete network evidence.
+    vpnSuspected: concreteVpnNetworkEvidence
   });
   const isCloudOrDatacenterNetwork = classification.isDatacenterOrHosting || Boolean(location.isVpnOrHosting);
   const datacenterAsn = classification.isConsumerBroadband ? false : isCloudOrDatacenterNetwork;
@@ -8336,7 +8338,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     auxiliary_mobile: false,
     os_mismatch: Boolean(raw?.isOsTampered),
     relay: Boolean(torExitNode),
-    ml_prediction: Boolean(raw?.vpnSuspected) && !commercialVpnProvider && !hasTzMismatch
+    // Require concrete hosting/proxy evidence so a legacy `vpnSuspected` born of a timezone-only
+    // mismatch — even one the server canonicalizes as an equivalent timezone — cannot be
+    // resurrected as an ML VPN verdict.
+    ml_prediction: Boolean(raw?.vpnSuspected) && !commercialVpnProvider && !hasTzMismatch && datacenterAsn
   };
   const vpnSuspected = vpnMethods.public_vpn || vpnMethods.relay || vpnMethods.ml_prediction || vpnMethods.os_mismatch || datacenterAsn && botSubtype !== "good_bot";
   const tamperDetected = Boolean(raw?.tamperDetected || requestContext.tamperedRequest);
@@ -9658,6 +9663,10 @@ app.post("/api/visitor/identify", async (req, res) => {
       net: { ip: extractedIp, asn: location.asn }
     };
     const identityProfile = rawIdentityProfile ?? fallbackIdentityProfile;
+    const lshIdentityProfile = {
+      ...identityProfile
+    };
+    delete lshIdentityProfile.screen;
     const identityHardwareFingerprint = typeof requestBody.hardwareFingerprint === "string" && requestBody.hardwareFingerprint.trim().length > 0 ? requestBody.hardwareFingerprint.trim() : typeof identityProfile.hardwareFingerprint === "string" && identityProfile.hardwareFingerprint.trim().length > 0 ? identityProfile.hardwareFingerprint.trim() : hardwareId;
     const identityBrowserFingerprint = typeof requestBody.browserFingerprint === "string" && requestBody.browserFingerprint.trim().length > 0 ? requestBody.browserFingerprint.trim() : typeof identityProfile.browserFingerprint === "string" ? identityProfile.browserFingerprint.trim() : "";
     const identitySessionId = typeof requestBody.sessionId === "string" && requestBody.sessionId.trim().length > 0 ? requestBody.sessionId.trim().slice(0, 80) : currentSessionId;
@@ -9678,7 +9687,7 @@ app.post("/api/visitor/identify", async (req, res) => {
       markSchemaMigration(db, "v4-canonical-identity");
       upsertVisitorProfile(db, visitorId, identityProfile, identityHardwareFingerprint, nowUtc);
       upsertBlocks(db, visitorId, blockKeysFor(identityProfile), nowUtc);
-      const anchorHash = simhash512(identityProfile);
+      const anchorHash = simhash512(lshIdentityProfile);
       const anchorHashHex = simhashToHex(anchorHash);
       const existingAnchor = db.prepare("SELECT distinct_storage_seeds_count FROM hardware_anchors WHERE hardware_id = ?").get(identityHardwareFingerprint);
       const distinctSeeds = Math.max(
@@ -9759,17 +9768,17 @@ app.post("/api/visitor/identify", async (req, res) => {
       exactHardwareId: hardwareId,
       distinctStorageSeedsCount: existingVisitor || verifiedVid ? 2 : 1,
       privacyHardened,
-      query: simhash512(identityProfile),
-      candidates: retrieveLshCandidates(db, identityProfile)
+      query: simhash512(lshIdentityProfile),
+      candidates: retrieveLshCandidates(db, lshIdentityProfile)
     });
-    if (identityStage.stage === "lsh_fuzzy" && identityStage.matchLabel && identityStage.matchLabel !== visitorId) {
+    if (identityStage.stage === "lsh_fuzzy" && identityStage.visitorId && identityStage.visitorId !== visitorId && identityStage.visitorId !== identityStage.matchLabel) {
       try {
         const fuzzyAnchor = db.prepare(
-          "SELECT visitor_id, distinct_storage_seeds_count FROM hardware_anchors WHERE hardware_id = ?"
-        ).get(identityStage.matchLabel);
-        if (fuzzyAnchor?.visitor_id && fuzzyAnchor.visitor_id !== visitorId && Number(fuzzyAnchor.distinct_storage_seeds_count ?? 0) < 2) {
+          "SELECT MAX(distinct_storage_seeds_count) AS max_seeds FROM hardware_anchors WHERE visitor_id = ?"
+        ).get(identityStage.visitorId);
+        if (fuzzyAnchor && Number(fuzzyAnchor.max_seeds ?? 0) < 2) {
           const provisionalVisitorId = visitorId;
-          visitorId = String(fuzzyAnchor.visitor_id);
+          visitorId = String(identityStage.visitorId);
           visitorToken = signVisitorId(visitorId);
           isReturning = true;
           visitorFound = true;

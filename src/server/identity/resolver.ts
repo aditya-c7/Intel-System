@@ -101,7 +101,12 @@ export interface SupplementaryMatch {
 }
 
 export interface ResolveVisitorResult {
+  /** Visitor id this request uses (matched id on a hit, freshly minted id otherwise). */
   visitor_id: string;
+  /** The matched visitor id, returned explicitly so callers never have to recover it from a
+   *  match label / anchor lookup. Null when nothing matched (fresh or degraded path).
+   *  Optional to keep existing result literals (e.g. server.ts bootstrap) compatible. */
+  matched_visitor_id?: string | null;
   match_mode: ResolverMatchMode | string;
   match_score: number;
   is_new: boolean;
@@ -523,6 +528,7 @@ function degradedResult(
   }
   return {
     visitor_id: visitorId,
+    matched_visitor_id: null,
     match_mode: 'none',
     match_score: 0,
     is_new: true,
@@ -563,6 +569,7 @@ export async function resolveVisitor(db: AIBotDatabase, input: ResolveVisitorInp
           upsertBlocks(db, storageVisitorId, keys, nowUtc);
           return {
             visitor_id: storageVisitorId,
+            matched_visitor_id: storageVisitorId,
             match_mode: 'exact',
             match_score: 100,
             is_new: false,
@@ -628,6 +635,7 @@ export async function resolveVisitor(db: AIBotDatabase, input: ResolveVisitorInp
       upsertBlocks(db, best.id, keys, nowUtc);
       return {
         visitor_id: best.id,
+        matched_visitor_id: best.id,
         match_mode: best.mode,
         match_score: best.score,
         is_new: false,
@@ -648,6 +656,7 @@ export async function resolveVisitor(db: AIBotDatabase, input: ResolveVisitorInp
     upsertBlocks(db, visitorId, keys, nowUtc);
     return {
       visitor_id: visitorId,
+      matched_visitor_id: null,
       match_mode: 'none',
       match_score: 0,
       is_new: true,

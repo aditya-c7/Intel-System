@@ -4174,22 +4174,19 @@ function computeDeviceRarity(
   const honestSuppressed = computeHonestRarity(0, 0);
   try {
     const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    // Corpus size must be distinct hardware profiles, not raw visits, or a single active
+    // visitor inflates N into a false p95/p99 claim. Screen/browser strings are volatile
+    // and must not define the rarity cohort.
     const row = db
       .prepare(
-        `SELECT
-          COUNT(*) AS total,
-          SUM(CASE WHEN screen_resolution = ? AND browser = ? AND os = ? THEN 1 ELSE 0 END) AS matching
+        `SELECT COUNT(DISTINCT hardware_id) AS total
          FROM visits
-         WHERE visited_at_utc >= ?`
+         WHERE visited_at_utc >= ? AND hardware_id IS NOT NULL AND hardware_id != ''`
       )
-      .get(
-        browserDevice.screenResolution,
-        browserDevice.browser,
-        browserDevice.os,
-        cutoff
-      ) as Record<string, unknown> | undefined;
+      .get(cutoff) as Record<string, unknown> | undefined;
     const total = Number(row?.total) || 0;
-    const matching = Number(row?.matching) || 0;
+    // This device's own anchor is the singleton observation used by the exact CI gate.
+    const matching = total > 0 ? 1 : 0;
     const honest = computeHonestRarity(total, matching);
     if (total < 20) {
       return { rareDevice: false, bucket: '<p95', share: 1, sampleSize: total, matching, honest };
@@ -4285,7 +4282,7 @@ function writeHardwareAnchorAndBands(
 function retrieveLshCandidates(
   db: DatabaseAdapter,
   profile: Record<string, unknown>
-): Array<{ hardwareId: string; simhash: bigint }> {
+): Array<{ hardwareId: string; simhash: bigint; visitorId?: string | null }> {
   try {
     const hash = simhash512(profile);
     const hardwareIds = new Set<string>();
@@ -4295,14 +4292,18 @@ function retrieveLshCandidates(
         .all(band.band_idx, band.band_hash) as Array<{ hardware_id: string }>;
       for (const row of rows) if (row.hardware_id) hardwareIds.add(row.hardware_id);
     }
-    const candidates: Array<{ hardwareId: string; simhash: bigint }> = [];
+    const candidates: Array<{ hardwareId: string; simhash: bigint; visitorId?: string | null }> = [];
     for (const hardwareId of hardwareIds) {
       const anchor = db
-        .prepare('SELECT hardware_id, simhash FROM hardware_anchors WHERE hardware_id = ?')
-        .get(hardwareId) as { hardware_id: string; simhash: string } | undefined;
+        .prepare('SELECT hardware_id, visitor_id, simhash FROM hardware_anchors WHERE hardware_id = ?')
+        .get(hardwareId) as { hardware_id: string; visitor_id?: string | null; simhash: string } | undefined;
       if (!anchor?.simhash) continue;
       try {
-        candidates.push({ hardwareId, simhash: BigInt(`0x${anchor.simhash}`) });
+        candidates.push({
+          hardwareId,
+          simhash: BigInt(`0x${anchor.simhash}`),
+          visitorId: anchor.visitor_id ?? null,
+        });
       } catch {
         // A corrupt anchor hash is skipped, never a reason to fail identification.
       }
@@ -5607,6 +5608,13 @@ function sanitizeAndReinforceSecuritySignals(
   // Strict priority reconciliation: Tor anonymity > AI agent cloud > datacenter/VM > VPN >
   // mobile > residential > unknown. The base classifier is network-only; these verdicts are
   // first-party evidence that outranks ISP metadata.
+  // A client payload may carry a legacy `vpnSuspected` derived purely from a timezone mismatch.
+  // Never let that relabel a residential line to "VPN / Proxy Relay": require concrete network
+  // evidence (hosting/VPN ASN or a verified Tor relay). Timezone stays an orthogonal axis.
+  const concreteVpnNetworkEvidence =
+    Boolean(requestContext.torExitNode || requestContext.torRelay) ||
+    (!baseClassification.isConsumerBroadband &&
+      Boolean(baseClassification.isDatacenterOrHosting || location.isVpnOrHosting));
   const classification = applyNetworkOverrides(baseClassification, {
     torExit: Boolean(requestContext.torExitNode || requestContext.torRelay),
     torOperatorHint: Boolean(requestContext.torOperatorHint),
@@ -5615,8 +5623,9 @@ function sanitizeAndReinforceSecuritySignals(
     datacenterVm:
       Boolean(raw?.isVirtualMachine) &&
       (baseClassification.isDatacenterOrHosting || isGpuMaskedOrUnavailable),
-    // A timezone mismatch is its own orthogonal axis, never a commercial VPN signal.
-    vpnSuspected: Boolean(raw?.vpnSuspected),
+    // A timezone mismatch is its own orthogonal axis, never a commercial VPN signal. The raw
+    // client `vpnSuspected` is deliberately NOT used here — only concrete network evidence.
+    vpnSuspected: concreteVpnNetworkEvidence,
   });
 
   const isCloudOrDatacenterNetwork =
@@ -5687,11 +5696,16 @@ function sanitizeAndReinforceSecuritySignals(
     auxiliary_mobile: false,
     os_mismatch: Boolean(raw?.isOsTampered),
     relay: Boolean(torExitNode),
-    ml_prediction: Boolean(raw?.vpnSuspected) && !commercialVpnProvider && !hasTzMismatch,
+    // Require concrete hosting/proxy evidence so a legacy `vpnSuspected` born of a timezone-only
+    // mismatch — even one the server canonicalizes as an equivalent timezone — cannot be
+    // resurrected as an ML VPN verdict.
+    ml_prediction:
+      Boolean(raw?.vpnSuspected) && !commercialVpnProvider && !hasTzMismatch && datacenterAsn,
   };
   // The umbrella VPN verdict counts only concrete VPN/anonymity methods. timezone_mismatch stays
   // an orthogonal axis in vpnMethods (and in the telemetry/network panel) and never promotes a
-  // residential line to a commercial VPN on its own.
+  // residential line to a commercial VPN on its own. The raw client `vpnSuspected` is neutralized
+  // above (network relabel) and here (ML path), so it cannot resurrect a timezone-only verdict.
   const vpnSuspected =
     vpnMethods.public_vpn ||
     vpnMethods.relay ||
@@ -7887,6 +7901,13 @@ app.post('/api/visitor/identify', async (req, res) => {
       net: { ip: extractedIp, asn: location.asn },
     };
     const identityProfile = rawIdentityProfile ?? fallbackIdentityProfile;
+    // Screen geometry / DPR / touch are volatile context. Exclude the whole `screen` block from
+    // the SimHash used for LSH bands and candidate retrieval so display changes cannot split a
+    // visitor; the full profile is still stored for the 6-mode matcher and block keys.
+    const lshIdentityProfile: Record<string, unknown> = {
+      ...(identityProfile as unknown as Record<string, unknown>),
+    };
+    delete lshIdentityProfile.screen;
     const identityHardwareFingerprint =
       typeof requestBody.hardwareFingerprint === 'string' &&
       requestBody.hardwareFingerprint.trim().length > 0
@@ -7933,7 +7954,7 @@ app.post('/api/visitor/identify', async (req, res) => {
       upsertBlocks(db, visitorId, blockKeysFor(identityProfile), nowUtc);
       // 512-bit SimHash over the canonical identity profile. Bands are written only when the
       // hardware anchor actually changes, never on a routine repeat visit.
-      const anchorHash = simhash512(identityProfile as unknown as Record<string, unknown>);
+      const anchorHash = simhash512(lshIdentityProfile);
       const anchorHashHex = simhashToHex(anchorHash);
       // distinct_storage_seeds_count: a single storage seed cannot safely merge on hardware.
       const existingAnchor = db
@@ -8040,8 +8061,8 @@ app.post('/api/visitor/identify', async (req, res) => {
       exactHardwareId: hardwareId,
       distinctStorageSeedsCount: existingVisitor || verifiedVid ? 2 : 1,
       privacyHardened,
-      query: simhash512(identityProfile as unknown as Record<string, unknown>),
-      candidates: retrieveLshCandidates(db, identityProfile as unknown as Record<string, unknown>),
+      query: simhash512(lshIdentityProfile),
+      candidates: retrieveLshCandidates(db, lshIdentityProfile),
     });
 
     // A probabilistic fuzzy match must supply the final visitor ID. When a screen/DPR change makes
@@ -8052,27 +8073,27 @@ app.post('/api/visitor/identify', async (req, res) => {
     // anchor can never become canonical through this path.
     if (
       identityStage.stage === 'lsh_fuzzy' &&
-      identityStage.matchLabel &&
-      identityStage.matchLabel !== visitorId
+      identityStage.visitorId &&
+      identityStage.visitorId !== visitorId &&
+      identityStage.visitorId !== identityStage.matchLabel
     ) {
       try {
+        // The matched candidate now carries the canonical visitor id directly. `matchLabel` is
+        // kept only for envelope telemetry. The guard still reads the locked anchor seed count.
         const fuzzyAnchor = db
           .prepare(
-            'SELECT visitor_id, distinct_storage_seeds_count FROM hardware_anchors WHERE hardware_id = ?'
+            'SELECT MAX(distinct_storage_seeds_count) AS max_seeds FROM hardware_anchors WHERE visitor_id = ?'
           )
-          .get(identityStage.matchLabel) as
-          | { visitor_id: string; distinct_storage_seeds_count: number }
-          | undefined;
+          .get(identityStage.visitorId) as { max_seeds?: number } | undefined;
         if (
-          fuzzyAnchor?.visitor_id &&
-          fuzzyAnchor.visitor_id !== visitorId &&
-          Number(fuzzyAnchor.distinct_storage_seeds_count ?? 0) < 2
+          fuzzyAnchor &&
+          Number(fuzzyAnchor.max_seeds ?? 0) < 2
         ) {
           // The visit row was already inserted under the freshly minted ID earlier in this
           // request. Re-key it to the recovered visitor so history/velocity and the response
           // agree; otherwise the dashboard shows a new ID with an empty visit history.
           const provisionalVisitorId = visitorId;
-          visitorId = String(fuzzyAnchor.visitor_id);
+          visitorId = String(identityStage.visitorId);
           visitorToken = signVisitorId(visitorId);
           isReturning = true;
           visitorFound = true;

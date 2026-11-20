@@ -1276,9 +1276,9 @@ export async function collectHardwareSignals(
     gpuVendor,
     gpuRenderer,
     String(maxTextureSize),
-    browserDevice.screenResolution,
+    // Screen resolution and DPR are volatile context (zoom, monitor swaps, windowing). They
+    // must never mint a new hardware_id; they stay available as telemetry fields elsewhere.
     String(colorDepth),
-    browserDevice.pixelRatio,
     String(cpuCores ?? 'na'),
     String(deviceMemoryGb ?? 'na'),
     colorGamut,
@@ -3266,41 +3266,28 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         };
       }
 
-      // 3A — quota headroom physics (never a veto, only positive evidence).
-      if (headroomBytes !== null && headroomBytes > 0 && headroomBytes < 9.5 * GIB_BYTES) {
-        return {
-          isPrivate: true,
-          browserName,
-          method: `chromium-quota-headroom (${headroomGiB} GiB)`,
-          quotaBytes,
-          headroomGiB,
-          idbDurabilityRatio: null,
-          opfsFlushMs: null,
-        };
-      }
-
-      // 3B — legacy temp-storage quota versus the V8 heap ceiling.
+      // 3A/3B — quota headroom and legacy temp quota are single, weak proofs. On Chromium 152 a
+      // normal desktop with a small volume can report <9.5 GiB headroom, so these are now
+      // context-only: recorded in the method string but NEVER enough to assert incognito.
+      const quotaContext =
+        headroomBytes !== null && headroomBytes > 0 && headroomBytes < 9.5 * GIB_BYTES
+          ? `quota-headroom ${headroomGiB}GiB`
+          : null;
       const webkitQuota = await queryWebkitTemporaryQuota();
       const heapLimit = readJsHeapSizeLimit();
-      if (
+      const webkitContext =
         webkitQuota !== null &&
         heapLimit !== null &&
         webkitQuota < 2 * heapLimit &&
         webkitQuota < 9.5 * GIB_BYTES
-      ) {
-        return {
-          isPrivate: true,
-          browserName,
-          method: 'chromium-webkit-temp-quota',
-          quotaBytes,
-          headroomGiB,
-          idbDurabilityRatio: null,
-          opfsFlushMs: null,
-        };
-      }
+          ? 'webkit-temp-quota-low'
+          : null;
 
-      // 3C — storage physics. This layer is NEVER vetoed by a 10.00 GiB headroom:
-      // Chrome 156 reports that headroom in both normal and off-the-record modes.
+      // 3C — storage physics. TWO independent proofs are required: the IndexedDB strict-commit
+      // durability ratio AND the OPFS worker flush/commit probe. A single vector (small quota,
+      // a lone IDB ratio, or a lone OPFS timing outlier) can no longer produce an incognito
+      // verdict, which eliminates the normal-desktop false positive while genuine private
+      // windows — where both probes observe memory-backed storage — are still detected.
       const idbRatio = await probeChromiumIdbDurability();
       const opfsProbe = await probeChromiumOpfsWorkerFlush();
       const opfsFlushMs = opfsProbe ? opfsProbe.medianFlushMs : null;
@@ -3310,17 +3297,11 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         opfsProbe !== null &&
         (opfsProbe.medianFlushMs < 0.12 || opfsProbe.flushToWriteRatio < 0.85);
 
-      if (
-        idbIndicatesIncognito ||
-        (idbRatio === null && opfsIndicatesIncognito) ||
-        (idbRatio !== null && idbRatio < 1.42 && opfsIndicatesIncognito)
-      ) {
+      if (idbIndicatesIncognito && opfsIndicatesIncognito) {
         return {
           isPrivate: true,
           browserName,
-          method: idbIndicatesIncognito
-            ? `idb-memenv-durability-ratio (${idbRatio}x)`
-            : `opfs-ram-flush (${opfsFlushMs}ms)`,
+          method: `idb-memenv-durability-ratio+opfs-ram-flush (${idbRatio}x / ${opfsFlushMs}ms)`,
           quotaBytes,
           headroomGiB,
           idbDurabilityRatio: idbRatio,
@@ -3331,7 +3312,9 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       return {
         isPrivate: false,
         browserName,
-        method: `disk-persisted-verified (IDB ${idbRatio ?? 'n/a'}x)`,
+        method: `disk-persisted-verified (IDB ${idbRatio ?? 'n/a'}x${
+          quotaContext ? `; ${quotaContext} context only` : ''
+        }${webkitContext ? `; ${webkitContext} context only` : ''})`,
         quotaBytes,
         headroomGiB,
         idbDurabilityRatio: idbRatio,
@@ -3558,7 +3541,10 @@ export async function evaluateSecuritySignals(
   if (cloudOrMaskedGpu) {
     vpnReasons.push('Cloud / Masked GPU environment');
   }
-  const vpnSuspected = timezoneMismatch || datacenterAsn;
+  // A timezone discrepancy is an orthogonal context axis, never VPN evidence. Only concrete
+  // network/anonymity evidence (hosting/proxy ASN, provider-flagged VPN routing) may create a
+  // VPN suspicion. `timezoneMismatch` stays intact below for vpnMethods/event output.
+  const vpnSuspected = datacenterAsn;
 
   // 3. VM / Hypervisor & OS Identity Integrity (WebGL GPU + native accessors)
   const vmStatus = detectVmAndIntegrity(hardwareSignals.gpuVendor, hardwareSignals.gpuRenderer, {
@@ -3592,7 +3578,13 @@ export async function evaluateSecuritySignals(
 
   // 4. Private Mode / Incognito Inspection (multi-engine physics)
   const incognito = await detectIncognitoMode();
-  const privateBrowsing = (await hasPersistedStorageGrant())
+  const persistentStorageGrant = await hasPersistedStorageGrant();
+  // Hard veto: a returning visitor with day-old first-party IDs or a persistent storage grant
+  // has proven durable storage continuity and MUST NOT be reported as incognito, whatever the
+  // two-proof physics probe says.
+  const firstPartyContinuity = hasStoredIdentity || persistentStorageGrant;
+  const incognitoVerified = firstPartyContinuity ? false : incognito.isPrivate;
+  const privateBrowsing = persistentStorageGrant
     ? {
         likely: false,
         confidence: 0,
@@ -3604,7 +3596,7 @@ export async function evaluateSecuritySignals(
       }
     : await assessPrivateBrowsing(hasStoredIdentity, incognito);
   const storageQuotaMb = privateBrowsing.quotaMb;
-  let incognitoLikely = privateBrowsing.likely;
+  let incognitoLikely = firstPartyContinuity ? false : privateBrowsing.likely;
 
   let localStorageAvailable = true;
   try {
@@ -3745,7 +3737,7 @@ export async function evaluateSecuritySignals(
   // highest card, and two elevated cards add +1 synergy (three or more add +2).
   const riskFactors: string[] = [];
 
-  const incognitoScore = incognito.isPrivate ? 4 : 0;
+  const incognitoScore = incognitoVerified ? 4 : 0;
   if (incognitoScore > 0) {
     const storageDetail =
       storageQuotaMb !== null
@@ -3765,14 +3757,15 @@ export async function evaluateSecuritySignals(
     );
   }
 
+  // VPN card is gated on concrete datacenter/hosting evidence. A timezone mismatch is only
+  // low-weight context (+2) when concrete evidence already exists — on its own it produces no
+  // VPN card and no VPN verdict, only the orthogonal timezone axis in vpnMethods/telemetry.
   const vpnScore = torBrowserClient.detected
     ? 9
-    : datacenterAsn && timezoneMismatch
-    ? 8
     : datacenterAsn
-    ? 6
-    : timezoneMismatch
-    ? 5
+    ? timezoneMismatch
+      ? 8
+      : 6
     : 0;
   if (vpnScore > 0) {
     riskFactors.push(
@@ -3831,10 +3824,10 @@ export async function evaluateSecuritySignals(
     vpnReasons,
     tamperDetected,
     tamperReasons,
-    incognitoLikely: incognito.isPrivate,
-    isIncognito: incognito.isPrivate,
-    incognito: incognito.isPrivate,
-    privateMode: incognito.isPrivate,
+    incognitoLikely: incognitoVerified,
+    isIncognito: incognitoVerified,
+    incognito: incognitoVerified,
+    privateMode: incognitoVerified,
     incognitoMethod: incognito.method,
     headroomGiB: incognito.headroomGiB,
     idbDurabilityRatio: incognito.idbDurabilityRatio,
@@ -4808,7 +4801,9 @@ function buildIdentityProfile(
       height: screen.height,
       dpr: screen.pixelRatio ?? 1,
       colorDepth: screen.colorDepth,
-      touch: screen.maxTouchPoints ?? 0,
+      // No `touch` here: maxTouchPoints is volatile capability context. It must not enter the
+      // identity profile (simhash512 / 6-mode matcher / block keys), or a touch-screen toggle
+      // would split the visitor into a new identity.
     },
     timezone: timezoneName,
     timezoneSignals: { name: timezoneName, offsetMinutes: timezoneOffset },
@@ -4915,8 +4910,10 @@ export async function identifyCurrentVisitor(options?: {
       ? 'manual_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8)
       : CURRENT_PAGE_LOAD_ID;
 
-    // Module-cached: this is the same probe run that started at module load.
+    // Module-cached: this is the same probe run that started at module load. A returning
+    // visitor with a day-old first-party id/token has durable continuity — hard veto.
     const incog = await detectIncognitoMode();
+    const incognitoVerified = stored.visitorId && stored.visitorToken ? false : incog.isPrivate;
 
     // Phase 4 — sealed request envelope: one-time nonce + SHA-256 over the canonical
     // string the server recomputes. Crypto failures degrade to an empty signature
@@ -4943,8 +4940,20 @@ export async function identifyCurrentVisitor(options?: {
     // Tri-layer fingerprints: deterministic hashes over the hardware-only and browser-only
     // signal families. The server resolver indexes on these; the canonical visitorId /
     // hardwareId above are untouched.
+    // Touch capability (navigator.maxTouchPoints / ontouchstart) is volatile context, not a
+    // stable hardware anchor. computeHardwareFingerprint() folds the whole `screen` family into
+    // the device digest, so neutralize maxTouchPoints at the call site: toggling touch must not
+    // split the visitor. The raw value is still available as capability context (device
+    // detection, emulator evidence, event JSON `touch_start`); it is simply excluded from the
+    // identity hash and the identity profile.
     const identityHardwareFingerprint = collectedSignals
-      ? computeHardwareFingerprint(collectedSignals)
+      ? computeHardwareFingerprint({
+          ...collectedSignals,
+          systemEntropy: {
+            ...collectedSignals.systemEntropy,
+            screen: { ...collectedSignals.systemEntropy.screen, maxTouchPoints: null },
+          },
+        })
       : hardwareSignals.hardwareId;
     const identityBrowserFingerprint = collectedSignals
       ? computeBrowserFingerprint(collectedSignals)
@@ -4987,9 +4996,9 @@ export async function identifyCurrentVisitor(options?: {
         clientHints,
         securityEnvelope,
         // Top-level mirrors so no server-side spelling path can miss the verdict.
-        incognito: incog.isPrivate,
-        isIncognito: incog.isPrivate,
-        privateMode: incog.isPrivate,
+        incognito: incognitoVerified,
+        isIncognito: incognitoVerified,
+        privateMode: incognitoVerified,
         incognitoMethod: incog.method,
         idbDurabilityRatio: incog.idbDurabilityRatio,
         opfsFlushMs: incog.opfsFlushMs,
