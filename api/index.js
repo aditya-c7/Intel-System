@@ -14382,7 +14382,14 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       hardwareId,
       nowMs
     });
-    const headerRequestUserAgent = readRequestHeader(rawRequestHeaders, "user-agent");
+    const encodedOriginalUa = readRequestHeader(rawRequestHeaders, "x-intel-original-ua");
+    let headerRequestUserAgent = readRequestHeader(rawRequestHeaders, "user-agent");
+    if (encodedOriginalUa) {
+      try {
+        headerRequestUserAgent = decodeURIComponent(encodedOriginalUa) || headerRequestUserAgent;
+      } catch {
+      }
+    }
     const envelopeRequestUserAgent = typeof requestBody.securityEnvelope?.userAgent === "string" ? requestBody.securityEnvelope.userAgent.trim() : "";
     const headerCarriesBotSignature = Boolean(headerRequestUserAgent) && (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) || GOOD_BOT_UA_RULES2.some((rule) => rule.pattern.test(headerRequestUserAgent)) || AI_AGENT_UA_RULES2.some((rule) => rule.pattern.test(headerRequestUserAgent)));
     const fullRequestUserAgent = headerCarriesBotSignature ? headerRequestUserAgent : envelopeRequestUserAgent || headerRequestUserAgent;

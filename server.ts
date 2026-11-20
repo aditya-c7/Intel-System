@@ -8144,7 +8144,18 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     // Edge proxies truncate long User-Agent headers, so the signed envelope carries the full UA;
     // fall back to the raw header for older clients. A crawler/automation signature in the raw
     // header always wins so a spoofed envelope cannot mask a bot.
-    const headerRequestUserAgent = readRequestHeader(rawRequestHeaders, 'user-agent');
+    // The Workers→Node adapter truncates comma-containing UA strings at the first comma.
+    // The Worker forwards the complete value encoded in `x-intel-original-ua`; prefer it so
+    // `…(KHTML, like Gecko; compatible; GPTBot…)` survives intact on the API path too.
+    const encodedOriginalUa = readRequestHeader(rawRequestHeaders, 'x-intel-original-ua');
+    let headerRequestUserAgent = readRequestHeader(rawRequestHeaders, 'user-agent');
+    if (encodedOriginalUa) {
+      try {
+        headerRequestUserAgent = decodeURIComponent(encodedOriginalUa) || headerRequestUserAgent;
+      } catch {
+        // Malformed encoding: keep the plain header.
+      }
+    }
     const envelopeRequestUserAgent =
       typeof requestBody.securityEnvelope?.userAgent === 'string'
         ? requestBody.securityEnvelope.userAgent.trim()

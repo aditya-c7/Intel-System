@@ -31,6 +31,7 @@ const CLIENT_HINT_VARY = 'Sec-CH-UA*';
 /** Headers a client could otherwise spoof to fake an IP or a location. */
 const UNTRUSTED_FORWARD_HEADERS = [
   'x-intel-edge-geo',
+  'x-intel-original-ua',
   'x-vercel-forwarded-for',
   'x-vercel-proxied-for',
   'x-vercel-ip-country',
@@ -102,6 +103,16 @@ function buildEdgeGeoHeader(request) {
 function forwardApiRequest(request) {
   const headers = new Headers(request.headers);
   for (const name of UNTRUSTED_FORWARD_HEADERS) headers.delete(name);
+
+  // The Workers→Node request adapter splits a comma-containing `user-agent` at the first
+  // comma, which truncated `AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot…)`
+  // to `…(KHTML` and made named crawlers look human on the API path. Forward the complete
+  // value in an encoded, comma-free header that the server prefers over `user-agent`.
+  const userAgent = request.headers.get('user-agent');
+  if (userAgent) {
+    headers.set('user-agent', userAgent);
+    headers.set('x-intel-original-ua', encodeURIComponent(userAgent));
+  }
 
   const clientIp = request.headers.get('cf-connecting-ip') || '';
   if (clientIp) {
