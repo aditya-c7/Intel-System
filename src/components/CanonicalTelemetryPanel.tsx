@@ -97,4 +97,3 @@ export function NetworkAxesPanel({ view }: { view: CanonicalView }) {
     </section>
   );
 }
-
