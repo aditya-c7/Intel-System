@@ -617,6 +617,23 @@ export function detectAiBotFromServerSignals(params: {
       }
     }
 
+    // An ASN / organisation match names the operator's network, never the product. Every
+    // cloud ASN hosts millions of real people, so "AS16509 → Bedrock AgentCore" (or any
+    // other AI-provider ASN) branded ordinary visitors as AI agents. When the first match
+    // came from the network, still test the entry's header patterns: a Web Bot Auth
+    // `Signature-Agent` / `Signature` header is a real product claim.
+    if (matched && !claimedByUaOrHeader && entry.headerPatterns) {
+      for (const { header, pattern } of entry.headerPatterns) {
+        const hVal = (headers[header] as string) || '';
+        if (hVal && pattern.test(hVal)) {
+          claimedByUaOrHeader = true;
+          break;
+        }
+      }
+    }
+    // Network-only evidence cannot name an agent. Skip this entry and keep scanning.
+    if (matched && !claimedByUaOrHeader) continue;
+
     if (matched) {
       let identity: BotIdentity = entry.identity;
       const networkMatches =

@@ -987,6 +987,16 @@ function detectAiBotFromServerSignals(params) {
         }
       }
     }
+    if (matched && !claimedByUaOrHeader && entry.headerPatterns) {
+      for (const { header, pattern } of entry.headerPatterns) {
+        const hVal = headers[header] || "";
+        if (hVal && pattern.test(hVal)) {
+          claimedByUaOrHeader = true;
+          break;
+        }
+      }
+    }
+    if (matched && !claimedByUaOrHeader) continue;
     if (matched) {
       let identity = entry.identity;
       const networkMatches = asnNumber !== null && Boolean(entry.asnNumbers?.includes(asnNumber)) || Boolean(entry.asnPatterns?.some((pattern) => pattern.test(asnOrg)));
@@ -4790,12 +4800,9 @@ function classifyBotTraffic(headers, network, client) {
   const secFetchDest = readRequestHeader(headers, "sec-fetch-dest");
   const networkHaystack = [network.org, network.isp, network.asn].filter((part) => typeof part === "string" && part.trim().length > 0).join(" ");
   const clientSignals = Array.isArray(client.botSignals) ? client.botSignals.filter((s) => typeof s === "string" && s.trim().length > 0) : [];
-  const hardAutomation = Boolean(client.stealthPluginDetected || client.cdpRuntimeLeak || client.antiDetectBrowser) || typeof client.tamperingMlScore === "number" && client.tamperingMlScore >= 0.5;
+  const hardAutomation = Boolean(client.stealthPluginDetected || client.antiDetectBrowser);
   if (hardAutomation) {
     const reasons = [];
-    if (client.cdpRuntimeLeak) {
-      reasons.push("CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked)");
-    }
     if (client.stealthPluginDetected) {
       reasons.push("Stealth plugin artifacts (rewritten native getters / iframe identity leak)");
     }
@@ -4916,13 +4923,19 @@ function classifyBotTraffic(headers, network, client) {
       reasons: reasons.length > 0 ? reasons : ["Automated traffic signature detected"]
     };
   }
+  const developerToolsAttached = Boolean(
+    client.developerTools || client.cdpRuntimeLeak || client.automationEnvironment === "electron" || client.automationEnvironment === "ide_webview"
+  );
   return {
     subtype: "human",
     label: "Verified Human",
     provider: "None",
-    category: "Human Interaction",
+    category: developerToolsAttached ? "Developer Tools" : "Human Interaction",
     confidence: 0.6,
-    reasons: ["Interactive browser profile without automation signatures"]
+    reasons: developerToolsAttached ? [
+      "Interactive browser profile without automation signatures",
+      `Developer tools attached (${client.automationEnvironment || "cdp"}) \u2014 informational`
+    ] : ["Interactive browser profile without automation signatures"]
   };
 }
 var AI_BOT_CIDR_SOURCES = [
@@ -5357,7 +5370,7 @@ async function resolveAiAgentIdentity(input) {
       ]
     });
   }
-  if ((asnIn(input.network.asn, GCP_ASNS) || hostMatchesSuffix(await confirmedNames(), ["googleusercontent.com"])) && (webBotAuth.present || silentCloudTelemetry)) {
+  if ((asnIn(input.network.asn, GCP_ASNS) || hostMatchesSuffix(await confirmedNames(), ["googleusercontent.com"])) && (webBotAuth.present || silentCloudTelemetry && clientAutomation)) {
     return aiAgentResult({
       agentId: "gemini",
       agentName: "Google Gemini / Cloud Agent (GCP VM)",
@@ -5420,7 +5433,7 @@ async function resolveAiAgentIdentity(input) {
       ]
     });
   }
-  if (asnIn(input.network.asn, META_ASNS) && desktopChrome && silentCloudTelemetry) {
+  if (asnIn(input.network.asn, META_ASNS) && desktopChrome && silentCloudTelemetry && clientAutomation) {
     return aiAgentResult({
       agentId: "muse",
       agentName: "Meta Muse (Cloud VM Browser Agent)",
@@ -7197,7 +7210,7 @@ function sanitizeHardwareSignals(raw, browserDevice) {
 }
 function hasIndependentAutomationProof(raw, requestContext) {
   return Boolean(
-    raw?.cdpRuntimeLeak || raw?.stealthPluginDetected || raw?.webdriver || raw?.cdpDetected || raw?.isBot || raw?.canvasFarblingDetected || raw?.replayDetected || raw?.tamperedRequest || requestContext?.tamperedRequest || requestContext?.replayDetected
+    raw?.stealthPluginDetected || raw?.webdriver || raw?.cdpDetected || raw?.isBot || raw?.canvasFarblingDetected || raw?.replayDetected || raw?.tamperedRequest || requestContext?.tamperedRequest || requestContext?.replayDetected
   );
 }
 function isConfirmedTorRfpClient(raw, requestContext) {
@@ -7233,11 +7246,14 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const antiDetectBrowser = rfpExempt ? false : Boolean(raw?.tamperingDetails?.anti_detect_browser);
   const tamperingMlScore = typeof raw?.tamperingMlScore === "number" && Number.isFinite(raw.tamperingMlScore) ? raw.tamperingMlScore : 0;
   const mlTampering = rfpExempt ? false : tamperingMlScore >= 0.5;
+  const developerToolsAttached = Boolean(
+    raw?.developerTools || raw?.cdpRuntimeLeak || raw?.automationEnvironment === "electron" || raw?.automationEnvironment === "ide_webview"
+  );
   const stealthAutomation = Boolean(
-    raw?.stealthPluginDetected || raw?.cdpRuntimeLeak || antiDetectBrowser || mlTampering
+    raw?.stealthPluginDetected || antiDetectBrowser
   );
   const activeDeception = Boolean(
-    raw?.stealthPluginDetected || antiDetectBrowser || mlTampering
+    raw?.stealthPluginDetected || antiDetectBrowser
   );
   const hardAutomationReasons = [];
   if (raw?.cdpRuntimeLeak) {
@@ -7263,6 +7279,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       botSignals,
       cdpRuntimeLeak: Boolean(raw?.cdpRuntimeLeak),
       stealthPluginDetected: Boolean(raw?.stealthPluginDetected),
+      developerTools: developerToolsAttached,
+      automationEnvironment: raw?.automationEnvironment,
+      humanCorroboration: raw?.humanCorroboration,
       antiDetectBrowser,
       tamperingMlScore
     }
@@ -7398,7 +7417,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const botScore = spoofedImpostor ? 10 : activeDeception ? 9 : botSubtype === "bad_bot" ? 7 : botSubtype === "ai_agent" ? 7 : botSubtype === "good_bot" ? 2 : 0;
   const botStatus = spoofedImpostor ? "Spoofed AI Impostor" : stealthAutomation || botSubtype === "bad_bot" ? "Bot / Automated" : aiAgent?.detected && aiAgent.agentName ? aiAgent.agentName : botSubtype === "ai_agent" ? "AI Agent \xB7 Cloud Browser" : botSubtype === "good_bot" ? "Good Bot \xB7 Search Crawler" : "Verified Human";
   const aiAgentDetail = aiAgent?.detected && aiAgent.agentName ? `${aiAgent.agentName} \u2014 ${aiAgent.operator}${aiAgent.executionMode ? ` \xB7 ${aiAgent.executionMode}` : ""} \xB7 ${aiAgent.confidence}${aiAgent.verified ? " (verified)" : ""}: ${aiAgent.evidence[0] || "agent identity attributed from request headers"}` : "";
-  const botDetail = stealthAutomation ? `${hardAutomationReasons.join("; ") || "Stealth / anti-detect automation runtime detected"} \u2014 hard automation artifact, never a verified human` : botSubtype === "human" && !aiAgent?.detected ? "Verified human interactive session" : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected");
+  const botDetail = stealthAutomation ? `${hardAutomationReasons.join("; ") || "Stealth / anti-detect automation runtime detected"} \u2014 hard automation artifact, never a verified human` : botSubtype === "human" && !aiAgent?.detected ? developerToolsAttached ? `Verified human interactive session \xB7 developer tools attached${raw?.automationEnvironment && raw.automationEnvironment !== "none" ? ` (${raw.automationEnvironment})` : ""}` : "Verified human interactive session" : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected");
   const botSignal = {
     id: "bot",
     title: "Bot & Automation Detection",
@@ -7624,7 +7643,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       tamperingConfidence: raw?.tamperingConfidence || "high",
       tamperingMlScore: rfpExempt ? 24e-4 : typeof raw?.tamperingMlScore === "number" ? raw.tamperingMlScore : 24e-4,
       tamperingDetails: tamperingDetailsResponse,
-      developerTools: Boolean(raw?.developerTools),
+      developerTools: developerToolsAttached,
+      automationEnvironment: raw?.automationEnvironment || "none",
+      humanCorroboration: typeof raw?.humanCorroboration === "number" && Number.isFinite(raw.humanCorroboration) ? Math.max(0, Math.min(1, raw.humanCorroboration)) : 0,
       privacySettings: Boolean(raw?.privacySettings || clientTorBrowser),
       // Phase 4 — sealed request envelope verdicts
       tamperedRequest,
@@ -8199,8 +8220,11 @@ app.post("/api/visitor/identify", async (req, res) => {
     const headerCarriesBotSignature = Boolean(headerRequestUserAgent) && (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) || GOOD_BOT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)) || AI_AGENT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)));
     const fullRequestUserAgent = headerCarriesBotSignature ? headerRequestUserAgent : envelopeRequestUserAgent || headerRequestUserAgent;
     const rfpExemptRequest = isConfirmedTorRfpClient(rawSecuritySignals);
+    const developerToolsSignals = Boolean(
+      rawSecuritySignals?.developerTools || rawSecuritySignals?.cdpRuntimeLeak || rawSecuritySignals?.automationEnvironment === "electron" || rawSecuritySignals?.automationEnvironment === "ide_webview"
+    );
     const hardAutomationSignals = !rfpExemptRequest && Boolean(
-      rawSecuritySignals?.cdpRuntimeLeak || rawSecuritySignals?.stealthPluginDetected || rawSecuritySignals?.tamperingDetails?.anti_detect_browser || typeof rawSecuritySignals?.tamperingMlScore === "number" && rawSecuritySignals.tamperingMlScore >= 0.5
+      rawSecuritySignals?.stealthPluginDetected || rawSecuritySignals?.tamperingDetails?.anti_detect_browser
     );
     const botClassification = classifyBotTraffic(
       { ...rawRequestHeaders, "user-agent": fullRequestUserAgent },
@@ -8215,6 +8239,9 @@ app.post("/api/visitor/identify", async (req, res) => {
         botSignals: Array.isArray(rawSecuritySignals?.botSignals) ? rawSecuritySignals.botSignals : [],
         cdpRuntimeLeak: Boolean(rawSecuritySignals?.cdpRuntimeLeak),
         stealthPluginDetected: Boolean(rawSecuritySignals?.stealthPluginDetected),
+        developerTools: developerToolsSignals,
+        automationEnvironment: rawSecuritySignals?.automationEnvironment,
+        humanCorroboration: rawSecuritySignals?.humanCorroboration,
         antiDetectBrowser: rfpExemptRequest ? false : Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
         tamperingMlScore: rfpExemptRequest ? 0 : typeof rawSecuritySignals?.tamperingMlScore === "number" ? rawSecuritySignals.tamperingMlScore : 0
       }

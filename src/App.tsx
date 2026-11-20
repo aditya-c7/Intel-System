@@ -1113,10 +1113,7 @@ export default function App() {
     data?.tamperingDetails?.anti_detect_browser ||
       data?.tamperingDetails?.devtools_device_emulation ||
       data?.securitySignals?.stealthPluginDetected ||
-      data?.securitySignals?.cdpRuntimeLeak ||
-      data?.tampering ||
-      data?.securitySignals?.tampering ||
-      (typeof tamperingMlScore === 'number' && tamperingMlScore >= 0.5)
+      (typeof tamperingMlScore === 'number' && tamperingMlScore >= 0.8)
   );
   const spoofedSpecTag = spoofedSpecs ? ' (Spoofed / Unverified)' : '';
 
@@ -1157,10 +1154,9 @@ export default function App() {
       (data?.tampering ||
         data?.securitySignals?.tampering ||
         data?.securitySignals?.stealthPluginDetected ||
-        data?.securitySignals?.cdpRuntimeLeak ||
         data?.tamperingDetails?.anti_detect_browser ||
         data?.tamperingDetails?.devtools_device_emulation ||
-        (typeof tamperingMlScore === 'number' && tamperingMlScore >= 0.5))
+        (typeof tamperingMlScore === 'number' && tamperingMlScore >= 0.8))
   );
 
   // 4-signal core grid model (null-safe: renders only inside the data block). The server's
@@ -1340,14 +1336,23 @@ export default function App() {
       },
       active_call: Boolean(data.activeCall ?? s.activeCall),
       bot: data.bot ?? (s.botSubtype === 'bad_bot' || s.botSubtype === 'ai_agent' ? 'bad' : 'not_detected'),
-      bot_type: data.bot_type ?? (s.botSubtype ?? (s.aiAgent?.detected ? 'ai_agent' : null)),
+      bot_type:
+        data.bot_type ??
+        (s.botSubtype && s.botSubtype !== 'human'
+          ? s.botSubtype
+          : s.aiAgent?.detected
+          ? 'ai_agent'
+          : null),
       bot_info: data.bot_info ?? (s.aiAgent?.detected ? {
         category: 'ai_agent',
         provider: s.aiAgent.operator || 'Unknown',
         name: s.aiAgent.agentName,
         identity: s.aiAgent.verified ? 'verified' : 'unknown',
       } : null),
-      developer_tools: Boolean(s.developerTools),
+      developer_tools: Boolean(s.developerTools ?? s.cdpRuntimeLeak),
+      automation_environment: s.automationEnvironment ?? 'none',
+      human_corroboration:
+        typeof s.humanCorroboration === 'number' ? s.humanCorroboration : null,
       ip_blocklist: {
         email_spam: false,
         attack_source: Boolean(s.ipBlocklisted),

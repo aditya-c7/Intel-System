@@ -1336,7 +1336,23 @@ export interface VmDetectionContext {
 }
 
 /**
+ * Runtime host of the page. This is an environment label, never a bot verdict.
+ * Fingerprint Pro makes the same split between `developer_tools` and `bot`.
+ */
+export type AutomationEnvironment = 'none' | 'electron' | 'ide_webview' | 'headless_shell' | 'vm';
+
+/**
  * Bot & automation verdict.
+ *
+ * Three independent axes, exactly like Fingerprint Pro's server response:
+ *   bot                   → is the traffic automated? (`isBot`)
+ *   developerTools        → is a CDP / DevTools bridge attached? (informational)
+ *   automationEnvironment → which host is the page running inside?
+ *
+ * A CDP bridge alone is NOT proof of a bot: Electron apps, IDE webviews (VS Code,
+ * Cursor, OpenCode) and anyone with DevTools open expose it while a real person is
+ * driving the session. Only an automation UA, the WebDriver handshake, a spinning
+ * runtime binding, or stealth-plugin artifacts prove automation on their own.
  */
 export interface BotAutomationSignals {
   isBot: boolean;
@@ -1347,10 +1363,16 @@ export interface BotAutomationSignals {
   botSignals?: string[];
   /** True when only ambiguous environment quirks were found. Never a bot verdict. */
   botSuspicion?: boolean;
-  /** CDP Runtime domain serialization leak: protocol-level automation proof. */
+  /** CDP Runtime domain serialization leak: developer-tools evidence, not a verdict. */
   cdpRuntimeLeak?: boolean;
   /** Stealth plugin (puppeteer-extra / playwright-stealth) artifacts detected. */
   stealthPluginDetected?: boolean;
+  /** A CDP / DevTools bridge is attached to this page (informational, not a threat). */
+  developerTools?: boolean;
+  /** Host runtime: `none`, `electron`, `ide_webview`, `headless_shell` or `vm`. */
+  automationEnvironment?: AutomationEnvironment;
+  /** 0–1 confidence that a real person is driving this runtime (geometry, inputs, GPU). */
+  humanCorroboration?: number;
 }
 
 /**
@@ -1778,6 +1800,147 @@ export interface StealthArtifacts {
   stealthReasons: string[];
 }
 
+/** Trusted-input counters. Installed once; a real person accumulates input, a script does not. */
+let trustedPointerEvents = 0;
+let trustedKeyEvents = 0;
+let trustedInputTrackerInstalled = false;
+let lastTrustedInputAt = 0;
+
+const IDE_WEBVIEW_UA_PATTERN =
+  /(?:^|[\s(])(?:Code|Cursor|OpenCode|Windsurf|VSCodium|vscode-webview)\/[\d.]+/i;
+
+/**
+ * Reads the host runtime from immutable facts (the user-agent string and the
+ * `process.versions` object Electron exposes) without trusting any single getter.
+ * Never throws; an unreachable scope degrades to `none`.
+ */
+export function detectAutomationEnvironment(
+  ua?: string,
+  gpuRenderer?: string
+): { environment: AutomationEnvironment; electron: boolean; ideWebview: boolean; headlessShell: boolean } {
+  const userAgent = ua ?? (typeof navigator !== 'undefined' ? navigator.userAgent || '' : '');
+  let electronVersion = '';
+  let hasAcquireVsCodeApi = false;
+  let webviewProtocol = '';
+  try {
+    const scope = window as unknown as {
+      process?: { versions?: { electron?: string } };
+      acquireVsCodeApi?: unknown;
+    };
+    electronVersion = String(scope.process?.versions?.electron || '');
+    hasAcquireVsCodeApi = typeof scope.acquireVsCodeApi === 'function';
+  } catch {
+    // Hostile proxies are not evidence.
+  }
+  try {
+    webviewProtocol = typeof location !== 'undefined' ? location.protocol : '';
+  } catch {
+    // Ignore.
+  }
+
+  const electron = /Electron\/\d/i.test(userAgent) || Boolean(electronVersion);
+  const ideWebview =
+    hasAcquireVsCodeApi ||
+    IDE_WEBVIEW_UA_PATTERN.test(userAgent) ||
+    /^(vscode-webview|code-oss)/i.test(webviewProtocol);
+  const headlessShell = /HeadlessChrome|PhantomJS|SlimerJS/i.test(userAgent);
+
+  let environment: AutomationEnvironment = 'none';
+  if (ideWebview) environment = 'ide_webview';
+  else if (electron) environment = 'electron';
+  else if (headlessShell) environment = 'headless_shell';
+  else if (/swiftshader|llvmpipe|mesa offscreen/i.test((gpuRenderer || '').toLowerCase())) {
+    // A software rasterizer is the signature of a GPU-less VM / container. Informational only.
+    environment = 'vm';
+  }
+
+  return { environment, electron, ideWebview, headlessShell };
+}
+
+/** Starts the passive trusted-input tracker (idempotent, capture phase, never blocks). */
+export function installTrustedInputTracker(): void {
+  if (trustedInputTrackerInstalled || typeof window === 'undefined') return;
+  trustedInputTrackerInstalled = true;
+  try {
+    const onPointer = (event: Event): void => {
+      if (!(event as PointerEvent).isTrusted) return;
+      trustedPointerEvents += 1;
+      lastTrustedInputAt = Date.now();
+    };
+    const onKey = (event: Event): void => {
+      if (!(event as KeyboardEvent).isTrusted) return;
+      trustedKeyEvents += 1;
+      lastTrustedInputAt = Date.now();
+    };
+    window.addEventListener('pointerdown', onPointer, { capture: true, passive: true });
+    window.addEventListener('pointermove', onPointer, { capture: true, passive: true });
+    window.addEventListener('keydown', onKey, { capture: true, passive: true });
+  } catch {
+    // A blocked listener is not evidence.
+  }
+}
+
+/**
+ * Human-corroboration score in [0, 1].
+ *
+ * CDP / DevTools attachment is not automation by itself; a person is expected to expose
+ * ordinary human runtime facts (a real viewport, a visible document, languages, hardware
+ * rendering) and, once they interact, trusted input events. A headless shell or a scripted
+ * runtime accumulates none of these.
+ */
+export function measureHumanCorroboration(gpuRenderer?: string): {
+  score: number;
+  checks: string[];
+  trustedInput: boolean;
+} {
+  installTrustedInputTracker();
+  const checks: string[] = [];
+  let earned = 0;
+  let total = 0;
+  const add = (condition: boolean, weight: number, label: string): void => {
+    total += weight;
+    if (condition) {
+      earned += weight;
+      checks.push(label);
+    }
+  };
+
+  let outerOk = false;
+  let innerOk = false;
+  let visible = false;
+  let languagesOk = false;
+  let nativeChrome = false;
+  try {
+    outerOk = window.outerWidth > 0 && window.outerHeight > 0;
+    innerOk = window.innerWidth >= 320 && window.innerHeight >= 240;
+    visible = document.visibilityState === 'visible';
+    languagesOk = Array.isArray(navigator.languages) && navigator.languages.length > 0;
+    const chromeObject = (window as unknown as { chrome?: { runtime?: unknown } }).chrome;
+    nativeChrome = Boolean(chromeObject && typeof chromeObject === 'object');
+  } catch {
+    // Keep every false.
+  }
+
+  add(outerOk, 2, 'non-zero outer viewport');
+  add(innerOk, 2, 'desktop-sized inner viewport');
+  add(visible, 1, 'document visible');
+  add(languagesOk, 1, 'navigator.languages populated');
+  add(!/swiftshader|llvmpipe|mesa offscreen/i.test((gpuRenderer || '').toLowerCase()), 2, 'hardware GPU');
+  add(nativeChrome, 1, 'window.chrome runtime present');
+  const trustedInput = trustedPointerEvents + trustedKeyEvents > 0;
+  if (trustedInput) {
+    total += 2;
+    earned += 2;
+    checks.push('trusted pointer/keyboard input observed');
+  }
+
+  return {
+    score: total > 0 ? Math.round((earned / total) * 100) / 100 : 0,
+    checks,
+    trustedInput,
+  };
+}
+
 export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
   const reasons: string[] = [];
   let cdpRuntimeLeak = false;
@@ -1854,7 +2017,8 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
       } else if (childWindow) {
         const childUa = String(childWindow.navigator?.userAgent || '');
         if (childUa && childUa !== String(navigator.userAgent || '')) {
-          definitive = true;
+          // A content-script / privacy extension can rewrite the iframe UA while the
+          // top-level identity stays genuine. Record it, but do not call it definitive.
           reasons.push('User-Agent differs between the top window and a same-origin iframe');
         }
         const childTouch = Number(childWindow.navigator?.maxTouchPoints ?? 0);
@@ -1925,8 +2089,10 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
   // A software rasterizer is a VM/headless signal, NOT evidence of a stealth plugin. Counting
   // it here made plain SwiftShader headless sessions look like "Puppeteer / Playwright Stealth"
   // and pushed them into the critical tier. Only actual patch artifacts count toward this flag.
-  const artifactCount = reasons.length;
-  const stealthPluginDetected = definitive || artifactCount >= 2;
+  // The CDP Runtime leak is developer-tools evidence by itself (DevTools open, Electron, IDE
+  // webview), so it must not combine with one benign quirk into a "stealth plugin" verdict.
+  const patchArtifacts = reasons.filter((reason) => !/^CDP Runtime\.enable/.test(reason));
+  const stealthPluginDetected = definitive || patchArtifacts.length >= 2;
 
   return { cdpRuntimeLeak, stealthPluginDetected, stealthReasons: reasons };
 }
@@ -2025,16 +2191,35 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
 
   // Soft evidence alone is suspicion, never a verdict: two coincidental quirks (an in-app
   // browser with a disabled GPU) must not label a human as automated.
-  // A stealth plugin or a live CDP Runtime session is automation even when `navigator.webdriver`
-  // was rewritten: the protocol layer sits above the page and cannot be patched.
+  //
+  // CDP Runtime attachment is *developer-tools* evidence, not a bot verdict. Electron apps,
+  // IDE webviews (VS Code, Cursor, OpenCode) and any Chromium with DevTools open expose it
+  // while a real person is driving the session. Fingerprint Pro makes exactly this split:
+  // `developer_tools` is its own signal and `bot` stays `not_detected`. A CDP bridge only
+  // stays a bot signal when the runtime is simultaneously headless-shaped (no viewport,
+  // no languages, software GPU), which a real window never is.
+  const runtimeHost = detectAutomationEnvironment(ua, gpuRenderer);
+  const human = measureHumanCorroboration(gpuRenderer);
+  const developerTools = stealth.cdpRuntimeLeak || runtimeHost.environment === 'ide_webview';
+  const headlessShapedCdp =
+    stealth.cdpRuntimeLeak && human.score < 0.34 && (zeroGeometry || emptyLanguages || softwareGpu);
+  // Research-backed corroboration rule (incolumitas / Fingerprint Pro): patch artifacts from
+  // privacy extensions are "suspicious", never a verdict. A stealth plugin only reaches the
+  // bot gate when the runtime does NOT look like a person's desktop (viewport, languages,
+  // hardware GPU, native window.chrome). Deterministic signals below are unaffected.
+  const humanCorroborated = human.score >= 0.6;
+  const stealthBot = stealth.stealthPluginDetected && !humanCorroborated;
+
   const isBot =
     webdriver ||
     cdpDetected ||
     headlessUa ||
     d19Hard ||
-    stealth.cdpRuntimeLeak ||
-    stealth.stealthPluginDetected;
-  const botSuspicion = !isBot && softEvidenceCount >= 2;
+    stealthBot ||
+    headlessShapedCdp;
+  const botSuspicion =
+    !isBot &&
+    (softEvidenceCount >= 2 || (stealth.stealthPluginDetected && humanCorroborated));
   let botReason = 'Verified human runtime & native DOM prototypes';
   const allBotReasons: string[] = [];
 
@@ -2046,14 +2231,19 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
     botReason = 'Headless browser User-Agent signature detected';
   } else if (d19Hard) {
     botReason = botD19.reasons[0] || 'BotD hard automation signal detected';
-  } else if (stealth.cdpRuntimeLeak || stealth.stealthPluginDetected) {
+  } else if (stealthBot) {
     botReason =
-      stealth.stealthReasons[0] ||
-      (stealth.cdpRuntimeLeak
-        ? 'CDP Runtime session detected through the serialization side channel'
-        : 'Stealth automation plugin artifacts detected');
+      stealth.stealthReasons[0] || 'Stealth automation plugin artifacts detected';
+  } else if (headlessShapedCdp) {
+    botReason = 'Headless-shaped runtime with a CDP Runtime session attached';
   } else if (botSuspicion) {
     botReason = `Low-confidence environment quirks (${softEvidenceCount} soft signals)`;
+  } else if (developerTools) {
+    botReason = runtimeHost.ideWebview
+      ? 'Verified human session inside an IDE webview with a DevTools protocol bridge'
+      : runtimeHost.electron
+      ? 'Verified human session inside an Electron shell with a DevTools protocol bridge'
+      : 'Verified human session with a Chrome DevTools protocol bridge attached';
   }
 
   if (botReason !== 'Verified human runtime & native DOM prototypes') {
@@ -2071,6 +2261,12 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
   if (isBot && botReason === 'Verified human runtime & native DOM prototypes') {
     botReason = allBotReasons[0] || 'Hard automation artifact detected';
   }
+  // Informational only: an attached DevTools / CDP bridge on an otherwise human runtime.
+  if (developerTools && !isBot && allBotReasons.length === 0) {
+    allBotReasons.push(
+      `Developer tools attached (${runtimeHost.environment}) — informational, not automation`
+    );
+  }
 
   return {
     isBot,
@@ -2082,7 +2278,10 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
     botSignals: allBotReasons,
     botSuspicion,
     cdpRuntimeLeak: stealth.cdpRuntimeLeak,
-    stealthPluginDetected: stealth.stealthPluginDetected,
+    stealthPluginDetected: stealthBot,
+    developerTools,
+    automationEnvironment: runtimeHost.environment,
+    humanCorroboration: human.score,
   };
 }
 
@@ -3223,13 +3422,13 @@ export async function evaluateSecuritySignals(
     ];
   }
 
-  // Canvas farbling injects different pixels on every read. It must reach every verdict surface,
-  // not just `raw_device_attributes.canvas.noise`.
+  // Canvas farbling injects different pixels on every read. It is a privacy defence
+  // (Brave / Safari / Tor RFP), not an automation signature: keep the tampering verdict but
+  // do NOT set `anti_detect_browser`, which is the hard bot gate on the server.
   if (canvasNoiseDetected) {
     tampering.tampering = true;
     tampering.tampering_confidence = 'high';
     tampering.tampering_ml_score = Math.max(0.72, tampering.tampering_ml_score);
-    tampering.tampering_details.anti_detect_browser = true;
     tampering.tampering_details.anomaly_score = Math.max(
       0.6,
       tampering.tampering_details.anomaly_score
@@ -3251,7 +3450,6 @@ export async function evaluateSecuritySignals(
     botAssessment.isBot ||
     botAssessment.webdriver ||
     botAssessment.cdpDetected ||
-    Boolean(botAssessment.cdpRuntimeLeak) ||
     Boolean(botAssessment.stealthPluginDetected) ||
     canvasNoiseDetected ||
     browserDevice.devtoolsDeviceEmulation ||
@@ -3422,6 +3620,10 @@ export async function evaluateSecuritySignals(
     cdpDetected: botAssessment.cdpDetected,
     cdpRuntimeLeak: Boolean(botAssessment.cdpRuntimeLeak),
     stealthPluginDetected: Boolean(botAssessment.stealthPluginDetected),
+    /* Three-axis split (Fingerprint Pro parity): developer tools ≠ bot */
+    developerTools: Boolean(tampering.developerTools || botAssessment.developerTools),
+    automationEnvironment: botAssessment.automationEnvironment ?? 'none',
+    humanCorroboration: botAssessment.humanCorroboration ?? 0,
     /* Phase 2 — client-side Tor Browser fingerprint (Gecko RFP + letterboxing) */
     isTorBrowserClient: torBrowserClient.detected,
     /* Phase 5 — browser tampering (DevTools device emulation / anti-detect browsers) */
@@ -3429,7 +3631,6 @@ export async function evaluateSecuritySignals(
     tamperingConfidence: tampering.tampering_confidence,
     tamperingMlScore: tampering.tampering_ml_score,
     tamperingDetails: tampering.tampering_details,
-    developerTools: tampering.developerTools,
     /* Phase 5 — active call detection (pruned when unsupported) */
     activeCall: activeCall.active,
     activeCallSupported: activeCall.supported,

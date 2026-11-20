@@ -1242,6 +1242,12 @@ interface BotClientSignals {
   cdpRuntimeLeak?: boolean;
   /** Stealth plugin artifacts (non-native getters, iframe leak, proxy chain). */
   stealthPluginDetected?: boolean;
+  /** A CDP / DevTools bridge is attached (developer-tools evidence, not a bot verdict). */
+  developerTools?: boolean;
+  /** Host runtime reported by the client: electron / ide_webview / headless_shell / vm / none. */
+  automationEnvironment?: string;
+  /** 0–1 client confidence that a real person drives the runtime. */
+  humanCorroboration?: number;
   /** Client tamperingDetails.anti_detect_browser — hard proof of an anti-detect browser. */
   antiDetectBrowser?: boolean;
   /** Client tampering_ml_score; >= 0.5 is a hard automation escalation. */
@@ -1493,14 +1499,16 @@ function classifyBotTraffic(
   // labelled "Verified Human". These client artifacts are checked BEFORE every UA rule so no
   // crawler, agent or interactive-browser path can downgrade the verdict. `anti_detect_browser`
   // and a >= 0.5 tampering ML score arrive from the collector's browser-tampering assessment.
+  //
+  // A bare CDP Runtime leak is deliberately NOT in this set. Electron apps, IDE webviews
+  // (VS Code, Cursor, OpenCode) and any Chromium with DevTools open expose it while a real
+  // person is driving the session — Fingerprint Pro reports it as `developer_tools`, never as
+  // `bot`. Only the WebDriver handshake, an automation UA, a spinning runtime binding, an
+  // anti-detect footprint or stealth-plugin artifacts prove automation on their own.
   const hardAutomation =
-    Boolean(client.stealthPluginDetected || client.cdpRuntimeLeak || client.antiDetectBrowser) ||
-    (typeof client.tamperingMlScore === 'number' && client.tamperingMlScore >= 0.5);
+    Boolean(client.stealthPluginDetected || client.antiDetectBrowser);
   if (hardAutomation) {
     const reasons: string[] = [];
-    if (client.cdpRuntimeLeak) {
-      reasons.push('CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked)');
-    }
     if (client.stealthPluginDetected) {
       reasons.push('Stealth plugin artifacts (rewritten native getters / iframe identity leak)');
     }
@@ -1656,13 +1664,24 @@ function classifyBotTraffic(
     };
   }
 
+  const developerToolsAttached = Boolean(
+    client.developerTools ||
+      client.cdpRuntimeLeak ||
+      client.automationEnvironment === 'electron' ||
+      client.automationEnvironment === 'ide_webview'
+  );
   return {
     subtype: 'human',
     label: 'Verified Human',
     provider: 'None',
-    category: 'Human Interaction',
+    category: developerToolsAttached ? 'Developer Tools' : 'Human Interaction',
     confidence: 0.6,
-    reasons: ['Interactive browser profile without automation signatures'],
+    reasons: developerToolsAttached
+      ? [
+          'Interactive browser profile without automation signatures',
+          `Developer tools attached (${client.automationEnvironment || 'cdp'}) — informational`,
+        ]
+      : ['Interactive browser profile without automation signatures'],
   };
 }
 
@@ -2312,7 +2331,7 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
   if (
     (asnIn(input.network.asn, GCP_ASNS) ||
       hostMatchesSuffix(await confirmedNames(), ['googleusercontent.com'])) &&
-    (webBotAuth.present || silentCloudTelemetry)
+    (webBotAuth.present || (silentCloudTelemetry && clientAutomation))
   ) {
     return aiAgentResult({
       agentId: 'gemini',
@@ -2388,7 +2407,7 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
       ],
     });
   }
-  if (asnIn(input.network.asn, META_ASNS) && desktopChrome && silentCloudTelemetry) {
+  if (asnIn(input.network.asn, META_ASNS) && desktopChrome && silentCloudTelemetry && clientAutomation) {
     return aiAgentResult({
       agentId: 'muse',
       agentName: 'Meta Muse (Cloud VM Browser Agent)',
@@ -5039,8 +5058,7 @@ function hasIndependentAutomationProof(
   requestContext?: { tamperedRequest?: boolean; replayDetected?: boolean } | null
 ): boolean {
   return Boolean(
-    raw?.cdpRuntimeLeak ||
-      raw?.stealthPluginDetected ||
+    raw?.stealthPluginDetected ||
       raw?.webdriver ||
       raw?.cdpDetected ||
       raw?.isBot ||
@@ -5133,14 +5151,23 @@ function sanitizeAndReinforceSecuritySignals(
       ? raw.tamperingMlScore
       : 0;
   const mlTampering = rfpExempt ? false : tamperingMlScore >= 0.5;
+  // Developer-tools evidence is its own axis (Fingerprint Pro parity). A CDP Runtime leak
+  // means DevTools, an Electron shell or an IDE webview is attached — not that the session
+  // is automated. It is reported as `developer_tools` and never escalates the bot verdict.
+  const developerToolsAttached = Boolean(
+    raw?.developerTools ||
+      raw?.cdpRuntimeLeak ||
+      raw?.automationEnvironment === 'electron' ||
+      raw?.automationEnvironment === 'ide_webview'
+  );
   const stealthAutomation = Boolean(
-    raw?.stealthPluginDetected || raw?.cdpRuntimeLeak || antiDetectBrowser || mlTampering
+    raw?.stealthPluginDetected || antiDetectBrowser
   );
   // A bare CDP Runtime leak proves automation, but it is not active deception: stock Playwright
   // and Puppeteer always emit it. Only plugin patches, an anti-detect footprint or a tampering
   // model score justify the critical 9/10 tier. This keeps a plain headless browser at 7–8.
   const activeDeception = Boolean(
-    raw?.stealthPluginDetected || antiDetectBrowser || mlTampering
+    raw?.stealthPluginDetected || antiDetectBrowser
   );
   const hardAutomationReasons: string[] = [];
   if (raw?.cdpRuntimeLeak) {
@@ -5169,6 +5196,9 @@ function sanitizeAndReinforceSecuritySignals(
         botSignals,
         cdpRuntimeLeak: Boolean(raw?.cdpRuntimeLeak),
         stealthPluginDetected: Boolean(raw?.stealthPluginDetected),
+        developerTools: developerToolsAttached,
+        automationEnvironment: raw?.automationEnvironment,
+        humanCorroboration: raw?.humanCorroboration,
         antiDetectBrowser,
         tamperingMlScore,
       }
@@ -5532,7 +5562,13 @@ function sanitizeAndReinforceSecuritySignals(
   const botDetail = stealthAutomation
     ? `${hardAutomationReasons.join('; ') || 'Stealth / anti-detect automation runtime detected'} — hard automation artifact, never a verified human`
     : botSubtype === 'human' && !aiAgent?.detected
-      ? 'Verified human interactive session'
+      ? developerToolsAttached
+        ? `Verified human interactive session · developer tools attached${
+            raw?.automationEnvironment && raw.automationEnvironment !== 'none'
+              ? ` (${raw.automationEnvironment})`
+              : ''
+          }`
+        : 'Verified human interactive session'
       : aiAgentDetail
       ? aiAgentDetail
       : botSubtype === 'ai_agent'
@@ -5952,7 +5988,12 @@ function sanitizeAndReinforceSecuritySignals(
         ? raw.tamperingMlScore
         : 0.0024,
       tamperingDetails: tamperingDetailsResponse,
-      developerTools: Boolean(raw?.developerTools),
+      developerTools: developerToolsAttached,
+      automationEnvironment: raw?.automationEnvironment || 'none',
+      humanCorroboration:
+        typeof raw?.humanCorroboration === 'number' && Number.isFinite(raw.humanCorroboration)
+          ? Math.max(0, Math.min(1, raw.humanCorroboration))
+          : 0,
       privacySettings: Boolean(raw?.privacySettings || clientTorBrowser),
       // Phase 4 — sealed request envelope verdicts
       tamperedRequest,
@@ -6856,14 +6897,18 @@ app.post('/api/visitor/identify', async (req, res) => {
     // them here used to leave the final classification as "Verified Human" even when the bot
     // tile was escalated — the two paths now read the exact same client fields.
     const rfpExemptRequest = isConfirmedTorRfpClient(rawSecuritySignals);
+    // Developer-tools evidence is a separate axis from automation (Fingerprint Pro parity).
+    const developerToolsSignals = Boolean(
+      rawSecuritySignals?.developerTools ||
+        rawSecuritySignals?.cdpRuntimeLeak ||
+        rawSecuritySignals?.automationEnvironment === 'electron' ||
+        rawSecuritySignals?.automationEnvironment === 'ide_webview'
+    );
     const hardAutomationSignals =
       !rfpExemptRequest &&
       Boolean(
-        rawSecuritySignals?.cdpRuntimeLeak ||
-          rawSecuritySignals?.stealthPluginDetected ||
-          rawSecuritySignals?.tamperingDetails?.anti_detect_browser ||
-          (typeof rawSecuritySignals?.tamperingMlScore === 'number' &&
-            rawSecuritySignals.tamperingMlScore >= 0.5)
+        rawSecuritySignals?.stealthPluginDetected ||
+          rawSecuritySignals?.tamperingDetails?.anti_detect_browser
       );
     const botClassification = classifyBotTraffic(
       { ...rawRequestHeaders, 'user-agent': fullRequestUserAgent },
@@ -6882,6 +6927,9 @@ app.post('/api/visitor/identify', async (req, res) => {
           : [],
         cdpRuntimeLeak: Boolean(rawSecuritySignals?.cdpRuntimeLeak),
         stealthPluginDetected: Boolean(rawSecuritySignals?.stealthPluginDetected),
+        developerTools: developerToolsSignals,
+        automationEnvironment: rawSecuritySignals?.automationEnvironment,
+        humanCorroboration: rawSecuritySignals?.humanCorroboration,
         antiDetectBrowser: rfpExemptRequest
           ? false
           : Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),

@@ -85,33 +85,72 @@ function detectEngine(): { evalLen: number; isV8: boolean } {
 }
 
 /** True when a `Navigator` getter on the prototype OR the instance was replaced by a spoof. */
-function hasHookedNavigatorGetter(): boolean {
+function hookedNavigatorGetters(): string[] {
+  const hooked: string[] = [];
   try {
-    if (typeof navigator === 'undefined') return false;
+    if (typeof navigator === 'undefined') return hooked;
     const touched: (object | null)[] = [
       typeof Navigator !== 'undefined' ? Navigator.prototype : null,
       navigator,
     ];
-    return touched.some((target) => {
-      if (!target) return false;
-      return ['userAgent', 'platform', 'webdriver'].some((property) => {
+    for (const target of touched) {
+      if (!target) continue;
+      for (const property of ['userAgent', 'platform', 'webdriver']) {
         const descriptor = Object.getOwnPropertyDescriptor(target, property);
-        if (!descriptor) return false;
+        if (!descriptor) continue;
         // An own data property on the navigator instance is an explicit spoof: real browsers
         // expose these as prototype getters, never as instance values.
-        if (target === navigator && !descriptor.get && !descriptor.set) return true;
-        const getter = descriptor.get;
-        if (!getter) return false;
-        try {
-          return !/\[native code\]/.test(Function.prototype.toString.call(getter));
-        } catch {
-          return true;
+        if (target === navigator && !descriptor.get && !descriptor.set) {
+          hooked.push(property);
+          continue;
         }
-      });
-    });
+        const getter = descriptor.get;
+        if (!getter) continue;
+        try {
+          if (!/\[native code\]/.test(Function.prototype.toString.call(getter)) && !hooked.includes(property)) {
+            hooked.push(property);
+          }
+        } catch {
+          if (!hooked.includes(property)) hooked.push(property);
+        }
+      }
+    }
   } catch {
-    return false;
+    // Ignore hostile proxies.
   }
+  return hooked;
+}
+
+/**
+ * `screen.width` vs its own `device-width` media query. Browser zoom, fractional display
+ * scaling and sub-pixel rounding legitimately disagree by ±1–2 CSS px, so the check only
+ * fails when no width in that tolerance band matches. A real anti-detect spoof moves
+ * `screen.width` far outside the band.
+ */
+function deviceWidthQueryMatches(screenWidth: number): boolean {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return true;
+  for (let delta = 0; delta <= 2; delta += 1) {
+    const candidates = delta === 0 ? [screenWidth] : [screenWidth - delta, screenWidth + delta];
+    for (const width of candidates) {
+      try {
+        if (window.matchMedia(`(device-width: ${width}px)`).matches) return true;
+      } catch {
+        // Keep trying the remaining widths.
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * The JS `navigator.userAgent` and the HTTP `User-Agent` must agree, but edge proxies
+ * truncate long headers and some privacy tools shorten the header side. A truncation is a
+ * prefix relationship, not a spoof; only a substantial non-prefix difference is evidence.
+ */
+function userAgentContradictsHeader(headerUA: string, ua: string): boolean {
+  if (!headerUA || !ua || headerUA === ua) return false;
+  if (ua.startsWith(headerUA) || headerUA.startsWith(ua)) return false;
+  return Math.abs(headerUA.length - ua.length) > 8;
 }
 
 export function detectBrowserTampering(input: TamperingInput = {}): TamperingAssessment {
@@ -185,10 +224,11 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
   }
 
   // 6a. Cross-path media-query check (anti-detect browsers spoofing `screen.width`).
+  //     A ±1–2 px band absorbs browser zoom / fractional DPI rounding, so a normal window
+  //     never trips this; only a real spoof moves `screen.width` outside the band.
   if (typeof window !== 'undefined' && screenWidth > 0 && typeof window.matchMedia === 'function') {
     try {
-      const matchesEmulatedWidth = window.matchMedia(`(device-width: ${screenWidth}px)`).matches;
-      if (!matchesEmulatedWidth) {
+      if (!deviceWidthQueryMatches(screenWidth)) {
         antiDetect = true;
         anomalyPoints += 30;
         reasons.push('screen.width disagrees with its own device-width media query');
@@ -198,11 +238,16 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     }
   }
 
-  // 6b. Replaced Navigator.prototype getters.
-  if (hasHookedNavigatorGetter()) {
-    antiDetect = true;
-    anomalyPoints += 50;
-    reasons.push('Navigator getter / own property replaced by a non-native spoof');
+  // 6b. Replaced Navigator.prototype getters. Privacy extensions commonly wrap a getter
+  //     while returning the real value, so a non-native getter is weak evidence on its own:
+  //     it must never set `anti_detect_browser` or cross the tampering threshold. Only a
+  //     value that actually contradicts another source (rule 8 below) is proof.
+  const hookedGetters = hookedNavigatorGetters();
+  if (hookedGetters.length > 0) {
+    anomalyPoints += 10;
+    reasons.push(
+      `Navigator getter decorated by a non-native wrapper (${hookedGetters.join(', ')}) — value verified independently`
+    );
   }
 
   // 7. A docked DevTools window reserves a large slice of the outer viewport. Chrome and
@@ -216,9 +261,10 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
   const developerTools =
     outerHeight > 0 && innerHeight > 0 && outerHeight - innerHeight > 200;
 
-  // 8. The JS user-agent must equal the HTTP User-Agent header the server observed.
+  // 8. The JS user-agent must equal the HTTP User-Agent header the server observed. Edge
+  //    proxies truncate long headers, so a prefix relationship is a truncation, not a spoof.
   const headerUA = (input.serverHeaderUA || '').trim();
-  if (headerUA && ua && headerUA !== ua) {
+  if (userAgentContradictsHeader(headerUA, ua)) {
     antiDetect = true;
     anomalyPoints += 40;
     reasons.push('JS navigator.userAgent differs from the HTTP User-Agent header');
