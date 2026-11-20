@@ -3,6 +3,7 @@ import { handleAsNodeRequest } from 'cloudflare:node';
 import { DurableObject } from 'cloudflare:workers';
 import app, { initializeDatabaseSchema, withDatabase } from '../server.ts';
 import { findAgentByUa, displayFor, PILLS } from '../src/lib/agentRegistry.ts';
+import { verifyWebBotAuth, WBA_TRUSTED_SIGNERS } from '../src/lib/wbaVerifier.ts';
 
 // Workers' node:http adapter uses this as a routing key, not a public TCP port.
 const API_PORT = 3000;
@@ -32,6 +33,11 @@ const CLIENT_HINT_VARY = 'Sec-CH-UA*';
 const UNTRUSTED_FORWARD_HEADERS = [
   'x-intel-edge-geo',
   'x-intel-original-ua',
+  'x-intel-original-authority',
+  'x-intel-original-signature-agent',
+  'x-intel-original-signature-input',
+  'x-intel-original-signature',
+  'x-intel-wba-attestation',
   'x-vercel-forwarded-for',
   'x-vercel-proxied-for',
   'x-vercel-ip-country',
@@ -59,6 +65,18 @@ const STRIP_DOCUMENT_HEADERS = [
   'content-digest',
   'repr-digest',
 ];
+
+/**
+ * Files copied from `public/` into `dist/` by Vite. They must be served verbatim: no HTML
+ * rewriting, no bot-meta injection, no X-Intel-Bot-* branding and no UA-specific
+ * `Cache-Control: private/no-store`. Their own caching (as emitted by the asset layer) wins.
+ */
+const PASS_THROUGH_PATHS = new Set([
+  '/robots.txt',
+  '/llms.txt',
+  '/agents.md',
+  '/sitemap.xml',
+]);
 
 function cfString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : '';
@@ -114,6 +132,25 @@ function forwardApiRequest(request) {
     headers.set('x-intel-original-ua', encodeURIComponent(userAgent));
   }
 
+  // Web Bot Auth / authority values are always taken from the REAL inbound request and
+  // encoded before forwarding, mirroring x-intel-original-ua above. A client-supplied
+  // x-intel-original-* header is deleted first, so it can never spoof these. The genuine
+  // Signature / Signature-Agent / Signature-Input headers are deliberately left in place.
+  const originalAuthority = request.headers.get('host') || new URL(request.url).host;
+  if (originalAuthority) {
+    headers.set('x-intel-original-authority', encodeURIComponent(originalAuthority));
+  }
+  const wbaHeaderPairs = [
+    ['x-intel-original-signature-agent', 'signature-agent'],
+    ['x-intel-original-signature-input', 'signature-input'],
+    ['x-intel-original-signature', 'signature'],
+    ['x-intel-wba-attestation', 'x-intel-wba-attestation'],
+  ];
+  for (const [target, source] of wbaHeaderPairs) {
+    const value = request.headers.get(source);
+    if (value) headers.set(target, encodeURIComponent(value));
+  }
+
   const clientIp = request.headers.get('cf-connecting-ip') || '';
   if (clientIp) {
     headers.set('cf-connecting-ip', clientIp);
@@ -146,6 +183,68 @@ function apiResponse(response) {
   const result = applyClientHintHeaders(response);
   result.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, no-transform');
   return result;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Short-lived signed-agent cookie (WebCrypto only — no Node crypto in Workers) */
+/* -------------------------------------------------------------------------- */
+
+const textEncoder = new TextEncoder();
+
+function toBase64Url(bytes) {
+  let binary = '';
+  for (const byte of new Uint8Array(bytes)) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest('SHA-256', textEncoder.encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function hmacSha256Base64Url(secret, message) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    textEncoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, textEncoder.encode(message));
+  return toBase64Url(signature);
+}
+
+/**
+ * A verified Web Bot Auth request earns a 60-second, HMAC-signed `intel_wba` cookie so the
+ * backend/client can recognise subsequent same-agent traffic without re-verifying on every
+ * navigation. Returns null (no cookie) unless the signature is verified and the shared
+ * secret is configured with sufficient entropy. Any failure fails open — never breaks the doc.
+ */
+async function buildWbaCookie(request, verdict, env) {
+  const secret = env.VISITOR_HMAC_SECRET;
+  if (verdict.signatureStatus !== 'verified' || typeof secret !== 'string' || secret.length < 32) {
+    return null;
+  }
+  try {
+    const host = request.headers.get('host') || new URL(request.url).host;
+    const ua = request.headers.get('user-agent') || '';
+    const ip = request.headers.get('cf-connecting-ip') || '';
+    const [uaDigest, ipDigest] = await Promise.all([sha256Hex(ua), sha256Hex(ip)]);
+    const payload = {
+      op: verdict.verifiedOperator || '',
+      agentId: verdict.verifiedAgentId || '',
+      host,
+      uaHash: uaDigest.slice(0, 16),
+      ipHash: ipDigest.slice(0, 16),
+      exp: Date.now() + 60_000,
+    };
+    const part = toBase64Url(textEncoder.encode(JSON.stringify(payload)));
+    const signature = await hmacSha256Base64Url(secret, part);
+    return `intel_wba=${part}.${signature}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=60`;
+  } catch (error) {
+    console.error('intel_wba cookie generation failed:', error);
+    return null;
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -204,6 +303,18 @@ function hasSignedAgentHeaders(request) {
 }
 
 /**
+ * The verifier reads headers via Object.keys()/index access, so a Headers instance (whose
+ * entries are not enumerable own properties) must be materialised into a plain record first.
+ */
+function headersToRecord(headers) {
+  const record = {};
+  headers.forEach((value, name) => {
+    record[name] = value;
+  });
+  return record;
+}
+
+/**
  * Deterministically composes the name shown everywhere for a named agent. `displayFor`
  * from the registry is the primary source; when it returns an object without a composed
  * label we compose `Identity · Pill · Provider` ourselves so every surface agrees.
@@ -245,8 +356,8 @@ function identityFromAgent(info) {
   }
 }
 
-/** The one edge verdict producer, fed by the raw UA plus optional Cloudflare Bot Management. */
-function computeEdgeVerdict(request) {
+/** The one edge verdict producer: raw UA, optional Cloudflare Bot Management and Web Bot Auth. */
+async function computeEdgeVerdict(request) {
   const rawUa = request.headers.get('user-agent') || '';
   let agent = null;
   try {
@@ -259,7 +370,39 @@ function computeEdgeVerdict(request) {
   // Optional chaining: deployments without Bot Management still get a verdict from UA alone.
   const botManagement = request.cf?.botManagement;
   const verifiedBot = Boolean(botManagement?.verifiedBot);
-  const signedAgent = Boolean(agent) && hasSignedAgentHeaders(request);
+
+  // The cheap header pre-check keeps signature verification off the overwhelming majority of
+  // anonymous requests. Only requests presenting a full RFC 9421 signature triple are verified.
+  const hasSigned = hasSignedAgentHeaders(request);
+  let verification = { status: 'none' };
+  if (hasSigned) {
+    try {
+      const authority = request.headers.get('host') || new URL(request.url).host;
+      const result = await verifyWebBotAuth({
+        headers: headersToRecord(request.headers),
+        authority,
+        trust: WBA_TRUSTED_SIGNERS,
+      });
+      verification = recordOf(result);
+    } catch (error) {
+      // A verification outage must never reject a visitor — fail open to an unverified verdict.
+      console.error('Web Bot Auth verification failure:', error);
+      verification = { status: 'error' };
+    }
+  }
+
+  const signatureStatus = firstString(verification, 'status', 'signatureStatus') || 'none';
+  const signedAgent = signatureStatus === 'verified'; // genuine, cryptographically verified
+  const verifiedAgentId = firstString(verification, 'agentId', 'agent_id', 'agent', 'id');
+  const verifiedOperator = firstString(
+    verification,
+    'operator',
+    'signer',
+    'organization',
+    'vendor',
+    'name'
+  );
+  const evidence = verification.evidence ?? null;
 
   // The registry's proof tier supplies the registry-consistent badge (Verified/Signed);
   // a real Cloudflare Bot Management / Web Bot Auth signal can only strengthen it.
@@ -275,15 +418,38 @@ function computeEdgeVerdict(request) {
   }
 
   const pill = pillLabelFor(info);
+  let name = display ? verdictName(display, info, identity, pill) : '';
+  let provider = firstString(info, 'provider', 'operator', 'organization', 'vendor', 'company') || null;
+  let botType = firstString(info, 'id', 'agentId', 'key', 'slug', 'type', 'name') || null;
+
+  // When the signature is genuine, the verified identity is authoritative for the name shown
+  // in the verdict (and therefore in the X-Intel-Bot-* headers and SSR payload).
+  if (signedAgent && (verifiedAgentId || verifiedOperator)) {
+    const verifiedInfo = { id: verifiedAgentId, agentId: verifiedAgentId, name: verifiedAgentId, operator: verifiedOperator };
+    let verifiedDisplay = null;
+    try {
+      verifiedDisplay = displayFor(verifiedInfo, identity);
+    } catch {
+      verifiedDisplay = null;
+    }
+    name = verdictName(verifiedDisplay, verifiedInfo, identity, pillLabelFor(verifiedInfo));
+    provider = verifiedOperator || provider;
+    botType = verifiedAgentId || botType;
+  }
+
   return {
     agent,
-    name: display ? verdictName(display, info, identity, pill) : '',
-    provider: firstString(info, 'provider', 'operator', 'organization', 'vendor', 'company') || null,
-    botType: firstString(info, 'id', 'agentId', 'key', 'slug', 'type', 'name') || null,
+    name,
+    provider,
+    botType,
     identity,
     os: edgeOsLabel(request),
     verifiedBot,
     signedAgent,
+    verifiedAgentId,
+    verifiedOperator,
+    signatureStatus,
+    evidence,
   };
 }
 
@@ -386,6 +552,11 @@ async function handleDocument(request, env, verdict) {
             botType: verdict.botType,
             identity: verdict.identity,
             os: verdict.os,
+            signedAgent: verdict.signedAgent,
+            verifiedAgentId: verdict.verifiedAgentId || null,
+            verifiedOperator: verdict.verifiedOperator || null,
+            signatureStatus: verdict.signatureStatus || 'none',
+            evidence: verdict.evidence ?? null,
           });
           element.append(
             `<script id="intel-initial-verdict" type="application/json">${payload}</script>`,
@@ -403,6 +574,9 @@ async function handleDocument(request, env, verdict) {
   }
   for (const name of STRIP_DOCUMENT_HEADERS) result.headers.delete(name);
   result.headers.set('Cache-Control', 'private, no-store, max-age=0');
+
+  const wbaCookie = await buildWbaCookie(request, verdict, env);
+  if (wbaCookie) result.headers.append('Set-Cookie', wbaCookie);
   return result;
 }
 
@@ -540,7 +714,7 @@ export default {
       );
     }
 
-    const verdict = computeEdgeVerdict(request);
+    const verdict = await computeEdgeVerdict(request);
 
     // API branch — the only path that uses apiResponse() / the ratelimit binding.
     if (pathname === '/api' || pathname.startsWith('/api/')) {
@@ -550,6 +724,12 @@ export default {
     // Immutable hashed assets: pass through untouched — never rewritten and never branded
     // with a per-visitor bot verdict. (run_worker_first excludes /assets/* in production.)
     if (pathname.startsWith('/assets/')) {
+      return applyClientHintHeaders(await env.ASSETS.fetch(request));
+    }
+
+    // Crawler control / LLM metadata files are copied verbatim from public/ into dist/.
+    // Serve them directly so they keep their own caching and are never UA-branded.
+    if (PASS_THROUGH_PATHS.has(pathname)) {
       return applyClientHintHeaders(await env.ASSETS.fetch(request));
     }
 

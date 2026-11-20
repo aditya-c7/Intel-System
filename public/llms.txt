@@ -1,0 +1,39 @@
+# Intel — First-Party Visitor Identity & Network Intelligence
+
+Intel is a first-party visitor identity and network-intelligence dashboard. It shows what a
+visiting browser or automated agent looks like to the site itself: device and OS hints, network
+and geolocation data derived from the connection, and a bot / automation verdict. All data is
+collected first-party — there are no third-party cookies and no cross-site trackers.
+
+## What it does
+
+- Issues a first-party visitor identity for a browsing session and stores the visit history
+  locally (private history is never exposed publicly).
+- Reports network intelligence: connection-derived geolocation, ASN / organization, transport
+  details, and client hints where the browser provides them.
+- Detects named AI agents and crawlers from their real User-Agent and, when present, verified
+  Web Bot Auth (RFC 9421) signatures. Detected agents are shown publicly in the
+  **Bot & Automation Detection** section of the dashboard.
+- Is transparent about uncertainty: signals that require paid or privileged data are reported
+  as unavailable rather than guessed.
+
+## Key URLs
+
+- / — the dashboard.
+- /api/health — health check (`{"status":"ok"}`).
+- /api/intel/geolocation — connection-derived geolocation for the current visitor.
+
+## For AI agents and crawlers
+
+Named assistants and crawlers (GPTBot, ChatGPT-User, OAI-SearchBot, ClaudeBot, Claude-User,
+Claude-SearchBot, Googlebot, Applebot, PerplexityBot, Perplexity-User, Amazonbot, Bingbot,
+CCBot, MistralAI-User, Manus-User, GrokBot, GrokAgent) are detected and shown in the
+**Bot & Automation Detection** section. Identify yourself with your real User-Agent and sign
+requests with Web Bot Auth where available. See /agents.md for agent instructions and
+/robots.txt for the advisory crawl policy.
+
+## Privacy and contact
+
+First-party only; no third-party cookies. Private visit history is not publicly listed.
+Documentation and the full source are maintained in the project repository; see the site's
+README / documentation links for implementation and API details.

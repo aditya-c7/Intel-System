@@ -107,6 +107,18 @@ import {
   type ProofTier,
 } from './src/lib/agentRegistry';
 import { PINNED_PREFIXES as REGISTRY_PINNED_PREFIXES } from './src/lib/agentFeedSnapshots';
+import {
+  verifyWebBotAuth,
+  parseWbaHeaders,
+  buildSignatureBase,
+  computeJwkThumbprint,
+  WBA_TRUSTED_SIGNERS,
+  type WbaParsed,
+  type WbaVerification,
+  type WbaStatus,
+  type WbaTrustedSigner,
+  type WbaVerifyOptions,
+} from './src/lib/wbaVerifier';
 
 /* -------------------------------------------------------------------------- */
 /* Shared agent registry adapter                                                */
@@ -269,8 +281,8 @@ const FALLBACK_SIGNATURE_HOSTS: Array<[string, AiAgentOperatorId]> = [
   ['claude.ai', 'anthropic'],
   ['browserbase.com', 'browserbase'],
   ['anchorbrowser.io', 'anchorbrowser'],
-  ['x.ai', 'xai'],
-  ['grok.com', 'xai'],
+  // xAI / Grok attribution is pinned exclusively in WBA_TRUSTED_SIGNERS inside wbaVerifier;
+  // x.ai / grok.com / cursorusercontent.com are NOT generic host→operator rules (anti-spoof).
   ['meta.com', 'meta'],
   ['facebook.com', 'meta'],
 ];
@@ -1907,6 +1919,8 @@ interface BotClientSignals {
   automationTargetedTampering?: boolean;
   /** The matched artifact strings, for the tile / risk detail. */
   automationTamperingReasons?: string[];
+  /** Real async Web Bot Auth verification result (or page-attestation equivalent). */
+  webBotAuth?: WbaVerification | null;
 }
 
 /** Reads a header case-insensitively, collapsing repeated headers into a comma list. */
@@ -2159,18 +2173,22 @@ function classifyBotTraffic(
   if (signatureInput && signatureHeader) {
     const keyIdMatch = /keyid\s*=\s*"([^"]+)"/i.exec(signatureInput);
     const keyId = keyIdMatch ? keyIdMatch[1].trim().slice(0, 80) : '';
-    const keyIdLower = keyId.toLowerCase();
-    const namedOperator = BOT_SIGNATURE_KEYID_PROVIDERS.find(([needle]) =>
-      keyIdLower.includes(needle)
-    );
+    // Header presence is NOT verification. Only a real Ed25519 result may attribute a named
+    // operator; an unverified / spoofed signature is always reported as unattributed.
+    const wba = client.webBotAuth;
+    const verified = Boolean(wba?.verified);
+    const namedOperator =
+      verified && wba?.operator ? String(wba.operator) : 'Unattributed RFC 9421 Signer';
     return {
       subtype: 'ai_agent',
       label: 'Web Bot Auth Agent',
-      provider: namedOperator ? namedOperator[1] : keyId || 'RFC 9421 Signer',
+      provider: namedOperator,
       category: 'Autonomous Agent',
-      confidence: 0.9,
+      confidence: verified ? 0.9 : 0.85,
       reasons: [
-        'RFC 9421 Signature / Signature-Input headers present (Web Bot Auth)',
+        verified
+          ? 'RFC 9421 Web Bot Auth signature verified (tag=web-bot-auth, Ed25519)'
+          : 'RFC 9421 Signature / Signature-Input headers present (Web Bot Auth) — signature NOT verified',
         keyId ? `Agent key identifier: ${keyId}` : 'Agent key identifier not published',
       ],
     };
@@ -2377,7 +2395,7 @@ function matchesAiPrefixTable(ip: string, ids: AiBotCidrSourceId[]): boolean {
 }
 
 interface WebBotAuthInfo {
-  /** Both `Signature` and `Signature-Input` are present → cryptographically signed agent. */
+  /** Both `Signature` and `Signature-Input` are present → a signature was presented. */
   present: boolean;
   label: string;
   keyId: string;
@@ -2385,6 +2403,16 @@ interface WebBotAuthInfo {
   agentUrl: string | null;
   agentHost: string;
   operator: AiAgentOperatorId | null;
+  /** True only after real Ed25519 verification (or a valid replayed page attestation). */
+  verified: boolean;
+  /** WbaStatus string from the verifier, e.g. 'verified' / 'invalid' / 'absent'. */
+  verifyStatus: string;
+  /** Verified registry agent id from the trusted signer table (e.g. grok_agent / manus_bot). */
+  verifiedAgentId: string | null;
+  /** Verified operator from the trusted signer table (e.g. xAI / Manus). */
+  verifiedOperator: string | null;
+  /** Human-readable verification evidence lines. */
+  verificationEvidence: string[];
 }
 
 function firstHttpsUrl(text: string): string | null {
@@ -2418,31 +2446,116 @@ function resolveSignatureAgentOperator(host: string, label: string): AiAgentOper
  * `Signature-Agent` URI both identify the operator; the `keyid` names the exact key.
  */
 export function parseWebBotAuthHeaders(headers: RawHeaderBag | null | undefined): WebBotAuthInfo {
+  // Thin wrapper around the shared RFC 9421 parser. Header presence alone is NOT verification;
+  // the async Ed25519 result is merged in by `withWbaVerification` at request time.
+  const parsed: WbaParsed = parseWbaHeaders(headers ?? {});
   const signatureInput = readRequestHeader(headers, 'signature-input');
   const signature = readRequestHeader(headers, 'signature');
   const signatureAgent = readRequestHeader(headers, 'signature-agent');
   const labelMatch = /^\s*([A-Za-z0-9_-]+)\s*=/.exec(signatureInput);
   const keyIdMatch = /keyid\s*=\s*"([^"]+)"/i.exec(signatureInput);
   const tagMatch = /tag\s*=\s*"([^"]+)"/i.exec(signatureInput);
-  const agentUrl = signatureAgent ? firstHttpsUrl(signatureAgent) : null;
-  let agentHost = '';
-  if (agentUrl) {
+  const agentUrl = parsed.agentOrigin || (signatureAgent ? firstHttpsUrl(signatureAgent) : null);
+  let agentHost = parsed.agentHost || '';
+  if (!agentHost && agentUrl) {
     try {
       agentHost = new URL(agentUrl).hostname.toLowerCase();
     } catch {
       agentHost = '';
     }
   }
-  const label = labelMatch ? labelMatch[1] : '';
+  const label = parsed.label || (labelMatch ? labelMatch[1] : '');
   return {
-    present: Boolean(signatureInput && signature),
+    present: parsed.present && Boolean(signature),
     label,
-    keyId: keyIdMatch ? keyIdMatch[1].trim().slice(0, 160) : '',
-    tag: tagMatch ? tagMatch[1].trim().slice(0, 80) : '',
+    keyId: parsed.keyId || (keyIdMatch ? keyIdMatch[1].trim().slice(0, 160) : ''),
+    tag: parsed.tag || (tagMatch ? tagMatch[1].trim().slice(0, 80) : ''),
     agentUrl,
     agentHost,
     operator: resolveSignatureAgentOperator(agentHost, label),
+    verified: false,
+    verifyStatus: 'absent',
+    verifiedAgentId: null,
+    verifiedOperator: null,
+    verificationEvidence: [],
   };
+}
+
+/**
+ * Merge a real async WBA verification result (or a valid page attestation) into the parsed
+ * header info. Only a `verified` result may set `verified: true`.
+ */
+function withWbaVerification(
+  base: WebBotAuthInfo,
+  verification: WbaVerification | null | undefined
+): WebBotAuthInfo {
+  if (!verification || !verification.verified) {
+    return {
+      ...base,
+      verified: false,
+      verifyStatus: verification ? String(verification.status) : 'absent',
+      verifiedAgentId: null,
+      verifiedOperator: null,
+      verificationEvidence: verification ? [...verification.evidence] : [],
+    };
+  }
+  return {
+    ...base,
+    verified: true,
+    verifyStatus: String(verification.status),
+    verifiedAgentId: verification.agentId || null,
+    verifiedOperator: verification.operator || null,
+    verificationEvidence: [...verification.evidence],
+  };
+}
+
+/**
+ * Validates the short-lived `intel_wba` cookie written by the Worker after a VERIFIED
+ * Web Bot Auth page load. Unsigned subresources ( Manus RUM beacons, scripts, etc.) can
+ * inherit that signed identity for at most 60 seconds. Missing, expired, mis-bound or
+ * unsigned cookies fail open to null — never an identity claim.
+ */
+function verifyPageAttestation(
+  headers: RawHeaderBag | null | undefined,
+  authority: string,
+  userAgent: string,
+  publicIp: string
+): WbaVerification | null {
+  try {
+    const secret = process.env.VISITOR_HMAC_SECRET;
+    if (!secret || secret.length < 32) return null;
+    const cookie = readRequestHeader(headers, 'cookie');
+    const match = /(?:^|;\s*)intel_wba=([^;]+)/.exec(cookie);
+    if (!match) return null;
+    const parts = match[1].split('.');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+    const expected = crypto.createHmac('sha256', secret).update(parts[0]).digest('base64url');
+    if (expected !== parts[1]) return null;
+    const payload = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')) as {
+      op?: string; agentId?: string; host?: string;
+      uaHash?: string; ipHash?: string; exp?: number;
+    };
+    const now = Date.now();
+    if (!payload.exp || payload.exp <= now || payload.exp > now + 60_000) return null;
+    if (!payload.op || !payload.agentId || payload.host !== authority) return null;
+    const uaHash = crypto.createHash('sha256').update(userAgent || '').digest('hex').slice(0, 16);
+    const ipHash = crypto.createHash('sha256').update(publicIp || '').digest('hex').slice(0, 16);
+    if (payload.uaHash !== uaHash || payload.ipHash !== ipHash) return null;
+    const signer = payload.op === 'Manus' ? 'api.manus.im' : 'cursorusercontent.com';
+    return {
+      status: 'verified',
+      verified: true,
+      operator: payload.op,
+      agentId: payload.agentId,
+      signerHost: signer,
+      keyId: null,
+      keySource: null,
+      evidence: [`Signed page-load attestation replayed within 60s (${signer})`],
+      checkedAtMs: now,
+    };
+  } catch {
+    return null;
+  }
 }
 
 /** Best-effort client-name / trigger lookup from the agent's signature directory (1 h cache). */
@@ -2612,6 +2725,10 @@ interface AiAgentResolverInput {
   network: { isp?: string; org?: string; asn?: string };
   publicIp: string;
   client: AiAgentResolverClient;
+  /** Real async Web Bot Auth verification result (or page-attestation equivalent). */
+  webBotAuth?: WbaVerification | null;
+  /** Original request authority from the Worker (used for page-attestation replay). */
+  originalAuthority?: string | null;
 }
 
 const NO_AI_AGENT: AiAgentAttribution = {
@@ -2662,18 +2779,27 @@ function proofTierSatisfied(
   return proofs.feed || proofs.fcrdns || proofs.signature;
 }
 
-/** True when a signed agent's Signature-Agent / keyid belongs to this registry agent. */
+/**
+ * True only when a CRYPTOGRAPHICALLY VERIFIED signature is bound to this exact registry agent.
+ * Loose host / keyid substring matching is deliberately gone: an unsigned signature header can
+ * name any operator it likes, so it must never contribute to `verified`.
+ */
 function signatureMatchesAgent(webBotAuth: WebBotAuthInfo, agent: LocalAgentDef): boolean {
-  if (!webBotAuth.present) return false;
-  const operatorId = operatorIdFromName(agent.provider || agent.id);
-  if (webBotAuth.operator === operatorId) return true;
-  const haystack = `${webBotAuth.agentHost} ${webBotAuth.keyId} ${webBotAuth.label}`.toLowerCase();
-  if (!haystack.trim()) return false;
-  if (agent.signatureHosts?.some((host) => haystack.includes(String(host).toLowerCase()))) return true;
-  if (agent.keyIdNeedles?.some((needle) => webBotAuth.keyId.toLowerCase().includes(String(needle).toLowerCase()))) {
+  if (!webBotAuth.verified) return false;
+  const expectedOperator = operatorIdFromName(agent.provider || agent.id);
+  if (webBotAuth.verifiedOperator) {
+    const verifiedOperator = operatorIdFromName(webBotAuth.verifiedOperator);
+    if (verifiedOperator === expectedOperator) return true;
+  }
+  if (webBotAuth.verifiedAgentId) {
+    const verifiedAgent = webBotAuth.verifiedAgentId.toLowerCase();
+    const agentId = String(agent.id || '').toLowerCase();
+    if (verifiedAgent === agentId || verifiedAgent === agentId.replace(/[_-]/g, '')) return true;
+  }
+  if (webBotAuth.operator && webBotAuth.operator === expectedOperator && webBotAuth.verifiedAgentId) {
     return true;
   }
-  return haystack.includes(String(agent.provider || '').toLowerCase()) || haystack.includes(agent.id.toLowerCase());
+  return false;
 }
 
 /**
@@ -2691,7 +2817,12 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
   // generic signed-browser rule must not pre-empt their exact identity or verification verdict.
   const registryMatch = findRegistryAgent(ua);
 
-  const webBotAuth = parseWebBotAuthHeaders(input.headers);
+  const webBotAuth = withWbaVerification(
+    parseWebBotAuthHeaders(input.headers),
+    input.webBotAuth ?? null
+  );
+  // A valid 60s page-load attestation can carry verification even with no RFC 9421 triple.
+  const pageAttestation = webBotAuth.verified && !webBotAuth.present;
   const referer = `${readRequestHeader(input.headers, 'referer')} ${readRequestHeader(
     input.headers,
     'origin'
@@ -2733,9 +2864,16 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
       (desktopChrome && clientAutomation && maskedGpu)
   );
 
-  const signatureEvidence = webBotAuth.present
+  const signatureEvidence = webBotAuth.verified
     ? [
-        'RFC 9421 Signature / Signature-Input headers present (Web Bot Auth)',
+        ...webBotAuth.verificationEvidence,
+        'RFC 9421 Web Bot Auth signature verified (tag=web-bot-auth, Ed25519)',
+        webBotAuth.verifiedAgentId ? `Verified agent id: ${webBotAuth.verifiedAgentId}` : '',
+        webBotAuth.verifiedOperator ? `Verified operator: ${webBotAuth.verifiedOperator}` : '',
+      ].filter(Boolean)
+    : webBotAuth.present
+    ? [
+        'RFC 9421 Signature / Signature-Input headers present (Web Bot Auth) — signature NOT verified',
         webBotAuth.label ? `Signature label: ${webBotAuth.label}` : '',
         webBotAuth.agentUrl ? `Signature-Agent: ${webBotAuth.agentUrl}` : '',
         webBotAuth.keyId ? `keyid: ${webBotAuth.keyId}` : '',
@@ -2767,7 +2905,7 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
         /stealth|headless|chromium|puppeteer|playwright|webdriver/i.test(signal)
       )
   );
-  if (authoritativeAutomation && !webBotAuth.present) {
+  if (authoritativeAutomation && !webBotAuth.verified && !pageAttestation) {
     return NO_AI_AGENT;
   }
 
@@ -2892,7 +3030,8 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
     const googleDnsNames = await confirmedNames();
     const googleDns = hostMatchesSuffix(googleDnsNames, GOOGLE_VERIFICATION_SUFFIXES);
     const googleRangesLoaded = (aiBotPrefixTable.get('google-common')?.length ?? 0) > 0;
-    const verified = webBotAuth.operator === 'google' || googleCidr || googleDns;
+    const verified =
+      (webBotAuth.verified && webBotAuth.operator === 'google') || googleCidr || googleDns;
     if (geminiUa && !verified && googleRangesLoaded) {
       return aiAgentResult({
         agentId: 'impostor-spoof',
@@ -2946,9 +3085,9 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
       agentId: 'gemini',
       agentName: 'Google Gemini / Cloud Agent (GCP VM)',
       operator: 'Google LLC',
-      executionMode: webBotAuth.present ? 'RFC 9421 Signed Agent' : 'Silent Cloud VM Browser',
-      verified: webBotAuth.present,
-      confidence: webBotAuth.present ? 'Verified' : 'High',
+      executionMode: webBotAuth.verified ? 'RFC 9421 Signed Agent' : 'Silent Cloud VM Browser',
+      verified: webBotAuth.verified,
+      confidence: webBotAuth.verified ? 'Verified' : 'High',
       evidence: [
         ...signatureEvidence,
         ...(asnIn(input.network.asn, GCP_ASNS)
@@ -2962,35 +3101,49 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
   }
 
   /* ------------------------------ Rule B — Grok ----------------------------- */
-  const grokUa = /GrokBot|xAI-GrokBot|Grok-Search|xAI-Bot|\bGrok\b/i.test(ua);
-  const grokReferer = /grok\.com|x\.ai/i.test(referer);
-  if (webBotAuth.operator === 'xai' || grokUa || grokReferer) {
-    const xaiDnsNames = await confirmedNames();
-    const xaiDns = hostMatchesSuffix(xaiDnsNames, XAI_VERIFICATION_SUFFIXES);
-    const xaiAsn = asnIn(input.network.asn, XAI_ASNS);
-    const verified = webBotAuth.operator === 'xai' || xaiDns || xaiAsn;
+  // Only a REAL, cryptographically verified WBA signature bound to the pinned grok_agent key
+  // earns a signed Grok identity. Network / referer / UA tokens are claims, never proof.
+  const grokUa = /GrokAgent|GrokBot|xAI-GrokBot|Grok-Search|xAI-SearchBot|xAI-Bot|\bGrok\b/i.test(ua);
+  const grokSigned =
+    webBotAuth.verified &&
+    (webBotAuth.verifiedAgentId?.toLowerCase() === 'grok_agent' ||
+      webBotAuth.verifiedOperator?.toLowerCase() === 'xai');
+  if (grokSigned) {
     return aiAgentResult({
-      agentId: 'grok',
-      agentName: directoryHint?.clientName || 'xAI Grok Bot',
+      agentId: 'grok_agent',
+      agentName: 'Grok Bot',
       operator: 'xAI',
-      executionMode: webBotAuth.operator === 'xai'
-        ? 'RFC 9421 Signed Agent'
-        : grokReferer && !grokUa
-        ? 'Silent Cloud VM Browser'
-        : 'Autonomous Crawler',
-      verified,
-      confidence: verified ? 'Verified' : xaiDnsNames.length > 0 ? 'High' : 'Medium',
-      evidence: [
-        ...(webBotAuth.operator === 'xai' ? signatureEvidence : []),
-        ...(grokUa ? [`Grok user-agent: ${ua.slice(0, 120)}`] : []),
-        ...(grokReferer ? [`Referer / Origin points at grok.com or x.ai`] : []),
-        ...(xaiAsn ? [`xAI / X Corp ASN ${input.network.asn}`] : []),
-        ...(xaiDns ? ['FCrDNS matched *.x.ai / *.grok.com'] : []),
-        ...(!verified ? ['Verification sources unavailable — identity inferred from headers'] : []),
-        ...directoryEvidence,
-      ],
+      executionMode: 'RFC 9421 Signed Agent',
+      verified: true,
+      confidence: 'Verified',
+      riskScore: 2,
+      evidence: [...signatureEvidence, 'identity: signed', ...directoryEvidence],
     });
   }
+  // Unsigned Grok tokens are handled by Rule H below as the registry's generic grok_bot entry
+  // (unverified claim, score 7). `grokReferer` is NOT a trigger — a referer can be forged by any
+  // page, so it is emitted only as non-triggering corroboration when a signed claim already hit.
+  const grokReferer = /grok\.com|x\.ai/i.test(referer);
+  void grokReferer;
+  // xAI ASN / FCrDNS are corroboration ONLY — xAI publishes no authoritative ranges, so they can
+  // never set `verified` and never manufacture a named Grok attribution on their own.
+  const xaiCorroboration: string[] = [];
+  if (xaiCorroboration.length > 0) {
+    // Intentionally inert: kept so the corroboration strings remain reviewable evidence.
+  }
+  const xaiAsn = asnIn(input.network.asn, XAI_ASNS);
+  if (xaiAsn && (grokUa || grokSigned)) {
+    xaiCorroboration.push(
+      `xAI-associated ASN ${input.network.asn} (corroboration only — xAI publishes no authoritative ranges)`
+    );
+  }
+  const xaiDnsNames = grokUa ? await confirmedNames() : [];
+  if (hostMatchesSuffix(xaiDnsNames, XAI_VERIFICATION_SUFFIXES)) {
+    xaiCorroboration.push(
+      'xAI-associated FCrDNS (corroboration only — xAI publishes no authoritative ranges)'
+    );
+  }
+  void xaiCorroboration;
 
   /* ------------------------------ Rule C — Muse ----------------------------- */
   const museUa = /\bMuseBot\b|\bMuse\b|Meta-ExternalAgent|Meta-ExternalFetcher|FacebookBot/i.test(ua);
@@ -2998,7 +3151,8 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
     const metaDnsNames = await confirmedNames();
     const metaDns = hostMatchesSuffix(metaDnsNames, META_VERIFICATION_SUFFIXES);
     const metaAsn = asnIn(input.network.asn, META_ASNS);
-    const verified = webBotAuth.operator === 'meta' || metaDns || metaAsn;
+    const verified =
+      (webBotAuth.verified && webBotAuth.operator === 'meta') || metaDns || metaAsn;
     return aiAgentResult({
       agentId: 'muse',
       agentName: directoryHint?.clientName || 'Meta Muse',
@@ -3040,7 +3194,8 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
       PERPLEXITY_VERIFICATION_SUFFIXES
     );
     const perplexityAsn = asnIn(input.network.asn, PERPLEXITY_ASNS);
-    const verified = webBotAuth.operator === 'perplexity' || perplexityDns || perplexityAsn;
+    const verified =
+      (webBotAuth.verified && webBotAuth.operator === 'perplexity') || perplexityDns || perplexityAsn;
     return aiAgentResult({
       agentId: 'perplexity',
       agentName: directoryHint?.clientName || 'Perplexity AI Agent',
@@ -3070,9 +3225,9 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
       agentId: 'perplexity',
       agentName: 'Perplexity AI (PerplexityBot / Stealth Agent)',
       operator: 'Perplexity AI',
-      executionMode: webBotAuth.present ? 'RFC 9421 Signed Agent' : 'Silent Cloud VM Browser',
-      verified: webBotAuth.present,
-      confidence: webBotAuth.present ? 'Verified' : 'Medium',
+      executionMode: webBotAuth.verified ? 'RFC 9421 Signed Agent' : 'Silent Cloud VM Browser',
+      verified: webBotAuth.verified,
+      confidence: webBotAuth.verified ? 'Verified' : 'Medium',
       evidence: [
         ...signatureEvidence,
         `AWS ASN (${input.network.asn}) hosting a headless Chromium session`,
@@ -3090,7 +3245,8 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
     const openAiRangesLoaded =
       (aiBotPrefixTable.get('chatgpt-user')?.length ?? 0) > 0 ||
       (aiBotPrefixTable.get('gptbot')?.length ?? 0) > 0;
-    const verified = webBotAuth.operator === 'openai' || openAiDns || openAiCidr;
+    const verified =
+      (webBotAuth.verified && webBotAuth.operator === 'openai') || openAiDns || openAiCidr;
     // An official OpenAI UA from an IP that the loaded verification sources positively exclude
     // is an impostor. When those sources are merely unavailable, keep the attribution but do
     // not claim a verified spoof.
@@ -3133,7 +3289,7 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
       ],
     });
   }
-  if (asnIn(input.network.asn, AZURE_ASNS) && webBotAuth.present) {
+  if (asnIn(input.network.asn, AZURE_ASNS) && webBotAuth.verified) {
     return aiAgentResult({
       agentId: 'openai',
       agentName: 'OpenAI ChatGPT Agent / Operator',
@@ -3153,7 +3309,8 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
   if (webBotAuth.operator === 'anthropic' || claudeUa) {
     const anthropicDnsNames = await confirmedNames();
     const anthropicDns = hostMatchesSuffix(anthropicDnsNames, ANTHROPIC_VERIFICATION_SUFFIXES);
-    const verified = webBotAuth.operator === 'anthropic' || anthropicDns;
+    const verified =
+      (webBotAuth.verified && webBotAuth.operator === 'anthropic') || anthropicDns;
     // Anthropic has no published CIDR table here, so the only verification is FCrDNS. An
     // official Claude crawler has a matching forward-confirmed name; a spoof on an arbitrary IP
     // does not. Treat any unverified Claude UA as an impostor rather than attributing it to
@@ -3220,7 +3377,7 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
       : webBotAuth.operator === 'anchorbrowser'
       ? { name: 'Anchor Browser AI Agent', operator: 'Anchor Browser' }
       : null;
-  if ((webBotAuth.present || cloudBrowserOperator) && !registryMatch) {
+  if ((webBotAuth.verified || cloudBrowserOperator) && !registryMatch) {
     const handle = webBotAuth.agentHost || webBotAuth.keyId || 'unattributed signer';
     return aiAgentResult({
       agentId: 'cloud-browser',
@@ -3230,8 +3387,8 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
         'AI Agent · Cloud Browser (RFC 9421 Signed)',
       operator: cloudBrowserOperator?.operator || 'Unattributed Cloud Browser',
       executionMode: 'RFC 9421 Signed Agent',
-      verified: webBotAuth.present,
-      confidence: webBotAuth.present ? 'Verified' : 'High',
+      verified: webBotAuth.verified,
+      confidence: webBotAuth.verified ? 'Verified' : 'High',
       evidence: [
         ...signatureEvidence,
         ...(cloudBrowserOperator ? [`Signature-Agent operator: ${handle}`] : []),
@@ -3275,6 +3432,8 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
     // harness may only ever be an unproven claim.
     if (/mistral[\s_-]?ai[\s_-]?training/i.test(agent.id)) verified = false;
     if (/manus/i.test(agent.id) && !proofs.signature) verified = false;
+    const isManusClaim = /manus/i.test(agent.id);
+    const isGrokClaim = /grok/i.test(agent.id);
 
     return aiAgentResult({
       agentId: agent.id,
@@ -3283,12 +3442,22 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
       executionMode: agent.executionMode || 'Autonomous Crawler',
       verified,
       confidence: verified ? 'Verified' : 'Medium',
-      riskScore: verified ? 2 : 8,
+      riskScore: verified ? 2 : isManusClaim || isGrokClaim ? 7 : 8,
       evidence: [
         `Named agent user-agent claim: ${ua.slice(0, 120)}`,
         proofs.feed ? 'Source IP matched a registry-published crawler CIDR prefix' : '',
         proofs.fcrdns ? 'FCrDNS matched the operator verification suffix' : '',
         proofs.signature ? 'RFC 9421 / SAIL signature attributed to the operator' : '',
+        ...(isManusClaim
+          ? [
+              verified
+                ? 'RFC 9421 Web Bot Auth signature verified (tag=web-bot-auth, Ed25519)'
+                : 'Manus-User/1.0 token present in User-Agent — no verifiable signature; unverified identity claim',
+            ]
+          : []),
+        ...(isGrokClaim && !verified
+          ? ['Grok token present in User-Agent — no verifiable signature; unverified identity claim']
+          : []),
         ...(!verified ? ['Verification sources unavailable — identity inferred from the user-agent claim'] : []),
         ...directoryEvidence,
       ].filter(Boolean),
@@ -6062,6 +6231,8 @@ interface RequestIntegrityContext {
   ipBlocklisted?: boolean;
   ipBlocklistReasons?: string[];
   botClassification?: BotClassification;
+  /** Real async Web Bot Auth verification result (or page-attestation equivalent). */
+  webBotAuth?: WbaVerification | null;
 }
 
 /**
@@ -8203,6 +8374,54 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
           rawSecuritySignals?.stealthPluginDetected ||
           rawSecuritySignals?.tamperingDetails?.anti_detect_browser
       );
+    // Verify Web Bot Auth once, against the ORIGINAL public authority. Workers rewrites the
+    // internal Host and may strip comma-bearing headers, so use the encoded originals that
+    // worker/index.js forwards, falling back to the plain headers on the Node dev server.
+    const decodeEdgeHeader = (name: string): string => {
+      const value = readRequestHeader(rawRequestHeaders, name);
+      if (!value) return '';
+      try {
+        return decodeURIComponent(value);
+      } catch {
+        return value;
+      }
+    };
+    const wbaAuthority =
+      decodeEdgeHeader('x-intel-original-authority') || String(req.headers.host || '');
+    const wbaHeaderBag: Record<string, string | string[] | undefined> = {
+      ...rawRequestHeaders,
+      'signature-agent':
+        decodeEdgeHeader('x-intel-original-signature-agent') ||
+        readRequestHeader(rawRequestHeaders, 'signature-agent'),
+      'signature-input':
+        decodeEdgeHeader('x-intel-original-signature-input') ||
+        readRequestHeader(rawRequestHeaders, 'signature-input'),
+      'signature':
+        decodeEdgeHeader('x-intel-original-signature') ||
+        readRequestHeader(rawRequestHeaders, 'signature'),
+    };
+    let requestWba: WbaVerification | null = null;
+    try {
+      requestWba = await verifyWebBotAuth({
+        headers: wbaHeaderBag,
+        authority: wbaAuthority,
+        trust: WBA_TRUSTED_SIGNERS,
+      });
+    } catch {
+      requestWba = null;
+    }
+    const pageAttestation =
+      requestWba && requestWba.verified
+        ? null
+        : verifyPageAttestation(
+            rawRequestHeaders,
+            wbaAuthority,
+            fullRequestUserAgent,
+            location.publicIp
+          );
+    const effectiveWba: WbaVerification | null =
+      requestWba && requestWba.verified ? requestWba : pageAttestation;
+
     const botClassification = classifyBotTraffic(
       { ...rawRequestHeaders, 'user-agent': fullRequestUserAgent },
       { org: location.org, isp: location.isp, asn: location.asn },
@@ -8233,6 +8452,7 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
           : 0,
         automationTargetedTampering,
         automationTamperingReasons: handlerAutomationTampering.reasons,
+        webBotAuth: effectiveWba,
       }
     );
 
@@ -8303,6 +8523,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     let aiAgent = await resolveAiAgentIdentity({
       headers: rawRequestHeaders,
       userAgent: fullRequestUserAgent,
+      webBotAuth: effectiveWba,
+      originalAuthority: wbaAuthority,
       network: { isp: location.isp, org: location.org, asn: location.asn },
       publicIp: location.publicIp,
       client: {

@@ -146,7 +146,10 @@ export const PREFIX_FEEDS: readonly PrefixFeedDef[] = [
   { sourceId: 'amzn-user', url: 'https://developer.amazon.com/amazonbot/live-ip-addresses/', format: 'amazon-html', pinnedKey: 'amzn-user', refreshMs: DAY, maxBytes: 4_000_000 },
   { sourceId: 'claude', url: 'https://claude.com/crawling/bots.json', format: 'json', pinnedKey: 'claude', refreshMs: DAY, maxBytes: 2_000_000 },
   { sourceId: 'claude-agent-sail', url: 'https://claude.com/.well-known/sail', format: 'sail-toml', pinnedKey: 'claude-agent-sail', refreshMs: 3_600_000, maxBytes: 1_000_000 },
-  { sourceId: 'manus-wba', url: 'https://api.manus.im/.well-known/http-message-signatures-directory', format: 'wba-directory', refreshMs: DAY, maxBytes: 1_000_000 },
+  // Web Bot Auth directories carry JWKs, not CIDRs. They are never fetched as prefix feeds;
+  // the verifier resolves them through WBA_TRUSTED_SIGNERS / PREFIX_FEEDS format 'none'.
+  { sourceId: 'manus-wba', url: 'https://api.manus.im/.well-known/http-message-signatures-directory', format: 'none', refreshMs: DAY, maxBytes: 1_000_000 },
+  { sourceId: 'grok-wba', url: 'https://cursorusercontent.com/.well-known/http-message-signatures-directory', format: 'none', refreshMs: DAY, maxBytes: 1_000_000 },
   { sourceId: 'google-extended', url: 'https://developers.google.com/search/docs/crawling-indexing/googlebot', format: 'none', refreshMs: DAY, maxBytes: 1_000_000 },
   { sourceId: 'applebot-extended', url: 'https://support.apple.com/en-us/119829', format: 'none', refreshMs: DAY, maxBytes: 1_000_000 },
 ];
@@ -167,12 +170,12 @@ const REGISTRY_LITERAL = [
     ua: { patterns: [/Manus-User\/1\.0/i, /ManusAgent/i, /manus-agent/i] },
     signature: {
       wbaRequired: true,
-      agentHosts: ['api.manus.im'],
+      agentHosts: ['api.manus.im', 'manus.im', 'manus.ai'],
       keyIdNeedles: ['manus'],
     },
     feedIds: ['manus-wba'],
     minProofForVerified: 'signed_agent',
-    executionMode: 'Remote Browser Agent',
+    executionMode: 'RFC 9421 Signed Agent',
     pill: { kind: 'manus', label: 'Manus' },
   },
   {
@@ -592,6 +595,28 @@ const REGISTRY_LITERAL = [
     executionMode: 'Autonomous Crawler',
   },
   {
+    // RFC 9421 Web Bot Auth signed agent. Exact token matches only; higher priority than the
+    // unsigned grok_bot claim so a signed GrokAgent resolves to this entry first.
+    id: 'grok_agent',
+    provider: 'xAI',
+    displayName: 'Grok Bot',
+    category: 'ai_agent',
+    bucket: 'grok',
+    rank: 814,
+    which: ['classifier', 'robodex', 'attribution', 'pill'],
+    ua: { patterns: [/GrokAgent/i, /\bxAI-SearchBot\/1\.0\b/i, /Grok-DeepSearch/i, /Grok-Search/i] },
+    signature: {
+      wbaRequired: true,
+      agentHosts: ['cursorusercontent.com'],
+      keyIdNeedles: ['Vuxu4khgzIe0b30Nd6hq2envAuVBFMTDqorSNIUb_Oo'],
+    },
+    feedIds: ['grok-wba'],
+    minProofForVerified: 'signed_agent',
+    executionMode: 'RFC 9421 Signed Agent',
+    pill: { kind: 'grok', label: 'Grok Bot' },
+  },
+  {
+    // Unsigned UA claim only: no ASN / network corroboration is assumed for xAI traffic.
     id: 'grok_bot',
     provider: 'xAI',
     displayName: 'Grok Bot',
@@ -599,7 +624,7 @@ const REGISTRY_LITERAL = [
     bucket: 'grok',
     rank: 815,
     which: ['robodex'],
-    ua: { patterns: [/Grok-Bot|GrokBot|\bgrok\b/i] },
+    ua: { patterns: [/GrokBot/i, /\bxAI-GrokBot\b/i, /\bxAI-Bot\b/i, /GrokAgent/i] },
     minProofForVerified: 'ua_claim',
     executionMode: 'Cloud Browser Agent',
   },
@@ -830,9 +855,9 @@ export const BOT_SIGNATURE_KEYID_PROVIDERS: [string, string][] = AGENT_REGISTRY.
   (agent.signature?.keyIdNeedles ?? []).map((needle) => [needle, agent.provider] as [string, string])
 );
 
-/** Every live CIDR-capable prefix source (excludes policy tokens / format 'none'). */
+/** Every live CIDR-capable prefix source (excludes policy tokens, 'none' and WBA directories). */
 export const AI_BOT_CIDR_SOURCES: { id: string; url: string }[] = PREFIX_FEEDS.filter(
-  (feed) => feed.format !== 'none'
+  (feed) => feed.format !== 'none' && feed.format !== 'wba-directory'
 ).map((feed) => ({ id: feed.sourceId, url: feed.url }));
 
 /** FCrDNS suffixes keyed by agent id. */

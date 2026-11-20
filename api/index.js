@@ -654,7 +654,10 @@ var PREFIX_FEEDS = [
   { sourceId: "amzn-user", url: "https://developer.amazon.com/amazonbot/live-ip-addresses/", format: "amazon-html", pinnedKey: "amzn-user", refreshMs: DAY, maxBytes: 4e6 },
   { sourceId: "claude", url: "https://claude.com/crawling/bots.json", format: "json", pinnedKey: "claude", refreshMs: DAY, maxBytes: 2e6 },
   { sourceId: "claude-agent-sail", url: "https://claude.com/.well-known/sail", format: "sail-toml", pinnedKey: "claude-agent-sail", refreshMs: 36e5, maxBytes: 1e6 },
-  { sourceId: "manus-wba", url: "https://api.manus.im/.well-known/http-message-signatures-directory", format: "wba-directory", refreshMs: DAY, maxBytes: 1e6 },
+  // Web Bot Auth directories carry JWKs, not CIDRs. They are never fetched as prefix feeds;
+  // the verifier resolves them through WBA_TRUSTED_SIGNERS / PREFIX_FEEDS format 'none'.
+  { sourceId: "manus-wba", url: "https://api.manus.im/.well-known/http-message-signatures-directory", format: "none", refreshMs: DAY, maxBytes: 1e6 },
+  { sourceId: "grok-wba", url: "https://cursorusercontent.com/.well-known/http-message-signatures-directory", format: "none", refreshMs: DAY, maxBytes: 1e6 },
   { sourceId: "google-extended", url: "https://developers.google.com/search/docs/crawling-indexing/googlebot", format: "none", refreshMs: DAY, maxBytes: 1e6 },
   { sourceId: "applebot-extended", url: "https://support.apple.com/en-us/119829", format: "none", refreshMs: DAY, maxBytes: 1e6 }
 ];
@@ -670,12 +673,12 @@ var REGISTRY_LITERAL = [
     ua: { patterns: [/Manus-User\/1\.0/i, /ManusAgent/i, /manus-agent/i] },
     signature: {
       wbaRequired: true,
-      agentHosts: ["api.manus.im"],
+      agentHosts: ["api.manus.im", "manus.im", "manus.ai"],
       keyIdNeedles: ["manus"]
     },
     feedIds: ["manus-wba"],
     minProofForVerified: "signed_agent",
-    executionMode: "Remote Browser Agent",
+    executionMode: "RFC 9421 Signed Agent",
     pill: { kind: "manus", label: "Manus" }
   },
   {
@@ -1095,6 +1098,28 @@ var REGISTRY_LITERAL = [
     executionMode: "Autonomous Crawler"
   },
   {
+    // RFC 9421 Web Bot Auth signed agent. Exact token matches only; higher priority than the
+    // unsigned grok_bot claim so a signed GrokAgent resolves to this entry first.
+    id: "grok_agent",
+    provider: "xAI",
+    displayName: "Grok Bot",
+    category: "ai_agent",
+    bucket: "grok",
+    rank: 814,
+    which: ["classifier", "robodex", "attribution", "pill"],
+    ua: { patterns: [/GrokAgent/i, /\bxAI-SearchBot\/1\.0\b/i, /Grok-DeepSearch/i, /Grok-Search/i] },
+    signature: {
+      wbaRequired: true,
+      agentHosts: ["cursorusercontent.com"],
+      keyIdNeedles: ["Vuxu4khgzIe0b30Nd6hq2envAuVBFMTDqorSNIUb_Oo"]
+    },
+    feedIds: ["grok-wba"],
+    minProofForVerified: "signed_agent",
+    executionMode: "RFC 9421 Signed Agent",
+    pill: { kind: "grok", label: "Grok Bot" }
+  },
+  {
+    // Unsigned UA claim only: no ASN / network corroboration is assumed for xAI traffic.
     id: "grok_bot",
     provider: "xAI",
     displayName: "Grok Bot",
@@ -1102,7 +1127,7 @@ var REGISTRY_LITERAL = [
     bucket: "grok",
     rank: 815,
     which: ["robodex"],
-    ua: { patterns: [/Grok-Bot|GrokBot|\bgrok\b/i] },
+    ua: { patterns: [/GrokBot/i, /\bxAI-GrokBot\b/i, /\bxAI-Bot\b/i, /GrokAgent/i] },
     minProofForVerified: "ua_claim",
     executionMode: "Cloud Browser Agent"
   },
@@ -1285,7 +1310,7 @@ var BOT_SIGNATURE_KEYID_PROVIDERS = AGENT_REGISTRY.flatMap(
   (agent) => (agent.signature?.keyIdNeedles ?? []).map((needle) => [needle, agent.provider])
 );
 var AI_BOT_CIDR_SOURCES = PREFIX_FEEDS.filter(
-  (feed) => feed.format !== "none"
+  (feed) => feed.format !== "none" && feed.format !== "wba-directory"
 ).map((feed) => ({ id: feed.sourceId, url: feed.url }));
 var VERIFICATION_SUFFIXES_BY_AGENT = Object.fromEntries(
   AGENT_REGISTRY.filter((agent) => agent.fcrdnsSuffixes).map((agent) => [agent.id, [...agent.fcrdnsSuffixes]])
@@ -9225,10 +9250,431 @@ var PINNED_PREFIXES = {
   ]
 };
 
+// src/lib/wbaVerifier.ts
+var WBA_TRUSTED_SIGNERS = [
+  {
+    agentId: "manus_bot",
+    operator: "Manus",
+    directoryHosts: ["api.manus.im", "manus.im", "manus.ai"],
+    requirePinnedKey: false,
+    directoryUrl: "https://api.manus.im/.well-known/http-message-signatures-directory"
+  },
+  {
+    agentId: "grok_agent",
+    operator: "xAI",
+    directoryHosts: ["cursorusercontent.com"],
+    requirePinnedKey: true,
+    pinnedKeyX: ["STDZXOMW-Cg7paRpv_BtjujEHIQVNbzidfjY9M9w6hc"],
+    pinnedKeyIds: ["Vuxu4khgzIe0b30Nd6hq2envAuVBFMTDqorSNIUb_Oo"],
+    directoryUrl: "https://cursorusercontent.com/.well-known/http-message-signatures-directory"
+  }
+];
+var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+var B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+function splitTopLevel(value, separator) {
+  const out = [];
+  let start = 0;
+  let depth = 0;
+  let quoted = false;
+  let escaped = false;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') quoted = false;
+      continue;
+    }
+    if (ch === '"') quoted = true;
+    else if (ch === "(") depth++;
+    else if (ch === ")") depth = Math.max(0, depth - 1);
+    else if (ch === separator && depth === 0) {
+      out.push(value.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  out.push(value.slice(start).trim());
+  return out.filter((part) => part.length > 0);
+}
+function headerValues(headers, name) {
+  const wanted = name.toLowerCase();
+  const values = [];
+  for (const key of Object.keys(headers || {})) {
+    if (key.toLowerCase() !== wanted) continue;
+    const raw = headers[key];
+    if (Array.isArray(raw)) {
+      for (const item of raw) if (typeof item === "string") values.push(item);
+    } else if (typeof raw === "string") {
+      values.push(raw);
+    }
+  }
+  return values;
+}
+function stripQuotes(value) {
+  const v = value.trim();
+  if (v.length >= 2 && v[0] === '"' && v[v.length - 1] === '"') {
+    return v.slice(1, -1).replace(/\\(['"\\])/g, "$1");
+  }
+  return v;
+}
+function base64ToBytes(input) {
+  let text = input.replace(/[\s\r\n]/g, "").replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  if (!text) return new Uint8Array(0);
+  if (text.length % 4 === 1 || !/^[A-Za-z0-9+/]+$/.test(text)) return null;
+  const out = [];
+  let buffer = 0;
+  let bits = 0;
+  for (let i = 0; i < text.length; i++) {
+    const idx = B64.indexOf(text[i]);
+    if (idx < 0) return null;
+    buffer = buffer << 6 | idx;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push(buffer >> bits & 255);
+    }
+  }
+  return new Uint8Array(out);
+}
+function bytesToBase64Url(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i];
+    const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+    const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    out += B64URL[b0 >> 2];
+    out += B64URL[(b0 & 3) << 4 | b1 >> 4];
+    if (i + 1 < bytes.length) out += B64URL[(b1 & 15) << 2 | b2 >> 6];
+    if (i + 2 < bytes.length) out += B64URL[b2 & 63];
+  }
+  return out;
+}
+function isReservedHost(host) {
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (/\.(local|internal|test|invalid|example|onion)$/.test(host)) return true;
+  if (host === "metadata" || host === "metadata.google.internal") return true;
+  if (!host.includes(".")) return true;
+  return false;
+}
+function parseAgentIdentity(values) {
+  for (const raw of values) {
+    const text = typeof raw === "string" ? raw : "";
+    const candidates = [];
+    for (const match of text.match(/"(?:[^"\\]|\\.)*"/g) ?? []) candidates.push(stripQuotes(match));
+    for (const match of text.match(/'[^']*'/g) ?? []) candidates.push(match.slice(1, -1));
+    for (const match of text.match(/https:\/\/[^\s,;"'()]+/gi) ?? []) candidates.push(match);
+    for (const candidate of candidates) {
+      const m = /^https:\/\/([^\s/?#]+)/i.exec(candidate);
+      if (!m) continue;
+      const authority = m[1];
+      if (!authority || authority.includes("@") || authority.includes(":")) continue;
+      let host = authority.toLowerCase().replace(/\.$/, "");
+      if (!host || /^\d{1,3}(\.\d{1,3}){3}$/.test(host)) continue;
+      if (host.includes("[") || host.includes("]") || host.includes(":")) continue;
+      if (isReservedHost(host)) continue;
+      return { host, origin: `https://${host}` };
+    }
+  }
+  return { host: null, origin: null };
+}
+async function thumbprintWith(subtle, jwk) {
+  const canonical = '{"crv":' + JSON.stringify(jwk.crv) + ',"kty":' + JSON.stringify(jwk.kty) + ',"x":' + JSON.stringify(jwk.x) + "}";
+  const digest = await subtle.digest("SHA-256", new TextEncoder().encode(canonical));
+  return bytesToBase64Url(new Uint8Array(digest));
+}
+function ttlFromCacheControl(cacheControl) {
+  const DEFAULT_TTL = 36e5;
+  if (!cacheControl) return DEFAULT_TTL;
+  const match = /(?:s-maxage|max-age)\s*=\s*"?(\d+)"?/i.exec(cacheControl);
+  const seconds = match ? Number(match[1]) : DEFAULT_TTL / 1e3;
+  const ttl = Number.isFinite(seconds) ? seconds * 1e3 : DEFAULT_TTL;
+  return Math.min(864e5, Math.max(3e5, ttl));
+}
+var KID_BY_KEY = /* @__PURE__ */ new WeakMap();
+function sanitizeJwk(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw;
+  if (typeof record.x !== "string" || record.x.length === 0) return null;
+  const key = {
+    crv: typeof record.crv === "string" && record.crv ? record.crv : "Ed25519",
+    kty: typeof record.kty === "string" && record.kty ? record.kty : "OKP",
+    x: record.x
+  };
+  if (typeof record.kid === "string" && record.kid) {
+    key.kid = record.kid;
+    KID_BY_KEY.set(key, record.kid);
+  }
+  return key;
+}
+function parseWbaHeaders(headers) {
+  const parsed = {
+    present: false,
+    label: "",
+    keyId: "",
+    tag: "",
+    created: null,
+    expires: null,
+    covered: [],
+    rawSignatureInput: "",
+    signatureBytes: null,
+    agentHost: null,
+    agentOrigin: null
+  };
+  const inputValues = headerValues(headers, "signature-input");
+  const signatureValues = headerValues(headers, "signature");
+  const agentValues = headerValues(headers, "signature-agent");
+  parsed.present = inputValues.some((value2) => typeof value2 === "string" && value2.trim().length > 0);
+  if (!parsed.present) return parsed;
+  const identity = parseAgentIdentity(agentValues);
+  parsed.agentHost = identity.host;
+  parsed.agentOrigin = identity.origin;
+  const inputMembers = splitTopLevel(inputValues[0] ?? "", ",");
+  const signatureText = signatureValues[0] ?? "";
+  const signatureMembers = signatureText.trim() ? splitTopLevel(signatureText, ",") : [];
+  if (inputValues.length !== 1 || signatureValues.length > 1 || inputMembers.length !== 1 || signatureMembers.length > 1) {
+    return parsed;
+  }
+  const member = inputMembers[0];
+  const eq = member.indexOf("=");
+  if (eq > 0) parsed.label = member.slice(0, eq).trim();
+  const value = eq >= 0 ? member.slice(eq + 1).trim() : "";
+  const open = value.indexOf("(");
+  const close = value.lastIndexOf(")");
+  if (open < 0 || close <= open) return parsed;
+  parsed.rawSignatureInput = value;
+  const coveredText = value.slice(open + 1, close);
+  const tokenPattern = /"(?:[^"\\]|\\.)*"|\S+/g;
+  for (const match of coveredText.match(tokenPattern) ?? []) {
+    const name = stripQuotes(match).toLowerCase();
+    if (name && name !== "@signature-params" && !parsed.covered.includes(name)) parsed.covered.push(name);
+  }
+  for (const param of splitTopLevel(value.slice(close + 1), ";")) {
+    const p = param.indexOf("=");
+    if (p < 0) continue;
+    const name = param.slice(0, p).trim().toLowerCase();
+    const rawValue = param.slice(p + 1).trim();
+    if (name === "created" || name === "expires") {
+      const n = Number(rawValue);
+      if (Number.isFinite(n)) parsed[name] = n;
+    } else if (name === "keyid") {
+      parsed.keyId = stripQuotes(rawValue);
+    } else if (name === "tag") {
+      parsed.tag = stripQuotes(rawValue);
+    }
+  }
+  const sigMember = signatureMembers[0] ?? "";
+  const sigEq = sigMember.indexOf("=");
+  const sigValue = sigEq >= 0 ? sigMember.slice(sigEq + 1).trim() : "";
+  if (sigValue.length >= 2 && sigValue[0] === ":" && sigValue[sigValue.length - 1] === ":") {
+    parsed.signatureBytes = base64ToBytes(sigValue.slice(1, -1));
+  }
+  return parsed;
+}
+function buildSignatureBase(parsed, authority) {
+  if (!parsed.agentOrigin) return null;
+  if (!parsed.rawSignatureInput) return null;
+  const lines = [];
+  for (const component of parsed.covered) {
+    if (component === "@authority") {
+      lines.push(`"@authority": ${authority}`);
+    } else if (component === "signature-agent") {
+      lines.push(`"signature-agent": "${parsed.agentOrigin}"`);
+    }
+  }
+  if (lines.length === 0) return null;
+  lines.push(`"@signature-params": ${parsed.rawSignatureInput}`);
+  return lines.join("\n") + "\n";
+}
+async function fetchDirectoryKeys(url, fetchDirectory) {
+  try {
+    let body;
+    let cacheControl;
+    if (fetchDirectory) {
+      const response = await fetchDirectory(url);
+      if (!response || typeof response.body !== "string") return null;
+      body = response.body;
+      cacheControl = response.cacheControl;
+    } else {
+      const f = globalThis.fetch;
+      if (typeof f !== "function") return null;
+      const response = await f(url, { redirect: "error" });
+      if (!response || response.ok === false || typeof response.status === "number" && response.status >= 400) return null;
+      body = await response.text();
+      cacheControl = response.headers && typeof response.headers.get === "function" ? response.headers.get("cache-control") ?? void 0 : void 0;
+    }
+    if (typeof body !== "string") return null;
+    const json = JSON.parse(body);
+    if (!json || !Array.isArray(json.keys)) return null;
+    const keys = [];
+    for (const raw of json.keys.slice(0, 500)) {
+      const key = sanitizeJwk(raw);
+      if (key) keys.push(key);
+    }
+    return { keys, ttlMs: ttlFromCacheControl(cacheControl) };
+  } catch {
+    return null;
+  }
+}
+function resolveAuthority(opts, headers) {
+  if (typeof opts.authority === "string" && opts.authority.trim()) return opts.authority.trim();
+  for (const name of ["host", ":authority", "x-forwarded-host"]) {
+    const values = headerValues(headers, name);
+    if (!values.length) continue;
+    const authority = values[0].split(",")[0].trim();
+    if (authority) return authority;
+  }
+  return "";
+}
+async function verifyWebBotAuth(opts) {
+  const options = opts || {};
+  const nowMs = Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+  const evidence = [];
+  const finish = (status, extra) => ({
+    status,
+    verified: status === "verified",
+    operator: null,
+    agentId: null,
+    signerHost: null,
+    keyId: null,
+    keySource: null,
+    ...extra,
+    evidence: extra && extra.evidence ? [...evidence, ...extra.evidence] : [...evidence],
+    checkedAtMs: nowMs
+  });
+  try {
+    const headers = options.headers || {};
+    const parsed = parseWbaHeaders(headers);
+    if (!parsed.present) return finish("absent");
+    if (parsed.tag !== "web-bot-auth") return finish("unsupported");
+    evidence.push("wba.tag:web-bot-auth");
+    const hasAgent = parsed.covered.includes("signature-agent");
+    const hasAuthority = parsed.covered.includes("@authority") || parsed.covered.includes("@target-uri");
+    if (!hasAgent || !hasAuthority) return finish("invalid", { evidence: ["wba.coverage:fail"] });
+    evidence.push("wba.coverage:" + parsed.covered.join("+"));
+    const createdMs = parsed.created === null ? NaN : parsed.created * 1e3;
+    const expiresMs = parsed.expires === null ? NaN : parsed.expires * 1e3;
+    if (!Number.isFinite(createdMs) || !Number.isFinite(expiresMs)) return finish("expired");
+    if (!(createdMs <= nowMs + 5e3 && nowMs + 5e3 <= expiresMs)) return finish("expired");
+    if (expiresMs - createdMs > 864e5) return finish("expired");
+    evidence.push("wba.time:valid");
+    if (!parsed.signatureBytes || parsed.signatureBytes.length === 0 || !parsed.agentHost) {
+      return finish("invalid");
+    }
+    if (parsed.keyId) evidence.push("wba.keyid:" + parsed.keyId);
+    const trust = options.trust ?? WBA_TRUSTED_SIGNERS;
+    const signer = trust.find(
+      (candidate) => candidate.directoryHosts.some((host) => host.toLowerCase() === parsed.agentHost.toLowerCase())
+    );
+    if (!signer) return finish("unknown_signer");
+    const baseIdentity = {
+      operator: signer.operator,
+      agentId: signer.agentId,
+      signerHost: parsed.agentHost,
+      keyId: parsed.keyId || null
+    };
+    const subtle = options.subtle ?? (globalThis.crypto && globalThis.crypto.subtle);
+    if (!subtle || typeof subtle.verify !== "function" || typeof subtle.importKey !== "function") {
+      return finish("unavailable", { ...baseIdentity, evidence: ["wba.crypto:unavailable"] });
+    }
+    let keys;
+    let keySource;
+    if (!signer.directoryUrl && signer.pinnedKeyX && signer.pinnedKeyX.length > 0) {
+      keys = signer.pinnedKeyX.map((x, i) => {
+        const key = { crv: "Ed25519", kty: "OKP", x };
+        const kid = signer.pinnedKeyIds && signer.pinnedKeyIds[i];
+        if (kid) {
+          key.kid = kid;
+          KID_BY_KEY.set(key, kid);
+        }
+        return key;
+      });
+      keySource = "pinned";
+    } else {
+      const url = signer.directoryUrl || `https://${parsed.agentHost}/.well-known/http-message-signatures-directory`;
+      const cache = options.cache;
+      const cached = cache && cache.get(url);
+      if (cached && cached.expiresAtMs > nowMs) {
+        keys = cached.keys;
+      } else {
+        const directory = await fetchDirectoryKeys(url, options.fetchDirectory);
+        if (!directory) {
+          return finish("unavailable", { ...baseIdentity, evidence: ["wba.directory:unavailable"] });
+        }
+        keys = directory.keys;
+        if (cache) {
+          cache.set(url, {
+            keys: keys.map(({ crv, kty, x }) => ({ crv, kty, x })),
+            fetchedAtMs: nowMs,
+            expiresAtMs: nowMs + directory.ttlMs
+          });
+        }
+      }
+      keySource = "directory";
+    }
+    if (keys.length === 0) {
+      return finish("unavailable", { ...baseIdentity, keySource, evidence: ["wba.keys:none"] });
+    }
+    const thumbprints = /* @__PURE__ */ new Map();
+    if (typeof subtle.digest === "function") {
+      for (const key of keys) {
+        try {
+          thumbprints.set(key, await thumbprintWith(subtle, key));
+        } catch {
+        }
+      }
+    }
+    let candidates;
+    if (parsed.keyId) {
+      candidates = keys.filter(
+        (key) => key.kid && key.kid === parsed.keyId || thumbprints.get(key) === parsed.keyId
+      );
+      if (candidates.length === 0) {
+        return finish("unavailable", { ...baseIdentity, keySource, evidence: ["wba.keyid:unmatched"] });
+      }
+    } else {
+      candidates = keys;
+    }
+    if (signer.requirePinnedKey) {
+      const pinnedX = new Set(signer.pinnedKeyX ?? []);
+      const pinnedIds = new Set(signer.pinnedKeyIds ?? []);
+      candidates = candidates.filter(
+        (key) => pinnedX.has(key.x) || (key.kid ? pinnedIds.has(key.kid) : false) || (thumbprints.has(key) ? pinnedIds.has(thumbprints.get(key)) : false)
+      );
+      if (candidates.length === 0) {
+        return finish("unknown_signer", { ...baseIdentity, keySource, evidence: ["wba.pinned:fail"] });
+      }
+    }
+    const authority = resolveAuthority(options, headers);
+    const base = buildSignatureBase(parsed, authority);
+    if (!base) return finish("invalid", { ...baseIdentity, keySource });
+    const message = new TextEncoder().encode(base);
+    const signature = new Uint8Array(parsed.signatureBytes.length);
+    signature.set(parsed.signatureBytes);
+    for (const key of candidates) {
+      try {
+        const cryptoKey = await subtle.importKey(
+          "jwk",
+          { kty: key.kty, crv: key.crv, x: key.x },
+          { name: "Ed25519" },
+          false,
+          ["verify"]
+        );
+        const ok = await subtle.verify("Ed25519", cryptoKey, signature, message);
+        if (!ok) continue;
+        evidence.push("wba.verified:" + parsed.agentHost);
+        return finish("verified", { ...baseIdentity, keySource });
+      } catch {
+      }
+    }
+    return finish("invalid", { ...baseIdentity, keySource, evidence: ["wba.signature:invalid"] });
+  } catch {
+    return finish("invalid", { evidence: ["wba.error"] });
+  }
+}
+
 // server.ts
 var GOOD_BOT_UA_RULES2 = GOOD_BOT_UA_RULES;
 var AI_AGENT_UA_RULES2 = AI_AGENT_UA_RULES;
-var BOT_SIGNATURE_KEYID_PROVIDERS2 = BOT_SIGNATURE_KEYID_PROVIDERS;
 var AI_BOT_CIDR_SOURCES2 = AI_BOT_CIDR_SOURCES;
 function registryLookup(value, key) {
   if (!value || typeof value !== "object") return void 0;
@@ -9306,8 +9752,8 @@ var FALLBACK_SIGNATURE_HOSTS = [
   ["claude.ai", "anthropic"],
   ["browserbase.com", "browserbase"],
   ["anchorbrowser.io", "anchorbrowser"],
-  ["x.ai", "xai"],
-  ["grok.com", "xai"],
+  // xAI / Grok attribution is pinned exclusively in WBA_TRUSTED_SIGNERS inside wbaVerifier;
+  // x.ai / grok.com / cursorusercontent.com are NOT generic host→operator rules (anti-spoof).
   ["meta.com", "meta"],
   ["facebook.com", "meta"]
 ];
@@ -10669,18 +11115,17 @@ function classifyBotTraffic(headers, network, client) {
   if (signatureInput && signatureHeader) {
     const keyIdMatch = /keyid\s*=\s*"([^"]+)"/i.exec(signatureInput);
     const keyId = keyIdMatch ? keyIdMatch[1].trim().slice(0, 80) : "";
-    const keyIdLower = keyId.toLowerCase();
-    const namedOperator = BOT_SIGNATURE_KEYID_PROVIDERS2.find(
-      ([needle]) => keyIdLower.includes(needle)
-    );
+    const wba = client.webBotAuth;
+    const verified = Boolean(wba?.verified);
+    const namedOperator = verified && wba?.operator ? String(wba.operator) : "Unattributed RFC 9421 Signer";
     return {
       subtype: "ai_agent",
       label: "Web Bot Auth Agent",
-      provider: namedOperator ? namedOperator[1] : keyId || "RFC 9421 Signer",
+      provider: namedOperator,
       category: "Autonomous Agent",
-      confidence: 0.9,
+      confidence: verified ? 0.9 : 0.85,
       reasons: [
-        "RFC 9421 Signature / Signature-Input headers present (Web Bot Auth)",
+        verified ? "RFC 9421 Web Bot Auth signature verified (tag=web-bot-auth, Ed25519)" : "RFC 9421 Signature / Signature-Input headers present (Web Bot Auth) \u2014 signature NOT verified",
         keyId ? `Agent key identifier: ${keyId}` : "Agent key identifier not published"
       ]
     };
@@ -10849,31 +11294,91 @@ function resolveSignatureAgentOperator(host, label) {
   return null;
 }
 function parseWebBotAuthHeaders(headers) {
+  const parsed = parseWbaHeaders(headers ?? {});
   const signatureInput = readRequestHeader(headers, "signature-input");
   const signature = readRequestHeader(headers, "signature");
   const signatureAgent = readRequestHeader(headers, "signature-agent");
   const labelMatch = /^\s*([A-Za-z0-9_-]+)\s*=/.exec(signatureInput);
   const keyIdMatch = /keyid\s*=\s*"([^"]+)"/i.exec(signatureInput);
   const tagMatch = /tag\s*=\s*"([^"]+)"/i.exec(signatureInput);
-  const agentUrl = signatureAgent ? firstHttpsUrl(signatureAgent) : null;
-  let agentHost = "";
-  if (agentUrl) {
+  const agentUrl = parsed.agentOrigin || (signatureAgent ? firstHttpsUrl(signatureAgent) : null);
+  let agentHost = parsed.agentHost || "";
+  if (!agentHost && agentUrl) {
     try {
       agentHost = new URL(agentUrl).hostname.toLowerCase();
     } catch {
       agentHost = "";
     }
   }
-  const label = labelMatch ? labelMatch[1] : "";
+  const label = parsed.label || (labelMatch ? labelMatch[1] : "");
   return {
-    present: Boolean(signatureInput && signature),
+    present: parsed.present && Boolean(signature),
     label,
-    keyId: keyIdMatch ? keyIdMatch[1].trim().slice(0, 160) : "",
-    tag: tagMatch ? tagMatch[1].trim().slice(0, 80) : "",
+    keyId: parsed.keyId || (keyIdMatch ? keyIdMatch[1].trim().slice(0, 160) : ""),
+    tag: parsed.tag || (tagMatch ? tagMatch[1].trim().slice(0, 80) : ""),
     agentUrl,
     agentHost,
-    operator: resolveSignatureAgentOperator(agentHost, label)
+    operator: resolveSignatureAgentOperator(agentHost, label),
+    verified: false,
+    verifyStatus: "absent",
+    verifiedAgentId: null,
+    verifiedOperator: null,
+    verificationEvidence: []
   };
+}
+function withWbaVerification(base, verification) {
+  if (!verification || !verification.verified) {
+    return {
+      ...base,
+      verified: false,
+      verifyStatus: verification ? String(verification.status) : "absent",
+      verifiedAgentId: null,
+      verifiedOperator: null,
+      verificationEvidence: verification ? [...verification.evidence] : []
+    };
+  }
+  return {
+    ...base,
+    verified: true,
+    verifyStatus: String(verification.status),
+    verifiedAgentId: verification.agentId || null,
+    verifiedOperator: verification.operator || null,
+    verificationEvidence: [...verification.evidence]
+  };
+}
+function verifyPageAttestation(headers, authority, userAgent, publicIp) {
+  try {
+    const secret = process.env.VISITOR_HMAC_SECRET;
+    if (!secret || secret.length < 32) return null;
+    const cookie = readRequestHeader(headers, "cookie");
+    const match = /(?:^|;\s*)intel_wba=([^;]+)/.exec(cookie);
+    if (!match) return null;
+    const parts = match[1].split(".");
+    if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+    const expected = crypto.createHmac("sha256", secret).update(parts[0]).digest("base64url");
+    if (expected !== parts[1]) return null;
+    const payload = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
+    const now = Date.now();
+    if (!payload.exp || payload.exp <= now || payload.exp > now + 6e4) return null;
+    if (!payload.op || !payload.agentId || payload.host !== authority) return null;
+    const uaHash = crypto.createHash("sha256").update(userAgent || "").digest("hex").slice(0, 16);
+    const ipHash = crypto.createHash("sha256").update(publicIp || "").digest("hex").slice(0, 16);
+    if (payload.uaHash !== uaHash || payload.ipHash !== ipHash) return null;
+    const signer = payload.op === "Manus" ? "api.manus.im" : "cursorusercontent.com";
+    return {
+      status: "verified",
+      verified: true,
+      operator: payload.op,
+      agentId: payload.agentId,
+      signerHost: signer,
+      keyId: null,
+      keySource: null,
+      evidence: [`Signed page-load attestation replayed within 60s (${signer})`],
+      checkedAtMs: now
+    };
+  } catch {
+    return null;
+  }
 }
 async function fetchWebBotAuthDirectory(agentUrl) {
   let origin = "";
@@ -11026,23 +11531,32 @@ function proofTierSatisfied(minProof, proofs) {
   return proofs.feed || proofs.fcrdns || proofs.signature;
 }
 function signatureMatchesAgent(webBotAuth, agent) {
-  if (!webBotAuth.present) return false;
-  const operatorId = operatorIdFromName(agent.provider || agent.id);
-  if (webBotAuth.operator === operatorId) return true;
-  const haystack = `${webBotAuth.agentHost} ${webBotAuth.keyId} ${webBotAuth.label}`.toLowerCase();
-  if (!haystack.trim()) return false;
-  if (agent.signatureHosts?.some((host) => haystack.includes(String(host).toLowerCase()))) return true;
-  if (agent.keyIdNeedles?.some((needle) => webBotAuth.keyId.toLowerCase().includes(String(needle).toLowerCase()))) {
+  if (!webBotAuth.verified) return false;
+  const expectedOperator = operatorIdFromName(agent.provider || agent.id);
+  if (webBotAuth.verifiedOperator) {
+    const verifiedOperator = operatorIdFromName(webBotAuth.verifiedOperator);
+    if (verifiedOperator === expectedOperator) return true;
+  }
+  if (webBotAuth.verifiedAgentId) {
+    const verifiedAgent = webBotAuth.verifiedAgentId.toLowerCase();
+    const agentId = String(agent.id || "").toLowerCase();
+    if (verifiedAgent === agentId || verifiedAgent === agentId.replace(/[_-]/g, "")) return true;
+  }
+  if (webBotAuth.operator && webBotAuth.operator === expectedOperator && webBotAuth.verifiedAgentId) {
     return true;
   }
-  return haystack.includes(String(agent.provider || "").toLowerCase()) || haystack.includes(agent.id.toLowerCase());
+  return false;
 }
 async function resolveAiAgentIdentity(input) {
   const ua = input.userAgent || readRequestHeader(input.headers, "user-agent");
   if (!ua) return NO_AI_AGENT;
   if (isRegistryPolicyToken(ua)) return NO_AI_AGENT;
   const registryMatch = findRegistryAgent(ua);
-  const webBotAuth = parseWebBotAuthHeaders(input.headers);
+  const webBotAuth = withWbaVerification(
+    parseWebBotAuthHeaders(input.headers),
+    input.webBotAuth ?? null
+  );
+  const pageAttestation = webBotAuth.verified && !webBotAuth.present;
   const referer = `${readRequestHeader(input.headers, "referer")} ${readRequestHeader(
     input.headers,
     "origin"
@@ -11067,8 +11581,13 @@ async function resolveAiAgentIdentity(input) {
   const silentCloudTelemetry = Boolean(
     input.client.isVirtualMachine || idbRatio !== null && idbRatio > 0.95 && maskedGpu || desktopChrome && clientAutomation && maskedGpu
   );
-  const signatureEvidence = webBotAuth.present ? [
-    "RFC 9421 Signature / Signature-Input headers present (Web Bot Auth)",
+  const signatureEvidence = webBotAuth.verified ? [
+    ...webBotAuth.verificationEvidence,
+    "RFC 9421 Web Bot Auth signature verified (tag=web-bot-auth, Ed25519)",
+    webBotAuth.verifiedAgentId ? `Verified agent id: ${webBotAuth.verifiedAgentId}` : "",
+    webBotAuth.verifiedOperator ? `Verified operator: ${webBotAuth.verifiedOperator}` : ""
+  ].filter(Boolean) : webBotAuth.present ? [
+    "RFC 9421 Signature / Signature-Input headers present (Web Bot Auth) \u2014 signature NOT verified",
     webBotAuth.label ? `Signature label: ${webBotAuth.label}` : "",
     webBotAuth.agentUrl ? `Signature-Agent: ${webBotAuth.agentUrl}` : "",
     webBotAuth.keyId ? `keyid: ${webBotAuth.keyId}` : ""
@@ -11083,7 +11602,7 @@ async function resolveAiAgentIdentity(input) {
       (signal) => /stealth|headless|chromium|puppeteer|playwright|webdriver/i.test(signal)
     )
   );
-  if (authoritativeAutomation && !webBotAuth.present) {
+  if (authoritativeAutomation && !webBotAuth.verified && !pageAttestation) {
     return NO_AI_AGENT;
   }
   const remoteBrowserUa = /firecrawl|browserbase|browser[-_ ]?use|skyvern|multion|hyperbrowser|steel[-_ ]?browser|airtop|\bnotte\b|lightpanda|browserless|scrapingbee|scrapfly|zenrows|brightdata|oxylabs|\bzyte\b/i;
@@ -11157,7 +11676,7 @@ async function resolveAiAgentIdentity(input) {
     const googleDnsNames = await confirmedNames();
     const googleDns = hostMatchesSuffix(googleDnsNames, GOOGLE_VERIFICATION_SUFFIXES);
     const googleRangesLoaded = (aiBotPrefixTable.get("google-common")?.length ?? 0) > 0;
-    const verified = webBotAuth.operator === "google" || googleCidr || googleDns;
+    const verified = webBotAuth.verified && webBotAuth.operator === "google" || googleCidr || googleDns;
     if (geminiUa && !verified && googleRangesLoaded) {
       return aiAgentResult({
         agentId: "impostor-spoof",
@@ -11195,9 +11714,9 @@ async function resolveAiAgentIdentity(input) {
       agentId: "gemini",
       agentName: "Google Gemini / Cloud Agent (GCP VM)",
       operator: "Google LLC",
-      executionMode: webBotAuth.present ? "RFC 9421 Signed Agent" : "Silent Cloud VM Browser",
-      verified: webBotAuth.present,
-      confidence: webBotAuth.present ? "Verified" : "High",
+      executionMode: webBotAuth.verified ? "RFC 9421 Signed Agent" : "Silent Cloud VM Browser",
+      verified: webBotAuth.verified,
+      confidence: webBotAuth.verified ? "Verified" : "High",
       evidence: [
         ...signatureEvidence,
         ...asnIn(input.network.asn, GCP_ASNS) ? [`Google Cloud ASN (${input.network.asn}) hosting the browser`] : ["Reverse DNS matched *.googleusercontent.com"],
@@ -11205,37 +11724,44 @@ async function resolveAiAgentIdentity(input) {
       ]
     });
   }
-  const grokUa = /GrokBot|xAI-GrokBot|Grok-Search|xAI-Bot|\bGrok\b/i.test(ua);
-  const grokReferer = /grok\.com|x\.ai/i.test(referer);
-  if (webBotAuth.operator === "xai" || grokUa || grokReferer) {
-    const xaiDnsNames = await confirmedNames();
-    const xaiDns = hostMatchesSuffix(xaiDnsNames, XAI_VERIFICATION_SUFFIXES);
-    const xaiAsn = asnIn(input.network.asn, XAI_ASNS);
-    const verified = webBotAuth.operator === "xai" || xaiDns || xaiAsn;
+  const grokUa = /GrokAgent|GrokBot|xAI-GrokBot|Grok-Search|xAI-SearchBot|xAI-Bot|\bGrok\b/i.test(ua);
+  const grokSigned = webBotAuth.verified && (webBotAuth.verifiedAgentId?.toLowerCase() === "grok_agent" || webBotAuth.verifiedOperator?.toLowerCase() === "xai");
+  if (grokSigned) {
     return aiAgentResult({
-      agentId: "grok",
-      agentName: directoryHint?.clientName || "xAI Grok Bot",
+      agentId: "grok_agent",
+      agentName: "Grok Bot",
       operator: "xAI",
-      executionMode: webBotAuth.operator === "xai" ? "RFC 9421 Signed Agent" : grokReferer && !grokUa ? "Silent Cloud VM Browser" : "Autonomous Crawler",
-      verified,
-      confidence: verified ? "Verified" : xaiDnsNames.length > 0 ? "High" : "Medium",
-      evidence: [
-        ...webBotAuth.operator === "xai" ? signatureEvidence : [],
-        ...grokUa ? [`Grok user-agent: ${ua.slice(0, 120)}`] : [],
-        ...grokReferer ? [`Referer / Origin points at grok.com or x.ai`] : [],
-        ...xaiAsn ? [`xAI / X Corp ASN ${input.network.asn}`] : [],
-        ...xaiDns ? ["FCrDNS matched *.x.ai / *.grok.com"] : [],
-        ...!verified ? ["Verification sources unavailable \u2014 identity inferred from headers"] : [],
-        ...directoryEvidence
-      ]
+      executionMode: "RFC 9421 Signed Agent",
+      verified: true,
+      confidence: "Verified",
+      riskScore: 2,
+      evidence: [...signatureEvidence, "identity: signed", ...directoryEvidence]
     });
   }
+  const grokReferer = /grok\.com|x\.ai/i.test(referer);
+  void grokReferer;
+  const xaiCorroboration = [];
+  if (xaiCorroboration.length > 0) {
+  }
+  const xaiAsn = asnIn(input.network.asn, XAI_ASNS);
+  if (xaiAsn && (grokUa || grokSigned)) {
+    xaiCorroboration.push(
+      `xAI-associated ASN ${input.network.asn} (corroboration only \u2014 xAI publishes no authoritative ranges)`
+    );
+  }
+  const xaiDnsNames = grokUa ? await confirmedNames() : [];
+  if (hostMatchesSuffix(xaiDnsNames, XAI_VERIFICATION_SUFFIXES)) {
+    xaiCorroboration.push(
+      "xAI-associated FCrDNS (corroboration only \u2014 xAI publishes no authoritative ranges)"
+    );
+  }
+  void xaiCorroboration;
   const museUa = /\bMuseBot\b|\bMuse\b|Meta-ExternalAgent|Meta-ExternalFetcher|FacebookBot/i.test(ua);
   if (webBotAuth.operator === "meta" || museUa) {
     const metaDnsNames = await confirmedNames();
     const metaDns = hostMatchesSuffix(metaDnsNames, META_VERIFICATION_SUFFIXES);
     const metaAsn = asnIn(input.network.asn, META_ASNS);
-    const verified = webBotAuth.operator === "meta" || metaDns || metaAsn;
+    const verified = webBotAuth.verified && webBotAuth.operator === "meta" || metaDns || metaAsn;
     return aiAgentResult({
       agentId: "muse",
       agentName: directoryHint?.clientName || "Meta Muse",
@@ -11275,7 +11801,7 @@ async function resolveAiAgentIdentity(input) {
       PERPLEXITY_VERIFICATION_SUFFIXES
     );
     const perplexityAsn = asnIn(input.network.asn, PERPLEXITY_ASNS);
-    const verified = webBotAuth.operator === "perplexity" || perplexityDns || perplexityAsn;
+    const verified = webBotAuth.verified && webBotAuth.operator === "perplexity" || perplexityDns || perplexityAsn;
     return aiAgentResult({
       agentId: "perplexity",
       agentName: directoryHint?.clientName || "Perplexity AI Agent",
@@ -11298,9 +11824,9 @@ async function resolveAiAgentIdentity(input) {
       agentId: "perplexity",
       agentName: "Perplexity AI (PerplexityBot / Stealth Agent)",
       operator: "Perplexity AI",
-      executionMode: webBotAuth.present ? "RFC 9421 Signed Agent" : "Silent Cloud VM Browser",
-      verified: webBotAuth.present,
-      confidence: webBotAuth.present ? "Verified" : "Medium",
+      executionMode: webBotAuth.verified ? "RFC 9421 Signed Agent" : "Silent Cloud VM Browser",
+      verified: webBotAuth.verified,
+      confidence: webBotAuth.verified ? "Verified" : "Medium",
       evidence: [
         ...signatureEvidence,
         `AWS ASN (${input.network.asn}) hosting a headless Chromium session`,
@@ -11314,7 +11840,7 @@ async function resolveAiAgentIdentity(input) {
     const openAiDns = hostMatchesSuffix(openAiDnsNames, OPENAI_VERIFICATION_SUFFIXES);
     const openAiCidr = matchesAiPrefixTable(input.publicIp, ["chatgpt-user", "gptbot", "searchbot"]);
     const openAiRangesLoaded = (aiBotPrefixTable.get("chatgpt-user")?.length ?? 0) > 0 || (aiBotPrefixTable.get("gptbot")?.length ?? 0) > 0;
-    const verified = webBotAuth.operator === "openai" || openAiDns || openAiCidr;
+    const verified = webBotAuth.verified && webBotAuth.operator === "openai" || openAiDns || openAiCidr;
     if (openAiUa && !verified && (openAiRangesLoaded || openAiDnsNames.length > 0)) {
       return aiAgentResult({
         agentId: "impostor-spoof",
@@ -11346,7 +11872,7 @@ async function resolveAiAgentIdentity(input) {
       ]
     });
   }
-  if (asnIn(input.network.asn, AZURE_ASNS) && webBotAuth.present) {
+  if (asnIn(input.network.asn, AZURE_ASNS) && webBotAuth.verified) {
     return aiAgentResult({
       agentId: "openai",
       agentName: "OpenAI ChatGPT Agent / Operator",
@@ -11364,7 +11890,7 @@ async function resolveAiAgentIdentity(input) {
   if (webBotAuth.operator === "anthropic" || claudeUa) {
     const anthropicDnsNames = await confirmedNames();
     const anthropicDns = hostMatchesSuffix(anthropicDnsNames, ANTHROPIC_VERIFICATION_SUFFIXES);
-    const verified = webBotAuth.operator === "anthropic" || anthropicDns;
+    const verified = webBotAuth.verified && webBotAuth.operator === "anthropic" || anthropicDns;
     if (claudeUa && !verified) {
       return aiAgentResult({
         agentId: "impostor-spoof",
@@ -11411,15 +11937,15 @@ async function resolveAiAgentIdentity(input) {
     });
   }
   const cloudBrowserOperator = webBotAuth.operator === "browserbase" ? { name: "Browserbase Cloud Agent", operator: "Browserbase" } : webBotAuth.operator === "anchorbrowser" ? { name: "Anchor Browser AI Agent", operator: "Anchor Browser" } : null;
-  if ((webBotAuth.present || cloudBrowserOperator) && !registryMatch) {
+  if ((webBotAuth.verified || cloudBrowserOperator) && !registryMatch) {
     const handle = webBotAuth.agentHost || webBotAuth.keyId || "unattributed signer";
     return aiAgentResult({
       agentId: "cloud-browser",
       agentName: directoryHint?.clientName || cloudBrowserOperator?.name || "AI Agent \xB7 Cloud Browser (RFC 9421 Signed)",
       operator: cloudBrowserOperator?.operator || "Unattributed Cloud Browser",
       executionMode: "RFC 9421 Signed Agent",
-      verified: webBotAuth.present,
-      confidence: webBotAuth.present ? "Verified" : "High",
+      verified: webBotAuth.verified,
+      confidence: webBotAuth.verified ? "Verified" : "High",
       evidence: [
         ...signatureEvidence,
         ...cloudBrowserOperator ? [`Signature-Agent operator: ${handle}`] : [],
@@ -11448,6 +11974,8 @@ async function resolveAiAgentIdentity(input) {
     let verified = proofTierSatisfied(agent.minProofForVerified, proofs);
     if (/mistral[\s_-]?ai[\s_-]?training/i.test(agent.id)) verified = false;
     if (/manus/i.test(agent.id) && !proofs.signature) verified = false;
+    const isManusClaim = /manus/i.test(agent.id);
+    const isGrokClaim = /grok/i.test(agent.id);
     return aiAgentResult({
       agentId: agent.id,
       agentName: agent.displayName,
@@ -11455,12 +11983,16 @@ async function resolveAiAgentIdentity(input) {
       executionMode: agent.executionMode || "Autonomous Crawler",
       verified,
       confidence: verified ? "Verified" : "Medium",
-      riskScore: verified ? 2 : 8,
+      riskScore: verified ? 2 : isManusClaim || isGrokClaim ? 7 : 8,
       evidence: [
         `Named agent user-agent claim: ${ua.slice(0, 120)}`,
         proofs.feed ? "Source IP matched a registry-published crawler CIDR prefix" : "",
         proofs.fcrdns ? "FCrDNS matched the operator verification suffix" : "",
         proofs.signature ? "RFC 9421 / SAIL signature attributed to the operator" : "",
+        ...isManusClaim ? [
+          verified ? "RFC 9421 Web Bot Auth signature verified (tag=web-bot-auth, Ed25519)" : "Manus-User/1.0 token present in User-Agent \u2014 no verifiable signature; unverified identity claim"
+        ] : [],
+        ...isGrokClaim && !verified ? ["Grok token present in User-Agent \u2014 no verifiable signature; unverified identity claim"] : [],
         ...!verified ? ["Verification sources unavailable \u2014 identity inferred from the user-agent claim"] : [],
         ...directoryEvidence
       ].filter(Boolean)
@@ -14410,6 +14942,39 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const hardAutomationSignals = (!rfpExemptRequest || automationTargetedTampering) && Boolean(
       automationTargetedTampering || rawSecuritySignals?.stealthPluginDetected || rawSecuritySignals?.tamperingDetails?.anti_detect_browser
     );
+    const decodeEdgeHeader = (name) => {
+      const value = readRequestHeader(rawRequestHeaders, name);
+      if (!value) return "";
+      try {
+        return decodeURIComponent(value);
+      } catch {
+        return value;
+      }
+    };
+    const wbaAuthority = decodeEdgeHeader("x-intel-original-authority") || String(req.headers.host || "");
+    const wbaHeaderBag = {
+      ...rawRequestHeaders,
+      "signature-agent": decodeEdgeHeader("x-intel-original-signature-agent") || readRequestHeader(rawRequestHeaders, "signature-agent"),
+      "signature-input": decodeEdgeHeader("x-intel-original-signature-input") || readRequestHeader(rawRequestHeaders, "signature-input"),
+      "signature": decodeEdgeHeader("x-intel-original-signature") || readRequestHeader(rawRequestHeaders, "signature")
+    };
+    let requestWba = null;
+    try {
+      requestWba = await verifyWebBotAuth({
+        headers: wbaHeaderBag,
+        authority: wbaAuthority,
+        trust: WBA_TRUSTED_SIGNERS
+      });
+    } catch {
+      requestWba = null;
+    }
+    const pageAttestation = requestWba && requestWba.verified ? null : verifyPageAttestation(
+      rawRequestHeaders,
+      wbaAuthority,
+      fullRequestUserAgent,
+      location.publicIp
+    );
+    const effectiveWba = requestWba && requestWba.verified ? requestWba : pageAttestation;
     const botClassification = classifyBotTraffic(
       { ...rawRequestHeaders, "user-agent": fullRequestUserAgent },
       { org: location.org, isp: location.isp, asn: location.asn },
@@ -14429,7 +14994,8 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         antiDetectBrowser: rfpExemptRequest ? false : Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
         tamperingMlScore: rfpExemptRequest ? 0 : typeof rawSecuritySignals?.tamperingMlScore === "number" ? rawSecuritySignals.tamperingMlScore : 0,
         automationTargetedTampering,
-        automationTamperingReasons: handlerAutomationTampering.reasons
+        automationTamperingReasons: handlerAutomationTampering.reasons,
+        webBotAuth: effectiveWba
       }
     );
     const torLookupTarget = location.publicIp.trim().toLowerCase();
@@ -14473,6 +15039,8 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     let aiAgent = await resolveAiAgentIdentity({
       headers: rawRequestHeaders,
       userAgent: fullRequestUserAgent,
+      webBotAuth: effectiveWba,
+      originalAuthority: wbaAuthority,
       network: { isp: location.isp, org: location.org, asn: location.asn },
       publicIp: location.publicIp,
       client: {

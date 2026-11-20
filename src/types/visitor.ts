@@ -121,6 +121,7 @@ export interface AiAgentAttribution {
   agentId:
     | 'gemini'
     | 'grok'
+    | 'grok_agent'
     | 'muse'
     | 'perplexity'
     | 'openai'
