@@ -15,7 +15,11 @@ import { NetworkStabilityPanel } from './components/NetworkStabilityPanel';
 import { CpuActivityPanel } from './components/CpuActivityPanel';
 import { isMobileDevice } from './lib/deviceClass';
 import { normalizeIdentity } from './shared/normalization/uaNormalizer';
-import { SmartSignalsGrid } from './components/SmartSignalsGrid';
+import {
+  SmartSignalsGrid,
+  safeIncognitoStatus,
+  safeIncognitoDetail,
+} from './components/SmartSignalsGrid';
 import {
   CursorAttributionOverlay,
   resolveAutomationLabel,
@@ -55,6 +59,69 @@ import {
   Bot,
   ChevronRight,
 } from 'lucide-react';
+
+/** Edge-computed verdict injected into index.html by the Worker before any JS runs. */
+interface InitialVerdict {
+  name: string;
+  provider: string | null;
+  botType: string | null;
+  identity: string | null;
+  os: string | null;
+}
+
+/** Maps a runtime hostOs probe value onto the one canonical family label. */
+function mapRuntimeOs(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const key = value.trim().toLowerCase();
+  const families: Record<string, string> = {
+    linux: 'Linux',
+    linux_x64: 'Linux',
+    linux_arm: 'Linux',
+    macos: 'macOS',
+    mac: 'macOS',
+    darwin: 'macOS',
+    osx: 'macOS',
+    windows: 'Windows',
+    win: 'Windows',
+    win32: 'Windows',
+  };
+  return families[key] ?? null;
+}
+
+/** Second, independent runtime signal: the GPU/ANGLE backend implies an OS family. */
+function osHintFromGpuRenderer(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const renderer = value.toLowerCase();
+  if (/metal|apple m\d|apple gpu/.test(renderer)) return 'macOS';
+  if (/direct3d|d3d1[01]|dxgi|windows/.test(renderer)) return 'Windows';
+  if (/vulkan|mesa|glx|x11|wayland|llvmpipe|linux/.test(renderer)) return 'Linux';
+  return null;
+}
+
+/** Never let a server-side "verified" claim survive on the displayed OS string. */
+function stripVerifiedSuffix(value: string | null | undefined): string {
+  return (value || '').replace(/\s*\(verified\)\s*$/i, '').trim();
+}
+
+/** Module-level reader for the Worker's server-rendered JSON verdict (runs once at import). */
+function readInitialVerdict(): InitialVerdict | null {
+  if (typeof document === 'undefined') return null;
+  const node = document.getElementById('intel-initial-verdict');
+  if (!node) return null;
+  try {
+    const parsed = JSON.parse(node.textContent || '') as Record<string, unknown>;
+    if (!parsed || typeof parsed.name !== 'string' || !parsed.name.trim()) return null;
+    return {
+      name: parsed.name.trim(),
+      provider: typeof parsed.provider === 'string' && parsed.provider.trim() ? parsed.provider : null,
+      botType: typeof parsed.botType === 'string' && parsed.botType.trim() ? parsed.botType : null,
+      identity: typeof parsed.identity === 'string' && parsed.identity.trim() ? parsed.identity : null,
+      os: typeof parsed.os === 'string' && parsed.os.trim() ? stripVerifiedSuffix(parsed.os) : null,
+    };
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Formats a stored UTC ISO-8601 timestamp into the visitor's local timezone.
@@ -391,13 +458,26 @@ function createSignalRow(
  * server's exact status wording and out-of-10 rating line.
  */
 function smartSignalToRow(signal: SmartSignal): SignalRowModel {
+  // Incognito copy is sanitized to the three allowed human labels; every other signal keeps
+  // the server's exact status/detail verbatim (including the bot's exact agent name).
+  const isIncognito = signal.id === 'incognito';
+  const detected =
+    isIncognito &&
+    /incognito|private|detected|yes/i.test(signal.status) &&
+    !/not detected/i.test(signal.status);
+  const statusLabel = isIncognito
+    ? safeIncognitoStatus(signal.status, detected)
+    : signal.status;
+  const caption = isIncognito
+    ? safeIncognitoDetail(signal.detail, detected) ?? statusLabel
+    : signal.detail;
   return {
     key: signal.id,
     dotClass: TONE_DOT_CLASS[toneForScore(signal.scoreOutOf10)],
     title: signal.title,
-    caption: signal.detail,
-    statusLabel: signal.status,
-    tooltip: `${signal.title} • ${signal.detail}`,
+    caption,
+    statusLabel,
+    tooltip: `${signal.title} • ${caption}`,
     riskScore: signal.scoreOutOf10,
     riskLabel: signal.riskLabel,
   };
@@ -455,27 +535,72 @@ const UNAVAILABLE_CARD_TITLES = [
   'Virtual Machine & OS Integrity',
 ] as const;
 
-function buildSignalRows(serverSignals?: SmartSignals | null): SignalRowModel[] {
-  if (serverSignals) {
-    return [
-      serverSignals.incognito,
-      serverSignals.bot,
-      serverSignals.vpn,
-      serverSignals.vm,
-    ].map(smartSignalToRow);
+/** Placeholder bot statuses that may be replaced by the server's exact agent name. */
+const GENERIC_BOT_STATUSES = new Set([
+  'not detected',
+  'you are a bot',
+  'unavailable',
+  'detected',
+  'verified crawler',
+  'ai agent',
+  'n/a',
+  'none',
+  'unknown',
+  'false',
+  'low-confidence soft signals',
+  'soft signals',
+  'weak signals',
+  'heuristic',
+]);
+
+function buildSignalRows(
+  serverSignals?: SmartSignals | null,
+  exactBotName?: string | null
+): SignalRowModel[] {
+  const rows: SignalRowModel[] = serverSignals
+    ? [serverSignals.incognito, serverSignals.bot, serverSignals.vpn, serverSignals.vm].map(
+        smartSignalToRow
+      )
+    : UNAVAILABLE_CARD_TITLES.map((title) =>
+        createSignalRow({
+          key: title,
+          tone: 'ok',
+          title,
+          caption: 'Awaiting canonical signal grid from the Worker',
+          statusLabel: 'Unavailable',
+          tooltip: 'Server-computed signal grid not present in this response',
+          riskScore: 0,
+          riskLabel: 'Unavailable',
+        })
+      );
+
+  // The exact edge/server verdict always wins over a coarse placeholder. `smartSignalToRow`
+  // already prints server `bot.status` + `bot.detail` verbatim; only generic statuses get the
+  // exact name appended so the "Bot & Automation Detection" card and the Bot tile agree.
+  const name = exactBotName?.trim();
+  const vagueName = /soft signals|low[- ]confidence|weak signals|heuristic|not detected/i.test(name || '');
+  if (name && !vagueName) {
+    const index = rows.findIndex((row) => row.key === 'bot' || row.title === 'Bot & Automation Detection');
+    if (index >= 0) {
+      const row = rows[index];
+      const generic =
+        !row.statusLabel.trim() ||
+        GENERIC_BOT_STATUSES.has(row.statusLabel.trim().toLowerCase()) ||
+        /soft signals|low[- ]confidence|weak signals|heuristic/i.test(row.statusLabel);
+      if (generic) {
+        rows[index] = {
+          ...row,
+          statusLabel: name,
+          caption:
+            row.caption && !GENERIC_BOT_STATUSES.has(row.caption.trim().toLowerCase())
+              ? `${row.caption} · ${name}`
+              : name,
+          tooltip: `${row.title} • ${name}`,
+        };
+      }
+    }
   }
-  return UNAVAILABLE_CARD_TITLES.map((title) =>
-    createSignalRow({
-      key: title,
-      tone: 'ok',
-      title,
-      caption: 'Awaiting canonical signal grid from the Worker',
-      statusLabel: 'Unavailable',
-      tooltip: 'Server-computed signal grid not present in this response',
-      riskScore: 0,
-      riskLabel: 'Unavailable',
-    })
-  );
+  return rows;
 }
 
 interface JsonTreeNodeProps {
@@ -712,6 +837,8 @@ function JsonPreview({ value }: { value: unknown }) {
 
 export default function App() {
   const [data, setData] = useState<IntelVisitorResponse | null>(null);
+  // Server-rendered edge verdict. Pure fallback — it never seeds `data` or triggers a fetch.
+  const [initialVerdict, setInitialVerdict] = useState(readInitialVerdict);
   const [loading, setLoading] = useState<boolean>(true);
   const [refreshing, setRefreshing] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
@@ -937,7 +1064,12 @@ export default function App() {
   // canonical envelope) outranks any stale aiAgent / Gemini field, so the cursor pill, the
   // attribution banner and the Event JSON can never disagree or name a stealth session as a
   // signed cloud agent.
-  const displayBotType = data?.bot_type ?? canonical.automation?.bot_type ?? null;
+  // The edge verdict is a fallback for the bot_type before the API response lands.
+  const displayBotType =
+    data?.bot_type ?? initialVerdict?.botType ?? canonical.automation?.bot_type ?? null;
+  // Exact agent name from the Worker's edge verdict (or the server's own bot_info). Never a
+  // stale aiAgent fallback — a verdict, once present, is authoritative for the name.
+  const exactBotName = initialVerdict?.name ?? data?.bot_info?.name ?? null;
   const automationDisplayLabel = resolveAutomationLabel(displayBotType);
   const spoofedSpecs = Boolean(
     data?.tamperingDetails?.anti_detect_browser ||
@@ -960,29 +1092,19 @@ export default function App() {
       : null;
   const timezoneMismatchContextual = Boolean(canonical.network?.timezone_mismatch);
 
-  // Emulated / spoofed OS is blocked from display: show the real hardware OS and label the
-  // claimed one. Silicon truth comes from the additive hardware signals on the response.
-  const hardwareTruth = data?.hardwareSignals as unknown as Record<string, unknown> | undefined;
-  const spoofedOsClaim =
-    selectedVisitIndex === 0 &&
-    (Boolean(data?.tamperingDetails?.devtools_device_emulation) ||
-      Boolean(hardwareTruth?.archUaMismatch) ||
-      Boolean(hardwareTruth?.osUaMismatch))
-      ? data?.browserDevice?.os || ''
-      : '';
-  const spoofedOsBlocked = Boolean(spoofedOsClaim && spoofedOsClaim !== 'Unavailable');
-  const hardwareOsTruth =
-    typeof hardwareTruth?.hostOs === 'string' && hardwareTruth.hostOs !== 'unknown'
-      ? hardwareTruth.hostOs
-      : null;
-  const hardwareOsLabel = hardwareOsTruth
-    ? { linux: 'Linux', macos: 'macOS', windows: 'Windows' }[hardwareOsTruth] ?? hardwareOsTruth
-    : null;
-
-  // Server-verified UA-CH identity for the current session. `browserDevice.browser/os` is read
-  // from mutable JS APIs and is spoofable, so the summary tiles prefer the request's own
-  // Sec-CH-UA* headers. A selected past visit keeps its own recorded browser / OS values.
   const isCurrentVisit = selectedVisitIndex === 0;
+
+  // OS truth: the runtime hardware probe outranks UA-CH / navigator claims. Two independent
+  // runtime signals (hostOs + GPU backend) must agree before any "(verified)" suffix is used.
+  const hardwareTruth = data?.hardwareSignals as unknown as Record<string, unknown> | undefined;
+  const osUaMismatch = Boolean(hardwareTruth?.osUaMismatch);
+  const runtimeOsLabel = mapRuntimeOs(hardwareTruth?.hostOs);
+  const gpuOsHint = osHintFromGpuRenderer(data?.hardwareSignals?.gpuRenderer);
+  const runtimeOsCorroborated =
+    runtimeOsLabel !== null && gpuOsHint !== null && runtimeOsLabel === gpuOsHint && !osUaMismatch;
+
+  // Server-verified UA-CH identity for the current session. Kept only as a fallback when the
+  // runtime probe cannot name an OS — and never with a "(verified)" suffix of its own.
   const serverBrowserDetails = data?.browser_details;
   const currentBrowserLabel = serverBrowserDetails
     ? [
@@ -995,20 +1117,42 @@ export default function App() {
         .join(' ')
         .trim()
     : '';
-  const currentOsLabel = serverBrowserDetails
-    ? [serverBrowserDetails.os, serverBrowserDetails.os_version]
-        .filter(Boolean)
-        .join(' ')
-        .trim()
-    : '';
+  const currentOsLabel = stripVerifiedSuffix(
+    serverBrowserDetails
+      ? [serverBrowserDetails.os, serverBrowserDetails.os_version].filter(Boolean).join(' ').trim()
+      : ''
+  );
+  // A past visit keeps its own recorded OS; the current visit's claim comes from UA-CH/JS.
+  const claimedOsRaw = isCurrentVisit
+    ? currentOsLabel || data?.browserDevice.os || ''
+    : activeVisit?.os || data?.browserDevice.os || '';
+  const claimedOsFamily = mapRuntimeOs(claimedOsRaw) ||
+    (/mac/i.test(claimedOsRaw) ? 'macOS' : /win/i.test(claimedOsRaw) ? 'Windows' : /linux/i.test(claimedOsRaw) ? 'Linux' : null);
+  const runtimeDisagrees = Boolean(
+    runtimeOsLabel && claimedOsFamily && runtimeOsLabel !== claimedOsFamily
+  );
+  const spoofedOsClaim =
+    isCurrentVisit &&
+    (runtimeDisagrees ||
+      Boolean(data?.tamperingDetails?.devtools_device_emulation) ||
+      Boolean(hardwareTruth?.archUaMismatch) ||
+      osUaMismatch)
+      ? stripVerifiedSuffix(claimedOsRaw)
+      : '';
+  const spoofedOsBlocked = Boolean(spoofedOsClaim && spoofedOsClaim !== 'Unavailable');
+
+  const serverOsLabel = stripVerifiedSuffix(
+    isCurrentVisit && currentOsLabel
+      ? currentOsLabel
+      : activeVisit?.os || data?.browserDevice.os || 'Unavailable'
+  );
+  const displayOs = runtimeOsLabel
+    ? `${runtimeOsLabel}${runtimeOsCorroborated ? ' (verified)' : ''}`
+    : serverOsLabel;
   const displayBrowser =
     isCurrentVisit && currentBrowserLabel
       ? currentBrowserLabel
       : activeVisit?.browser || data?.browserDevice.browser || 'Unavailable';
-  const displayOs =
-    isCurrentVisit && currentOsLabel
-      ? currentOsLabel
-      : activeVisit?.os || data?.browserDevice.os || 'Unavailable';
   // Only annotate the tiles when the current session actually shows tampering / stealth
   // evidence — on a clean session the server-verified value is the unremarkable default.
   const showServerVerifiedNote = Boolean(
@@ -1025,7 +1169,7 @@ export default function App() {
   // 4-signal core grid model (null-safe: renders only inside the data block). Only the
   // server-computed grid is displayed; a legacy response gets explicit unavailable tiles.
   const serverSmartSignals = data?.smartSignals ?? data?.securitySignals?.smartSignals ?? null;
-  const signalRows = buildSignalRows(serverSmartSignals);
+  const signalRows = buildSignalRows(serverSmartSignals, data?.bot_info?.name ?? exactBotName);
 
   // User-visible risk stays on the 0-10 suspect-score scale. The normalizer converts any
   // legacy 0-100 mirror back to 0-10; the tier follows that same displayed score.
@@ -1048,8 +1192,11 @@ export default function App() {
     isBot: Boolean(data?.securitySignals.isBot),
     // Server-authoritative semantic bot type outranks any stale aiAgent / Gemini claim.
     botType: displayBotType,
-    agentId: data?.securitySignals.aiAgent?.agentId ?? null,
-    agentName: data?.securitySignals.aiAgent?.agentName ?? null,
+    agentId: data?.securitySignals.aiAgent?.agentId ?? initialVerdict?.botType ?? null,
+    agentName: data?.securitySignals.aiAgent?.agentName ?? exactBotName ?? null,
+    agentVerified: Boolean(data?.securitySignals.aiAgent?.verified),
+    // The raw request UA is what the shared agent registry matches for exact pill labels.
+    userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : null,
   });
 
   // API v4 event payload rendered by the bottom inspector. Built exclusively from live
@@ -1062,6 +1209,15 @@ export default function App() {
   const eventJson = useMemo(() => {
     if (!data) return null;
     const s = data.securitySignals;
+    // Edge verdict fallback: a named agent is authoritative, so no stale aiAgent value may
+    // ever supply bot / bot_type / bot_info once one of these verdict fields exists.
+    const eventBotType = data.bot_type ?? initialVerdict?.botType ?? null;
+    const eventBotIdentity =
+      initialVerdict?.identity === 'verified' ||
+      initialVerdict?.identity === 'signed' ||
+      initialVerdict?.identity === 'spoofed'
+        ? initialVerdict.identity
+        : 'unknown';
     // Optional silicon-truth fields are additive: older responses simply omit them.
     const hw = (data.hardwareSignals ?? {}) as unknown as Record<string, unknown>;
     // Canonical network identity is derived only from server-side IP geolocation and the
@@ -1194,37 +1350,38 @@ export default function App() {
       // derivation so a legacy response can never print bot:"not_detected" next to isBot:true.
       bot:
         data.bot ??
-        (Boolean(s.isBot) || s.botSubtype === 'bad_bot' || s.botSubtype === 'ai_agent'
+        (exactBotName
+          ? eventBotIdentity === 'spoofed'
+            ? 'bad'
+            : 'good'
+          : Boolean(s.isBot) || s.botSubtype === 'bad_bot' || s.botSubtype === 'ai_agent'
           ? 'bad'
           : 'not_detected'),
-      // Mirror the canonical bot_type verbatim. Only when no server bot_type exists do the
-      // legacy fallbacks apply, and an automation label can never fall through to `ai_agent`
-      // from a stale aiAgent field.
-      bot_type:
-        displayBotType ??
-        (s.botSubtype && s.botSubtype !== 'human'
-          ? s.botSubtype
-          : s.aiAgent?.detected
-          ? 'ai_agent'
-          : null),
-      bot_info:
-        data.bot_info && !automationDisplayLabel
-          ? data.bot_info
-          : automationDisplayLabel
-          ? {
-              category: 'browser_automation',
-              provider: data.bot_info?.provider ?? 'Unknown',
-              name: automationDisplayLabel,
-              identity: 'unknown',
-            }
-          : s.aiAgent?.detected
-          ? {
-              category: 'ai_agent',
-              provider: s.aiAgent.operator || 'Unknown',
-              name: s.aiAgent.agentName,
-              identity: s.aiAgent.verified ? 'verified' : 'unknown',
-            }
-          : null,
+      // Mirror the authoritative bot_type verbatim. The edge verdict fills in when the API
+      // response has not supplied one; no stale aiAgent field is consulted after that.
+      bot_type: eventBotType,
+      bot_info: automationDisplayLabel
+        ? {
+            category: 'browser_automation',
+            provider: data.bot_info?.provider ?? initialVerdict?.provider ?? 'Unknown',
+            name: automationDisplayLabel,
+            identity: 'unknown',
+          }
+        : exactBotName
+        ? {
+            category: data.bot_info?.category ?? eventBotType ?? 'crawler',
+            provider: data.bot_info?.provider ?? initialVerdict?.provider ?? 'Unknown',
+            name: exactBotName,
+            identity: data.bot_info?.identity ?? eventBotIdentity,
+          }
+        : s.aiAgent?.detected
+        ? {
+            category: 'ai_agent',
+            provider: s.aiAgent.operator || 'Unknown',
+            name: s.aiAgent.agentName,
+            identity: s.aiAgent.verified ? 'verified' : 'unknown',
+          }
+        : null,
       // Developer tools = a real docked DevTools UI / IDE webview, proved ONLY by the
       // canonical envelope's inspector_state. A bare CDP binding / cdpRuntimeLeak /
       // automation_protocol_attached is reported separately and never sets this true.
@@ -1272,6 +1429,13 @@ export default function App() {
       proxy: Boolean(canonical?.network?.proxy ?? (s as unknown as { proxyDetected?: boolean }).proxyDetected ?? false),
       proxy_confidence: canonical?.network?.proxy ? 'high' : 'low',
       incognito: Boolean(s.isIncognito ?? s.incognito ?? s.privateMode),
+      // Human-only copy in the Event JSON: no IDB ratios / fail-open / raw method strings.
+      incognito_status: safeIncognitoStatus(
+        (s as { incognitoDetail?: string }).incognitoDetail ??
+          (s as { incognitoMethod?: string }).incognitoMethod ??
+          '',
+        Boolean(s.isIncognito ?? s.incognito ?? s.privateMode)
+      ),
       incognito_confidence:
         (s as { incognitoConfidence?: 'high' | 'low' }).incognitoConfidence ?? null,
       privacy_settings: Boolean(
@@ -1308,11 +1472,12 @@ export default function App() {
       // Reconciled display: a spoofed / emulated OS claim is blocked and the verified host OS
       // is shown. No emulated iOS / Android value is ever presented as the underlying truth.
       reconciled_display: {
-        os: spoofedOsBlocked
-          ? hardwareOsLabel ?? 'Underlying OS verified'
-          : currentOsLabel || data.browserDevice.os,
+        // Same corrected OS the tiles show: runtime truth first, "(verified)" only when two
+        // independent runtime signals agree and osUaMismatch is false.
+        os: displayOs,
         claimed_os: spoofedOsBlocked ? spoofedOsClaim : null,
         spoofed_os_blocked: spoofedOsBlocked,
+        os_source: runtimeOsLabel ? 'runtime_hardware' : 'server',
       },
       timezone_display: {
         browser: browserTimezoneLabel,
@@ -1387,6 +1552,12 @@ export default function App() {
     canonical,
     displayBotType,
     automationDisplayLabel,
+    exactBotName,
+    initialVerdict,
+    displayOs,
+    spoofedOsBlocked,
+    spoofedOsClaim,
+    runtimeOsLabel,
     spoofedSpecs,
     tamperingDetected,
     swiftShader,
@@ -1401,16 +1572,22 @@ export default function App() {
   const headlessAutomation =
     automationDisplayLabel === 'Headless Browser Automation' ||
     canonicalAutomation?.automation_environment === 'headless_shell';
+  // A verified/named edge verdict is a valid banner reason even before (or without) an API
+  // response; automation labels stay reserved for actual automation verdicts.
+  const bannerVerdictName = !automationDisplayLabel ? exactBotName : null;
   const automationBannerLabel =
-    automationDisplayLabel ?? (headlessAutomation ? 'Headless Browser Automation' : null);
+    automationDisplayLabel ??
+    (headlessAutomation ? 'Headless Browser Automation' : null) ??
+    bannerVerdictName;
   const automationOperator =
     canonicalAutomation &&
     canonicalAutomation.operator_verification_method !== 'none' &&
     canonicalAutomation.named_operator
       ? canonicalAutomation.named_operator
-      : 'unknown';
+      : initialVerdict?.provider ?? 'unknown';
   const showAttributionBanner = Boolean(
-    data && (torExitDetected || torBrowserClient || automationBannerLabel)
+    (data || initialVerdict) &&
+      (torExitDetected || torBrowserClient || automationBannerLabel || bannerVerdictName)
   );
 
   return (
@@ -1597,6 +1774,13 @@ export default function App() {
                 <div className="skeleton-shimmer h-4 w-52 max-w-full rounded" />
                 <div className="skeleton-shimmer h-3 w-20 rounded" />
               </div>
+              {/* The edge verdict is already known before the API responds: surface the exact
+                  name in the Bot & Automation Detection area instead of a blank skeleton. */}
+              {initialVerdict?.name && (
+                <div className="text-[11px] font-mono text-slate-600 break-words">
+                  Bot &amp; Automation Detection · {initialVerdict.name}
+                </div>
+              )}
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
                 {Array.from({ length: 8 }).map((_, index) => (
                   <div
@@ -2030,7 +2214,7 @@ export default function App() {
                             <span className="block text-[10px] sm:text-[11px] text-slate-500 leading-snug">
                               {torBrowserClient && !data.browserDevice.reportedModel
                                 ? 'Model hidden by Tor Browser'
-                                : `${spoofedOsBlocked ? hardwareOsLabel ?? 'Underlying OS verified' : displayOs} • ${
+                                : `${displayOs} • ${
                                     activeVisit?.deviceType || data.browserDevice.deviceType
                                   }`}
                             </span>
@@ -2042,11 +2226,7 @@ export default function App() {
                               activeVisit?.deviceType || data.browserDevice.deviceType
                             }`}
                           >
-                            {spoofedOsBlocked
-                              ? hardwareOsLabel
-                                ? `${hardwareOsLabel} (verified)`
-                                : 'Underlying OS verified'
-                              : displayOs}{' '}
+                            {displayOs}{' '}
                             • {activeVisit?.deviceType || data.browserDevice.deviceType}
                           </span>
                         )}

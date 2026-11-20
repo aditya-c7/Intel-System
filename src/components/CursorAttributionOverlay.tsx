@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { PILLS, findAgentByUa, AGENT_REGISTRY } from '../lib/agentRegistry';
 
 /**
  * Cursor attribution overlay.
@@ -182,18 +183,154 @@ export function CursorAttributionOverlay({ identity }: { identity: CursorIdentit
   );
 }
 
+/* -------------------------------------------------------------------------- */
+/* Shared agent registry — single source of truth for exact pill labels       */
+/* -------------------------------------------------------------------------- */
+
+type RegistryRow = Record<string, unknown>;
+
+function asRecord(value: unknown): RegistryRow {
+  return value && typeof value === 'object' ? (value as RegistryRow) : {};
+}
+
+function firstString(record: RegistryRow, ...keys: string[]): string {
+  for (const key of keys) {
+    const candidate = record[key];
+    if (typeof candidate === 'string' && candidate.trim()) return candidate.trim();
+  }
+  return '';
+}
+
+interface RegistryPill {
+  id: string;
+  label: string;
+}
+
+/** Flattens the registry's PILLS table regardless of whether it is a Map, array or record. */
+function registryPills(): RegistryPill[] {
+  const pills: unknown = PILLS;
+  if (!pills) return [];
+  if (pills instanceof Map) {
+    return Array.from(pills.entries()).map(([key, value]) => ({
+      id: String(key).toLowerCase(),
+      label: typeof value === 'string' ? value : firstString(asRecord(value), 'label', 'pill', 'name'),
+    }));
+  }
+  if (Array.isArray(pills)) {
+    return pills.map((entry) => {
+      const row = asRecord(entry);
+      return {
+        id: firstString(row, 'id', 'agentId', 'key', 'slug', 'name').toLowerCase(),
+        label: firstString(row, 'label', 'pill', 'name'),
+      };
+    });
+  }
+  return Object.entries(pills as RegistryRow).map(([key, value]) => ({
+    id: key.toLowerCase(),
+    label: typeof value === 'string' ? value : firstString(asRecord(value), 'label', 'pill', 'name'),
+  }));
+}
+
+/** Canonical displayName from the registry — e.g. `Manus Bot`, not the short pill `Manus`. */
+function displayNameForId(id: string): string {
+  const needle = id.trim().toLowerCase();
+  const agent = AGENT_REGISTRY.find((entry) => entry.id.toLowerCase() === needle);
+  return agent?.displayName ?? '';
+}
+
+/** Exact pill label for a registry id, falling back to a legacy label only if unregistered. */
+function pillLabelFor(id: string, fallback: string): string {
+  const needle = id.trim().toLowerCase();
+  const exact = displayNameForId(needle);
+  if (exact) return exact;
+  const match = registryPills().find((pill) => pill.id === needle || pill.label.toLowerCase() === needle);
+  return match?.label || fallback;
+}
+
+/**
+ * Resolves a named agent from the raw request user-agent (authoritative at the edge) or,
+ * when that is unavailable, from a verified agent id / name. PILLS supplies the exact label.
+ */
+function registryPillFor(input: {
+  userAgent?: string | null;
+  agentId?: string | null;
+  agentName?: string | null;
+}): RegistryPill | null {
+  const ua = (input.userAgent || '').trim();
+  if (ua) {
+    let found: unknown = null;
+    try {
+      found = findAgentByUa(ua);
+    } catch {
+      found = null;
+    }
+    if (found) {
+      const row = asRecord(found);
+      const id = firstString(row, 'id', 'agentId', 'key', 'slug', 'name').toLowerCase();
+      const label = firstString(row, 'displayName', 'name', 'label');
+      const pill = pillLabelFor(id, label);
+      if (pill) return { id, label: pill };
+    }
+  }
+
+  const id = (input.agentId || '').trim().toLowerCase();
+  if (id) {
+    const label = pillLabelFor(id, '');
+    if (label) return { id, label };
+  }
+
+  const name = (input.agentName || '').trim().toLowerCase();
+  if (name) {
+    const match = registryPills().find(
+      (pill) =>
+        pill.label.toLowerCase().includes(name) ||
+        name.includes(pill.label.toLowerCase()) ||
+        pill.id.includes(name)
+    );
+    if (match) return match;
+  }
+  return null;
+}
+
+/** Maps a registry id/label onto the existing pill style kinds without breaking any of them. */
+function registryKind(pill: RegistryPill): CursorIdentityKind {
+  const key = `${pill.id} ${pill.label}`.toLowerCase();
+  if (key.includes('claude')) return 'claude';
+  if (key.includes('gemini')) return 'gemini';
+  if (key.includes('grok')) return 'grok';
+  if (key.includes('perplexity')) return 'perplexity';
+  if (key.includes('muse')) return 'muse';
+  if (key.includes('chatgpt') || key.includes('openai') || key.includes('gpt-')) return 'chatgpt';
+  if (key.includes('firecrawl')) return 'firecrawl';
+  if (key.includes('browser use') || key.includes('browser-use') || key.includes('browseruse'))
+    return 'browseruse';
+  if (key.includes('skyvern')) return 'skyvern';
+  if (key.includes('multion')) return 'multion';
+  if (key.includes('hyperbrowser')) return 'hyperbrowser';
+  if (key.includes('steel')) return 'steel';
+  if (key.includes('airtop')) return 'airtop';
+  if (key.includes('notte')) return 'notte';
+  if (key.includes('lightpanda')) return 'lightpanda';
+  // Crawlers and other named bots get the neutral "cloud" emblem; they keep their exact
+  // registry label but never a fabricated signed-agent identity.
+  return 'cloud';
+}
+
 /** Brand pill for a named remote browser harness; null when the name is unknown. */
 function remoteBrowserIdentity(name: string): CursorIdentity | null {
-  if (name.includes('firecrawl')) return { kind: 'firecrawl', label: 'Firecrawl' };
+  if (name.includes('firecrawl'))
+    return { kind: 'firecrawl', label: pillLabelFor('firecrawl', 'Firecrawl') };
   if (name.includes('browser use') || name.includes('browser-use') || name.includes('browseruse'))
-    return { kind: 'browseruse', label: 'Browser Use' };
-  if (name.includes('skyvern')) return { kind: 'skyvern', label: 'Skyvern' };
-  if (name.includes('multion')) return { kind: 'multion', label: 'MultiOn' };
-  if (name.includes('hyperbrowser')) return { kind: 'hyperbrowser', label: 'Hyperbrowser' };
-  if (name.includes('steel')) return { kind: 'steel', label: 'Steel' };
-  if (name.includes('airtop')) return { kind: 'airtop', label: 'Airtop' };
-  if (name.includes('notte')) return { kind: 'notte', label: 'Notte' };
-  if (name.includes('lightpanda')) return { kind: 'lightpanda', label: 'Lightpanda' };
+    return { kind: 'browseruse', label: pillLabelFor('browseruse', 'Browser Use') };
+  if (name.includes('skyvern')) return { kind: 'skyvern', label: pillLabelFor('skyvern', 'Skyvern') };
+  if (name.includes('multion')) return { kind: 'multion', label: pillLabelFor('multion', 'MultiOn') };
+  if (name.includes('hyperbrowser'))
+    return { kind: 'hyperbrowser', label: pillLabelFor('hyperbrowser', 'Hyperbrowser') };
+  if (name.includes('steel')) return { kind: 'steel', label: pillLabelFor('steel', 'Steel') };
+  if (name.includes('airtop')) return { kind: 'airtop', label: pillLabelFor('airtop', 'Airtop') };
+  if (name.includes('notte')) return { kind: 'notte', label: pillLabelFor('notte', 'Notte') };
+  if (name.includes('lightpanda'))
+    return { kind: 'lightpanda', label: pillLabelFor('lightpanda', 'Lightpanda') };
   return null;
 }
 
@@ -241,45 +378,72 @@ export function resolveCursorIdentity(input: {
   botType?: string | null;
   agentId?: string | null;
   agentName?: string | null;
+  /** Raw request user-agent. The registry resolves exact named agents from it. */
+  userAgent?: string | null;
+  /** True when the agent id/name came from a verified signed-agent verdict, not a stale mirror. */
+  agentVerified?: boolean;
 }): CursorIdentity | null {
-  // An automation verdict outranks every signed-agent claim. A stale aiAgent / Gemini field
-  // must never name a stealth Playwright session as a signed cloud agent.
   const automationLabel = resolveAutomationLabel(input.botType);
-  const automationVerdict =
-    Boolean(input.isBot) ||
-    input.botSubtype === 'bad_bot' ||
-    input.botSubtype === 'ai_agent';
-  if (automationLabel && automationVerdict) {
+
+  // A named agent resolved from the *raw request UA* is authoritative at the edge; so is a
+  // verified signed-agent claim. Only when neither exists may an automation bot_type win —
+  // that keeps stealth automation authoritative without letting a stale aiAgent/Gemini field
+  // replace a real named crawler with "Automated" (or mint a bogus Gemini label).
+  const uaAgent = (input.userAgent || '').trim()
+    ? (() => {
+        try {
+          return findAgentByUa((input.userAgent || '').trim());
+        } catch {
+          return null;
+        }
+      })()
+    : null;
+  const authoritativeNamedAgent = Boolean(
+    uaAgent || (input.agentVerified && (input.agentId || input.agentName))
+  );
+  if (automationLabel && !authoritativeNamedAgent) {
     return { kind: 'automation', label: automationLabel };
   }
-  if (automationLabel) {
-    // bot_type is authoritative even when a stale bot mirror lags: still no agent label.
-    return { kind: 'automation', label: 'Automated' };
+
+  // Registry lookup first — PILLS supplies the exact label (e.g. `Manus Bot`,
+  // `MistralAI-User`, `Googlebot`) so every surface spells the agent identically.
+  const pill = registryPillFor(input);
+  if (pill) {
+    return { kind: registryKind(pill), label: pill.label };
   }
 
   const agent = (input.agentId || '').toLowerCase();
   const agentName = (input.agentName || '').toLowerCase();
 
+  // Legacy signed-agent kinds are preserved as a fallback when the registry has no entry.
   if (agent === 'claude' || agentName.includes('claude'))
-    return { kind: 'claude', label: 'Claude-User' };
+    return { kind: 'claude', label: pillLabelFor('claude', 'Claude-User') };
   if (agent === 'gemini' || agentName.includes('gemini'))
-    return { kind: 'gemini', label: 'Gemini' };
-  if (agent === 'grok' || agentName.includes('grok')) return { kind: 'grok', label: 'Grok' };
+    return { kind: 'gemini', label: pillLabelFor('gemini', 'Gemini') };
+  if (agent === 'grok' || agentName.includes('grok'))
+    return { kind: 'grok', label: pillLabelFor('grok', 'Grok') };
   if (agent === 'perplexity' || agentName.includes('perplexity'))
-    return { kind: 'perplexity', label: 'Perplexity' };
-  if (agent === 'muse' || agentName.includes('muse')) return { kind: 'muse', label: 'Muse' };
+    return { kind: 'perplexity', label: pillLabelFor('perplexity', 'Perplexity') };
+  if (agent === 'muse' || agentName.includes('muse'))
+    return { kind: 'muse', label: pillLabelFor('muse', 'Muse') };
   if (agent === 'openai' || agentName.includes('chatgpt') || agentName.includes('gpt'))
-    return { kind: 'chatgpt', label: 'ChatGPT-User' };
+    return { kind: 'chatgpt', label: pillLabelFor('chatgpt', 'ChatGPT-User') };
 
   const remoteBrand = remoteBrowserIdentity(agentName);
   if (remoteBrand) return remoteBrand;
 
   if (agent === 'cloud-browser' || agent === 'remote-browser')
-    return { kind: 'cloud', label: 'Remote Browser' };
+    return { kind: 'cloud', label: pillLabelFor('remotebrowser', 'Remote Browser') };
+
+  // A named agent was detected but has no registry pill: keep its exact name rather than
+  // collapsing to "Automated" — the name comes from the server's authoritative verdict.
+  if (authoritativeNamedAgent && input.agentName && input.agentName !== 'unknown') {
+    return { kind: 'cloud', label: input.agentName.trim() };
+  }
 
   // Any other automated visitor still gets attribution, but never the human cursor.
   if (input.isBot || input.botSubtype === 'bad_bot' || input.botSubtype === 'ai_agent')
-    return { kind: 'automated', label: 'Automated' };
+    return { kind: 'automation', label: automationLabel || 'Automated' };
 
   return null;
 }

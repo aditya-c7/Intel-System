@@ -99,6 +99,29 @@ function ulpDistance(a: number, b: number): number {
 }
 
 /**
+ * Independent host-OS hint from the WebGL graphics backend. This is deliberately a
+ * DIFFERENT source from the `Math.tanh` ULP probe: the two must agree before an OS is
+ * asserted as verified. Software renderers (SwiftShader/llvmpipe) give no reliable host
+ * clue and therefore return 'unknown'.
+ */
+function hostOsFromGpuBackend(vendor: string, renderer: string): HostOsFamily {
+  const text = `${vendor || ''} ${renderer || ''}`;
+  if (/Direct3D|D3D11|D3D12|ANGLE\s*\([^)]*Direct3D|Microsoft Basic Render/i.test(text)) {
+    return 'windows';
+  }
+  if (/\bMetal\b|Apple M[1-9]\b|Apple GPU\b/i.test(text)) {
+    return 'macos';
+  }
+  // Mesa / EGL / X11 / Vulkan-on-Linux are strong Linux indicators, but exclude the
+  // software renderers because those run unchanged on Windows and macOS too.
+  if (!/SwiftShader|Software Rasterizer|Software Renderer|Microsoft Basic Render/i.test(text) &&
+      /\bMesa\b|llvmpipe|softpipe|Gallium|Linux|X11|\bEGL\b|\bGLX\b/i.test(text)) {
+    return 'linux';
+  }
+  return 'unknown';
+}
+
+/**
  * IEEE754 NaN sign-bit architecture probe. `Math.sqrt(-1)` yields a NaN whose top byte
  * is 0xff on x86-class FP implementations (sign bit set) and 0x7f on ARM/aarch64
  * (sign bit cleared). Some engines canonicalise the payload, so an unexpected byte is
@@ -298,17 +321,42 @@ export function resolveHardwareTruth(input: HardwareTruthInput = {}): HardwareTr
   if (archUaMismatch) reasons.push(`Silicon ${silicon} contradicts claimed architecture ${claimedArchFamily}`);
 
   const claimedOsFamily = osFamilyFromClaim(input.claimedOs || '', input.userAgent || '');
+  const gpuHostOs = hostOsFromGpuBackend(input.gpuVendor || '', input.gpuRenderer || '');
+
+  // The `Math.tanh` ULP probe is only one-ULP separated between Linux/macOS/Windows and
+  // V8/libm changes can shift it. It is NEVER sufficient on its own. Require agreement
+  // with the independent graphics-backend hint before asserting a host OS; a disagreement
+  // means "unknown", not "pick one". Software renderers leave the OS unknown.
+  let resolvedHostOs: HostOsFamily = 'unknown';
+  if (tanh.hostOs !== 'unknown' && gpuHostOs !== 'unknown' && tanh.hostOs === gpuHostOs) {
+    resolvedHostOs = tanh.hostOs;
+    reasons.push(`Host OS ${resolvedHostOs} confirmed by independent math and graphics-backend probes`);
+  } else if (tanh.hostOs !== 'unknown' && gpuHostOs !== 'unknown') {
+    reasons.push(
+      `Host OS probes disagree (math=${tanh.hostOs}, graphics=${gpuHostOs}); OS left unverified`
+    );
+  } else if (gpuHostOs !== 'unknown') {
+    resolvedHostOs = gpuHostOs;
+    reasons.push(`Host OS ${gpuHostOs} inferred from graphics backend (not independently confirmed)`);
+  } else if (tanh.hostOs !== 'unknown') {
+    reasons.push(
+      `Math ULP probe suggested ${tanh.hostOs} but no corroborating graphics backend; OS left unverified`
+    );
+  }
+
   const osUaMismatch =
-    tanh.hostOs !== 'unknown' &&
+    resolvedHostOs !== 'unknown' &&
     claimedOsFamily !== 'unknown' &&
-    tanh.hostOs !== claimedOsFamily;
-  if (osUaMismatch) reasons.push(`Host OS ${tanh.hostOs} contradicts claimed OS ${claimedOsFamily}`);
+    resolvedHostOs !== claimedOsFamily;
+  if (osUaMismatch) {
+    reasons.push(`Host OS ${resolvedHostOs} contradicts claimed OS ${claimedOsFamily}`);
+  }
 
   return {
     architecture: archLabel,
     architectureSource,
     claimedArchitecture: claimedArchitecture || (claimedArchFamily !== 'unknown' ? claimedArchFamily : ''),
-    hostOs: tanh.hostOs,
+    hostOs: resolvedHostOs,
     engine,
     engineErrorLength: engineLength,
     gpuArchFamily,

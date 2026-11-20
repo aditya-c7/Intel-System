@@ -128,6 +128,20 @@ export interface AiAgentAttribution {
     | 'cloud-browser'
     | 'remote-browser'
     | 'impostor-spoof'
+    | 'mistral'
+    | 'manus'
+    | 'googlebot'
+    | 'applebot'
+    | 'amazonbot'
+    | 'bingbot'
+    | 'oai_search_bot'
+    | 'claude_bot'
+    | 'claude_user'
+    | 'claude_search_bot'
+    | 'perplexity_bot'
+    | 'perplexity_user'
+    | 'mistral_ai_index'
+    | 'mistral_ai_training'
     | null;
   agentName: string;
   operator: string;

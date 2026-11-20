@@ -635,240 +635,951 @@ function mergeLocationWithEdge(location, edge) {
   };
 }
 
-// src/lib/aiBotDirectory.ts
-var BOT_DIRECTORY = [
-  // OpenAI - verified (CIDR/FCrDNS verified)
+// src/lib/agentRegistry.ts
+var DAY = 864e5;
+var PREFIX_FEEDS = [
+  { sourceId: "mistral-user", url: "https://mistral.ai/robots.txt", format: "none", pinnedKey: "mistral-user", refreshMs: DAY, maxBytes: 2e6 },
+  { sourceId: "mistral-index", url: "https://mistral.ai/robots.txt", format: "none", pinnedKey: "mistral-index", refreshMs: DAY, maxBytes: 2e6 },
+  { sourceId: "gptbot", url: "https://openai.com/gptbot.json", format: "json", pinnedKey: "gptbot", refreshMs: DAY, maxBytes: 2e6 },
+  { sourceId: "chatgpt-user", url: "https://openai.com/chatgpt-user.json", format: "json", pinnedKey: "chatgpt-user", refreshMs: DAY, maxBytes: 4e6 },
+  { sourceId: "searchbot", url: "https://openai.com/searchbot.json", format: "json", pinnedKey: "searchbot", refreshMs: DAY, maxBytes: 2e6 },
+  { sourceId: "google-common", url: "https://developers.google.com/search/apis/ipranges/googlebot.json", format: "json", pinnedKey: "google-common", refreshMs: DAY, maxBytes: 8e6 },
+  { sourceId: "perplexitybot", url: "https://www.perplexity.com/perplexitybot.json", format: "json", pinnedKey: "perplexitybot", refreshMs: DAY, maxBytes: 2e6 },
+  { sourceId: "perplexity-user", url: "https://www.perplexity.com/perplexity-user.json", format: "json", pinnedKey: "perplexity-user", refreshMs: DAY, maxBytes: 2e6 },
+  { sourceId: "applebot", url: "https://search.developer.apple.com/applebot.json", format: "json", pinnedKey: "applebot", refreshMs: DAY, maxBytes: 2e6 },
+  { sourceId: "bingbot", url: "https://www.bing.com/toolbox/bingbot.json", format: "json", pinnedKey: "bingbot", refreshMs: DAY, maxBytes: 2e6 },
+  { sourceId: "ccbot", url: "https://index.commoncrawl.org/ccbot.json", format: "json", pinnedKey: "ccbot", refreshMs: DAY, maxBytes: 2e6 },
+  { sourceId: "amazonbot", url: "https://developer.amazon.com/amazonbot/ip-addresses/", format: "amazon-html", pinnedKey: "amazonbot", refreshMs: DAY, maxBytes: 4e6 },
+  { sourceId: "amzn-search-bot", url: "https://developer.amazon.com/amazonbot/searchbot-ip-addresses/", format: "amazon-html", pinnedKey: "amzn-search-bot", refreshMs: DAY, maxBytes: 4e6 },
+  { sourceId: "amzn-user", url: "https://developer.amazon.com/amazonbot/live-ip-addresses/", format: "amazon-html", pinnedKey: "amzn-user", refreshMs: DAY, maxBytes: 4e6 },
+  { sourceId: "claude", url: "https://claude.com/crawling/bots.json", format: "json", pinnedKey: "claude", refreshMs: DAY, maxBytes: 2e6 },
+  { sourceId: "claude-agent-sail", url: "https://claude.com/.well-known/sail", format: "sail-toml", pinnedKey: "claude-agent-sail", refreshMs: 36e5, maxBytes: 1e6 },
+  { sourceId: "manus-wba", url: "https://api.manus.im/.well-known/http-message-signatures-directory", format: "wba-directory", refreshMs: DAY, maxBytes: 1e6 },
+  { sourceId: "google-extended", url: "https://developers.google.com/search/docs/crawling-indexing/googlebot", format: "none", refreshMs: DAY, maxBytes: 1e6 },
+  { sourceId: "applebot-extended", url: "https://support.apple.com/en-us/119829", format: "none", refreshMs: DAY, maxBytes: 1e6 }
+];
+var REGISTRY_LITERAL = [
   {
-    name: "ChatGPT-User",
-    provider: "OpenAI",
-    category: "ai_assistant",
-    identity: "verified",
-    uaPatterns: [/ChatGPT-User/i]
-  },
-  {
-    name: "OAI-SearchBot",
-    provider: "OpenAI",
-    category: "ai_search",
-    identity: "verified",
-    uaPatterns: [/OAI-SearchBot/i]
-  },
-  {
-    name: "GPTBot",
-    provider: "OpenAI",
-    category: "ai_crawler",
-    identity: "verified",
-    uaPatterns: [/GPTBot/i]
-  },
-  // OpenAI - signed (Web Bot Auth)
-  {
-    name: "ChatGPT Agent",
-    provider: "OpenAI",
-    category: "ai_agent",
-    identity: "signed",
-    requiresWebBotAuth: true,
-    asnPatterns: [/openai|azure/i],
-    uaPatterns: [/ChatGPT-Agent/i]
-  },
-  // OpenAI - unknown
-  {
-    name: "Codex",
-    provider: "OpenAI",
-    category: "ai_agent",
-    identity: "unknown",
-    uaPatterns: [/\bCodex\b/i]
-  },
-  // Google - verified
-  {
-    name: "Gemini Deep Research",
-    provider: "Google",
-    category: "ai_agent",
-    identity: "verified",
-    asnNumbers: [15169, 396982],
-    asnPatterns: [/google llc|google cloud|AS15169|AS396982/i],
-    uaPatterns: [/Googlebot|Google-Extended|Google-Agent|Mariner|Gemini/i]
-  },
-  {
-    name: "Google-Agent",
-    provider: "Google",
-    category: "ai_agent",
-    identity: "verified",
-    uaPatterns: [/Google-Agent/i]
-  },
-  {
-    name: "Google NotebookLM",
-    provider: "Google",
-    category: "ai_assistant",
-    identity: "verified",
-    uaPatterns: [/NotebookLM/i]
-  },
-  // Anthropic - verified
-  {
-    name: "Claude-User",
-    provider: "Anthropic",
-    category: "ai_assistant",
-    identity: "verified",
-    uaPatterns: [/Claude-User/i]
-  },
-  {
-    name: "Claude-SearchBot",
-    provider: "Anthropic",
-    category: "ai_search",
-    identity: "verified",
-    uaPatterns: [/Claude-SearchBot/i]
-  },
-  {
-    name: "ClaudeBot",
-    provider: "Anthropic",
-    category: "ai_crawler",
-    identity: "verified",
-    uaPatterns: [/ClaudeBot/i]
-  },
-  // Anthropic - unknown
-  {
-    name: "Claude Code",
-    provider: "Anthropic",
-    category: "ai_agent",
-    identity: "unknown",
-    uaPatterns: [/Claude Code|claude-code/i]
-  },
-  {
-    name: "Claude Duet",
-    provider: "Anthropic",
-    category: "ai_agent",
-    identity: "unknown",
-    uaPatterns: [/Claude-Duet|claude-duet/i]
-  },
-  // Perplexity - verified
-  {
-    name: "Perplexity-User",
-    provider: "Perplexity",
-    category: "ai_assistant",
-    identity: "verified",
-    uaPatterns: [/Perplexity-User/i]
-  },
-  {
-    name: "PerplexityBot",
-    provider: "Perplexity",
-    category: "ai_search",
-    identity: "verified",
-    uaPatterns: [/PerplexityBot/i]
-  },
-  // Meta
-  {
-    name: "Muse",
-    provider: "Meta",
-    category: "ai_agent",
-    identity: "unknown",
-    asnNumbers: [32934],
-    asnPatterns: [/meta platforms|AS32934/i],
-    uaPatterns: [/\bMuse\b/i]
-  },
-  {
-    name: "Meta-ExternalAgent",
-    provider: "Meta",
-    category: "ai_search",
-    identity: "verified",
-    uaPatterns: [/Meta-ExternalAgent|meta-externalagent/i]
-  },
-  {
-    name: "Meta-WebIndexer",
-    provider: "Meta",
-    category: "ai_search",
-    identity: "verified",
-    uaPatterns: [/Meta-WebIndexer/i]
-  },
-  // xAI
-  {
-    name: "Grok Bot",
-    provider: "xAI",
-    category: "ai_agent",
-    identity: "unknown",
-    uaPatterns: [/Grok-Bot|GrokBot|grok/i]
-  },
-  // Cloud Browser Agents - signed
-  {
-    name: "Browserbase Agent",
-    provider: "Browserbase",
-    category: "ai_agent",
-    identity: "signed",
-    uaPatterns: [/Browserbase/i],
-    requiresWebBotAuth: true
-  },
-  {
-    name: "Bedrock AgentCore",
-    provider: "AWS",
-    category: "ai_agent",
-    identity: "signed",
-    asnNumbers: [16509, 14618],
-    uaPatterns: [/BedrockAgentCore|bedrock-agent/i]
-  },
-  {
-    name: "Anchor Browser",
-    provider: "Anchor",
-    category: "ai_browser",
-    identity: "signed",
-    uaPatterns: [/AnchorBrowser|anchor-browser/i]
-  },
-  {
-    name: "Notte Browser",
-    provider: "Notte",
-    category: "ai_browser",
-    identity: "signed",
-    uaPatterns: [/NotteBrowser|notte/i]
-  },
-  {
-    name: "Manus Agent",
+    id: "manus_bot",
     provider: "Manus",
+    displayName: "Manus Bot",
     category: "ai_agent",
-    identity: "signed",
-    uaPatterns: [/ManusAgent|manus-agent/i]
+    bucket: "manus",
+    rank: 10,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/Manus-User\/1\.0/i, /ManusAgent/i, /manus-agent/i] },
+    signature: {
+      wbaRequired: true,
+      agentHosts: ["api.manus.im"],
+      keyIdNeedles: ["manus"]
+    },
+    feedIds: ["manus-wba"],
+    minProofForVerified: "signed_agent",
+    executionMode: "Remote Browser Agent",
+    pill: { kind: "manus", label: "Manus" }
   },
   {
-    name: "AGI Agent",
+    id: "mistral_ai_user",
+    provider: "Mistral",
+    displayName: "MistralAI-User",
+    category: "ai_assistant",
+    bucket: "mistral",
+    rank: 20,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/MistralAI-User\/1\.0/i] },
+    feedIds: ["mistral-user"],
+    minProofForVerified: "cidr",
+    executionMode: "User-Triggered Fetcher",
+    pill: { kind: "mistral", label: "MistralAI-User" }
+  },
+  {
+    id: "mistral_ai_index",
+    provider: "Mistral",
+    displayName: "MistralAI-Index",
+    category: "ai_search",
+    bucket: "mistral",
+    rank: 30,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/MistralAI-Index\/1\.0/i] },
+    feedIds: ["mistral-index"],
+    minProofForVerified: "cidr",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "mistral", label: "MistralAI-Index" }
+  },
+  {
+    id: "mistral_ai_training",
+    provider: "Mistral",
+    displayName: "MistralAI-Training",
+    category: "ai_crawler",
+    bucket: "mistral",
+    rank: 40,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/MistralAI-Training\/1\.0/i] },
+    // No official CIDR feed: a UA claim alone can never upgrade this agent to verified.
+    minProofForVerified: "ua_claim",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "mistral", label: "MistralAI-Training" }
+  },
+  {
+    id: "googlebot",
+    provider: "Google",
+    displayName: "Googlebot",
+    category: "search_crawler",
+    bucket: "gemini",
+    rank: 50,
+    which: ["classifier", "robodex", "attribution", "pill"],
+    ua: {
+      patterns: [/Googlebot\/2\.1/i],
+      requireNetworkMatch: true,
+      network: /google|googleusercontent/i
+    },
+    fcrdnsSuffixes: ["googlebot.com", "google.com", "googleusercontent.com"],
+    feedIds: ["google-common"],
+    minProofForVerified: "fcrdns",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "googlebot", label: "Googlebot" }
+  },
+  {
+    id: "applebot",
+    provider: "Apple",
+    displayName: "Applebot",
+    category: "search_crawler",
+    bucket: "apple",
+    rank: 60,
+    which: ["classifier", "robodex", "attribution", "pill"],
+    ua: {
+      patterns: [/Applebot\/0\.1/i],
+      requireNetworkMatch: true,
+      network: /apple/i
+    },
+    fcrdnsSuffixes: ["applebot.apple.com"],
+    feedIds: ["applebot"],
+    minProofForVerified: "fcrdns",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "applebot", label: "Applebot" }
+  },
+  {
+    id: "gptbot",
+    provider: "OpenAI",
+    displayName: "GPTBot",
+    category: "ai_crawler",
+    bucket: "openai",
+    rank: 70,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/GPTBot\/1\./i, /\bGPTBot\b/i] },
+    feedIds: ["gptbot"],
+    minProofForVerified: "cidr",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "gptbot", label: "GPTBot" }
+  },
+  {
+    id: "chatgpt_user",
+    provider: "OpenAI",
+    displayName: "ChatGPT-User",
+    category: "ai_assistant",
+    bucket: "openai",
+    rank: 80,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/ChatGPT-User\/1\.0/i] },
+    feedIds: ["chatgpt-user"],
+    minProofForVerified: "cidr",
+    executionMode: "User-Triggered Fetcher",
+    pill: { kind: "chatgpt_user", label: "ChatGPT-User" }
+  },
+  {
+    id: "oai_search_bot",
+    provider: "OpenAI",
+    displayName: "OAI-SearchBot",
+    category: "ai_search",
+    bucket: "openai",
+    rank: 90,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/OAI-SearchBot\/1\./i, /\bOAI-SearchBot\b/i] },
+    feedIds: ["searchbot"],
+    minProofForVerified: "cidr",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "oai_search_bot", label: "OAI-SearchBot" }
+  },
+  {
+    id: "claude_bot",
+    provider: "Anthropic",
+    displayName: "ClaudeBot",
+    category: "ai_crawler",
+    bucket: "claude",
+    rank: 100,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/\bClaudeBot\b/i] },
+    fcrdnsSuffixes: ["anthropic.com", "claude.ai"],
+    feedIds: ["claude"],
+    minProofForVerified: "cidr",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "claude_bot", label: "ClaudeBot" }
+  },
+  {
+    id: "claude_user",
+    provider: "Anthropic",
+    displayName: "Claude-User",
+    category: "ai_assistant",
+    bucket: "claude",
+    rank: 110,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/Claude-User/i] },
+    feedIds: ["claude"],
+    minProofForVerified: "cidr",
+    executionMode: "User-Triggered Fetcher",
+    pill: { kind: "claude_user", label: "Claude-User" }
+  },
+  {
+    id: "claude_search_bot",
+    provider: "Anthropic",
+    displayName: "Claude-SearchBot",
+    category: "ai_search",
+    bucket: "claude",
+    rank: 120,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/Claude-SearchBot/i] },
+    feedIds: ["claude"],
+    minProofForVerified: "cidr",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "claude_search_bot", label: "Claude-SearchBot" }
+  },
+  {
+    id: "claude_agent",
+    provider: "Anthropic",
+    displayName: "Claude Agent",
+    category: "ai_agent",
+    bucket: "claude",
+    rank: 130,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/Claude-Agent\/1\.0/i] },
+    signature: {
+      sail: true,
+      agentHosts: ["claude.com"],
+      keyIdNeedles: ["claude", "anthropic", "sail"]
+    },
+    feedIds: ["claude-agent-sail"],
+    minProofForVerified: "signed_agent",
+    executionMode: "RFC 9421 Signed Agent",
+    pill: { kind: "claude", label: "Claude Agent" }
+  },
+  {
+    id: "perplexity_bot",
+    provider: "Perplexity",
+    displayName: "PerplexityBot",
+    category: "ai_search",
+    bucket: "perplexity",
+    rank: 140,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/PerplexityBot\/1\.0/i, /\bPerplexityBot\b/i] },
+    feedIds: ["perplexitybot"],
+    minProofForVerified: "cidr",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "perplexity_bot", label: "PerplexityBot" }
+  },
+  {
+    id: "perplexity_user",
+    provider: "Perplexity",
+    displayName: "Perplexity-User",
+    category: "ai_assistant",
+    bucket: "perplexity",
+    rank: 150,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/Perplexity-User\/1\.0/i, /\bPerplexity-User\b/i] },
+    feedIds: ["perplexity-user"],
+    minProofForVerified: "cidr",
+    executionMode: "User-Triggered Fetcher",
+    pill: { kind: "perplexity_user", label: "Perplexity-User" }
+  },
+  {
+    id: "amazonbot",
+    provider: "Amazon",
+    displayName: "Amazonbot",
+    category: "ai_crawler",
+    bucket: "amazon",
+    rank: 160,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/Amazonbot\/0\.1/i, /\bAmazonbot\b/i] },
+    feedIds: ["amazonbot"],
+    minProofForVerified: "cidr",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "amazonbot", label: "Amazonbot" }
+  },
+  {
+    id: "amzn_search_bot",
+    provider: "Amazon",
+    displayName: "Amzn-SearchBot",
+    category: "ai_search",
+    bucket: "amazon",
+    rank: 170,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/Amzn-SearchBot\/0\.1/i] },
+    // Dedicated official sibling feed (searchbot-ip-addresses).
+    feedIds: ["amzn-search-bot"],
+    minProofForVerified: "cidr",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "amazonbot", label: "Amzn-SearchBot" }
+  },
+  {
+    id: "amzn_user",
+    provider: "Amazon",
+    displayName: "Amzn-User",
+    category: "ai_assistant",
+    bucket: "amazon",
+    rank: 180,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/Amzn-User\/0\.1/i] },
+    feedIds: ["amzn-user"],
+    minProofForVerified: "cidr",
+    executionMode: "User-Triggered Fetcher",
+    pill: { kind: "amazonbot", label: "Amzn-User" }
+  },
+  {
+    id: "bingbot",
+    provider: "Microsoft",
+    displayName: "Bingbot",
+    category: "search_crawler",
+    bucket: "microsoft",
+    rank: 190,
+    which: ["classifier", "robodex", "attribution", "pill"],
+    ua: {
+      patterns: [/bingbot\/2\.0/i, /\bbingbot\b/i],
+      requireNetworkMatch: true,
+      network: /microsoft|bing|msn/i
+    },
+    fcrdnsSuffixes: ["search.msn.com"],
+    feedIds: ["bingbot"],
+    minProofForVerified: "fcrdns",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "bingbot", label: "Bingbot" }
+  },
+  {
+    id: "ccbot",
+    provider: "Common Crawl",
+    displayName: "CCBot",
+    category: "ai_crawler",
+    bucket: "commoncrawl",
+    rank: 200,
+    which: ["robodex", "attribution", "pill"],
+    ua: { patterns: [/\bCCBot\b/i] },
+    feedIds: ["ccbot"],
+    minProofForVerified: "cidr",
+    executionMode: "Autonomous Crawler",
+    pill: { kind: "automation", label: "CCBot" }
+  },
+  /* ---- Legacy directory agents preserved from the pre-registry bot directory ----
+     These were previously detected by BOT_DIRECTORY. Keeping them in the single registry
+     avoids losing coverage while adding the newly verified crawler catalog above. */
+  {
+    id: "chatgpt_agent",
+    provider: "OpenAI",
+    displayName: "ChatGPT Agent",
+    category: "ai_agent",
+    bucket: "openai",
+    rank: 805,
+    which: ["robodex"],
+    ua: { patterns: [/ChatGPT-Agent/i] },
+    asnPatterns: [/openai|azure/i],
+    minProofForVerified: "ua_claim",
+    executionMode: "Cloud Browser Agent"
+  },
+  {
+    id: "codex",
+    provider: "OpenAI",
+    displayName: "Codex",
+    category: "ai_agent",
+    bucket: "openai",
+    rank: 806,
+    which: ["robodex"],
+    ua: { patterns: [/\bCodex\b/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "Coding Agent"
+  },
+  {
+    id: "gemini_deep_research",
+    provider: "Google",
+    displayName: "Gemini Deep Research",
+    category: "ai_agent",
+    bucket: "gemini",
+    rank: 807,
+    which: ["robodex"],
+    ua: { patterns: [/Gemini-Deep-Research|GoogleAgent-Mariner|Mariner|Google-Agent/i] },
+    asns: [15169, 396982],
+    asnPatterns: [/google llc|google cloud/i],
+    minProofForVerified: "allowlist",
+    executionMode: "User-Triggered Fetcher"
+  },
+  {
+    id: "google_agent",
+    provider: "Google",
+    displayName: "Google-Agent",
+    category: "ai_agent",
+    bucket: "gemini",
+    rank: 808,
+    which: ["robodex"],
+    ua: { patterns: [/Google-Agent/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "User-Triggered Fetcher"
+  },
+  {
+    id: "google_notebooklm",
+    provider: "Google",
+    displayName: "Google NotebookLM",
+    category: "ai_assistant",
+    bucket: "gemini",
+    rank: 809,
+    which: ["robodex"],
+    ua: { patterns: [/NotebookLM/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "User-Triggered Fetcher"
+  },
+  {
+    id: "claude_code",
+    provider: "Anthropic",
+    displayName: "Claude Code",
+    category: "ai_agent",
+    bucket: "claude",
+    rank: 810,
+    which: ["robodex"],
+    ua: { patterns: [/Claude Code|claude-code/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "Coding Agent"
+  },
+  {
+    id: "claude_duet",
+    provider: "Anthropic",
+    displayName: "Claude Duet",
+    category: "ai_agent",
+    bucket: "claude",
+    rank: 811,
+    which: ["robodex"],
+    ua: { patterns: [/Claude-Duet|claude-duet/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "Cloud Browser Agent"
+  },
+  {
+    id: "meta_muse",
+    provider: "Meta",
+    displayName: "Muse",
+    category: "ai_agent",
+    bucket: "muse",
+    rank: 812,
+    which: ["robodex"],
+    ua: { patterns: [/\bMuse\b/i] },
+    asns: [32934],
+    asnPatterns: [/meta platforms/i],
+    minProofForVerified: "allowlist",
+    executionMode: "Cloud Browser Agent"
+  },
+  {
+    id: "meta_external_agent",
+    provider: "Meta",
+    displayName: "Meta-ExternalAgent",
+    category: "ai_search",
+    bucket: "muse",
+    rank: 813,
+    which: ["robodex"],
+    ua: { patterns: [/Meta-ExternalAgent|meta-externalagent/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "Autonomous Crawler"
+  },
+  {
+    id: "meta_web_indexer",
+    provider: "Meta",
+    displayName: "Meta-WebIndexer",
+    category: "ai_search",
+    bucket: "muse",
+    rank: 814,
+    which: ["robodex"],
+    ua: { patterns: [/Meta-WebIndexer/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "Autonomous Crawler"
+  },
+  {
+    id: "grok_bot",
+    provider: "xAI",
+    displayName: "Grok Bot",
+    category: "ai_agent",
+    bucket: "grok",
+    rank: 815,
+    which: ["robodex"],
+    ua: { patterns: [/Grok-Bot|GrokBot|\bgrok\b/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "Cloud Browser Agent"
+  },
+  {
+    id: "browserbase_agent",
+    provider: "Browserbase",
+    displayName: "Browserbase Agent",
+    category: "ai_agent",
+    bucket: "cloud-browser",
+    rank: 816,
+    which: ["robodex"],
+    ua: { patterns: [/Browserbase/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "Cloud Browser Agent"
+  },
+  {
+    id: "bedrock_agentcore",
+    provider: "AWS",
+    displayName: "Bedrock AgentCore",
+    category: "ai_agent",
+    bucket: "none",
+    rank: 817,
+    which: ["robodex"],
+    ua: { patterns: [/BedrockAgentCore|bedrock-agent/i] },
+    asns: [16509, 14618],
+    minProofForVerified: "allowlist",
+    executionMode: "Cloud Browser Agent"
+  },
+  {
+    id: "anchor_browser",
+    provider: "Anchor",
+    displayName: "Anchor Browser",
+    category: "ai_browser",
+    bucket: "cloud-browser",
+    rank: 818,
+    which: ["robodex"],
+    ua: { patterns: [/AnchorBrowser|anchor-browser/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "Cloud Browser Agent"
+  },
+  {
+    id: "notte_browser",
+    provider: "Notte",
+    displayName: "Notte Browser",
+    category: "ai_browser",
+    bucket: "cloud-browser",
+    rank: 819,
+    which: ["robodex"],
+    ua: { patterns: [/NotteBrowser|\bnotte\b/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "Cloud Browser Agent"
+  },
+  {
+    id: "agi_agent",
     provider: "AGI Inc",
+    displayName: "AGI Agent",
     category: "ai_agent",
-    identity: "signed",
-    uaPatterns: [/AGIAgent|agi-agent/i]
+    bucket: "none",
+    rank: 820,
+    which: ["robodex"],
+    ua: { patterns: [/AGIAgent|agi-agent/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "Cloud Browser Agent"
   },
-  // Other - unknown
   {
-    name: "Cursor",
+    id: "cursor_agent",
     provider: "Anysphere",
+    displayName: "Cursor",
     category: "ai_agent",
-    identity: "unknown",
-    uaPatterns: [/\bCursor\b/i],
-    headerPatterns: [{ header: "x-cursor-agent", pattern: /.*/ }]
+    bucket: "none",
+    rank: 821,
+    which: ["robodex"],
+    ua: { patterns: [/\bCursor\b/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "Coding Agent"
   },
   {
-    name: "DuckAssistBot",
+    id: "duck_assist_bot",
     provider: "DuckDuckGo",
+    displayName: "DuckAssistBot",
     category: "ai_assistant",
-    identity: "verified",
-    uaPatterns: [/DuckAssistBot/i]
+    bucket: "none",
+    rank: 822,
+    which: ["robodex"],
+    ua: { patterns: [/DuckAssistBot/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "User-Triggered Fetcher"
   },
   {
-    name: "Kimi-User",
+    id: "kimi_user",
     provider: "Moonshot AI",
+    displayName: "Kimi-User",
     category: "ai_assistant",
-    identity: "verified",
-    uaPatterns: [/Kimi-User/i]
+    bucket: "none",
+    rank: 823,
+    which: ["robodex"],
+    ua: { patterns: [/Kimi-User/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "User-Triggered Fetcher"
   },
   {
-    name: "Cloudflare Browser Rendering",
+    id: "cloudflare_browser_rendering",
     provider: "Cloudflare",
+    displayName: "Cloudflare Browser Rendering",
     category: "browser_automation",
-    identity: "unknown",
-    asnNumbers: [13335],
-    uaPatterns: [/CloudflareBot|cf-browser/i]
+    bucket: "cloud-browser",
+    rank: 824,
+    which: ["robodex"],
+    ua: { patterns: [/CloudflareBot|cf-browser/i] },
+    asns: [13335],
+    minProofForVerified: "allowlist",
+    executionMode: "Cloud Browser Agent"
   },
   {
-    name: "Instinct",
+    id: "instinct",
     provider: "Spear Street Technology",
+    displayName: "Instinct",
     category: "ai_agent",
-    identity: "unknown",
-    uaPatterns: [/\bInstinct\b/i]
+    bucket: "none",
+    rank: 825,
+    which: ["robodex"],
+    ua: { patterns: [/\bInstinct\b/i] },
+    minProofForVerified: "ua_claim",
+    executionMode: "Cloud Browser Agent"
+  },
+  {
+    // Policy tokens are robots.txt directives, never HTTP user agents. They never visit.
+    id: "google_extended",
+    provider: "Google",
+    displayName: "Google-Extended",
+    category: "policy_token",
+    bucket: "gemini",
+    rank: 900,
+    which: [],
+    ua: { patterns: [/Google-Extended/i] },
+    feedIds: ["google-extended"],
+    minProofForVerified: "ua_claim",
+    policyToken: true
+  },
+  {
+    id: "applebot_extended",
+    provider: "Apple",
+    displayName: "Applebot-Extended",
+    category: "policy_token",
+    bucket: "apple",
+    rank: 901,
+    which: [],
+    ua: { patterns: [/Applebot-Extended/i] },
+    feedIds: ["applebot-extended"],
+    minProofForVerified: "ua_claim",
+    policyToken: true
   }
 ];
+var AGENT_REGISTRY = REGISTRY_LITERAL;
+var AGENT_BY_ID = Object.fromEntries(
+  AGENT_REGISTRY.map((agent) => [agent.id, agent])
+);
+var GOOD_BOT_UA_RULES = AGENT_REGISTRY.flatMap((agent) => {
+  if (!agent.ua?.requireNetworkMatch) return [];
+  return agent.ua.patterns.map((pattern) => ({
+    pattern,
+    provider: agent.provider,
+    label: agent.displayName,
+    category: agent.category,
+    network: agent.ua?.network
+  }));
+});
+var AI_AGENT_UA_RULES = AGENT_REGISTRY.flatMap((agent) => {
+  if (agent.policyToken || !agent.category.startsWith("ai_") && agent.category !== "autonomous_agent" && agent.category !== "browser_automation") {
+    return [];
+  }
+  if (!agent.ua) return [];
+  return agent.ua.patterns.map((pattern) => ({
+    pattern,
+    provider: agent.provider,
+    label: agent.displayName
+  }));
+});
+var BOT_SIGNATURE_KEYID_PROVIDERS = AGENT_REGISTRY.flatMap(
+  (agent) => (agent.signature?.keyIdNeedles ?? []).map((needle) => [needle, agent.provider])
+);
+var AI_BOT_CIDR_SOURCES = PREFIX_FEEDS.filter(
+  (feed) => feed.format !== "none"
+).map((feed) => ({ id: feed.sourceId, url: feed.url }));
+var VERIFICATION_SUFFIXES_BY_AGENT = Object.fromEntries(
+  AGENT_REGISTRY.filter((agent) => agent.fcrdnsSuffixes).map((agent) => [agent.id, [...agent.fcrdnsSuffixes]])
+);
+function identityFor(agent) {
+  switch (agent.minProofForVerified) {
+    case "cidr":
+    case "fcrdns":
+    case "allowlist":
+      return "verified";
+    case "rfc9421":
+    case "signed_agent":
+      return "signed";
+    default:
+      return "unknown";
+  }
+}
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+var BOT_DIRECTORY = AGENT_REGISTRY.filter(
+  (agent) => agent.which.includes("robodex")
+).map((agent) => {
+  const hosts = agent.signature?.agentHosts ?? [];
+  const headerPatterns = hosts.length ? [{ header: "signature-agent", pattern: new RegExp(hosts.map(escapeRegExp).join("|"), "i") }] : void 0;
+  return {
+    name: agent.displayName,
+    provider: agent.provider,
+    category: agent.category,
+    identity: identityFor(agent),
+    uaPatterns: agent.ua ? [...agent.ua.patterns] : void 0,
+    asnNumbers: agent.asns ? [...agent.asns] : void 0,
+    asnPatterns: agent.asnPatterns ? [...agent.asnPatterns] : void 0,
+    requiresWebBotAuth: Boolean(agent.signature?.wbaRequired || agent.signature?.sail),
+    headerPatterns
+  };
+});
+var PILLS = Object.fromEntries(
+  AGENT_REGISTRY.filter((agent) => agent.pill).map((agent) => [
+    agent.id,
+    {
+      kind: agent.pill.kind,
+      label: agent.pill.label || agent.displayName,
+      provider: agent.provider
+    }
+  ])
+);
+var BY_RANK = [...AGENT_REGISTRY].sort((a, b) => a.rank - b.rank);
+var POLICY_TOKENS = AGENT_REGISTRY.filter((agent) => agent.policyToken);
+function matchesUa(agent, ua) {
+  if (!agent.ua) return false;
+  for (const pattern of agent.ua.patterns) {
+    pattern.lastIndex = 0;
+    if (pattern.test(ua)) return true;
+  }
+  return false;
+}
+function findAgentByUa(ua) {
+  const value = typeof ua === "string" ? ua : "";
+  for (const agent of BY_RANK) {
+    if (agent.policyToken) continue;
+    if (matchesUa(agent, value)) return agent;
+  }
+  return null;
+}
+function isPolicyToken(ua) {
+  const value = typeof ua === "string" ? ua : "";
+  for (const agent of POLICY_TOKENS) {
+    if (matchesUa(agent, value)) return true;
+  }
+  return false;
+}
+function displayFor(agent, identity) {
+  const badge = identity === "verified" ? "Verified" : identity === "signed" ? "Signed" : identity === "spoofed" ? "Spoofed" : "Unverified";
+  const name = agent.displayName;
+  const provider = agent.provider;
+  const label = provider ? `${badge} \xB7 ${name} \xB7 ${provider}` : `${badge} \xB7 ${name}`;
+  return { badge, name, provider, label };
+}
+var MAX_FEED_PREFIXES = 5e3;
+var PREFIX_KEYS = /* @__PURE__ */ new Set(["ipv4Prefix", "ipv6Prefix", "prefix", "ip_prefix", "ipv4", "ipv6"]);
+function utf8Bytes(body) {
+  if (typeof TextEncoder !== "undefined") {
+    try {
+      return new TextEncoder().encode(body).length;
+    } catch {
+    }
+  }
+  return body.length;
+}
+function isIpv4(value) {
+  const parts = value.split(".");
+  return parts.length === 4 && parts.every(
+    (part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255
+  );
+}
+function isIpv6(value) {
+  if (!value.includes(":") || !/^[0-9a-fA-F:.]+$/.test(value)) return false;
+  return value.split("::").length <= 2;
+}
+function normalizePrefix(value) {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text) return null;
+  const slash = text.lastIndexOf("/");
+  if (slash >= 0) {
+    const ip = text.slice(0, slash);
+    const maskText = text.slice(slash + 1);
+    if (!/^\d{1,3}$/.test(maskText)) return null;
+    const mask = Number(maskText);
+    if (isIpv4(ip) && mask >= 0 && mask <= 32) return `${ip}/${mask}`;
+    if (isIpv6(ip) && mask >= 0 && mask <= 128) return `${ip}/${mask}`;
+    return null;
+  }
+  if (isIpv4(text)) return `${text}/32`;
+  if (isIpv6(text)) return `${text}/128`;
+  return null;
+}
+function isSpecialPurpose(prefix) {
+  const slash = prefix.lastIndexOf("/");
+  const ip = slash >= 0 ? prefix.slice(0, slash) : prefix;
+  if (isIpv4(ip)) {
+    const [a, b] = ip.split(".").map(Number);
+    if (a === 0 || a === 10 || a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
+    if (a === 192 && b === 0) return true;
+    if (a === 198 && (b === 18 || b === 19)) return true;
+    if (a >= 224) return true;
+    return false;
+  }
+  const lower = ip.toLowerCase();
+  if (lower === "::" || lower === "::1") return true;
+  if (/^fe[89ab]/.test(lower)) return true;
+  if (/^f[cd]/.test(lower)) return true;
+  if (/^ff/.test(lower)) return true;
+  return false;
+}
+function isTimestampLike(value) {
+  return /^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:?\d{2})?$/.test(value.trim());
+}
+function creationTimeFromJson(json) {
+  const visited = /* @__PURE__ */ new Set();
+  const visit = (node) => {
+    if (!node || typeof node !== "object" || visited.has(node)) return null;
+    visited.add(node);
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const found = visit(item);
+        if (found) return found;
+      }
+      return null;
+    }
+    const record = node;
+    for (const key of ["creationTime", "creation_time", "lastModified", "modified"]) {
+      const value = record[key];
+      if (typeof value === "string" && value && isTimestampLike(value)) return value.trim();
+    }
+    for (const value of Object.values(record)) {
+      const found = visit(value);
+      if (found) return found;
+    }
+    return null;
+  };
+  return visit(json);
+}
+function addPrefix(collector, raw) {
+  if (collector.list.length >= MAX_FEED_PREFIXES || typeof raw !== "string") return;
+  const prefix = normalizePrefix(raw);
+  if (prefix && !collector.seen.has(prefix)) {
+    collector.seen.add(prefix);
+    collector.list.push(prefix);
+  }
+}
+function collectJsonPrefixes(node, collector, visited) {
+  if (!node || typeof node !== "object" || visited.has(node)) return;
+  if (collector.list.length >= MAX_FEED_PREFIXES) return;
+  visited.add(node);
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      if (collector.list.length >= MAX_FEED_PREFIXES) return;
+      if (typeof item === "string") addPrefix(collector, item);
+      else collectJsonPrefixes(item, collector, visited);
+    }
+    return;
+  }
+  for (const [key, value] of Object.entries(node)) {
+    if (collector.list.length >= MAX_FEED_PREFIXES) return;
+    if (PREFIX_KEYS.has(key) && typeof value === "string") addPrefix(collector, value);
+    else collectJsonPrefixes(value, collector, visited);
+  }
+}
+function parseJsonBody(text) {
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  return JSON.parse(start >= 0 && end > start ? text.slice(start, end + 1) : text);
+}
+function extractEmbeddedJson(text) {
+  const at = text.search(/creationTime/i);
+  if (at < 0) return null;
+  const start = text.lastIndexOf("{", at);
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+function normalizeFeed(sourceId, body, fetchedAt) {
+  const text = typeof body === "string" ? body : "";
+  const feed = PREFIX_FEEDS.find((entry) => entry.sourceId === sourceId);
+  const format = feed?.format ?? "none";
+  const collector = { list: [], seen: /* @__PURE__ */ new Set() };
+  let creationTime = null;
+  let reason;
+  try {
+    if (format === "json" || format === "wba-directory") {
+      const json = parseJsonBody(text);
+      creationTime = creationTimeFromJson(json);
+      collectJsonPrefixes(json, collector, /* @__PURE__ */ new Set());
+    } else if (format === "amazon-html") {
+      const embedded = extractEmbeddedJson(text);
+      let parsed = null;
+      if (embedded) {
+        try {
+          parsed = JSON.parse(embedded);
+        } catch {
+          parsed = null;
+        }
+      }
+      if (parsed) {
+        creationTime = creationTimeFromJson(parsed);
+        collectJsonPrefixes(parsed, collector, /* @__PURE__ */ new Set());
+      }
+      if (collector.list.length === 0) {
+        for (const token of text.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g) ?? []) addPrefix(collector, token);
+      }
+    } else if (format === "sail-toml") {
+      const modified = text.match(/^\s*modified\s*=\s*["']([^"']+)["']/m);
+      if (modified) creationTime = modified[1];
+      const lists = text.match(/ipv[46]_prefixes\s*=\s*\[([^\]]*)\]/g) ?? [];
+      const local = [];
+      let invalid = null;
+      for (const list of lists) {
+        for (const raw of list.match(/["']([^"']+)["']/g) ?? []) {
+          const value = raw.replace(/^["']|["']$/g, "");
+          const prefix = normalizePrefix(value);
+          if (!prefix || isSpecialPurpose(prefix)) {
+            invalid = prefix ?? value;
+            continue;
+          }
+          if (!local.includes(prefix)) local.push(prefix);
+        }
+      }
+      if (invalid) {
+        reason = `SAIL document rejected: invalid or special-purpose prefix "${invalid}"`;
+      } else {
+        for (const prefix of local) addPrefix(collector, prefix);
+      }
+    }
+  } catch (error) {
+    reason = reason ?? `feed normalization failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  return {
+    prefixes: [...collector.list],
+    sourceId,
+    fetchedAt: typeof fetchedAt === "number" && Number.isFinite(fetchedAt) ? fetchedAt : Date.now(),
+    creationTime,
+    bytes: utf8Bytes(text),
+    ...reason ? { reason } : {}
+  };
+}
+
+// src/lib/aiBotDirectory.ts
+var BOT_DIRECTORY2 = BOT_DIRECTORY.map((entry) => ({
+  ...entry,
+  category: entry.category
+}));
 function detectAiBotFromServerSignals(params) {
   const { userAgent, asnNumber, asnOrg, headers } = params;
   const ua = userAgent || "";
@@ -877,7 +1588,7 @@ function detectAiBotFromServerSignals(params) {
   const signature = headers["signature"] || "";
   const hasWebBotAuth = Boolean(signatureAgent && signatureInput && signature);
   const networkKnown = asnNumber !== null || Boolean(asnOrg.trim()) && !/^unknown\b/i.test(asnOrg.trim());
-  for (const entry of BOT_DIRECTORY) {
+  for (const entry of BOT_DIRECTORY2) {
     let matched = false;
     let claimedByUaOrHeader = false;
     if (entry.uaPatterns) {
@@ -4601,7 +5312,4132 @@ function decideVerdictTier(input) {
   };
 }
 
+// src/lib/agentFeedSnapshots.ts
+var PINNED_PREFIXES = {
+  /** 4 prefixes */
+  "mistral-user": [
+    "20.240.160.161/32",
+    "20.240.160.1/32",
+    "20.240.194.83/32",
+    "51.12.243.114/32"
+  ],
+  /** 2 prefixes */
+  "mistral-index": [
+    "135.225.57.92/32",
+    "20.240.192.194/32"
+  ],
+  /** 18 prefixes */
+  "gptbot": [
+    "132.196.86.0/24",
+    "172.182.202.0/25",
+    "172.182.207.0/25",
+    "20.125.66.80/28",
+    "20.171.206.0/24",
+    "20.171.207.0/24",
+    "4.227.36.0/25",
+    "52.230.152.0/24",
+    "74.7.175.128/25",
+    "74.7.227.0/25",
+    "74.7.227.128/25",
+    "74.7.228.0/25",
+    "74.7.230.0/25",
+    "74.7.241.0/25",
+    "74.7.241.128/25",
+    "74.7.242.0/25",
+    "74.7.243.128/25",
+    "74.7.244.0/25"
+  ],
+  /** 237 prefixes */
+  "chatgpt-user": [
+    "104.208.184.192/28",
+    "104.210.139.192/28",
+    "104.210.139.224/28",
+    "128.85.198.32/28",
+    "13.65.138.112/28",
+    "13.67.72.16/28",
+    "13.71.2.208/28",
+    "13.76.116.80/28",
+    "13.76.32.208/28",
+    "13.83.167.128/28",
+    "13.83.237.176/28",
+    "132.196.82.48/28",
+    "134.138.52.128/28",
+    "134.138.52.16/28",
+    "134.138.52.64/28",
+    "134.138.52.96/28",
+    "134.138.57.176/28",
+    "134.138.57.64/28",
+    "134.138.57.80/28",
+    "134.138.58.32/28",
+    "134.149.233.80/28",
+    "134.33.102.192/28",
+    "135.116.136.160/28",
+    "135.13.64.240/28",
+    "135.220.73.208/28",
+    "135.220.73.240/28",
+    "135.222.99.32/28",
+    "135.237.131.208/28",
+    "135.237.133.48/28",
+    "137.135.191.176/28",
+    "138.91.46.96/28",
+    "145.132.136.96/28",
+    "158.158.5.32/28",
+    "168.63.252.240/28",
+    "172.162.248.64/28",
+    "172.170.1.80/28",
+    "172.170.225.0/28",
+    "172.170.241.80/28",
+    "172.172.206.48/28",
+    "172.175.152.224/28",
+    "172.178.140.144/28",
+    "172.178.141.112/28",
+    "172.178.141.128/28",
+    "172.183.143.224/28",
+    "172.183.222.128/28",
+    "172.192.112.208/28",
+    "172.197.160.192/28",
+    "172.197.203.16/28",
+    "172.198.161.128/28",
+    "172.198.58.176/28",
+    "172.198.78.192/28",
+    "172.198.79.112/28",
+    "172.199.137.80/28",
+    "172.204.28.224/28",
+    "172.204.96.80/28",
+    "172.205.189.192/28",
+    "172.206.38.240/28",
+    "172.207.1.32/28",
+    "172.212.172.160/28",
+    "172.215.215.32/28",
+    "191.232.238.96/28",
+    "191.233.197.0/28",
+    "191.233.199.160/28",
+    "191.234.167.144/28",
+    "191.235.99.160/28",
+    "191.237.249.64/28",
+    "20.102.212.144/28",
+    "20.113.211.112/28",
+    "20.113.225.112/28",
+    "20.125.112.224/28",
+    "20.125.144.144/28",
+    "20.161.75.208/28",
+    "20.168.7.192/28",
+    "20.169.73.32/28",
+    "20.169.73.64/28",
+    "20.169.78.128/28",
+    "20.169.78.160/28",
+    "20.169.78.192/28",
+    "20.169.78.48/28",
+    "20.169.78.64/28",
+    "20.169.86.224/28",
+    "20.169.86.240/28",
+    "20.170.184.16/28",
+    "20.170.184.32/28",
+    "20.170.184.48/28",
+    "20.170.184.64/28",
+    "20.170.184.80/28",
+    "20.172.29.32/28",
+    "20.199.211.160/28",
+    "20.199.242.0/28",
+    "20.200.212.240/28",
+    "20.206.101.192/28",
+    "20.210.211.192/28",
+    "20.212.62.208/28",
+    "20.215.187.208/28",
+    "20.215.219.128/28",
+    "20.215.219.160/28",
+    "20.215.219.208/28",
+    "20.218.30.240/28",
+    "20.219.161.192/28",
+    "20.219.184.96/28",
+    "20.219.71.192/28",
+    "20.222.36.192/28",
+    "20.227.140.32/28",
+    "20.228.106.176/28",
+    "20.235.87.224/28",
+    "20.249.63.208/28",
+    "20.250.136.64/28",
+    "20.250.6.128/28",
+    "20.254.201.208/28",
+    "20.45.178.144/28",
+    "20.55.229.144/28",
+    "20.57.199.192/28",
+    "20.63.180.96/28",
+    "20.63.221.64/28",
+    "20.78.130.48/28",
+    "20.83.243.176/28",
+    "20.98.18.80/28",
+    "23.101.217.176/28",
+    "23.102.140.144/28",
+    "23.102.141.32/28",
+    "23.98.142.176/28",
+    "23.98.186.176/28",
+    "23.98.186.192/28",
+    "23.98.186.64/28",
+    "23.98.186.96/28",
+    "4.151.119.48/28",
+    "4.151.71.176/28",
+    "4.189.118.208/28",
+    "4.189.119.48/28",
+    "4.197.115.112/28",
+    "4.197.22.112/28",
+    "4.197.64.0/28",
+    "4.197.64.16/28",
+    "4.197.64.48/28",
+    "4.197.64.64/28",
+    "4.201.232.64/28",
+    "4.205.128.176/28",
+    "4.218.24.64/28",
+    "4.226.200.16/28",
+    "4.226.226.32/28",
+    "40.116.73.208/28",
+    "40.119.36.240/28",
+    "40.124.161.0/28",
+    "40.74.200.208/28",
+    "40.81.234.144/28",
+    "40.81.67.96/28",
+    "40.84.221.208/28",
+    "40.84.221.224/28",
+    "48.221.184.80/28",
+    "48.221.184.96/28",
+    "48.221.40.176/28",
+    "51.116.2.80/28",
+    "51.116.221.96/28",
+    "51.57.0.96/28",
+    "51.57.158.112/28",
+    "51.57.158.96/28",
+    "51.59.24.64/28",
+    "51.59.24.80/28",
+    "51.59.48.80/28",
+    "51.8.155.112/28",
+    "51.8.155.48/28",
+    "52.148.129.32/28",
+    "52.156.77.144/28",
+    "52.159.227.32/28",
+    "52.159.249.96/28",
+    "52.161.49.96/28",
+    "52.165.212.48/28",
+    "52.172.129.160/28",
+    "52.173.219.112/28",
+    "52.173.219.96/28",
+    "52.173.221.16/28",
+    "52.173.221.176/28",
+    "52.173.221.208/28",
+    "52.173.234.16/28",
+    "52.173.234.80/28",
+    "52.183.217.240/28",
+    "52.190.137.144/28",
+    "52.190.137.16/28",
+    "52.190.139.48/28",
+    "52.190.142.64/28",
+    "52.190.190.16/28",
+    "52.190.251.112/28",
+    "52.225.75.208/28",
+    "52.231.30.48/28",
+    "52.231.34.176/28",
+    "52.231.39.144/28",
+    "52.231.50.64/28",
+    "52.236.94.144/28",
+    "52.241.146.208/28",
+    "52.242.132.224/28",
+    "52.242.132.240/28",
+    "52.255.109.144/28",
+    "52.255.109.80/28",
+    "52.255.109.96/28",
+    "52.255.111.0/28",
+    "52.255.111.80/28",
+    "57.154.174.112/28",
+    "57.154.175.0/28",
+    "57.154.187.32/28",
+    "68.154.28.96/28",
+    "68.220.57.64/28",
+    "70.153.189.192/28",
+    "70.153.32.16/28",
+    "70.153.32.32/28",
+    "70.153.87.224/28",
+    "70.156.152.96/28",
+    "74.161.200.96/28",
+    "74.224.217.64/28",
+    "74.226.253.160/28",
+    "74.248.37.160/28",
+    "74.7.35.112/28",
+    "74.7.35.48/28",
+    "74.7.36.64/28",
+    "74.7.36.80/28",
+    "74.7.36.96/28",
+    "85.211.128.16/28",
+    "85.211.128.32/28",
+    "9.129.0.0/16",
+    "9.160.128.16/28",
+    "9.160.128.64/28",
+    "9.160.163.128/28",
+    "9.160.34.144/28",
+    "9.160.36.16/28",
+    "9.160.96.16/28",
+    "9.163.101.48/28",
+    "9.205.128.32/28",
+    "9.205.128.48/28",
+    "9.205.25.128/28",
+    "9.205.30.128/28",
+    "9.205.30.144/28",
+    "9.205.30.176/28",
+    "9.205.8.48/28",
+    "9.205.8.64/28",
+    "9.223.181.208/28",
+    "9.234.96.192/28",
+    "9.234.97.96/28"
+  ],
+  /** 39 prefixes */
+  "searchbot": [
+    "104.210.140.128/28",
+    "13.66.216.176/28",
+    "135.234.64.0/24",
+    "172.182.193.224/28",
+    "172.182.193.80/28",
+    "172.182.194.144/28",
+    "172.182.194.32/28",
+    "172.182.195.48/28",
+    "172.182.209.208/28",
+    "172.182.211.192/28",
+    "172.182.213.192/28",
+    "172.182.224.0/28",
+    "172.203.190.112/28",
+    "172.203.190.128/28",
+    "172.203.190.80/28",
+    "20.14.99.96/28",
+    "20.168.18.32/28",
+    "20.169.6.224/28",
+    "20.169.7.48/28",
+    "20.169.77.0/25",
+    "20.171.123.64/28",
+    "20.171.53.224/28",
+    "20.25.151.224/28",
+    "20.42.10.176/28",
+    "23.102.145.48/28",
+    "4.227.36.0/25",
+    "40.67.175.0/25",
+    "40.90.214.16/28",
+    "51.8.102.0/24",
+    "74.7.175.128/25",
+    "74.7.228.0/25",
+    "74.7.228.128/25",
+    "74.7.229.0/25",
+    "74.7.229.128/25",
+    "74.7.230.0/25",
+    "74.7.241.128/25",
+    "74.7.242.128/25",
+    "74.7.243.0/25",
+    "74.7.244.0/25"
+  ],
+  /** 317 prefixes */
+  "google-common": [
+    "2001:4860:4801:10::/64",
+    "2001:4860:4801:11::/64",
+    "2001:4860:4801:12::/64",
+    "2001:4860:4801:13::/64",
+    "2001:4860:4801:14::/64",
+    "2001:4860:4801:15::/64",
+    "2001:4860:4801:16::/64",
+    "2001:4860:4801:17::/64",
+    "2001:4860:4801:18::/64",
+    "2001:4860:4801:19::/64",
+    "2001:4860:4801:1a::/64",
+    "2001:4860:4801:1b::/64",
+    "2001:4860:4801:1c::/64",
+    "2001:4860:4801:1d::/64",
+    "2001:4860:4801:1e::/64",
+    "2001:4860:4801:1f::/64",
+    "2001:4860:4801:20::/64",
+    "2001:4860:4801:21::/64",
+    "2001:4860:4801:22::/64",
+    "2001:4860:4801:23::/64",
+    "2001:4860:4801:24::/64",
+    "2001:4860:4801:25::/64",
+    "2001:4860:4801:26::/64",
+    "2001:4860:4801:27::/64",
+    "2001:4860:4801:28::/64",
+    "2001:4860:4801:29::/64",
+    "2001:4860:4801:2::/64",
+    "2001:4860:4801:2a::/64",
+    "2001:4860:4801:2b::/64",
+    "2001:4860:4801:2c::/64",
+    "2001:4860:4801:2d::/64",
+    "2001:4860:4801:2e::/64",
+    "2001:4860:4801:2f::/64",
+    "2001:4860:4801:30::/64",
+    "2001:4860:4801:31::/64",
+    "2001:4860:4801:32::/64",
+    "2001:4860:4801:33::/64",
+    "2001:4860:4801:34::/64",
+    "2001:4860:4801:35::/64",
+    "2001:4860:4801:36::/64",
+    "2001:4860:4801:37::/64",
+    "2001:4860:4801:38::/64",
+    "2001:4860:4801:39::/64",
+    "2001:4860:4801:3a::/64",
+    "2001:4860:4801:3b::/64",
+    "2001:4860:4801:3c::/64",
+    "2001:4860:4801:3d::/64",
+    "2001:4860:4801:3e::/64",
+    "2001:4860:4801:3f::/64",
+    "2001:4860:4801:40::/64",
+    "2001:4860:4801:41::/64",
+    "2001:4860:4801:42::/64",
+    "2001:4860:4801:43::/64",
+    "2001:4860:4801:44::/64",
+    "2001:4860:4801:45::/64",
+    "2001:4860:4801:46::/64",
+    "2001:4860:4801:47::/64",
+    "2001:4860:4801:48::/64",
+    "2001:4860:4801:49::/64",
+    "2001:4860:4801:4a::/64",
+    "2001:4860:4801:4b::/64",
+    "2001:4860:4801:4c::/64",
+    "2001:4860:4801:4d::/64",
+    "2001:4860:4801:4e::/64",
+    "2001:4860:4801:50::/64",
+    "2001:4860:4801:51::/64",
+    "2001:4860:4801:52::/64",
+    "2001:4860:4801:53::/64",
+    "2001:4860:4801:54::/64",
+    "2001:4860:4801:55::/64",
+    "2001:4860:4801:56::/64",
+    "2001:4860:4801:57::/64",
+    "2001:4860:4801:58::/64",
+    "2001:4860:4801:59::/64",
+    "2001:4860:4801:60::/64",
+    "2001:4860:4801:61::/64",
+    "2001:4860:4801:62::/64",
+    "2001:4860:4801:63::/64",
+    "2001:4860:4801:64::/64",
+    "2001:4860:4801:65::/64",
+    "2001:4860:4801:66::/64",
+    "2001:4860:4801:67::/64",
+    "2001:4860:4801:68::/64",
+    "2001:4860:4801:69::/64",
+    "2001:4860:4801:6a::/64",
+    "2001:4860:4801:6b::/64",
+    "2001:4860:4801:6c::/64",
+    "2001:4860:4801:6d::/64",
+    "2001:4860:4801:6e::/64",
+    "2001:4860:4801:6f::/64",
+    "2001:4860:4801:70::/64",
+    "2001:4860:4801:71::/64",
+    "2001:4860:4801:72::/64",
+    "2001:4860:4801:73::/64",
+    "2001:4860:4801:74::/64",
+    "2001:4860:4801:75::/64",
+    "2001:4860:4801:76::/64",
+    "2001:4860:4801:77::/64",
+    "2001:4860:4801:78::/64",
+    "2001:4860:4801:79::/64",
+    "2001:4860:4801:7a::/64",
+    "2001:4860:4801:7b::/64",
+    "2001:4860:4801:7c::/64",
+    "2001:4860:4801:7d::/64",
+    "2001:4860:4801:7e::/64",
+    "2001:4860:4801:7f::/64",
+    "2001:4860:4801:80::/64",
+    "2001:4860:4801:81::/64",
+    "2001:4860:4801:82::/64",
+    "2001:4860:4801:83::/64",
+    "2001:4860:4801:84::/64",
+    "2001:4860:4801:85::/64",
+    "2001:4860:4801:86::/64",
+    "2001:4860:4801:87::/64",
+    "2001:4860:4801:88::/64",
+    "2001:4860:4801:90::/64",
+    "2001:4860:4801:91::/64",
+    "2001:4860:4801:92::/64",
+    "2001:4860:4801:93::/64",
+    "2001:4860:4801:94::/64",
+    "2001:4860:4801:95::/64",
+    "2001:4860:4801:96::/64",
+    "2001:4860:4801:97::/64",
+    "2001:4860:4801:a0::/64",
+    "2001:4860:4801:a1::/64",
+    "2001:4860:4801:a2::/64",
+    "2001:4860:4801:a3::/64",
+    "2001:4860:4801:a4::/64",
+    "2001:4860:4801:a5::/64",
+    "2001:4860:4801:a6::/64",
+    "2001:4860:4801:a7::/64",
+    "2001:4860:4801:a8::/64",
+    "2001:4860:4801:a9::/64",
+    "2001:4860:4801:aa::/64",
+    "2001:4860:4801:ab::/64",
+    "2001:4860:4801:ac::/64",
+    "2001:4860:4801:ad::/64",
+    "2001:4860:4801:ae::/64",
+    "2001:4860:4801:b0::/64",
+    "2001:4860:4801:b1::/64",
+    "2001:4860:4801:b2::/64",
+    "2001:4860:4801:b3::/64",
+    "2001:4860:4801:b4::/64",
+    "2001:4860:4801:b5::/64",
+    "2001:4860:4801:b6::/64",
+    "2001:4860:4801:c::/64",
+    "2001:4860:4801:f::/64",
+    "192.178.4.0/27",
+    "192.178.4.128/27",
+    "192.178.4.160/27",
+    "192.178.4.192/27",
+    "192.178.4.224/27",
+    "192.178.4.32/27",
+    "192.178.4.64/27",
+    "192.178.4.96/27",
+    "192.178.5.0/27",
+    "192.178.6.0/27",
+    "192.178.6.128/27",
+    "192.178.6.160/27",
+    "192.178.6.192/27",
+    "192.178.6.224/27",
+    "192.178.6.32/27",
+    "192.178.6.64/27",
+    "192.178.6.96/27",
+    "192.178.7.0/27",
+    "192.178.7.128/27",
+    "192.178.7.160/27",
+    "192.178.7.192/27",
+    "192.178.7.224/27",
+    "192.178.7.32/27",
+    "192.178.7.64/27",
+    "192.178.7.96/27",
+    "34.100.182.96/28",
+    "34.101.50.144/28",
+    "34.118.254.0/28",
+    "34.118.66.0/28",
+    "34.126.178.96/28",
+    "34.146.150.144/28",
+    "34.147.110.144/28",
+    "34.151.74.144/28",
+    "34.152.50.64/28",
+    "34.154.114.144/28",
+    "34.155.98.32/28",
+    "34.165.18.176/28",
+    "34.175.160.64/28",
+    "34.176.130.16/28",
+    "34.22.85.0/27",
+    "34.64.82.64/28",
+    "34.65.242.112/28",
+    "34.80.50.80/28",
+    "34.88.194.0/28",
+    "34.89.10.80/28",
+    "34.89.198.80/28",
+    "34.96.162.48/28",
+    "35.247.243.240/28",
+    "66.249.64.0/27",
+    "66.249.64.128/27",
+    "66.249.64.160/27",
+    "66.249.64.192/27",
+    "66.249.64.224/27",
+    "66.249.64.32/27",
+    "66.249.64.64/27",
+    "66.249.64.96/27",
+    "66.249.65.0/27",
+    "66.249.65.128/27",
+    "66.249.65.160/27",
+    "66.249.65.192/27",
+    "66.249.65.224/27",
+    "66.249.65.32/27",
+    "66.249.65.64/27",
+    "66.249.65.96/27",
+    "66.249.66.0/27",
+    "66.249.66.128/27",
+    "66.249.66.160/27",
+    "66.249.66.192/27",
+    "66.249.66.224/27",
+    "66.249.66.32/27",
+    "66.249.66.64/27",
+    "66.249.66.96/27",
+    "66.249.67.0/27",
+    "66.249.67.32/27",
+    "66.249.67.64/27",
+    "66.249.68.0/27",
+    "66.249.68.128/27",
+    "66.249.68.160/27",
+    "66.249.68.192/27",
+    "66.249.68.224/27",
+    "66.249.68.32/27",
+    "66.249.68.64/27",
+    "66.249.68.96/27",
+    "66.249.69.0/27",
+    "66.249.69.128/27",
+    "66.249.69.160/27",
+    "66.249.69.192/27",
+    "66.249.69.224/27",
+    "66.249.69.32/27",
+    "66.249.69.64/27",
+    "66.249.69.96/27",
+    "66.249.70.0/27",
+    "66.249.70.128/27",
+    "66.249.70.160/27",
+    "66.249.70.192/27",
+    "66.249.70.224/27",
+    "66.249.70.32/27",
+    "66.249.70.64/27",
+    "66.249.70.96/27",
+    "66.249.71.0/27",
+    "66.249.71.128/27",
+    "66.249.71.160/27",
+    "66.249.71.192/27",
+    "66.249.71.224/27",
+    "66.249.71.32/27",
+    "66.249.71.64/27",
+    "66.249.71.96/27",
+    "66.249.72.0/27",
+    "66.249.72.128/27",
+    "66.249.72.160/27",
+    "66.249.72.192/27",
+    "66.249.72.224/27",
+    "66.249.72.32/27",
+    "66.249.72.64/27",
+    "66.249.72.96/27",
+    "66.249.73.0/27",
+    "66.249.73.128/27",
+    "66.249.73.160/27",
+    "66.249.73.192/27",
+    "66.249.73.224/27",
+    "66.249.73.32/27",
+    "66.249.73.64/27",
+    "66.249.73.96/27",
+    "66.249.74.0/27",
+    "66.249.74.128/27",
+    "66.249.74.160/27",
+    "66.249.74.192/27",
+    "66.249.74.224/27",
+    "66.249.74.32/27",
+    "66.249.74.64/27",
+    "66.249.74.96/27",
+    "66.249.75.0/27",
+    "66.249.75.128/27",
+    "66.249.75.160/27",
+    "66.249.75.192/27",
+    "66.249.75.224/27",
+    "66.249.75.32/27",
+    "66.249.75.64/27",
+    "66.249.75.96/27",
+    "66.249.76.0/27",
+    "66.249.76.128/27",
+    "66.249.76.160/27",
+    "66.249.76.192/27",
+    "66.249.76.224/27",
+    "66.249.76.32/27",
+    "66.249.76.64/27",
+    "66.249.76.96/27",
+    "66.249.77.0/27",
+    "66.249.77.128/27",
+    "66.249.77.160/27",
+    "66.249.77.192/27",
+    "66.249.77.224/27",
+    "66.249.77.32/27",
+    "66.249.77.64/27",
+    "66.249.77.96/27",
+    "66.249.78.0/27",
+    "66.249.78.128/27",
+    "66.249.78.160/27",
+    "66.249.78.192/27",
+    "66.249.78.224/27",
+    "66.249.78.32/27",
+    "66.249.78.64/27",
+    "66.249.78.96/27",
+    "66.249.79.0/27",
+    "66.249.79.128/27",
+    "66.249.79.160/27",
+    "66.249.79.192/27",
+    "66.249.79.224/27",
+    "66.249.79.32/27",
+    "66.249.79.64/27"
+  ],
+  /** 21 prefixes */
+  "perplexitybot": [
+    "107.20.236.150/32",
+    "18.210.92.235/32",
+    "18.97.1.228/32",
+    "18.97.9.100/32",
+    "18.97.9.101/32",
+    "18.97.9.102/32",
+    "18.97.9.103/32",
+    "18.97.9.96/32",
+    "18.97.9.97/32",
+    "18.97.9.98/32",
+    "18.97.9.99/32",
+    "3.222.232.239/32",
+    "3.224.62.45/32",
+    "3.41.218.160/32",
+    "3.41.218.161/32",
+    "3.41.218.162/32",
+    "3.41.218.163/32",
+    "3.41.218.164/32",
+    "3.41.218.165/32",
+    "3.41.218.166/32",
+    "3.41.218.167/32"
+  ],
+  /** 10 prefixes */
+  "perplexity-user": [
+    "18.97.43.80/32",
+    "18.97.43.81/32",
+    "18.97.43.82/32",
+    "18.97.43.83/32",
+    "18.97.43.84/32",
+    "18.97.43.85/32",
+    "18.97.43.86/32",
+    "18.97.43.87/32",
+    "34.193.163.52/32",
+    "44.208.221.197/32"
+  ],
+  /** 24 prefixes */
+  "applebot": [
+    "17.241.208.160/27",
+    "17.241.193.160/27",
+    "17.241.200.160/27",
+    "17.166.192.48/28",
+    "17.166.240.48/28",
+    "17.166.248.48/28",
+    "17.166.20.0/24",
+    "17.166.21.0/24",
+    "17.166.22.0/24",
+    "17.166.23.0/24",
+    "17.166.24.0/24",
+    "17.166.25.0/24",
+    "17.166.232.0/24",
+    "17.166.233.0/24",
+    "17.166.234.0/24",
+    "17.166.235.0/24",
+    "17.166.236.0/24",
+    "17.166.237.0/24",
+    "17.166.150.0/24",
+    "17.166.151.0/24",
+    "17.166.152.0/24",
+    "17.166.153.0/24",
+    "17.166.154.0/24",
+    "17.166.155.0/24"
+  ],
+  /** 29 prefixes */
+  "bingbot": [
+    "157.55.39.0/24",
+    "207.46.13.0/24",
+    "40.77.167.0/24",
+    "13.66.139.0/24",
+    "13.66.144.0/24",
+    "52.167.144.0/24",
+    "13.67.10.16/28",
+    "13.69.66.240/28",
+    "13.71.172.224/28",
+    "139.217.52.0/28",
+    "52.130.224.112/28",
+    "191.233.204.224/28",
+    "20.36.108.32/28",
+    "20.43.120.16/28",
+    "40.79.131.208/28",
+    "40.79.186.176/28",
+    "52.231.148.0/28",
+    "20.79.107.240/28",
+    "51.105.67.0/28",
+    "20.125.163.80/28",
+    "40.77.188.0/22",
+    "65.55.210.0/24",
+    "199.30.24.0/23",
+    "40.77.202.0/24",
+    "40.77.139.0/25",
+    "20.74.197.0/28",
+    "20.15.133.160/27",
+    "40.77.177.0/24",
+    "40.77.178.0/23"
+  ],
+  /** 5 prefixes */
+  "ccbot": [
+    "2600:1f28:365:8000::/56",
+    "3.41.188.32/29",
+    "18.97.9.168/29",
+    "18.97.14.80/29",
+    "18.97.14.88/30"
+  ],
+  /** 1292 prefixes */
+  "amazonbot": [
+    "3.81.245.78/32",
+    "3.81.253.213/32",
+    "3.85.116.107/32",
+    "3.86.129.126/32",
+    "3.88.96.254/32",
+    "3.88.245.236/32",
+    "3.89.170.186/32",
+    "3.89.176.255/32",
+    "3.90.73.206/32",
+    "3.91.138.117/32",
+    "3.91.140.8/32",
+    "3.92.37.4/32",
+    "3.92.253.216/32",
+    "3.93.98.99/32",
+    "3.93.211.16/32",
+    "3.93.222.50/32",
+    "3.93.253.174/32",
+    "3.94.40.182/32",
+    "3.94.46.239/32",
+    "3.94.75.111/32",
+    "3.94.156.104/32",
+    "3.94.157.25/32",
+    "3.94.199.128/32",
+    "3.208.33.245/32",
+    "3.208.47.73/32",
+    "3.208.129.204/32",
+    "3.208.146.193/32",
+    "3.208.156.9/32",
+    "3.208.224.218/32",
+    "3.209.2.17/32",
+    "3.209.156.113/32",
+    "3.209.174.110/32",
+    "3.209.187.64/32",
+    "3.209.221.199/32",
+    "3.210.29.96/32",
+    "3.210.114.189/32",
+    "3.210.115.187/32",
+    "3.210.123.121/32",
+    "3.210.152.134/32",
+    "3.210.223.61/32",
+    "3.211.16.169/32",
+    "3.211.90.118/32",
+    "3.211.105.134/32",
+    "3.211.181.86/32",
+    "3.211.184.174/32",
+    "3.211.196.5/32",
+    "3.212.18.59/32",
+    "3.212.32.46/32",
+    "3.212.86.97/32",
+    "3.212.136.194/32",
+    "3.212.144.73/32",
+    "3.212.205.90/32",
+    "3.212.219.113/32",
+    "3.212.237.74/32",
+    "3.213.46.222/32",
+    "3.213.80.185/32",
+    "3.213.85.234/32",
+    "3.213.106.226/32",
+    "3.213.142.248/32",
+    "3.213.213.161/32",
+    "3.214.176.44/32",
+    "3.214.218.132/32",
+    "3.215.14.122/32",
+    "3.215.59.93/32",
+    "3.215.156.193/32",
+    "3.215.221.125/32",
+    "3.216.13.10/32",
+    "3.216.86.144/32",
+    "3.216.199.69/32",
+    "3.216.227.216/32",
+    "3.216.250.224/32",
+    "3.217.47.0/32",
+    "3.217.82.254/32",
+    "3.217.171.106/32",
+    "3.217.190.160/32",
+    "3.217.211.204/32",
+    "3.218.20.222/32",
+    "3.218.35.239/32",
+    "3.218.103.254/32",
+    "3.218.147.175/32",
+    "3.218.202.170/32",
+    "3.219.80.71/32",
+    "3.219.81.66/32",
+    "3.219.118.96/32",
+    "3.219.145.31/32",
+    "3.220.55.106/32",
+    "3.220.70.171/32",
+    "3.220.138.53/32",
+    "3.220.148.166/32",
+    "3.220.175.119/32",
+    "3.220.202.135/32",
+    "3.221.48.218/32",
+    "3.221.50.71/32",
+    "3.221.156.96/32",
+    "3.221.222.168/32",
+    "3.221.232.188/32",
+    "3.221.244.28/32",
+    "3.222.85.38/32",
+    "3.222.134.229/32",
+    "3.222.144.151/32",
+    "3.222.186.80/32",
+    "3.222.190.107/32",
+    "3.222.230.205/32",
+    "3.223.38.249/32",
+    "3.223.61.36/32",
+    "3.223.107.167/32",
+    "3.223.122.95/32",
+    "3.223.134.5/32",
+    "3.223.181.32/32",
+    "3.223.229.145/32",
+    "3.223.245.78/32",
+    "3.224.104.67/32",
+    "3.224.157.127/32",
+    "3.224.191.210/32",
+    "3.224.205.25/32",
+    "3.224.215.150/32",
+    "3.224.220.101/32",
+    "3.225.9.97/32",
+    "3.225.12.172/32",
+    "3.225.45.252/32",
+    "3.225.50.29/32",
+    "3.226.34.98/32",
+    "3.226.101.249/32",
+    "3.226.106.93/32",
+    "3.226.115.242/32",
+    "3.226.160.157/32",
+    "3.226.184.56/32",
+    "3.227.62.11/32",
+    "3.227.96.103/32",
+    "3.227.180.70/32",
+    "3.228.111.48/32",
+    "3.228.140.40/32",
+    "3.228.150.65/32",
+    "3.229.2.217/32",
+    "3.229.62.67/32",
+    "3.229.65.105/32",
+    "3.229.95.193/32",
+    "3.229.128.107/32",
+    "3.229.164.203/32",
+    "3.229.181.245/32",
+    "3.230.14.171/32",
+    "3.230.43.143/32",
+    "3.230.54.110/32",
+    "3.230.69.161/32",
+    "3.230.161.52/32",
+    "3.230.224.6/32",
+    "3.231.72.210/32",
+    "3.231.180.166/32",
+    "3.231.192.213/32",
+    "3.231.193.38/32",
+    "3.231.193.169/32",
+    "3.232.39.98/32",
+    "3.232.82.72/32",
+    "3.232.84.110/32",
+    "3.232.102.111/32",
+    "3.232.145.99/32",
+    "3.232.202.209/32",
+    "3.232.208.252/32",
+    "3.233.110.127/32",
+    "3.234.87.64/32",
+    "3.234.94.166/32",
+    "3.235.215.92/32",
+    "3.239.194.129/32",
+    "13.216.71.17/32",
+    "13.216.200.208/32",
+    "13.216.205.205/32",
+    "13.217.73.235/32",
+    "13.219.57.118/32",
+    "13.223.39.7/32",
+    "13.223.113.242/32",
+    "13.223.134.105/32",
+    "13.223.215.220/32",
+    "18.204.83.102/32",
+    "18.204.89.56/32",
+    "18.204.152.114/32",
+    "18.204.239.30/32",
+    "18.205.91.101/32",
+    "18.205.127.11/32",
+    "18.205.173.53/32",
+    "18.205.213.231/32",
+    "18.206.47.187/32",
+    "18.206.80.86/32",
+    "18.207.79.144/32",
+    "18.207.89.138/32",
+    "18.208.11.93/32",
+    "18.208.15.146/32",
+    "18.208.113.192/32",
+    "18.209.82.211/32",
+    "18.209.137.234/32",
+    "18.209.198.85/32",
+    "18.209.201.119/32",
+    "18.210.56.100/32",
+    "18.210.58.238/32",
+    "18.210.77.56/32",
+    "18.210.120.208/32",
+    "18.210.147.97/32",
+    "18.211.32.162/32",
+    "18.211.39.188/32",
+    "18.211.76.162/32",
+    "18.211.148.239/32",
+    "18.211.161.73/32",
+    "18.211.191.113/32",
+    "18.211.217.198/32",
+    "18.211.242.14/32",
+    "18.213.27.222/32",
+    "18.213.70.100/32",
+    "18.213.86.182/32",
+    "18.213.87.246/32",
+    "18.213.102.186/32",
+    "18.213.123.90/32",
+    "18.213.133.156/32",
+    "18.213.188.154/32",
+    "18.213.191.165/32",
+    "18.213.240.226/32",
+    "18.214.7.8/32",
+    "18.214.17.122/32",
+    "18.214.78.166/32",
+    "18.214.106.155/32",
+    "18.214.124.6/32",
+    "18.214.138.148/32",
+    "18.214.186.220/32",
+    "18.214.195.55/32",
+    "18.214.238.178/32",
+    "18.214.251.19/32",
+    "18.215.24.66/32",
+    "18.215.31.42/32",
+    "18.215.49.176/32",
+    "18.215.77.19/32",
+    "18.215.112.101/32",
+    "18.215.119.68/32",
+    "18.232.11.247/32",
+    "18.232.12.157/32",
+    "18.232.36.1/32",
+    "18.232.191.232/32",
+    "18.232.204.128/32",
+    "18.233.22.168/32",
+    "18.233.24.238/32",
+    "18.235.81.246/32",
+    "18.235.158.19/32",
+    "23.20.146.223/32",
+    "23.20.149.71/32",
+    "23.20.178.124/32",
+    "23.21.119.232/32",
+    "23.21.148.226/32",
+    "23.21.175.228/32",
+    "23.21.179.27/32",
+    "23.21.179.35/32",
+    "23.21.179.120/32",
+    "23.21.204.95/32",
+    "23.21.205.230/32",
+    "23.21.207.129/32",
+    "23.21.210.40/32",
+    "23.21.225.190/32",
+    "23.21.227.240/32",
+    "23.21.228.180/32",
+    "23.21.250.48/32",
+    "23.22.19.198/32",
+    "23.22.20.228/32",
+    "23.22.35.162/32",
+    "23.22.59.87/32",
+    "23.22.105.143/32",
+    "23.22.141.240/32",
+    "23.22.146.41/32",
+    "23.22.148.181/32",
+    "23.22.230.70/32",
+    "23.23.14.241/32",
+    "23.23.99.55/32",
+    "23.23.103.31/32",
+    "23.23.104.107/32",
+    "23.23.137.202/32",
+    "23.23.169.144/32",
+    "23.23.180.225/32",
+    "23.23.212.212/32",
+    "23.23.213.182/32",
+    "23.23.214.190/32",
+    "23.23.224.159/32",
+    "32.192.16.179/32",
+    "32.192.112.25/32",
+    "32.192.146.164/32",
+    "32.192.158.119/32",
+    "32.192.170.30/32",
+    "32.193.7.60/32",
+    "32.193.117.94/32",
+    "32.193.200.204/32",
+    "32.194.54.130/32",
+    "32.194.70.253/32",
+    "32.194.84.196/32",
+    "32.194.189.87/32",
+    "32.194.241.222/32",
+    "32.195.25.4/32",
+    "32.195.30.1/32",
+    "32.195.79.67/32",
+    "32.195.82.105/32",
+    "32.195.85.141/32",
+    "32.195.96.205/32",
+    "32.195.127.227/32",
+    "32.195.171.51/32",
+    "32.195.185.225/32",
+    "32.196.5.45/32",
+    "32.196.13.177/32",
+    "32.196.78.138/32",
+    "32.196.99.18/32",
+    "32.196.127.32/32",
+    "32.196.172.181/32",
+    "32.196.219.86/32",
+    "32.196.220.178/32",
+    "32.197.0.57/32",
+    "32.197.29.81/32",
+    "32.197.74.42/32",
+    "32.197.108.117/32",
+    "32.197.176.179/32",
+    "32.198.237.6/32",
+    "32.198.246.135/32",
+    "32.199.124.50/32",
+    "34.192.55.180/32",
+    "34.192.67.98/32",
+    "34.192.125.239/32",
+    "34.192.126.103/32",
+    "34.192.215.69/32",
+    "34.192.221.205/32",
+    "34.193.2.57/32",
+    "34.193.23.131/32",
+    "34.193.220.170/32",
+    "34.193.228.159/32",
+    "34.194.14.255/32",
+    "34.194.95.99/32",
+    "34.194.100.135/32",
+    "34.194.165.45/32",
+    "34.194.209.245/32",
+    "34.194.225.116/32",
+    "34.194.226.74/32",
+    "34.194.233.48/32",
+    "34.194.243.75/32",
+    "34.195.60.66/32",
+    "34.195.144.83/32",
+    "34.195.170.146/32",
+    "34.195.185.14/32",
+    "34.195.191.37/32",
+    "34.195.248.30/32",
+    "34.196.6.199/32",
+    "34.196.6.240/32",
+    "34.196.30.12/32",
+    "34.196.49.100/32",
+    "34.196.114.170/32",
+    "34.196.190.12/32",
+    "34.196.237.236/32",
+    "34.197.28.78/32",
+    "34.197.96.67/32",
+    "34.197.179.252/32",
+    "34.198.44.69/32",
+    "34.199.54.89/32",
+    "34.199.72.6/32",
+    "34.199.167.166/32",
+    "34.199.252.22/32",
+    "34.200.36.216/32",
+    "34.200.86.246/32",
+    "34.200.133.183/32",
+    "34.200.169.0/32",
+    "34.201.181.54/32",
+    "34.202.16.142/32",
+    "34.202.88.37/32",
+    "34.202.103.152/32",
+    "34.202.112.188/32",
+    "34.202.153.229/32",
+    "34.202.164.232/32",
+    "34.202.182.197/32",
+    "34.202.210.13/32",
+    "34.203.105.116/32",
+    "34.203.111.15/32",
+    "34.203.118.32/32",
+    "34.203.118.85/32",
+    "34.203.172.148/32",
+    "34.203.201.219/32",
+    "34.204.150.196/32",
+    "34.204.233.120/32",
+    "34.205.10.151/32",
+    "34.205.117.127/32",
+    "34.205.122.5/32",
+    "34.205.123.23/32",
+    "34.205.163.103/32",
+    "34.205.170.13/32",
+    "34.205.175.100/32",
+    "34.205.199.8/32",
+    "34.205.234.123/32",
+    "34.206.193.60/32",
+    "34.206.205.131/32",
+    "34.206.212.24/32",
+    "34.206.229.66/32",
+    "34.206.249.188/32",
+    "34.224.9.144/32",
+    "34.224.132.215/32",
+    "34.224.201.217/32",
+    "34.224.224.155/32",
+    "34.224.232.175/32",
+    "34.225.24.180/32",
+    "34.225.79.179/32",
+    "34.225.87.80/32",
+    "34.225.138.57/32",
+    "34.225.243.131/32",
+    "34.226.56.197/32",
+    "34.226.89.140/32",
+    "34.227.156.153/32",
+    "34.227.233.168/32",
+    "34.227.234.246/32",
+    "34.228.105.150/32",
+    "34.230.124.21/32",
+    "34.230.161.23/32",
+    "34.230.175.224/32",
+    "34.230.208.4/32",
+    "34.230.245.58/32",
+    "34.231.11.219/32",
+    "34.231.45.47/32",
+    "34.231.77.232/32",
+    "34.231.118.144/32",
+    "34.231.130.193/32",
+    "34.231.156.59/32",
+    "34.231.181.240/32",
+    "34.231.219.196/32",
+    "34.232.103.129/32",
+    "34.232.115.106/32",
+    "34.232.173.22/32",
+    "34.232.249.216/32",
+    "34.233.111.76/32",
+    "34.233.114.237/32",
+    "34.233.164.201/32",
+    "34.233.171.240/32",
+    "34.233.219.155/32",
+    "34.234.10.40/32",
+    "34.234.60.110/32",
+    "34.234.121.216/32",
+    "34.234.190.75/32",
+    "34.234.197.175/32",
+    "34.234.200.207/32",
+    "34.234.206.30/32",
+    "34.234.235.23/32",
+    "34.235.75.8/32",
+    "34.235.173.180/32",
+    "34.235.178.44/32",
+    "34.235.239.240/32",
+    "34.236.26.60/32",
+    "34.236.41.241/32",
+    "34.236.82.22/32",
+    "34.236.89.150/32",
+    "34.236.91.13/32",
+    "34.236.135.14/32",
+    "34.236.185.101/32",
+    "34.236.189.117/32",
+    "34.236.252.251/32",
+    "34.237.89.221/32",
+    "34.238.45.183/32",
+    "34.238.144.226/32",
+    "34.239.85.139/32",
+    "34.239.197.197/32",
+    "34.239.229.196/32",
+    "35.153.42.147/32",
+    "35.153.86.40/32",
+    "35.153.86.200/32",
+    "35.153.155.149/32",
+    "35.153.218.211/32",
+    "35.168.73.117/32",
+    "35.168.151.95/32",
+    "35.168.238.50/32",
+    "35.169.89.12/32",
+    "35.169.102.85/32",
+    "35.169.119.108/32",
+    "35.169.209.75/32",
+    "35.169.240.53/32",
+    "35.170.40.230/32",
+    "35.170.103.34/32",
+    "35.170.116.99/32",
+    "35.170.195.233/32",
+    "35.170.205.140/32",
+    "35.170.215.163/32",
+    "35.171.117.160/32",
+    "35.171.122.241/32",
+    "35.171.141.42/32",
+    "35.171.173.150/32",
+    "35.172.91.0/32",
+    "35.172.125.172/32",
+    "35.173.18.61/32",
+    "35.173.38.202/32",
+    "35.173.60.40/32",
+    "35.173.88.80/32",
+    "35.173.97.68/32",
+    "35.174.141.243/32",
+    "35.174.150.32/32",
+    "35.174.185.174/32",
+    "35.174.187.247/32",
+    "35.174.253.85/32",
+    "35.175.85.189/32",
+    "44.193.102.198/32",
+    "44.193.115.232/32",
+    "44.194.6.175/32",
+    "44.194.64.226/32",
+    "44.194.108.197/32",
+    "44.194.134.53/32",
+    "44.194.139.149/32",
+    "44.195.50.71/32",
+    "44.195.132.139/32",
+    "44.195.142.56/32",
+    "44.195.145.102/32",
+    "44.195.163.77/32",
+    "44.195.225.95/32",
+    "44.196.2.129/32",
+    "44.196.35.207/32",
+    "44.196.118.6/32",
+    "44.196.161.7/32",
+    "44.197.65.237/32",
+    "44.197.76.210/32",
+    "44.198.40.214/32",
+    "44.198.105.10/32",
+    "44.198.154.81/32",
+    "44.198.223.49/32",
+    "44.198.231.31/32",
+    "44.199.175.190/32",
+    "44.205.43.166/32",
+    "44.205.65.19/32",
+    "44.205.74.196/32",
+    "44.205.120.22/32",
+    "44.205.156.100/32",
+    "44.205.180.155/32",
+    "44.205.192.249/32",
+    "44.206.65.8/32",
+    "44.206.93.215/32",
+    "44.206.213.217/32",
+    "44.207.29.72/32",
+    "44.207.69.106/32",
+    "44.207.155.89/32",
+    "44.207.207.36/32",
+    "44.207.209.230/32",
+    "44.207.241.206/32",
+    "44.207.252.58/32",
+    "44.208.89.66/32",
+    "44.208.131.254/32",
+    "44.208.193.63/32",
+    "44.208.212.174/32",
+    "44.208.220.225/32",
+    "44.208.223.68/32",
+    "44.208.245.240/32",
+    "44.209.24.209/32",
+    "44.209.35.147/32",
+    "44.209.80.115/32",
+    "44.209.89.189/32",
+    "44.209.108.13/32",
+    "44.209.187.99/32",
+    "44.209.254.112/32",
+    "44.210.60.235/32",
+    "44.210.199.190/32",
+    "44.210.204.255/32",
+    "44.210.213.220/32",
+    "44.210.226.29/32",
+    "44.211.3.154/32",
+    "44.211.10.233/32",
+    "44.212.106.171/32",
+    "44.212.131.50/32",
+    "44.212.145.46/32",
+    "44.212.232.231/32",
+    "44.212.242.70/32",
+    "44.213.36.21/32",
+    "44.213.159.215/32",
+    "44.213.202.136/32",
+    "44.213.202.160/32",
+    "44.214.19.8/32",
+    "44.214.224.199/32",
+    "44.214.227.26/32",
+    "44.214.237.175/32",
+    "44.215.61.66/32",
+    "44.215.168.29/32",
+    "44.215.181.176/32",
+    "44.215.210.112/32",
+    "44.215.227.72/32",
+    "44.215.231.15/32",
+    "44.215.235.20/32",
+    "44.215.239.33/32",
+    "44.216.105.106/32",
+    "44.216.172.204/32",
+    "44.216.237.125/32",
+    "44.217.12.90/32",
+    "44.217.44.195/32",
+    "44.217.174.180/32",
+    "44.217.177.142/32",
+    "44.217.255.167/32",
+    "44.218.6.93/32",
+    "44.218.79.142/32",
+    "44.218.120.180/32",
+    "44.218.170.184/32",
+    "44.219.46.88/32",
+    "44.219.74.122/32",
+    "44.219.243.132/32",
+    "44.220.2.97/32",
+    "44.220.21.130/32",
+    "44.221.19.65/32",
+    "44.221.37.41/32",
+    "44.221.105.234/32",
+    "44.221.106.162/32",
+    "44.221.138.137/32",
+    "44.221.180.179/32",
+    "44.221.227.90/32",
+    "44.222.9.101/32",
+    "44.223.115.10/32",
+    "44.223.116.149/32",
+    "44.223.116.180/32",
+    "44.223.193.255/32",
+    "44.223.227.26/32",
+    "44.223.232.55/32",
+    "50.16.43.55/32",
+    "50.16.72.185/32",
+    "50.16.216.166/32",
+    "50.16.247.74/32",
+    "50.16.248.61/32",
+    "50.17.115.150/32",
+    "50.17.193.48/32",
+    "50.17.228.207/32",
+    "50.17.246.254/32",
+    "50.19.46.134/32",
+    "50.19.64.10/32",
+    "50.19.78.178/32",
+    "50.19.79.213/32",
+    "50.19.102.70/32",
+    "50.19.106.86/32",
+    "50.19.167.76/32",
+    "50.19.221.48/32",
+    "50.19.243.82/32",
+    "50.19.251.21/32",
+    "52.0.41.164/32",
+    "52.0.63.151/32",
+    "52.0.81.156/32",
+    "52.0.101.108/32",
+    "52.0.105.244/32",
+    "52.0.108.238/32",
+    "52.0.178.92/32",
+    "52.0.218.219/32",
+    "52.1.75.30/32",
+    "52.1.84.252/32",
+    "52.1.100.136/32",
+    "52.1.106.130/32",
+    "52.1.157.90/32",
+    "52.2.4.213/32",
+    "52.2.11.133/32",
+    "52.2.39.252/32",
+    "52.2.47.27/32",
+    "52.2.58.41/32",
+    "52.2.63.204/32",
+    "52.2.83.227/32",
+    "52.2.191.202/32",
+    "52.3.26.180/32",
+    "52.3.74.68/32",
+    "52.3.78.144/32",
+    "52.3.102.51/32",
+    "52.3.104.214/32",
+    "52.3.127.170/32",
+    "52.3.130.157/32",
+    "52.3.155.146/32",
+    "52.3.156.186/32",
+    "52.3.188.146/32",
+    "52.4.76.156/32",
+    "52.4.128.0/32",
+    "52.4.143.63/32",
+    "52.4.201.109/32",
+    "52.4.213.199/32",
+    "52.4.229.9/32",
+    "52.4.238.8/32",
+    "52.5.13.52/32",
+    "52.5.165.11/32",
+    "52.5.175.224/32",
+    "52.5.221.152/32",
+    "52.5.232.250/32",
+    "52.5.233.62/32",
+    "52.5.242.243/32",
+    "52.6.5.24/32",
+    "52.6.89.179/32",
+    "52.6.97.88/32",
+    "52.6.173.78/32",
+    "52.6.216.39/32",
+    "52.6.232.201/32",
+    "52.6.255.193/32",
+    "52.7.13.44/32",
+    "52.7.13.143/32",
+    "52.7.33.248/32",
+    "52.7.78.54/32",
+    "52.7.101.58/32",
+    "52.7.232.91/32",
+    "52.20.8.32/32",
+    "52.20.88.157/32",
+    "52.20.98.185/32",
+    "52.20.137.159/32",
+    "52.20.137.229/32",
+    "52.20.157.145/32",
+    "52.20.159.75/32",
+    "52.20.203.24/32",
+    "52.20.205.113/32",
+    "52.20.240.226/32",
+    "52.21.26.34/32",
+    "52.21.46.201/32",
+    "52.21.50.209/32",
+    "52.21.62.139/32",
+    "52.21.85.213/32",
+    "52.21.109.236/32",
+    "52.21.184.211/32",
+    "52.21.187.65/32",
+    "52.21.223.189/32",
+    "52.22.2.95/32",
+    "52.22.64.232/32",
+    "52.22.87.224/32",
+    "52.23.91.14/32",
+    "52.23.112.144/32",
+    "52.44.148.203/32",
+    "52.44.157.127/32",
+    "52.44.174.136/32",
+    "52.44.229.124/32",
+    "52.45.15.233/32",
+    "52.45.29.57/32",
+    "52.45.77.169/32",
+    "52.45.92.83/32",
+    "52.45.184.225/32",
+    "52.45.190.80/32",
+    "52.45.194.165/32",
+    "52.54.15.103/32",
+    "52.54.45.70/32",
+    "52.54.54.197/32",
+    "52.54.67.48/32",
+    "52.54.95.127/32",
+    "52.54.157.23/32",
+    "52.54.249.218/32",
+    "52.55.108.228/32",
+    "52.55.208.70/32",
+    "52.70.123.241/32",
+    "52.70.138.176/32",
+    "52.70.166.208/32",
+    "52.70.169.120/32",
+    "52.70.170.85/32",
+    "52.70.184.86/32",
+    "52.70.209.13/32",
+    "52.70.240.171/32",
+    "52.70.249.201/32",
+    "52.70.251.201/32",
+    "52.71.46.142/32",
+    "52.71.123.230/32",
+    "52.71.139.1/32",
+    "52.71.203.206/32",
+    "52.71.216.196/32",
+    "52.71.218.25/32",
+    "52.72.165.106/32",
+    "52.72.240.198/32",
+    "52.73.6.26/32",
+    "52.73.52.182/32",
+    "52.73.59.127/32",
+    "52.73.132.106/32",
+    "52.73.142.41/32",
+    "52.86.84.160/32",
+    "52.86.125.110/32",
+    "52.86.135.254/32",
+    "52.87.216.1/32",
+    "52.90.14.235/32",
+    "52.91.123.6/32",
+    "52.200.39.39/32",
+    "52.200.54.136/32",
+    "52.200.58.199/32",
+    "52.200.72.138/32",
+    "52.200.93.170/32",
+    "52.200.115.159/32",
+    "52.200.142.199/32",
+    "52.200.146.144/32",
+    "52.200.245.197/32",
+    "52.200.251.20/32",
+    "52.201.0.89/32",
+    "52.201.9.130/32",
+    "52.201.35.30/32",
+    "52.201.64.62/32",
+    "52.201.155.215/32",
+    "52.201.158.126/32",
+    "52.201.173.132/32",
+    "52.202.52.82/32",
+    "52.202.229.247/32",
+    "52.202.233.37/32",
+    "52.202.248.123/32",
+    "52.203.65.83/32",
+    "52.203.68.145/32",
+    "52.203.92.216/32",
+    "52.203.110.191/32",
+    "52.203.152.231/32",
+    "52.203.175.146/32",
+    "52.203.203.38/32",
+    "52.203.237.170/32",
+    "52.204.15.176/32",
+    "52.204.37.237/32",
+    "52.204.71.8/32",
+    "52.204.81.148/32",
+    "52.204.89.12/32",
+    "52.204.174.139/32",
+    "52.204.217.5/32",
+    "52.204.253.129/32",
+    "52.205.113.104/32",
+    "52.205.141.124/32",
+    "52.205.222.214/32",
+    "52.205.246.252/32",
+    "52.206.4.37/32",
+    "52.206.52.236/32",
+    "52.206.59.204/32",
+    "52.206.64.59/32",
+    "52.206.147.195/32",
+    "52.206.204.50/32",
+    "52.207.28.157/32",
+    "52.207.47.227/32",
+    "54.80.1.215/32",
+    "54.80.73.122/32",
+    "54.80.120.78/32",
+    "54.80.121.108/32",
+    "54.80.136.167/32",
+    "54.80.185.200/32",
+    "54.81.11.133/32",
+    "54.81.14.82/32",
+    "54.81.45.126/32",
+    "54.81.134.131/32",
+    "54.81.191.5/32",
+    "54.81.238.39/32",
+    "54.82.109.15/32",
+    "54.83.11.233/32",
+    "54.83.23.103/32",
+    "54.83.56.1/32",
+    "54.83.180.239/32",
+    "54.83.199.241/32",
+    "54.83.240.58/32",
+    "54.84.88.22/32",
+    "54.84.93.8/32",
+    "54.84.102.81/32",
+    "54.84.147.79/32",
+    "54.84.161.62/32",
+    "54.84.169.196/32",
+    "54.84.205.220/32",
+    "54.84.250.51/32",
+    "54.85.7.119/32",
+    "54.85.109.140/32",
+    "54.85.126.86/32",
+    "54.85.223.45/32",
+    "54.85.241.125/32",
+    "54.86.59.155/32",
+    "54.86.197.92/32",
+    "54.86.234.119/32",
+    "54.86.239.192/32",
+    "54.87.4.126/32",
+    "54.87.62.248/32",
+    "54.87.95.7/32",
+    "54.87.236.2/32",
+    "54.88.84.219/32",
+    "54.88.188.59/32",
+    "54.88.247.44/32",
+    "54.89.90.224/32",
+    "54.90.8.255/32",
+    "54.90.21.233/32",
+    "54.90.26.89/32",
+    "54.90.244.132/32",
+    "54.91.122.193/32",
+    "54.92.171.106/32",
+    "54.144.22.233/32",
+    "54.144.42.14/32",
+    "54.144.44.182/32",
+    "54.144.185.255/32",
+    "54.144.247.210/32",
+    "54.145.82.217/32",
+    "54.146.67.173/32",
+    "54.146.84.169/32",
+    "54.146.102.185/32",
+    "54.146.119.126/32",
+    "54.146.167.72/32",
+    "54.146.185.99/32",
+    "54.147.80.137/32",
+    "54.147.136.146/32",
+    "54.147.182.90/32",
+    "54.147.238.89/32",
+    "54.152.21.44/32",
+    "54.152.30.242/32",
+    "54.152.163.42/32",
+    "54.152.194.33/32",
+    "54.156.55.147/32",
+    "54.156.124.2/32",
+    "54.156.208.198/32",
+    "54.156.234.172/32",
+    "54.156.248.117/32",
+    "54.157.84.74/32",
+    "54.157.99.244/32",
+    "54.157.174.108/32",
+    "54.158.43.170/32",
+    "54.158.139.192/32",
+    "54.158.155.182/32",
+    "54.159.18.27/32",
+    "54.159.98.248/32",
+    "54.159.140.186/32",
+    "54.159.223.204/32",
+    "54.159.245.22/32",
+    "54.160.47.239/32",
+    "54.160.118.78/32",
+    "54.160.136.135/32",
+    "54.161.158.222/32",
+    "54.161.238.223/32",
+    "54.161.253.173/32",
+    "54.162.58.185/32",
+    "54.162.69.192/32",
+    "54.162.70.124/32",
+    "54.163.33.176/32",
+    "54.163.136.244/32",
+    "54.163.169.168/32",
+    "54.163.213.42/32",
+    "54.164.106.236/32",
+    "54.164.208.167/32",
+    "54.165.11.5/32",
+    "54.165.99.177/32",
+    "54.165.161.174/32",
+    "54.166.104.83/32",
+    "54.166.126.132/32",
+    "54.166.181.246/32",
+    "54.167.14.199/32",
+    "54.167.32.123/32",
+    "54.167.81.78/32",
+    "54.172.35.126/32",
+    "54.172.157.35/32",
+    "54.172.235.198/32",
+    "54.173.224.14/32",
+    "54.174.244.224/32",
+    "54.175.220.249/32",
+    "54.197.52.174/32",
+    "54.197.82.195/32",
+    "54.197.102.71/32",
+    "54.197.114.76/32",
+    "54.197.178.107/32",
+    "54.198.33.233/32",
+    "54.198.34.175/32",
+    "54.204.12.115/32",
+    "54.204.35.170/32",
+    "54.204.62.163/32",
+    "54.204.120.7/32",
+    "54.204.178.26/32",
+    "54.205.137.46/32",
+    "54.205.150.0/32",
+    "54.205.205.14/32",
+    "54.208.10.176/32",
+    "54.208.120.99/32",
+    "54.208.131.189/32",
+    "54.209.6.230/32",
+    "54.209.100.30/32",
+    "54.210.51.58/32",
+    "54.210.77.145/32",
+    "54.210.152.179/32",
+    "54.210.155.69/32",
+    "54.211.13.212/32",
+    "54.211.195.14/32",
+    "54.221.203.24/32",
+    "54.221.211.160/32",
+    "54.221.239.88/32",
+    "54.221.245.154/32",
+    "54.221.254.95/32",
+    "54.224.80.42/32",
+    "54.224.242.33/32",
+    "54.225.81.20/32",
+    "54.225.98.148/32",
+    "54.225.148.123/32",
+    "54.225.181.161/32",
+    "54.225.199.17/32",
+    "54.225.201.2/32",
+    "54.226.95.110/32",
+    "54.226.117.47/32",
+    "54.226.201.45/32",
+    "54.227.251.182/32",
+    "54.234.122.80/32",
+    "54.235.81.195/32",
+    "54.235.125.129/32",
+    "54.235.158.162/32",
+    "54.235.172.96/32",
+    "54.235.172.108/32",
+    "54.235.191.179/32",
+    "54.235.199.187/32",
+    "54.236.90.11/32",
+    "54.236.95.142/32",
+    "54.236.100.102/32",
+    "54.236.100.106/32",
+    "54.236.102.157/32",
+    "54.236.227.238/32",
+    "54.237.219.210/32",
+    "54.243.63.52/32",
+    "54.243.204.71/32",
+    "54.243.211.244/32",
+    "67.202.25.8/32",
+    "72.44.42.254/32",
+    "75.101.156.93/32",
+    "98.80.17.126/32",
+    "98.80.60.233/32",
+    "98.80.89.155/32",
+    "98.80.130.239/32",
+    "98.82.38.120/32",
+    "98.82.39.241/32",
+    "98.82.40.168/32",
+    "98.82.42.197/32",
+    "98.82.59.253/32",
+    "98.82.63.147/32",
+    "98.82.66.172/32",
+    "98.82.67.109/32",
+    "98.82.70.65/32",
+    "98.82.88.135/32",
+    "98.82.107.102/32",
+    "98.82.214.73/32",
+    "98.82.224.29/32",
+    "98.82.226.145/32",
+    "98.83.8.142/32",
+    "98.83.10.183/32",
+    "98.83.59.126/32",
+    "98.83.72.38/32",
+    "98.83.94.113/32",
+    "98.83.101.133/32",
+    "98.83.176.66/32",
+    "98.83.177.42/32",
+    "98.83.178.66/32",
+    "98.83.225.16/32",
+    "98.83.225.157/32",
+    "98.83.226.125/32",
+    "98.83.250.208/32",
+    "98.84.60.17/32",
+    "98.84.70.201/32",
+    "98.84.131.195/32",
+    "98.84.184.80/32",
+    "98.84.192.142/32",
+    "98.84.200.43/32",
+    "98.84.206.170/32",
+    "98.85.17.171/32",
+    "98.85.32.206/32",
+    "98.85.36.128/32",
+    "98.85.170.76/32",
+    "98.86.65.222/32",
+    "98.86.80.124/32",
+    "98.86.132.251/32",
+    "98.86.203.217/32",
+    "98.86.212.51/32",
+    "98.87.77.225/32",
+    "98.87.133.23/32",
+    "98.87.141.21/32",
+    "98.87.182.7/32",
+    "98.87.207.126/32",
+    "98.87.213.181/32",
+    "98.87.238.5/32",
+    "98.87.250.62/32",
+    "98.88.57.244/32",
+    "98.88.187.143/32",
+    "98.89.99.238/32",
+    "98.89.106.231/32",
+    "98.89.197.159/32",
+    "98.89.209.185/32",
+    "98.90.98.103/32",
+    "98.90.110.79/32",
+    "98.90.125.157/32",
+    "98.90.148.129/32",
+    "98.90.215.62/32",
+    "98.90.249.120/32",
+    "98.91.44.166/32",
+    "98.91.72.186/32",
+    "98.91.94.136/32",
+    "98.91.104.214/32",
+    "98.91.110.187/32",
+    "98.91.111.24/32",
+    "98.91.143.225/32",
+    "98.94.138.179/32",
+    "98.94.142.186/32",
+    "98.95.124.8/32",
+    "100.24.90.135/32",
+    "100.24.134.117/32",
+    "100.24.149.244/32",
+    "100.24.167.60/32",
+    "100.25.9.234/32",
+    "100.25.96.137/32",
+    "100.25.103.91/32",
+    "100.25.120.246/32",
+    "100.26.7.250/32",
+    "100.27.71.33/32",
+    "100.27.79.68/32",
+    "100.27.149.198/32",
+    "100.27.153.9/32",
+    "100.27.161.155/32",
+    "100.28.44.58/32",
+    "100.28.49.152/32",
+    "100.28.57.133/32",
+    "100.28.118.16/32",
+    "100.28.133.214/32",
+    "100.28.204.82/32",
+    "100.28.245.118/32",
+    "100.29.34.97/32",
+    "100.29.48.32/32",
+    "100.29.63.24/32",
+    "100.29.70.220/32",
+    "100.29.74.61/32",
+    "100.29.107.38/32",
+    "100.29.116.208/32",
+    "100.29.126.60/32",
+    "100.29.128.75/32",
+    "100.29.148.60/32",
+    "100.29.155.89/32",
+    "100.29.160.53/32",
+    "100.29.164.142/32",
+    "100.29.164.178/32",
+    "100.30.8.247/32",
+    "100.30.43.47/32",
+    "100.30.51.229/32",
+    "100.30.88.88/32",
+    "100.30.157.22/32",
+    "100.31.32.118/32",
+    "100.31.229.251/32",
+    "100.48.38.64/32",
+    "100.48.40.16/32",
+    "100.48.126.46/32",
+    "100.48.145.68/32",
+    "100.48.254.147/32",
+    "100.49.9.181/32",
+    "100.49.11.239/32",
+    "100.49.26.210/32",
+    "100.49.87.166/32",
+    "100.50.57.146/32",
+    "100.50.82.187/32",
+    "100.50.88.53/32",
+    "100.50.92.12/32",
+    "100.50.101.121/32",
+    "100.50.195.113/32",
+    "100.50.204.204/32",
+    "100.51.28.129/32",
+    "100.51.30.134/32",
+    "100.51.131.3/32",
+    "100.51.145.133/32",
+    "100.51.173.237/32",
+    "100.51.246.38/32",
+    "100.51.251.51/32",
+    "100.52.10.132/32",
+    "100.52.56.144/32",
+    "100.52.80.224/32",
+    "100.52.115.57/32",
+    "100.52.138.120/32",
+    "100.52.138.205/32",
+    "100.55.106.152/32",
+    "100.55.188.3/32",
+    "100.55.234.220/32",
+    "100.56.51.40/32",
+    "100.56.99.138/32",
+    "100.56.112.244/32",
+    "100.56.127.196/32",
+    "100.56.142.210/32",
+    "100.56.151.105/32",
+    "100.56.195.235/32",
+    "100.57.46.166/32",
+    "100.57.60.108/32",
+    "100.57.69.236/32",
+    "100.57.70.187/32",
+    "100.57.145.59/32",
+    "100.57.194.146/32",
+    "100.57.211.199/32",
+    "100.57.216.250/32",
+    "100.57.246.13/32",
+    "100.58.4.37/32",
+    "100.58.45.198/32",
+    "100.59.145.242/32",
+    "100.59.209.89/32",
+    "100.59.227.61/32",
+    "100.60.1.224/32",
+    "100.60.51.118/32",
+    "100.60.153.145/32",
+    "100.60.159.110/32",
+    "100.60.164.156/32",
+    "100.60.181.98/32",
+    "100.60.212.69/32",
+    "100.60.218.80/32",
+    "100.60.224.239/32",
+    "100.60.230.7/32",
+    "100.60.230.43/32",
+    "100.61.20.229/32",
+    "100.61.24.214/32",
+    "100.61.64.186/32",
+    "100.61.110.40/32",
+    "100.61.251.108/32",
+    "100.61.252.112/32",
+    "100.62.132.114/32",
+    "100.62.191.85/32",
+    "100.62.205.149/32",
+    "100.62.208.199/32",
+    "100.62.224.15/32",
+    "100.62.247.207/32",
+    "100.63.9.237/32",
+    "100.63.38.186/32",
+    "100.63.167.112/32",
+    "100.63.217.53/32",
+    "100.63.226.160/32",
+    "100.63.227.156/32",
+    "100.63.236.174/32",
+    "100.63.239.85/32",
+    "107.20.25.33/32",
+    "107.20.181.148/32",
+    "107.20.224.184/32",
+    "107.20.255.194/32",
+    "107.21.4.76/32",
+    "107.21.49.20/32",
+    "107.21.171.94/32",
+    "107.22.54.180/32",
+    "107.22.208.39/32",
+    "107.22.219.12/32",
+    "107.23.62.75/32",
+    "107.23.208.98/32",
+    "174.129.20.137/32",
+    "174.129.115.115/32",
+    "174.129.131.108/32",
+    "174.129.189.60/32",
+    "174.129.242.195/32",
+    "184.72.84.154/32",
+    "184.72.95.195/32",
+    "184.72.140.245/32",
+    "184.73.35.182/32",
+    "184.73.47.24/32",
+    "184.73.68.20/32",
+    "184.73.98.121/32",
+    "184.73.126.164/32",
+    "184.73.167.217/32",
+    "184.73.175.194/32",
+    "184.73.195.18/32",
+    "184.73.216.192/32",
+    "184.73.232.51/32",
+    "184.73.239.35/32",
+    "184.192.10.131/32",
+    "184.192.13.104/32",
+    "184.192.16.41/32",
+    "184.192.17.38/32",
+    "184.192.22.162/32",
+    "184.192.32.200/32",
+    "184.192.37.104/32",
+    "184.192.45.148/32",
+    "184.192.57.50/32",
+    "184.192.58.249/32",
+    "184.192.60.239/32",
+    "184.192.65.160/32",
+    "184.192.71.112/32",
+    "184.192.75.146/32",
+    "184.192.76.56/32",
+    "184.192.87.53/32",
+    "184.192.89.251/32",
+    "184.192.90.88/32",
+    "184.192.91.223/32",
+    "184.192.111.161/32",
+    "184.192.114.128/32",
+    "184.192.119.173/32",
+    "184.192.123.97/32",
+    "184.192.124.134/32",
+    "184.192.127.115/32",
+    "184.192.132.218/32",
+    "184.192.133.10/32",
+    "184.192.138.135/32",
+    "184.192.139.185/32",
+    "184.192.142.177/32",
+    "184.192.142.248/32",
+    "184.192.145.41/32",
+    "184.192.150.219/32",
+    "184.192.153.80/32",
+    "184.192.160.199/32",
+    "184.192.161.161/32",
+    "184.192.163.135/32",
+    "184.192.166.248/32",
+    "184.192.167.118/32",
+    "184.192.172.179/32",
+    "184.192.174.76/32",
+    "184.192.175.55/32",
+    "184.192.176.204/32",
+    "184.192.180.115/32",
+    "184.192.184.46/32",
+    "184.192.189.128/32",
+    "184.192.199.116/32",
+    "184.192.199.181/32",
+    "184.192.200.93/32",
+    "184.192.200.176/32",
+    "184.192.200.235/32",
+    "184.192.202.136/32",
+    "184.192.203.238/32",
+    "184.192.210.213/32",
+    "184.192.212.143/32",
+    "184.192.212.212/32",
+    "184.192.218.172/32",
+    "184.192.228.95/32",
+    "184.192.232.81/32",
+    "184.192.232.184/32",
+    "184.192.233.81/32",
+    "184.192.233.216/32",
+    "184.192.234.12/32",
+    "184.192.234.21/32",
+    "184.192.234.129/32",
+    "184.192.234.200/32",
+    "184.192.234.218/32",
+    "184.192.234.235/32",
+    "184.192.235.64/32",
+    "184.192.235.146/32",
+    "184.192.235.180/32",
+    "184.192.236.147/32",
+    "184.192.236.194/32",
+    "184.192.236.219/32"
+  ],
+  /** 816 prefixes */
+  "amzn-search-bot": [
+    "3.82.67.224/32",
+    "3.82.90.168/32",
+    "3.83.75.212/32",
+    "3.85.141.163/32",
+    "3.86.74.89/32",
+    "3.89.17.222/32",
+    "3.89.155.158/32",
+    "3.90.92.205/32",
+    "3.90.117.221/32",
+    "3.91.142.95/32",
+    "3.91.164.253/32",
+    "3.92.140.162/32",
+    "3.93.116.95/32",
+    "3.93.120.17/32",
+    "3.94.185.94/32",
+    "3.208.37.94/32",
+    "3.208.113.39/32",
+    "3.209.57.4/32",
+    "3.209.71.33/32",
+    "3.209.162.193/32",
+    "3.210.17.17/32",
+    "3.210.117.45/32",
+    "3.210.238.203/32",
+    "3.210.239.195/32",
+    "3.211.100.186/32",
+    "3.211.143.75/32",
+    "3.211.158.39/32",
+    "3.211.227.132/32",
+    "3.212.138.251/32",
+    "3.212.155.47/32",
+    "3.213.103.242/32",
+    "3.213.110.122/32",
+    "3.213.117.114/32",
+    "3.213.253.252/32",
+    "3.214.51.149/32",
+    "3.214.131.136/32",
+    "3.214.235.2/32",
+    "3.214.252.9/32",
+    "3.215.155.189/32",
+    "3.215.205.141/32",
+    "3.216.26.183/32",
+    "3.216.221.144/32",
+    "3.216.244.57/32",
+    "3.216.253.252/32",
+    "3.217.20.26/32",
+    "3.217.34.58/32",
+    "3.217.34.183/32",
+    "3.217.63.43/32",
+    "3.217.66.30/32",
+    "3.217.161.64/32",
+    "3.218.2.114/32",
+    "3.218.37.5/32",
+    "3.219.6.124/32",
+    "3.219.192.9/32",
+    "3.219.192.12/32",
+    "3.219.223.95/32",
+    "3.220.71.23/32",
+    "3.221.35.158/32",
+    "3.221.56.120/32",
+    "3.221.61.12/32",
+    "3.221.116.68/32",
+    "3.221.121.46/32",
+    "3.221.167.25/32",
+    "3.221.254.28/32",
+    "3.222.16.22/32",
+    "3.222.19.80/32",
+    "3.222.127.245/32",
+    "3.222.196.181/32",
+    "3.222.252.213/32",
+    "3.223.42.33/32",
+    "3.223.100.234/32",
+    "3.223.139.87/32",
+    "3.223.155.74/32",
+    "3.223.242.201/32",
+    "3.224.45.108/32",
+    "3.224.73.194/32",
+    "3.224.123.189/32",
+    "3.224.159.71/32",
+    "3.224.205.7/32",
+    "3.224.216.148/32",
+    "3.225.111.192/32",
+    "3.225.136.217/32",
+    "3.225.200.77/32",
+    "3.225.209.122/32",
+    "3.226.3.62/32",
+    "3.226.50.226/32",
+    "3.226.139.230/32",
+    "3.226.196.238/32",
+    "3.226.229.153/32",
+    "3.227.142.177/32",
+    "3.227.227.6/32",
+    "3.228.117.65/32",
+    "3.228.151.92/32",
+    "3.228.206.225/32",
+    "3.229.67.114/32",
+    "3.229.72.127/32",
+    "3.229.219.29/32",
+    "3.230.59.35/32",
+    "3.230.179.91/32",
+    "3.230.230.154/32",
+    "3.230.250.35/32",
+    "3.230.253.54/32",
+    "3.231.178.162/32",
+    "3.231.188.44/32",
+    "3.232.18.244/32",
+    "3.232.204.221/32",
+    "3.232.253.211/32",
+    "3.233.175.168/32",
+    "3.233.189.187/32",
+    "3.234.13.59/32",
+    "3.234.28.73/32",
+    "3.234.152.213/32",
+    "13.216.24.101/32",
+    "13.216.102.104/32",
+    "13.216.187.148/32",
+    "13.216.196.168/32",
+    "13.219.54.187/32",
+    "13.219.152.101/32",
+    "13.219.170.211/32",
+    "13.219.196.61/32",
+    "13.222.91.251/32",
+    "13.223.109.92/32",
+    "13.223.163.204/32",
+    "13.223.222.73/32",
+    "18.204.69.251/32",
+    "18.204.90.3/32",
+    "18.205.13.0/32",
+    "18.205.44.190/32",
+    "18.205.140.254/32",
+    "18.205.180.59/32",
+    "18.206.50.226/32",
+    "18.206.66.34/32",
+    "18.206.69.92/32",
+    "18.206.202.183/32",
+    "18.207.88.6/32",
+    "18.208.43.113/32",
+    "18.208.95.0/32",
+    "18.209.135.224/32",
+    "18.209.142.234/32",
+    "18.209.178.202/32",
+    "18.210.45.73/32",
+    "18.210.115.131/32",
+    "18.210.225.20/32",
+    "18.211.141.154/32",
+    "18.213.84.33/32",
+    "18.213.133.4/32",
+    "18.213.249.250/32",
+    "18.214.84.4/32",
+    "18.214.124.101/32",
+    "18.214.125.232/32",
+    "18.214.186.114/32",
+    "18.214.206.100/32",
+    "18.215.42.159/32",
+    "18.215.99.115/32",
+    "18.215.135.45/32",
+    "18.215.215.162/32",
+    "18.233.44.129/32",
+    "18.233.214.108/32",
+    "18.233.235.66/32",
+    "18.234.249.23/32",
+    "18.235.234.69/32",
+    "23.20.194.146/32",
+    "23.21.30.253/32",
+    "23.21.72.195/32",
+    "23.21.115.175/32",
+    "23.21.214.230/32",
+    "23.21.236.157/32",
+    "23.21.254.26/32",
+    "23.22.4.24/32",
+    "23.22.245.96/32",
+    "23.22.246.84/32",
+    "23.23.97.185/32",
+    "23.23.138.175/32",
+    "23.23.169.169/32",
+    "23.23.188.58/32",
+    "23.23.201.125/32",
+    "23.23.214.73/32",
+    "32.193.207.248/32",
+    "32.193.230.132/32",
+    "32.194.42.66/32",
+    "32.196.238.12/32",
+    "32.197.85.247/32",
+    "32.197.106.56/32",
+    "32.198.161.214/32",
+    "32.199.114.136/32",
+    "32.199.225.217/32",
+    "34.192.94.60/32",
+    "34.192.213.30/32",
+    "34.192.224.176/32",
+    "34.193.28.138/32",
+    "34.193.137.18/32",
+    "34.193.176.214/32",
+    "34.194.81.161/32",
+    "34.194.96.61/32",
+    "34.194.165.188/32",
+    "34.194.196.150/32",
+    "34.194.236.194/32",
+    "34.194.237.29/32",
+    "34.195.79.160/32",
+    "34.195.90.205/32",
+    "34.195.194.181/32",
+    "34.196.22.75/32",
+    "34.196.127.79/32",
+    "34.196.221.51/32",
+    "34.197.25.140/32",
+    "34.197.27.62/32",
+    "34.197.154.32/32",
+    "34.197.240.80/32",
+    "34.197.246.201/32",
+    "34.198.33.203/32",
+    "34.198.41.184/32",
+    "34.198.117.140/32",
+    "34.198.223.196/32",
+    "34.199.0.168/32",
+    "34.199.2.135/32",
+    "34.199.111.130/32",
+    "34.199.134.92/32",
+    "34.200.55.56/32",
+    "34.200.59.71/32",
+    "34.200.178.28/32",
+    "34.200.190.72/32",
+    "34.201.89.57/32",
+    "34.201.229.234/32",
+    "34.201.230.145/32",
+    "34.203.29.230/32",
+    "34.203.33.121/32",
+    "34.204.31.92/32",
+    "34.204.82.126/32",
+    "34.204.145.175/32",
+    "34.204.234.171/32",
+    "34.206.13.250/32",
+    "34.206.127.169/32",
+    "34.206.160.62/32",
+    "34.206.189.108/32",
+    "34.207.31.244/32",
+    "34.207.190.20/32",
+    "34.224.5.130/32",
+    "34.224.43.52/32",
+    "34.224.104.19/32",
+    "34.224.135.86/32",
+    "34.224.242.232/32",
+    "34.225.204.15/32",
+    "34.225.220.51/32",
+    "34.225.241.157/32",
+    "34.226.77.125/32",
+    "34.226.171.86/32",
+    "34.226.176.13/32",
+    "34.227.89.68/32",
+    "34.227.210.84/32",
+    "34.227.211.218/32",
+    "34.228.0.97/32",
+    "34.228.124.71/32",
+    "34.229.27.119/32",
+    "34.229.55.190/32",
+    "34.230.225.128/32",
+    "34.231.91.210/32",
+    "34.231.191.101/32",
+    "34.231.198.5/32",
+    "34.232.233.214/32",
+    "34.233.138.154/32",
+    "34.233.177.9/32",
+    "34.233.191.178/32",
+    "34.233.249.54/32",
+    "34.234.21.24/32",
+    "34.234.177.179/32",
+    "34.234.182.15/32",
+    "34.234.221.209/32",
+    "34.235.6.168/32",
+    "34.235.19.146/32",
+    "34.235.221.79/32",
+    "34.235.227.102/32",
+    "34.236.65.219/32",
+    "34.236.66.23/32",
+    "34.236.163.131/32",
+    "34.237.22.79/32",
+    "34.237.37.16/32",
+    "34.238.12.204/32",
+    "34.238.63.49/32",
+    "34.238.66.168/32",
+    "34.238.75.183/32",
+    "34.238.132.4/32",
+    "34.239.77.160/32",
+    "34.239.87.171/32",
+    "34.239.90.1/32",
+    "34.239.253.240/32",
+    "35.153.187.89/32",
+    "35.168.48.89/32",
+    "35.168.75.176/32",
+    "35.168.147.87/32",
+    "35.168.181.24/32",
+    "35.169.1.17/32",
+    "35.169.2.39/32",
+    "35.169.2.149/32",
+    "35.169.74.227/32",
+    "35.169.106.154/32",
+    "35.169.110.137/32",
+    "35.170.104.4/32",
+    "35.170.105.219/32",
+    "35.170.123.50/32",
+    "35.170.123.152/32",
+    "35.171.37.0/32",
+    "35.171.77.201/32",
+    "35.171.190.227/32",
+    "35.171.199.44/32",
+    "35.171.200.29/32",
+    "35.172.15.28/32",
+    "35.172.125.46/32",
+    "35.172.188.13/32",
+    "35.173.101.225/32",
+    "35.173.123.161/32",
+    "35.174.28.56/32",
+    "35.175.65.253/32",
+    "35.175.132.11/32",
+    "44.193.34.148/32",
+    "44.193.96.92/32",
+    "44.194.47.12/32",
+    "44.194.84.22/32",
+    "44.194.124.103/32",
+    "44.194.165.181/32",
+    "44.195.71.32/32",
+    "44.195.217.176/32",
+    "44.196.9.78/32",
+    "44.196.83.48/32",
+    "44.196.116.215/32",
+    "44.196.118.139/32",
+    "44.196.235.241/32",
+    "44.197.4.190/32",
+    "44.197.254.236/32",
+    "44.198.66.156/32",
+    "44.198.230.203/32",
+    "44.199.62.58/32",
+    "44.199.112.216/32",
+    "44.199.145.199/32",
+    "44.205.173.56/32",
+    "44.205.208.84/32",
+    "44.206.81.21/32",
+    "44.206.127.11/32",
+    "44.206.217.175/32",
+    "44.207.64.241/32",
+    "44.208.55.64/32",
+    "44.208.90.52/32",
+    "44.208.239.245/32",
+    "44.209.121.79/32",
+    "44.209.167.138/32",
+    "44.209.243.164/32",
+    "44.210.22.203/32",
+    "44.210.41.97/32",
+    "44.210.169.22/32",
+    "44.210.170.50/32",
+    "44.210.179.109/32",
+    "44.210.189.34/32",
+    "44.210.225.188/32",
+    "44.211.6.49/32",
+    "44.212.202.62/32",
+    "44.212.207.23/32",
+    "44.212.241.192/32",
+    "44.212.251.138/32",
+    "44.213.56.230/32",
+    "44.213.206.151/32",
+    "44.213.211.166/32",
+    "44.213.228.74/32",
+    "44.213.241.45/32",
+    "44.215.74.155/32",
+    "44.215.99.191/32",
+    "44.215.159.243/32",
+    "44.215.171.38/32",
+    "44.216.105.237/32",
+    "44.216.173.42/32",
+    "44.216.177.139/32",
+    "44.216.239.225/32",
+    "44.217.43.241/32",
+    "44.217.64.212/32",
+    "44.217.156.115/32",
+    "44.217.164.115/32",
+    "44.217.204.19/32",
+    "44.217.221.211/32",
+    "44.217.223.236/32",
+    "44.217.237.69/32",
+    "44.217.251.254/32",
+    "44.218.56.203/32",
+    "44.218.61.226/32",
+    "44.218.248.140/32",
+    "44.218.253.125/32",
+    "44.219.149.9/32",
+    "44.219.225.200/32",
+    "44.219.225.212/32",
+    "44.221.129.95/32",
+    "44.221.203.99/32",
+    "44.221.241.220/32",
+    "44.221.244.76/32",
+    "44.223.253.120/32",
+    "50.17.88.23/32",
+    "50.19.98.34/32",
+    "50.19.173.230/32",
+    "52.0.114.157/32",
+    "52.0.207.54/32",
+    "52.0.236.109/32",
+    "52.1.97.122/32",
+    "52.1.233.104/32",
+    "52.2.191.37/32",
+    "52.3.17.185/32",
+    "52.3.30.234/32",
+    "52.3.62.173/32",
+    "52.3.91.235/32",
+    "52.3.193.39/32",
+    "52.3.251.73/32",
+    "52.4.189.224/32",
+    "52.4.251.246/32",
+    "52.5.12.245/32",
+    "52.5.20.105/32",
+    "52.5.45.215/32",
+    "52.5.113.11/32",
+    "52.6.24.217/32",
+    "52.6.54.116/32",
+    "52.6.57.17/32",
+    "52.6.171.10/32",
+    "52.6.216.48/32",
+    "52.6.231.0/32",
+    "52.7.48.229/32",
+    "52.7.126.210/32",
+    "52.7.171.101/32",
+    "52.7.225.39/32",
+    "52.7.227.80/32",
+    "52.7.249.12/32",
+    "52.20.27.34/32",
+    "52.20.85.108/32",
+    "52.20.124.247/32",
+    "52.20.158.171/32",
+    "52.20.234.254/32",
+    "52.21.93.114/32",
+    "52.21.99.253/32",
+    "52.21.133.215/32",
+    "52.22.52.60/32",
+    "52.22.75.143/32",
+    "52.22.233.217/32",
+    "52.23.69.1/32",
+    "52.44.115.134/32",
+    "52.44.199.164/32",
+    "52.45.83.81/32",
+    "52.45.194.99/32",
+    "52.45.211.110/32",
+    "52.54.130.150/32",
+    "52.55.107.99/32",
+    "52.70.16.42/32",
+    "52.70.37.172/32",
+    "52.70.95.48/32",
+    "52.70.226.93/32",
+    "52.71.16.223/32",
+    "52.71.72.39/32",
+    "52.71.144.112/32",
+    "52.71.159.156/32",
+    "52.71.205.86/32",
+    "52.71.243.5/32",
+    "52.72.227.157/32",
+    "52.73.35.133/32",
+    "52.87.75.190/32",
+    "52.87.216.218/32",
+    "52.200.64.94/32",
+    "52.200.125.80/32",
+    "52.200.198.83/32",
+    "52.200.202.121/32",
+    "52.200.244.204/32",
+    "52.201.26.95/32",
+    "52.201.77.2/32",
+    "52.201.114.98/32",
+    "52.201.149.75/32",
+    "52.202.15.97/32",
+    "52.202.30.225/32",
+    "52.202.160.12/32",
+    "52.202.182.148/32",
+    "52.202.234.14/32",
+    "52.203.139.107/32",
+    "52.203.235.174/32",
+    "52.204.1.121/32",
+    "52.204.203.171/32",
+    "52.205.16.194/32",
+    "52.206.29.234/32",
+    "52.206.59.229/32",
+    "52.206.116.153/32",
+    "52.206.129.89/32",
+    "52.206.188.45/32",
+    "52.207.6.18/32",
+    "52.207.43.63/32",
+    "54.80.143.10/32",
+    "54.81.2.245/32",
+    "54.81.15.167/32",
+    "54.81.32.142/32",
+    "54.81.126.112/32",
+    "54.82.2.214/32",
+    "54.83.18.137/32",
+    "54.83.58.194/32",
+    "54.83.126.221/32",
+    "54.83.172.18/32",
+    "54.84.71.94/32",
+    "54.84.83.113/32",
+    "54.84.160.219/32",
+    "54.84.185.230/32",
+    "54.85.38.148/32",
+    "54.85.95.196/32",
+    "54.85.178.213/32",
+    "54.87.216.234/32",
+    "54.87.255.90/32",
+    "54.88.60.135/32",
+    "54.88.236.97/32",
+    "54.89.16.186/32",
+    "54.89.45.9/32",
+    "54.89.69.250/32",
+    "54.89.70.93/32",
+    "54.90.18.3/32",
+    "54.90.28.43/32",
+    "54.90.227.223/32",
+    "54.91.249.2/32",
+    "54.92.148.34/32",
+    "54.92.203.235/32",
+    "54.145.34.70/32",
+    "54.145.161.111/32",
+    "54.146.71.85/32",
+    "54.147.14.240/32",
+    "54.147.66.130/32",
+    "54.147.119.34/32",
+    "54.147.229.64/32",
+    "54.157.89.253/32",
+    "54.157.138.252/32",
+    "54.157.208.183/32",
+    "54.158.133.188/32",
+    "54.158.154.192/32",
+    "54.159.237.70/32",
+    "54.160.45.52/32",
+    "54.161.25.53/32",
+    "54.161.157.185/32",
+    "54.162.54.187/32",
+    "54.162.153.212/32",
+    "54.163.22.228/32",
+    "54.163.82.179/32",
+    "54.163.123.236/32",
+    "54.165.95.216/32",
+    "54.165.171.73/32",
+    "54.165.202.67/32",
+    "54.165.205.16/32",
+    "54.166.24.13/32",
+    "54.166.70.223/32",
+    "54.167.5.166/32",
+    "54.167.94.112/32",
+    "54.167.133.42/32",
+    "54.167.188.181/32",
+    "54.172.50.210/32",
+    "54.172.92.66/32",
+    "54.172.176.34/32",
+    "54.173.156.58/32",
+    "54.173.160.86/32",
+    "54.173.161.122/32",
+    "54.174.127.227/32",
+    "54.174.161.242/32",
+    "54.175.167.28/32",
+    "54.196.187.118/32",
+    "54.204.10.196/32",
+    "54.204.14.125/32",
+    "54.204.105.49/32",
+    "54.204.159.166/32",
+    "54.204.189.191/32",
+    "54.205.6.162/32",
+    "54.205.7.250/32",
+    "54.205.137.236/32",
+    "54.208.186.113/32",
+    "54.208.229.84/32",
+    "54.209.33.199/32",
+    "54.209.59.28/32",
+    "54.209.67.252/32",
+    "54.209.139.3/32",
+    "54.210.16.158/32",
+    "54.210.47.231/32",
+    "54.210.51.122/32",
+    "54.221.233.6/32",
+    "54.224.159.224/32",
+    "54.225.210.250/32",
+    "54.225.211.168/32",
+    "54.225.220.226/32",
+    "54.226.54.148/32",
+    "54.227.95.204/32",
+    "54.227.122.71/32",
+    "54.227.250.126/32",
+    "54.234.109.91/32",
+    "54.234.156.138/32",
+    "54.234.227.173/32",
+    "54.235.183.179/32",
+    "54.235.187.99/32",
+    "54.236.77.176/32",
+    "54.236.90.239/32",
+    "54.236.146.97/32",
+    "54.236.180.98/32",
+    "54.236.184.238/32",
+    "54.236.251.98/32",
+    "54.237.229.245/32",
+    "54.242.155.65/32",
+    "54.243.78.23/32",
+    "54.243.119.155/32",
+    "54.243.128.188/32",
+    "54.243.172.250/32",
+    "54.243.185.76/32",
+    "54.243.211.63/32",
+    "72.44.45.175/32",
+    "75.101.144.251/32",
+    "98.80.36.221/32",
+    "98.80.83.102/32",
+    "98.82.61.199/32",
+    "98.82.68.7/32",
+    "98.82.78.131/32",
+    "98.82.83.103/32",
+    "98.82.193.30/32",
+    "98.82.238.39/32",
+    "98.83.194.21/32",
+    "98.83.194.176/32",
+    "98.84.79.84/32",
+    "98.84.86.216/32",
+    "98.84.185.30/32",
+    "98.84.242.117/32",
+    "98.85.153.239/32",
+    "98.85.191.237/32",
+    "98.85.194.38/32",
+    "98.86.33.14/32",
+    "98.86.38.110/32",
+    "98.86.69.65/32",
+    "98.86.83.164/32",
+    "98.86.93.251/32",
+    "98.86.101.20/32",
+    "98.86.133.40/32",
+    "98.86.217.46/32",
+    "98.87.182.1/32",
+    "98.87.203.235/32",
+    "98.87.218.210/32",
+    "98.88.3.219/32",
+    "98.88.4.13/32",
+    "98.88.4.160/32",
+    "98.88.43.210/32",
+    "98.88.67.17/32",
+    "98.88.114.29/32",
+    "98.88.146.174/32",
+    "98.88.180.222/32",
+    "98.88.186.79/32",
+    "98.88.219.59/32",
+    "98.88.224.25/32",
+    "98.88.234.184/32",
+    "98.88.240.41/32",
+    "98.89.74.239/32",
+    "98.89.89.208/32",
+    "98.89.110.216/32",
+    "98.89.176.131/32",
+    "98.89.191.68/32",
+    "98.89.198.186/32",
+    "98.89.238.137/32",
+    "98.89.254.223/32",
+    "98.89.255.185/32",
+    "98.90.1.201/32",
+    "98.90.53.3/32",
+    "98.90.53.72/32",
+    "98.90.93.167/32",
+    "98.90.129.48/32",
+    "98.90.132.132/32",
+    "98.90.144.220/32",
+    "98.90.155.195/32",
+    "98.90.166.177/32",
+    "98.90.171.206/32",
+    "98.90.212.161/32",
+    "98.91.3.186/32",
+    "98.91.9.192/32",
+    "98.91.81.246/32",
+    "98.91.91.18/32",
+    "98.91.104.211/32",
+    "98.91.120.100/32",
+    "98.91.142.137/32",
+    "98.91.147.104/32",
+    "98.91.150.214/32",
+    "98.91.160.54/32",
+    "98.91.171.8/32",
+    "98.94.116.10/32",
+    "98.94.126.135/32",
+    "98.94.137.118/32",
+    "98.94.149.8/32",
+    "98.94.158.230/32",
+    "98.94.164.245/32",
+    "98.94.174.49/32",
+    "98.94.174.228/32",
+    "98.94.180.226/32",
+    "98.94.182.242/32",
+    "98.94.188.12/32",
+    "98.94.193.28/32",
+    "98.94.196.171/32",
+    "98.94.202.176/32",
+    "98.94.203.213/32",
+    "98.94.208.188/32",
+    "98.94.209.71/32",
+    "98.94.216.122/32",
+    "98.94.225.199/32",
+    "98.94.225.207/32",
+    "98.94.228.253/32",
+    "98.94.237.222/32",
+    "98.94.240.137/32",
+    "98.94.246.215/32",
+    "98.94.252.84/32",
+    "98.94.253.137/32",
+    "98.95.1.231/32",
+    "98.95.7.71/32",
+    "98.95.20.69/32",
+    "98.95.23.214/32",
+    "98.95.23.228/32",
+    "98.95.34.178/32",
+    "98.95.37.200/32",
+    "98.95.38.161/32",
+    "98.95.39.39/32",
+    "98.95.44.247/32",
+    "98.95.49.54/32",
+    "98.95.55.232/32",
+    "98.95.56.98/32",
+    "98.95.56.240/32",
+    "98.95.62.182/32",
+    "98.95.65.140/32",
+    "98.95.74.218/32",
+    "98.95.89.44/32",
+    "98.95.91.59/32",
+    "98.95.100.253/32",
+    "98.95.104.207/32",
+    "98.95.106.159/32",
+    "98.95.110.94/32",
+    "98.95.120.52/32",
+    "98.95.126.63/32",
+    "98.95.129.148/32",
+    "98.95.130.0/32",
+    "98.95.145.11/32",
+    "98.95.148.56/32",
+    "98.95.150.125/32",
+    "98.95.156.127/32",
+    "98.95.159.241/32",
+    "98.95.161.76/32",
+    "98.95.161.103/32",
+    "98.95.162.121/32",
+    "98.95.174.52/32",
+    "98.95.175.92/32",
+    "100.24.190.202/32",
+    "100.25.17.231/32",
+    "100.25.30.152/32",
+    "100.25.127.167/32",
+    "100.25.153.201/32",
+    "100.25.199.161/32",
+    "100.26.122.24/32",
+    "100.27.85.243/32",
+    "100.28.152.127/32",
+    "100.28.177.247/32",
+    "100.29.59.194/32",
+    "100.29.157.182/32",
+    "100.31.22.225/32",
+    "100.31.34.200/32",
+    "100.48.0.143/32",
+    "100.48.137.73/32",
+    "100.48.162.26/32",
+    "100.49.196.199/32",
+    "100.50.44.58/32",
+    "100.50.76.106/32",
+    "100.50.108.84/32",
+    "100.50.153.151/32",
+    "100.51.22.85/32",
+    "100.51.81.206/32",
+    "100.51.156.79/32",
+    "100.52.70.176/32",
+    "100.55.111.152/32",
+    "100.55.191.83/32",
+    "100.56.25.168/32",
+    "100.57.68.185/32",
+    "100.58.26.90/32",
+    "100.58.39.170/32",
+    "100.58.52.102/32",
+    "100.58.57.149/32",
+    "100.58.58.209/32",
+    "100.59.72.83/32",
+    "100.59.254.242/32",
+    "100.60.14.30/32",
+    "100.60.123.70/32",
+    "100.60.141.252/32",
+    "100.60.170.171/32",
+    "100.60.204.184/32",
+    "100.60.204.250/32",
+    "100.61.92.1/32",
+    "100.62.13.116/32",
+    "100.62.157.123/32",
+    "100.62.179.212/32",
+    "100.62.186.188/32",
+    "107.20.21.185/32",
+    "107.20.124.65/32",
+    "107.20.132.237/32",
+    "107.20.164.28/32",
+    "107.20.195.185/32",
+    "107.21.9.54/32",
+    "107.21.62.197/32",
+    "107.22.6.189/32",
+    "107.22.145.162/32",
+    "107.22.199.65/32",
+    "107.23.25.176/32",
+    "107.23.41.220/32",
+    "174.129.228.153/32",
+    "184.72.137.83/32",
+    "184.73.10.164/32",
+    "184.73.154.145/32",
+    "184.192.3.139/32",
+    "184.192.68.254/32",
+    "184.192.125.80/32",
+    "184.192.132.1/32",
+    "184.192.160.224/32",
+    "184.192.172.115/32",
+    "184.192.201.21/32",
+    "184.192.207.91/32",
+    "184.192.211.188/32",
+    "184.192.212.181/32",
+    "184.192.213.86/32",
+    "184.192.213.200/32",
+    "184.192.214.49/32",
+    "184.192.214.62/32",
+    "184.192.215.194/32"
+  ],
+  /** 1023 prefixes */
+  "amzn-user": [
+    "100.24.86.21/32",
+    "100.24.94.158/32",
+    "100.25.233.255/32",
+    "100.26.69.34/32",
+    "100.27.118.106/32",
+    "100.27.157.160/32",
+    "100.27.158.82/32",
+    "100.27.169.147/32",
+    "100.27.91.246/32",
+    "100.28.104.194/32",
+    "100.28.113.237/32",
+    "100.28.151.241/32",
+    "100.28.33.208/32",
+    "100.29.104.31/32",
+    "100.29.106.130/32",
+    "100.29.122.28/32",
+    "100.29.92.161/32",
+    "107.20.201.23/32",
+    "107.20.42.162/32",
+    "107.21.114.117/32",
+    "107.21.229.211/32",
+    "107.22.218.90/32",
+    "107.22.241.68/32",
+    "107.22.255.3/32",
+    "107.22.55.149/32",
+    "107.22.87.58/32",
+    "107.23.190.53/32",
+    "107.23.242.35/32",
+    "107.23.56.227/32",
+    "13.216.113.150/32",
+    "13.216.136.62/32",
+    "13.216.143.182/32",
+    "13.216.152.158/32",
+    "13.216.162.32/32",
+    "13.216.169.197/32",
+    "13.216.27.246/32",
+    "13.217.158.72/32",
+    "13.218.255.40/32",
+    "13.219.0.206/32",
+    "13.219.122.158/32",
+    "13.219.125.104/32",
+    "13.219.138.92/32",
+    "13.219.15.124/32",
+    "13.219.173.86/32",
+    "13.219.211.133/32",
+    "13.219.48.105/32",
+    "13.222.48.80/32",
+    "13.222.68.90/32",
+    "13.223.10.22/32",
+    "13.223.112.99/32",
+    "13.223.12.55/32",
+    "13.223.123.7/32",
+    "13.223.125.191/32",
+    "13.223.127.163/32",
+    "13.223.135.149/32",
+    "13.223.141.183/32",
+    "13.223.143.171/32",
+    "13.223.208.86/32",
+    "13.223.212.171/32",
+    "13.223.219.110/32",
+    "13.223.222.177/32",
+    "13.223.237.145/32",
+    "13.223.32.32/32",
+    "13.223.33.67/32",
+    "174.129.24.225/32",
+    "18.204.129.185/32",
+    "18.204.147.58/32",
+    "18.204.174.34/32",
+    "18.204.200.202/32",
+    "18.204.77.144/32",
+    "18.205.121.5/32",
+    "18.205.170.69/32",
+    "18.205.179.96/32",
+    "18.205.207.200/32",
+    "18.205.94.193/32",
+    "18.206.10.25/32",
+    "18.206.102.242/32",
+    "18.206.103.117/32",
+    "18.206.31.0/32",
+    "18.206.49.169/32",
+    "18.206.63.178/32",
+    "18.206.75.17/32",
+    "18.206.80.142/32",
+    "18.207.68.55/32",
+    "18.207.71.20/32",
+    "18.207.79.53/32",
+    "18.208.49.162/32",
+    "18.208.68.221/32",
+    "18.208.96.116/32",
+    "18.209.149.152/32",
+    "18.209.155.76/32",
+    "18.209.183.128/32",
+    "18.209.189.61/32",
+    "18.210.135.253/32",
+    "18.210.143.14/32",
+    "18.210.177.112/32",
+    "18.210.211.84/32",
+    "18.210.58.248/32",
+    "18.210.79.138/32",
+    "18.210.88.179/32",
+    "18.211.100.116/32",
+    "18.211.172.15/32",
+    "18.211.184.127/32",
+    "18.211.228.10/32",
+    "18.213.102.71/32",
+    "18.213.108.226/32",
+    "18.213.174.38/32",
+    "18.213.18.100/32",
+    "18.213.225.24/32",
+    "18.214.155.227/32",
+    "18.214.160.25/32",
+    "18.214.180.93/32",
+    "18.214.202.10/32",
+    "18.214.208.13/32",
+    "18.214.236.252/32",
+    "18.214.32.251/32",
+    "18.214.97.194/32",
+    "18.215.133.216/32",
+    "18.215.19.140/32",
+    "18.215.37.82/32",
+    "18.215.81.159/32",
+    "18.232.221.67/32",
+    "18.233.242.106/32",
+    "18.233.247.66/32",
+    "18.233.254.6/32",
+    "18.233.44.115/32",
+    "18.233.52.165/32",
+    "18.235.117.231/32",
+    "18.235.176.68/32",
+    "184.72.220.200/32",
+    "184.72.231.109/32",
+    "184.72.242.66/32",
+    "184.73.1.121/32",
+    "184.73.212.232/32",
+    "23.20.14.164/32",
+    "23.20.14.43/32",
+    "23.20.157.74/32",
+    "23.20.190.101/32",
+    "23.21.161.204/32",
+    "23.21.164.86/32",
+    "23.21.226.79/32",
+    "23.21.74.3/32",
+    "23.21.78.102/32",
+    "23.22.140.49/32",
+    "23.22.164.241/32",
+    "23.22.236.99/32",
+    "23.22.87.173/32",
+    "23.22.87.189/32",
+    "23.23.111.110/32",
+    "23.23.152.43/32",
+    "23.23.16.236/32",
+    "23.23.201.145/32",
+    "23.23.209.179/32",
+    "3.208.167.128/32",
+    "3.208.247.204/32",
+    "3.208.46.236/32",
+    "3.209.130.7/32",
+    "3.210.93.112/32",
+    "3.211.144.3/32",
+    "3.211.145.5/32",
+    "3.211.153.227/32",
+    "3.211.177.14/32",
+    "3.211.189.40/32",
+    "3.211.192.237/32",
+    "3.211.199.193/32",
+    "3.211.22.7/32",
+    "3.211.99.154/32",
+    "3.212.148.16/32",
+    "3.212.151.142/32",
+    "3.212.155.239/32",
+    "3.212.155.80/32",
+    "3.212.20.54/32",
+    "3.212.203.251/32",
+    "3.212.205.155/32",
+    "3.213.119.107/32",
+    "3.213.132.166/32",
+    "3.213.183.18/32",
+    "3.213.192.229/32",
+    "3.213.205.133/32",
+    "3.213.223.246/32",
+    "3.213.23.95/32",
+    "3.213.74.26/32",
+    "3.213.80.230/32",
+    "3.214.107.231/32",
+    "3.214.110.59/32",
+    "3.214.154.139/32",
+    "3.214.173.19/32",
+    "3.214.189.85/32",
+    "3.214.213.94/32",
+    "3.215.193.161/32",
+    "3.215.254.248/32",
+    "3.215.8.42/32",
+    "3.215.85.254/32",
+    "3.216.16.254/32",
+    "3.216.24.167/32",
+    "3.216.83.21/32",
+    "3.217.124.227/32",
+    "3.217.155.115/32",
+    "3.217.166.57/32",
+    "3.217.186.68/32",
+    "3.217.47.198/32",
+    "3.217.54.78/32",
+    "3.217.93.234/32",
+    "3.218.11.113/32",
+    "3.218.125.55/32",
+    "3.218.140.139/32",
+    "3.218.177.210/32",
+    "3.218.184.146/32",
+    "3.218.191.159/32",
+    "3.218.226.239/32",
+    "3.218.255.41/32",
+    "3.218.35.149/32",
+    "3.218.68.30/32",
+    "3.219.10.249/32",
+    "3.219.103.72/32",
+    "3.219.249.170/32",
+    "3.219.27.100/32",
+    "3.219.52.199/32",
+    "3.219.98.171/32",
+    "3.220.134.7/32",
+    "3.220.2.22/32",
+    "3.220.89.3/32",
+    "3.221.105.67/32",
+    "3.221.110.107/32",
+    "3.221.204.121/32",
+    "3.221.221.12/32",
+    "3.221.252.69/32",
+    "3.222.193.181/32",
+    "3.222.195.11/32",
+    "3.222.22.183/32",
+    "3.222.57.253/32",
+    "3.223.130.34/32",
+    "3.223.132.246/32",
+    "3.223.148.78/32",
+    "3.223.173.19/32",
+    "3.223.212.88/32",
+    "3.223.245.225/32",
+    "3.223.37.137/32",
+    "3.224.3.11/32",
+    "3.224.66.185/32",
+    "3.224.95.40/32",
+    "3.225.112.119/32",
+    "3.225.130.6/32",
+    "3.225.214.36/32",
+    "3.225.250.64/32",
+    "3.225.254.186/32",
+    "3.225.27.26/32",
+    "3.226.118.11/32",
+    "3.226.168.167/32",
+    "3.226.198.163/32",
+    "3.226.230.216/32",
+    "3.226.55.191/32",
+    "3.226.85.33/32",
+    "3.227.129.67/32",
+    "3.227.179.202/32",
+    "3.227.195.183/32",
+    "3.228.145.87/32",
+    "3.228.187.171/32",
+    "3.228.43.75/32",
+    "3.228.90.152/32",
+    "3.229.141.83/32",
+    "3.229.147.55/32",
+    "3.229.204.29/32",
+    "3.229.206.235/32",
+    "3.229.254.1/32",
+    "3.229.69.123/32",
+    "3.229.88.194/32",
+    "3.230.138.76/32",
+    "3.230.149.251/32",
+    "3.230.15.20/32",
+    "3.230.29.144/32",
+    "3.230.47.56/32",
+    "3.230.52.168/32",
+    "3.230.90.160/32",
+    "3.230.99.92/32",
+    "3.231.179.13/32",
+    "3.231.88.131/32",
+    "3.232.137.33/32",
+    "3.232.180.42/32",
+    "3.232.19.149/32",
+    "3.232.197.101/32",
+    "3.232.20.91/32",
+    "3.232.221.166/32",
+    "3.232.235.15/32",
+    "3.232.240.88/32",
+    "3.233.103.22/32",
+    "3.233.121.160/32",
+    "3.233.183.168/32",
+    "3.233.218.90/32",
+    "3.233.93.65/32",
+    "3.234.161.147/32",
+    "3.234.185.44/32",
+    "3.234.47.132/32",
+    "3.234.77.32/32",
+    "3.234.8.148/32",
+    "3.235.12.133/32",
+    "3.235.125.9/32",
+    "3.81.194.188/32",
+    "3.81.253.151/32",
+    "3.82.135.179/32",
+    "3.82.29.30/32",
+    "3.84.64.201/32",
+    "3.85.182.19/32",
+    "3.86.137.101/32",
+    "3.87.104.37/32",
+    "3.88.92.27/32",
+    "3.89.14.22/32",
+    "3.89.14.224/32",
+    "3.89.213.23/32",
+    "3.91.124.128/32",
+    "3.92.14.207/32",
+    "3.93.132.173/32",
+    "3.94.154.72/32",
+    "3.94.216.37/32",
+    "3.94.225.17/32",
+    "3.94.226.92/32",
+    "3.94.34.209/32",
+    "3.95.79.208/32",
+    "3.95.81.91/32",
+    "3.95.96.198/32",
+    "34.192.141.13/32",
+    "34.192.213.97/32",
+    "34.192.238.32/32",
+    "34.192.33.34/32",
+    "34.192.98.253/32",
+    "34.193.131.3/32",
+    "34.194.118.119/32",
+    "34.194.149.187/32",
+    "34.194.219.117/32",
+    "34.194.219.191/32",
+    "34.194.47.173/32",
+    "34.195.225.185/32",
+    "34.195.23.213/32",
+    "34.195.45.53/32",
+    "34.196.142.152/32",
+    "34.196.155.48/32",
+    "34.196.169.196/32",
+    "34.196.187.85/32",
+    "34.196.42.137/32",
+    "34.196.80.7/32",
+    "34.197.143.174/32",
+    "34.197.149.47/32",
+    "34.197.153.75/32",
+    "34.197.175.171/32",
+    "34.197.2.163/32",
+    "34.197.201.73/32",
+    "34.197.209.185/32",
+    "34.197.73.235/32",
+    "34.198.130.224/32",
+    "34.198.143.69/32",
+    "34.198.162.37/32",
+    "34.198.56.37/32",
+    "34.198.82.162/32",
+    "34.199.156.195/32",
+    "34.199.25.251/32",
+    "34.200.114.155/32",
+    "34.200.159.199/32",
+    "34.200.169.53/32",
+    "34.200.192.85/32",
+    "34.200.203.147/32",
+    "34.200.205.234/32",
+    "34.200.74.100/32",
+    "34.200.81.78/32",
+    "34.200.86.207/32",
+    "34.202.2.123/32",
+    "34.202.30.230/32",
+    "34.202.41.56/32",
+    "34.202.49.146/32",
+    "34.203.149.5/32",
+    "34.203.99.163/32",
+    "34.204.104.43/32",
+    "34.204.215.184/32",
+    "34.204.57.203/32",
+    "34.205.201.97/32",
+    "34.205.238.95/32",
+    "34.206.101.22/32",
+    "34.206.135.181/32",
+    "34.207.48.202/32",
+    "34.207.52.183/32",
+    "34.224.114.26/32",
+    "34.224.120.185/32",
+    "34.224.190.94/32",
+    "34.225.108.229/32",
+    "34.225.133.0/32",
+    "34.225.171.229/32",
+    "34.226.125.221/32",
+    "34.226.51.110/32",
+    "34.226.56.238/32",
+    "34.226.69.93/32",
+    "34.227.118.181/32",
+    "34.227.131.153/32",
+    "34.227.239.141/32",
+    "34.227.42.212/32",
+    "34.228.109.18/32",
+    "34.230.156.160/32",
+    "34.230.234.54/32",
+    "34.230.255.232/32",
+    "34.231.114.104/32",
+    "34.231.184.75/32",
+    "34.231.68.10/32",
+    "34.231.81.35/32",
+    "34.232.184.48/32",
+    "34.232.187.124/32",
+    "34.232.47.104/32",
+    "34.233.148.122/32",
+    "34.233.151.134/32",
+    "34.233.255.1/32",
+    "34.233.36.75/32",
+    "34.233.48.215/32",
+    "34.233.97.140/32",
+    "34.234.14.185/32",
+    "34.234.154.134/32",
+    "34.235.11.182/32",
+    "34.236.104.213/32",
+    "34.236.123.186/32",
+    "34.236.132.205/32",
+    "34.236.132.67/32",
+    "34.236.164.210/32",
+    "34.236.166.107/32",
+    "34.236.209.30/32",
+    "34.236.214.169/32",
+    "34.236.224.25/32",
+    "34.236.253.178/32",
+    "34.237.147.161/32",
+    "34.237.191.141/32",
+    "34.237.207.92/32",
+    "34.237.208.14/32",
+    "34.237.227.70/32",
+    "34.237.232.130/32",
+    "34.237.80.208/32",
+    "34.237.99.86/32",
+    "34.238.107.122/32",
+    "34.238.18.3/32",
+    "34.238.71.63/32",
+    "34.239.15.203/32",
+    "34.239.188.168/32",
+    "34.239.195.85/32",
+    "34.239.206.162/32",
+    "34.239.68.202/32",
+    "35.153.10.9/32",
+    "35.153.107.141/32",
+    "35.153.113.217/32",
+    "35.153.124.65/32",
+    "35.153.197.87/32",
+    "35.153.36.100/32",
+    "35.168.104.113/32",
+    "35.168.183.119/32",
+    "35.168.44.111/32",
+    "35.169.122.102/32",
+    "35.169.198.60/32",
+    "35.169.212.245/32",
+    "35.169.251.66/32",
+    "35.169.56.220/32",
+    "35.170.223.99/32",
+    "35.171.215.147/32",
+    "35.171.218.156/32",
+    "35.171.77.2/32",
+    "35.172.188.66/32",
+    "35.172.62.192/32",
+    "35.172.84.121/32",
+    "35.173.12.118/32",
+    "35.173.12.250/32",
+    "35.173.140.109/32",
+    "35.173.160.101/32",
+    "35.173.172.43/32",
+    "35.173.53.155/32",
+    "35.174.214.80/32",
+    "35.174.229.240/32",
+    "35.174.232.222/32",
+    "35.174.97.70/32",
+    "35.175.22.142/32",
+    "35.175.34.176/32",
+    "35.175.43.19/32",
+    "44.193.128.83/32",
+    "44.193.136.188/32",
+    "44.193.149.106/32",
+    "44.193.163.140/32",
+    "44.193.21.207/32",
+    "44.194.163.207/32",
+    "44.194.194.219/32",
+    "44.194.203.102/32",
+    "44.194.222.211/32",
+    "44.194.70.31/32",
+    "44.195.151.174/32",
+    "44.195.16.2/32",
+    "44.195.178.236/32",
+    "44.195.228.45/32",
+    "44.195.245.78/32",
+    "44.195.248.164/32",
+    "44.195.96.4/32",
+    "44.196.132.20/32",
+    "44.196.15.171/32",
+    "44.196.210.221/32",
+    "44.196.236.142/32",
+    "44.197.30.79/32",
+    "44.197.95.23/32",
+    "44.198.105.147/32",
+    "44.198.125.78/32",
+    "44.198.131.235/32",
+    "44.198.134.204/32",
+    "44.198.205.87/32",
+    "44.198.237.57/32",
+    "44.205.109.175/32",
+    "44.205.197.17/32",
+    "44.205.215.215/32",
+    "44.205.36.200/32",
+    "44.205.58.205/32",
+    "44.205.68.181/32",
+    "44.206.129.15/32",
+    "44.206.15.195/32",
+    "44.206.184.47/32",
+    "44.206.40.110/32",
+    "44.206.84.82/32",
+    "44.207.127.111/32",
+    "44.207.135.147/32",
+    "44.207.169.172/32",
+    "44.207.194.222/32",
+    "44.207.229.212/32",
+    "44.207.26.24/32",
+    "44.207.83.128/32",
+    "44.208.104.56/32",
+    "44.208.16.208/32",
+    "44.208.200.219/32",
+    "44.208.203.166/32",
+    "44.208.236.62/32",
+    "44.208.56.213/32",
+    "44.208.77.108/32",
+    "44.208.83.208/32",
+    "44.208.85.236/32",
+    "44.209.162.73/32",
+    "44.210.192.115/32",
+    "44.212.148.132/32",
+    "44.212.198.85/32",
+    "44.212.239.227/32",
+    "44.213.158.218/32",
+    "44.213.163.24/32",
+    "44.214.194.234/32",
+    "44.214.207.7/32",
+    "44.214.212.218/32",
+    "44.214.32.136/32",
+    "44.214.62.148/32",
+    "44.215.161.26/32",
+    "44.215.216.21/32",
+    "44.215.224.27/32",
+    "44.215.24.160/32",
+    "44.215.63.87/32",
+    "44.215.7.194/32",
+    "44.215.81.252/32",
+    "44.215.84.21/32",
+    "44.215.89.216/32",
+    "44.216.100.41/32",
+    "44.216.104.198/32",
+    "44.216.243.74/32",
+    "44.216.5.127/32",
+    "44.216.58.133/32",
+    "44.216.7.31/32",
+    "44.217.121.202/32",
+    "44.217.152.47/32",
+    "44.217.158.120/32",
+    "44.217.254.94/32",
+    "44.218.132.213/32",
+    "44.218.149.105/32",
+    "44.218.169.19/32",
+    "44.218.183.161/32",
+    "44.218.187.96/32",
+    "44.218.200.142/32",
+    "44.218.30.160/32",
+    "44.218.99.76/32",
+    "44.219.115.49/32",
+    "44.219.143.106/32",
+    "44.219.23.147/32",
+    "44.219.64.51/32",
+    "44.220.9.209/32",
+    "44.221.111.36/32",
+    "44.221.132.209/32",
+    "44.221.185.185/32",
+    "44.221.223.252/32",
+    "44.221.225.24/32",
+    "44.221.244.31/32",
+    "44.221.99.201/32",
+    "44.222.28.176/32",
+    "44.222.60.175/32",
+    "44.223.220.158/32",
+    "44.223.230.228/32",
+    "50.16.147.3/32",
+    "50.16.231.180/32",
+    "50.16.4.171/32",
+    "50.17.1.240/32",
+    "50.17.134.19/32",
+    "50.17.153.9/32",
+    "50.17.191.57/32",
+    "50.17.207.81/32",
+    "50.17.230.96/32",
+    "50.19.126.63/32",
+    "50.19.204.59/32",
+    "50.19.251.209/32",
+    "50.19.29.68/32",
+    "50.19.35.165/32",
+    "50.19.59.54/32",
+    "52.0.129.197/32",
+    "52.0.175.66/32",
+    "52.0.190.163/32",
+    "52.0.192.213/32",
+    "52.0.194.51/32",
+    "52.0.29.253/32",
+    "52.0.31.88/32",
+    "52.0.92.85/32",
+    "52.1.178.161/32",
+    "52.1.245.227/32",
+    "52.1.58.136/32",
+    "52.2.182.123/32",
+    "52.2.196.120/32",
+    "52.2.240.114/32",
+    "52.2.253.241/32",
+    "52.20.100.136/32",
+    "52.20.139.63/32",
+    "52.20.29.92/32",
+    "52.200.116.93/32",
+    "52.200.28.69/32",
+    "52.200.8.184/32",
+    "52.200.84.90/32",
+    "52.201.206.154/32",
+    "52.201.41.193/32",
+    "52.201.98.75/32",
+    "52.202.101.32/32",
+    "52.202.103.180/32",
+    "52.202.121.224/32",
+    "52.202.216.228/32",
+    "52.202.253.248/32",
+    "52.202.35.1/32",
+    "52.202.37.123/32",
+    "52.203.152.175/32",
+    "52.203.209.127/32",
+    "52.203.244.55/32",
+    "52.203.32.72/32",
+    "52.203.86.132/32",
+    "52.204.124.205/32",
+    "52.204.162.207/32",
+    "52.204.226.159/32",
+    "52.204.226.207/32",
+    "52.204.226.223/32",
+    "52.204.64.101/32",
+    "52.204.78.168/32",
+    "52.204.81.241/32",
+    "52.205.135.221/32",
+    "52.205.246.20/32",
+    "52.205.27.163/32",
+    "52.206.102.51/32",
+    "52.206.130.42/32",
+    "52.206.143.135/32",
+    "52.206.169.224/32",
+    "52.206.181.180/32",
+    "52.206.46.172/32",
+    "52.206.52.116/32",
+    "52.206.60.64/32",
+    "52.206.61.139/32",
+    "52.207.120.139/32",
+    "52.207.133.220/32",
+    "52.207.16.197/32",
+    "52.207.61.91/32",
+    "52.207.72.172/32",
+    "52.21.106.0/32",
+    "52.21.120.37/32",
+    "52.21.146.37/32",
+    "52.21.166.33/32",
+    "52.21.48.195/32",
+    "52.22.150.64/32",
+    "52.22.196.44/32",
+    "52.22.210.122/32",
+    "52.22.89.200/32",
+    "52.23.133.109/32",
+    "52.23.146.199/32",
+    "52.23.51.117/32",
+    "52.23.97.153/32",
+    "52.3.104.17/32",
+    "52.3.239.250/32",
+    "52.3.70.186/32",
+    "52.4.106.28/32",
+    "52.4.161.44/32",
+    "52.4.20.22/32",
+    "52.4.200.143/32",
+    "52.4.229.83/32",
+    "52.4.5.89/32",
+    "52.44.145.57/32",
+    "52.44.222.44/32",
+    "52.44.93.127/32",
+    "52.45.105.249/32",
+    "52.45.162.115/32",
+    "52.45.180.161/32",
+    "52.45.82.146/32",
+    "52.45.91.149/32",
+    "52.5.101.193/32",
+    "52.5.11.240/32",
+    "52.5.126.84/32",
+    "52.5.139.177/32",
+    "52.5.158.30/32",
+    "52.5.237.111/32",
+    "52.5.241.167/32",
+    "52.5.71.38/32",
+    "52.5.9.202/32",
+    "52.5.91.235/32",
+    "52.54.128.50/32",
+    "52.54.247.126/32",
+    "52.54.73.166/32",
+    "52.55.118.104/32",
+    "52.55.174.246/32",
+    "52.55.203.221/32",
+    "52.6.108.202/32",
+    "52.7.157.23/32",
+    "52.7.217.144/32",
+    "52.7.224.72/32",
+    "52.7.23.251/32",
+    "52.7.57.117/32",
+    "52.7.66.242/32",
+    "52.70.155.245/32",
+    "52.70.247.71/32",
+    "52.71.225.8/32",
+    "52.71.39.142/32",
+    "52.71.50.120/32",
+    "52.71.70.228/32",
+    "52.72.232.179/32",
+    "52.72.73.184/32",
+    "52.73.115.59/32",
+    "52.73.158.87/32",
+    "52.73.197.50/32",
+    "52.73.206.11/32",
+    "52.73.215.66/32",
+    "52.86.118.49/32",
+    "52.86.198.100/32",
+    "52.86.235.69/32",
+    "52.86.53.42/32",
+    "52.86.86.102/32",
+    "52.87.0.229/32",
+    "52.87.118.241/32",
+    "52.87.127.40/32",
+    "52.87.52.141/32",
+    "52.87.74.18/32",
+    "54.144.163.59/32",
+    "54.144.165.228/32",
+    "54.144.166.248/32",
+    "54.145.100.187/32",
+    "54.145.120.66/32",
+    "54.145.201.55/32",
+    "54.145.202.232/32",
+    "54.146.124.96/32",
+    "54.146.217.77/32",
+    "54.146.78.43/32",
+    "54.147.28.169/32",
+    "54.152.240.110/32",
+    "54.152.250.63/32",
+    "54.152.62.114/32",
+    "54.156.101.5/32",
+    "54.156.218.150/32",
+    "54.156.228.126/32",
+    "54.156.60.28/32",
+    "54.156.75.181/32",
+    "54.157.127.12/32",
+    "54.157.17.251/32",
+    "54.157.60.117/32",
+    "54.157.89.202/32",
+    "54.157.93.108/32",
+    "54.158.126.53/32",
+    "54.158.87.246/32",
+    "54.159.127.105/32",
+    "54.159.41.249/32",
+    "54.159.73.59/32",
+    "54.160.29.53/32",
+    "54.161.82.218/32",
+    "54.162.184.206/32",
+    "54.163.119.115/32",
+    "54.163.119.23/32",
+    "54.163.149.34/32",
+    "54.163.156.179/32",
+    "54.163.96.5/32",
+    "54.164.253.209/32",
+    "54.165.187.237/32",
+    "54.165.237.175/32",
+    "54.166.114.87/32",
+    "54.166.123.195/32",
+    "54.166.147.9/32",
+    "54.166.168.104/32",
+    "54.166.186.204/32",
+    "54.166.203.36/32",
+    "54.166.221.13/32",
+    "54.166.51.59/32",
+    "54.167.145.47/32",
+    "54.167.149.221/32",
+    "54.167.157.19/32",
+    "54.167.167.144/32",
+    "54.167.254.156/32",
+    "54.172.147.40/32",
+    "54.172.181.132/32",
+    "54.172.223.244/32",
+    "54.172.235.19/32",
+    "54.173.251.40/32",
+    "54.173.254.186/32",
+    "54.173.3.145/32",
+    "54.173.73.223/32",
+    "54.174.132.51/32",
+    "54.174.156.91/32",
+    "54.174.185.149/32",
+    "54.174.185.64/32",
+    "54.174.239.164/32",
+    "54.174.255.71/32",
+    "54.174.33.240/32",
+    "54.174.79.6/32",
+    "54.175.137.98/32",
+    "54.175.225.187/32",
+    "54.175.92.255/32",
+    "54.196.107.151/32",
+    "54.196.38.144/32",
+    "54.197.112.73/32",
+    "54.197.64.106/32",
+    "54.198.102.234/32",
+    "54.198.16.172/32",
+    "54.198.232.105/32",
+    "54.198.233.242/32",
+    "54.204.105.187/32",
+    "54.204.223.93/32",
+    "54.204.35.237/32",
+    "54.204.59.63/32",
+    "54.204.80.55/32",
+    "54.205.119.2/32",
+    "54.205.136.35/32",
+    "54.205.160.25/32",
+    "54.205.201.74/32",
+    "54.205.208.13/32",
+    "54.205.213.166/32",
+    "54.205.3.125/32",
+    "54.205.40.225/32",
+    "54.205.45.210/32",
+    "54.208.132.243/32",
+    "54.208.179.143/32",
+    "54.208.246.64/32",
+    "54.208.27.202/32",
+    "54.209.190.9/32",
+    "54.209.191.8/32",
+    "54.209.36.112/32",
+    "54.209.9.33/32",
+    "54.210.131.110/32",
+    "54.210.198.121/32",
+    "54.210.31.211/32",
+    "54.210.80.37/32",
+    "54.211.199.50/32",
+    "54.211.75.0/32",
+    "54.211.78.165/32",
+    "54.221.237.132/32",
+    "54.221.32.154/32",
+    "54.224.116.206/32",
+    "54.224.224.135/32",
+    "54.224.240.158/32",
+    "54.224.53.14/32",
+    "54.225.113.76/32",
+    "54.225.145.181/32",
+    "54.225.162.45/32",
+    "54.225.169.17/32",
+    "54.225.221.30/32",
+    "54.225.67.8/32",
+    "54.225.71.221/32",
+    "54.226.73.182/32",
+    "54.227.13.229/32",
+    "54.227.28.87/32",
+    "54.234.167.100/32",
+    "54.235.211.99/32",
+    "54.235.213.173/32",
+    "54.236.112.173/32",
+    "54.236.158.242/32",
+    "54.236.167.56/32",
+    "54.236.239.164/32",
+    "54.237.184.17/32",
+    "54.237.29.9/32",
+    "54.242.10.253/32",
+    "54.242.167.254/32",
+    "54.243.110.227/32",
+    "54.243.144.14/32",
+    "54.243.201.33/32",
+    "54.243.209.16/32",
+    "54.243.211.8/32",
+    "54.80.175.67/32",
+    "54.80.198.127/32",
+    "54.80.234.89/32",
+    "54.80.243.130/32",
+    "54.80.45.194/32",
+    "54.80.71.176/32",
+    "54.80.74.44/32",
+    "54.81.154.68/32",
+    "54.81.165.33/32",
+    "54.81.246.115/32",
+    "54.82.11.240/32",
+    "54.82.116.145/32",
+    "54.82.165.97/32",
+    "54.82.184.206/32",
+    "54.82.79.140/32",
+    "54.83.14.168/32",
+    "54.83.178.173/32",
+    "54.83.238.70/32",
+    "54.83.29.252/32",
+    "54.83.61.93/32",
+    "54.84.247.173/32",
+    "54.84.255.139/32",
+    "54.84.42.70/32",
+    "54.84.58.86/32",
+    "54.84.96.236/32",
+    "54.85.116.136/32",
+    "54.85.13.251/32",
+    "54.85.152.251/32",
+    "54.85.173.232/32",
+    "54.85.182.11/32",
+    "54.85.182.74/32",
+    "54.85.183.163/32",
+    "54.85.42.248/32",
+    "54.86.102.52/32",
+    "54.86.113.36/32",
+    "54.86.128.12/32",
+    "54.86.173.205/32",
+    "54.86.200.206/32",
+    "54.86.235.24/32",
+    "54.86.41.234/32",
+    "54.87.147.32/32",
+    "54.87.230.73/32",
+    "54.87.231.234/32",
+    "54.87.82.164/32",
+    "54.88.17.4/32",
+    "54.88.231.214/32",
+    "54.89.1.163/32",
+    "54.89.197.100/32",
+    "54.89.37.100/32",
+    "54.89.57.217/32",
+    "54.90.15.96/32",
+    "54.90.160.213/32",
+    "54.90.251.223/32",
+    "54.91.222.113/32",
+    "54.91.68.167/32",
+    "54.91.90.149/32",
+    "54.92.230.27/32",
+    "67.202.14.197/32",
+    "75.101.211.35/32",
+    "98.80.55.141/32",
+    "98.82.243.141/32",
+    "98.82.255.249/32",
+    "98.82.55.41/32",
+    "98.83.170.172/32",
+    "98.83.18.54/32",
+    "98.83.191.241/32",
+    "98.83.248.195/32",
+    "98.83.46.92/32",
+    "98.83.70.133/32",
+    "98.83.89.12/32",
+    "98.84.242.231/32",
+    "98.85.106.40/32",
+    "98.85.137.77/32",
+    "98.85.140.218/32",
+    "98.85.146.158/32",
+    "98.85.211.76/32",
+    "98.85.214.32/32",
+    "98.85.218.4/32",
+    "98.85.238.47/32",
+    "98.85.246.245/32",
+    "98.86.129.100/32",
+    "98.86.184.138/32",
+    "98.86.187.75/32",
+    "98.86.188.104/32",
+    "98.86.192.5/32",
+    "98.86.205.54/32",
+    "98.86.207.121/32",
+    "98.86.207.186/32",
+    "98.86.212.136/32",
+    "98.86.212.35/32",
+    "98.86.214.58/32",
+    "98.86.218.208/32",
+    "98.86.24.23/32",
+    "98.86.249.175/32",
+    "98.86.25.36/32",
+    "98.86.27.21/32",
+    "98.86.29.203/32",
+    "98.86.4.188/32",
+    "98.86.50.127/32",
+    "98.86.51.12/32",
+    "98.86.54.86/32",
+    "98.86.60.7/32",
+    "98.86.78.84/32",
+    "98.86.80.106/32",
+    "98.87.100.94/32",
+    "98.87.110.161/32",
+    "98.87.115.179/32",
+    "98.87.119.92/32",
+    "98.87.125.106/32",
+    "98.87.130.228/32",
+    "98.87.132.166/32",
+    "98.87.141.217/32",
+    "98.87.145.207/32",
+    "98.87.177.122/32",
+    "98.87.178.41/32",
+    "98.87.179.143/32",
+    "98.87.179.166/32",
+    "98.87.179.77/32",
+    "98.87.180.162/32",
+    "98.87.180.251/32",
+    "98.87.180.82/32",
+    "98.87.182.201/32",
+    "98.87.182.37/32",
+    "98.87.182.62/32",
+    "98.87.183.122/32",
+    "98.87.183.61/32",
+    "98.87.184.100/32",
+    "98.87.184.28/32",
+    "98.87.30.184/32",
+    "98.87.36.115/32",
+    "98.87.39.1/32",
+    "98.87.44.13/32",
+    "98.87.48.159/32",
+    "98.87.52.210/32",
+    "98.87.54.118/32",
+    "98.87.63.1/32",
+    "98.87.68.53/32",
+    "98.87.69.247/32",
+    "98.87.70.113/32",
+    "98.87.73.104/32",
+    "98.87.83.39/32",
+    "98.87.91.253/32",
+    "98.87.92.12/32",
+    "98.87.95.193/32",
+    "98.87.95.44/32"
+  ],
+  /** 14 prefixes */
+  "claude": [
+    "216.73.216.0/22",
+    "34.162.230.222/32",
+    "34.162.244.71/32",
+    "34.162.191.81/32",
+    "34.162.86.102/32",
+    "136.79.143.251/32",
+    "136.83.20.215/32",
+    "34.162.111.78/32",
+    "34.162.90.102/32",
+    "34.162.27.34/32",
+    "34.152.124.140/32",
+    "34.153.21.190/32",
+    "34.186.252.4/32",
+    "34.162.153.71/32"
+  ],
+  /** 10 prefixes */
+  "claude-agent-sail": [
+    "136.71.21.147/32",
+    "34.31.25.14/32",
+    "34.67.187.248/32",
+    "34.71.122.171/32",
+    "34.70.177.231/32",
+    "34.66.255.143/32",
+    "34.68.65.207/32",
+    "34.171.207.92/32",
+    "34.60.73.195/32",
+    "153.61.208.16/32"
+  ]
+};
+
 // server.ts
+var GOOD_BOT_UA_RULES2 = GOOD_BOT_UA_RULES;
+var AI_AGENT_UA_RULES2 = AI_AGENT_UA_RULES;
+var BOT_SIGNATURE_KEYID_PROVIDERS2 = BOT_SIGNATURE_KEYID_PROVIDERS;
+var AI_BOT_CIDR_SOURCES2 = AI_BOT_CIDR_SOURCES;
+function registryLookup(value, key) {
+  if (!value || typeof value !== "object") return void 0;
+  const asRecord = value;
+  if (Object.prototype.hasOwnProperty.call(asRecord, key)) return asRecord[key];
+  const getter = value.get;
+  if (typeof getter === "function") return getter.call(value, key);
+  return void 0;
+}
+function asLocalAgent(agent) {
+  const raw = agent && typeof agent === "object" ? agent : {};
+  const signature = raw.signature;
+  return {
+    ...raw,
+    fcrdnsSuffixes: raw.fcrdnsSuffixes ? [...raw.fcrdnsSuffixes] : void 0,
+    feedIds: raw.feedIds ? [...raw.feedIds] : void 0,
+    asns: raw.asns ? raw.asns.map(String) : void 0,
+    signatureHosts: signature?.agentHosts ? [...signature.agentHosts] : void 0,
+    keyIdNeedles: signature?.keyIdNeedles ? [...signature.keyIdNeedles] : void 0
+  };
+}
+var REGISTRY_AGENT_LIST = Array.isArray(AGENT_REGISTRY) ? AGENT_REGISTRY.map(asLocalAgent) : Object.values(AGENT_REGISTRY ?? {}).map(asLocalAgent);
+function lookupAgent(id) {
+  if (!id) return null;
+  const direct = registryLookup(AGENT_BY_ID, id);
+  if (direct) return asLocalAgent(direct);
+  const needle = id.toLowerCase();
+  return REGISTRY_AGENT_LIST.find(
+    (agent) => String(agent.id || "").toLowerCase() === needle || String(agent.displayName || "").toLowerCase() === needle || String(agent.provider || "").toLowerCase() === needle
+  ) ?? null;
+}
+var findRegistryAgent = (ua) => findAgentByUa(ua) ?? null;
+var isRegistryPolicyToken = (ua) => Boolean(isPolicyToken(ua));
+var registryDisplay = (agent, identity) => displayFor(
+  agent,
+  identity
+);
+var normalizeRegistryFeed = (sourceId, body) => normalizeFeed(
+  sourceId,
+  body
+);
+function operatorIdFromName(name) {
+  const lower = name.toLowerCase();
+  if (/google/.test(lower)) return "google";
+  if (/openai|chatgpt/.test(lower)) return "openai";
+  if (/perplexity/.test(lower)) return "perplexity";
+  if (/anthropic|claude/.test(lower)) return "anthropic";
+  if (/xai|grok|\bx\b/.test(lower)) return "xai";
+  if (/meta|facebook/.test(lower)) return "meta";
+  if (/browserbase/.test(lower)) return "browserbase";
+  if (/anchor\s?browser/.test(lower)) return "anchorbrowser";
+  return lower.replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "unknown";
+}
+var FALLBACK_VERIFICATION_SUFFIXES = {
+  google: ["googlebot.com", "google.com"],
+  openai: ["openai.com", "chatgpt.com"],
+  perplexity: ["perplexity.ai"],
+  anthropic: ["anthropic.com", "claude.ai"],
+  xai: ["x.ai", "grok.com"],
+  meta: ["facebook.com", "meta.com", "fb.com"]
+};
+var FALLBACK_ASNS = {
+  google: ["15169", "396982"],
+  xai: ["400562", "13414"],
+  meta: ["32934", "63293"],
+  aws: ["16509", "14618"],
+  azure: ["8075"],
+  perplexity: ["209242"]
+};
+var FALLBACK_SIGNATURE_HOSTS = [
+  ["openai.com", "openai"],
+  ["chatgpt.com", "openai"],
+  ["perplexity.ai", "perplexity"],
+  ["anthropic.com", "anthropic"],
+  ["claude.ai", "anthropic"],
+  ["browserbase.com", "browserbase"],
+  ["anchorbrowser.io", "anchorbrowser"],
+  ["x.ai", "xai"],
+  ["grok.com", "xai"],
+  ["meta.com", "meta"],
+  ["facebook.com", "meta"]
+];
+function suffixesForAgent(...keys) {
+  const found = [];
+  const add = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) if (typeof item === "string" && item.trim()) found.push(item.trim());
+    }
+  };
+  for (const key of keys) {
+    add(registryLookup(VERIFICATION_SUFFIXES_BY_AGENT, key));
+    add(registryLookup(VERIFICATION_SUFFIXES_BY_AGENT, key.toLowerCase()));
+    add(lookupAgent(key)?.fcrdnsSuffixes);
+  }
+  const needles = keys.map((key) => key.toLowerCase());
+  for (const agent of REGISTRY_AGENT_LIST) {
+    if (needles.some(
+      (key) => key === String(agent.id || "").toLowerCase() || key === String(agent.provider || "").toLowerCase() || key === String(agent.displayName || "").toLowerCase()
+    )) {
+      add(agent.fcrdnsSuffixes);
+    }
+  }
+  if (found.length === 0) {
+    for (const key of keys) add(FALLBACK_VERIFICATION_SUFFIXES[key.toLowerCase()]);
+  }
+  return Array.from(new Set(found));
+}
+function asnsForAgent(...keys) {
+  const found = [];
+  const add = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const digits = typeof item === "number" ? String(item) : typeof item === "string" ? item : "";
+        if (digits.trim()) found.push(digits.trim());
+      }
+    }
+  };
+  for (const key of keys) add(lookupAgent(key)?.asns);
+  if (found.length === 0) {
+    for (const key of keys) add(FALLBACK_ASNS[key.toLowerCase()]);
+  }
+  return Array.from(new Set(found));
+}
+var SIGNATURE_HOST_RULES = (() => {
+  const rules = FALLBACK_SIGNATURE_HOSTS.map(([host, operator]) => ({ host, operator }));
+  for (const agent of REGISTRY_AGENT_LIST) {
+    const operator = operatorIdFromName(agent.provider || agent.id);
+    for (const rawHost of agent.signatureHosts ?? []) {
+      if (typeof rawHost === "string" && rawHost.trim()) {
+        rules.push({ host: rawHost.trim().toLowerCase(), operator });
+      }
+    }
+  }
+  for (const rawEntry of BOT_DIRECTORY ?? []) {
+    const entry = rawEntry && typeof rawEntry === "object" ? rawEntry : {};
+    const hosts = entry.signatureHosts ?? entry.hosts ?? entry.domains ?? entry.verificationSuffixes;
+    const name = entry.provider ?? entry.operator ?? entry.name;
+    if (Array.isArray(hosts) && typeof name === "string") {
+      const operator = operatorIdFromName(name);
+      for (const rawHost of hosts) {
+        if (typeof rawHost === "string" && rawHost.trim()) {
+          rules.push({ host: rawHost.trim().toLowerCase(), operator });
+        }
+      }
+    }
+  }
+  return rules;
+})();
+function isGoodCrawlerCategory(category) {
+  const value = String(category || "").toLowerCase();
+  return value === "search_crawler" || value === "search crawler" || value === "link_preview" || value === "link preview";
+}
+function pinnedPrefixEntries() {
+  const entries = [];
+  const add = (id, value) => {
+    const prefixes = Array.isArray(value) ? value.filter((item) => typeof item === "string" && item.includes("/")) : [];
+    if (prefixes.length > 0) entries.push([id, prefixes]);
+  };
+  const pinned = PINNED_PREFIXES;
+  if (Array.isArray(pinned)) {
+    for (const item of pinned) {
+      if (typeof item === "string") {
+        if (item.includes("/")) add("pinned", [item]);
+        continue;
+      }
+      const record = item && typeof item === "object" ? item : {};
+      const id = typeof record.id === "string" ? record.id : typeof record.sourceId === "string" ? record.sourceId : typeof record.agentId === "string" ? record.agentId : "pinned";
+      add(id, record.prefixes ?? record.prefix ?? record.cidrs ?? record.ranges);
+    }
+  } else if (pinned && typeof pinned === "object") {
+    for (const [id, prefixes] of Object.entries(pinned)) add(id, prefixes);
+  }
+  return entries;
+}
+function prefixesFromNormalizedFeed(normalized, sourceId) {
+  const found = [];
+  const add = (value) => {
+    if (typeof value === "string") {
+      if (value.includes("/")) found.push(value.trim());
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) add(item);
+      return;
+    }
+    if (value && typeof value === "object") {
+      const record = value;
+      for (const key of ["prefixes", "prefix", "cidrs", "ranges", "ipv4Prefix", "ipv6Prefix"]) {
+        if (record[key] !== void 0) add(record[key]);
+      }
+    }
+  };
+  if (normalized && typeof normalized === "object" && !Array.isArray(normalized)) {
+    const feedKey = registryLookup(PREFIX_FEEDS, sourceId);
+    const match = registryLookup(normalized, sourceId) ?? (typeof feedKey === "string" ? registryLookup(normalized, feedKey) : void 0);
+    if (match !== void 0) add(match);
+    else {
+      const compact = sourceId.replace(/[^a-z0-9]/gi, "").toLowerCase();
+      for (const [key, value] of Object.entries(normalized)) {
+        if (key.toLowerCase() === sourceId.toLowerCase() || key.replace(/[^a-z0-9]/gi, "").toLowerCase() === compact) {
+          add(value);
+        }
+      }
+    }
+  } else {
+    add(normalized);
+  }
+  return Array.from(new Set(found));
+}
 dotenv.config();
 var PORT = Number(process.env.PORT) || 3e3;
 var SESSION_TIMEOUT_MINUTES = 30;
@@ -5747,92 +10583,7 @@ function userAgentsCompatible(headerUserAgent, payloadUserAgent) {
   if (headerOs && payloadOs && headerOs !== payloadOs) return false;
   return true;
 }
-var GOOD_BOT_UA_RULES = [
-  {
-    pattern: /googlebot/i,
-    provider: "Google",
-    label: "Googlebot",
-    category: "Search Crawler",
-    network: /google/i
-  },
-  {
-    pattern: /bingbot|bingpreview/i,
-    provider: "Microsoft",
-    label: "Bingbot",
-    category: "Search Crawler",
-    network: /microsoft|\bbing\b/i
-  },
-  {
-    pattern: /applebot/i,
-    provider: "Apple",
-    label: "Applebot",
-    category: "Search Crawler",
-    network: /\bapple\b/i
-  },
-  {
-    pattern: /duckduckbot/i,
-    provider: "DuckDuckGo",
-    label: "DuckDuckBot",
-    category: "Search Crawler",
-    network: /duckduckgo/i
-  },
-  {
-    pattern: /linkedinbot/i,
-    provider: "LinkedIn",
-    label: "LinkedInBot",
-    category: "Link Preview",
-    network: /linkedin/i
-  },
-  {
-    pattern: /twitterbot/i,
-    provider: "X (Twitter)",
-    label: "Twitterbot",
-    category: "Link Preview",
-    network: /twitter|\bx corp\b/i
-  },
-  {
-    pattern: /slackbot/i,
-    provider: "Slack",
-    label: "Slackbot",
-    category: "Link Preview",
-    network: /slack/i
-  },
-  {
-    pattern: /vercelbot/i,
-    provider: "Vercel",
-    label: "Vercelbot",
-    category: "Link Preview",
-    network: /vercel/i
-  }
-];
-var AI_AGENT_UA_RULES = [
-  { pattern: /gptbot/i, provider: "OpenAI", label: "GPTBot" },
-  { pattern: /chatgpt-user/i, provider: "OpenAI", label: "ChatGPT-User" },
-  { pattern: /oai-searchbot/i, provider: "OpenAI", label: "OAI-SearchBot" },
-  { pattern: /claudebot/i, provider: "Anthropic", label: "ClaudeBot" },
-  { pattern: /claude-web/i, provider: "Anthropic", label: "Claude-Web" },
-  { pattern: /anthropic-ai/i, provider: "Anthropic", label: "Anthropic-AI" },
-  { pattern: /perplexitybot/i, provider: "Perplexity", label: "PerplexityBot" },
-  { pattern: /perplexity-user/i, provider: "Perplexity", label: "Perplexity-User" },
-  { pattern: /google-extended/i, provider: "Google", label: "Google-Extended" },
-  { pattern: /ccbot/i, provider: "Common Crawl", label: "CCBot" },
-  { pattern: /bytespider/i, provider: "ByteDance", label: "Bytespider" },
-  { pattern: /cohere-ai/i, provider: "Cohere", label: "Cohere-AI" },
-  { pattern: /meta-externalagent/i, provider: "Meta", label: "Meta-ExternalAgent" },
-  { pattern: /headlesschrome/i, provider: "Cloud Browser Agent", label: "Headless Chrome" }
-];
 var AUTOMATION_UA_PATTERN = /playwright|puppeteer|selenium|cypress|phantomjs/i;
-var BOT_SIGNATURE_KEYID_PROVIDERS = [
-  ["openai", "OpenAI"],
-  ["anthropic", "Anthropic"],
-  ["perplexity", "Perplexity"],
-  ["google", "Google"],
-  ["microsoft", "Microsoft"],
-  ["apple", "Apple"],
-  ["amazon", "Amazon"],
-  ["cloudflare", "Cloudflare"],
-  ["web-bot-auth", "Web Bot Auth Directory"]
-];
 var DATACENTER_NETWORK_PATTERN = /\b(amazon|amazonaws|aws|google cloud|azure|microsoft azure|digitalocean|hetzner|linode|akamai|ovh|vultr|oracle cloud|alibaba|aliyun|tencent|leaseweb|contabo|m247|choopa|datacamp)\b/i;
 var KNOWN_AI_CRAWLER_REASON = "LLM crawler user-agent signature";
 function classifyBotTraffic(headers, network, client) {
@@ -5872,7 +10623,7 @@ function classifyBotTraffic(headers, network, client) {
       reasons: reasons.length > 0 ? reasons : ["Hard automation artifact reported by client"]
     };
   }
-  for (const rule of GOOD_BOT_UA_RULES) {
+  for (const rule of GOOD_BOT_UA_RULES2) {
     if (!rule.pattern.test(ua)) continue;
     if (rule.network.test(networkHaystack)) {
       return {
@@ -5899,7 +10650,7 @@ function classifyBotTraffic(headers, network, client) {
       ]
     };
   }
-  for (const rule of AI_AGENT_UA_RULES) {
+  for (const rule of AI_AGENT_UA_RULES2) {
     if (!rule.pattern.test(ua)) continue;
     return {
       subtype: "ai_agent",
@@ -5919,7 +10670,7 @@ function classifyBotTraffic(headers, network, client) {
     const keyIdMatch = /keyid\s*=\s*"([^"]+)"/i.exec(signatureInput);
     const keyId = keyIdMatch ? keyIdMatch[1].trim().slice(0, 80) : "";
     const keyIdLower = keyId.toLowerCase();
-    const namedOperator = BOT_SIGNATURE_KEYID_PROVIDERS.find(
+    const namedOperator = BOT_SIGNATURE_KEYID_PROVIDERS2.find(
       ([needle]) => keyIdLower.includes(needle)
     );
     return {
@@ -5988,23 +10739,6 @@ function classifyBotTraffic(headers, network, client) {
     ] : ["Interactive browser profile without automation signatures"]
   };
 }
-var AI_BOT_CIDR_SOURCES = [
-  { id: "chatgpt-user", url: "https://openai.com/chatgpt-user.json" },
-  { id: "gptbot", url: "https://openai.com/gptbot.json" },
-  { id: "searchbot", url: "https://openai.com/searchbot.json" },
-  {
-    id: "google-common",
-    url: "https://developers.google.com/static/crawling/ipranges/common-crawlers.json"
-  },
-  {
-    id: "google-user-triggered",
-    url: "https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers.json"
-  },
-  {
-    id: "google-user-triggered-google",
-    url: "https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers-google.json"
-  }
-];
 var AI_BOT_CIDR_SYNC_INTERVAL_MS = 6 * 60 * 60 * 1e3;
 var AI_BOT_CIDR_TIMEOUT_MS = 1e4;
 var AI_AUTH_DIRECTORY_TIMEOUT_MS = 1500;
@@ -6012,7 +10746,7 @@ var AI_AUTH_DIRECTORY_TTL_MS = 60 * 60 * 1e3;
 var AI_FORWARD_DNS_TIMEOUT_MS = 1200;
 var AI_FORWARD_DNS_TTL_MS = 60 * 60 * 1e3;
 var AI_VERDICT_TABLE_MAX_ENTRIES = 1e4;
-var aiBotPrefixTable = /* @__PURE__ */ new Map();
+var aiBotPrefixTable = new Map(pinnedPrefixEntries());
 var aiBotCidrLastSyncMs = 0;
 var aiBotCidrSyncInFlight = null;
 var aiBotCidrTimer = null;
@@ -6041,7 +10775,7 @@ function extractAiPrefixes(payload) {
 async function syncAiBotCidrs() {
   const next = /* @__PURE__ */ new Map();
   await Promise.all(
-    AI_BOT_CIDR_SOURCES.map(async (source) => {
+    AI_BOT_CIDR_SOURCES2.map(async (source) => {
       const body = await fetchTextWithTimeout(
         source.url,
         AI_BOT_CIDR_TIMEOUT_MS,
@@ -6049,7 +10783,13 @@ async function syncAiBotCidrs() {
       );
       if (!body) return;
       try {
-        const prefixes = extractAiPrefixes(JSON.parse(body));
+        const parsed = JSON.parse(body);
+        const prefixes = Array.from(
+          /* @__PURE__ */ new Set([
+            ...extractAiPrefixes(parsed),
+            ...prefixesFromNormalizedFeed(normalizeRegistryFeed(source.id, body), source.id)
+          ])
+        );
         if (prefixes.length > 0) next.set(source.id, prefixes);
       } catch {
       }
@@ -6071,12 +10811,14 @@ function runAiBotCidrSync() {
 function ensureAiBotCidrSync() {
   if (aiBotCidrTimer === null) {
     void runAiBotCidrSync();
-    aiBotCidrTimer = setInterval(() => {
-      void runAiBotCidrSync();
-    }, AI_BOT_CIDR_SYNC_INTERVAL_MS);
-    const handle = aiBotCidrTimer;
-    if (typeof handle.unref === "function") handle.unref();
-    return;
+    try {
+      aiBotCidrTimer = setInterval(() => {
+        void runAiBotCidrSync();
+      }, AI_BOT_CIDR_SYNC_INTERVAL_MS);
+      const handle = aiBotCidrTimer;
+      if (typeof handle.unref === "function") handle.unref();
+    } catch {
+    }
   }
   if (Date.now() - aiBotCidrLastSyncMs >= AI_BOT_CIDR_SYNC_INTERVAL_MS) {
     void runAiBotCidrSync();
@@ -6099,13 +10841,11 @@ function resolveSignatureAgentOperator(host, label) {
   if (lowerHost === "agent.bot.goog" || lowerHost.endsWith(".bot.goog") || lowerHost.endsWith("bot.goog") || lowerLabel === "g") {
     return "google";
   }
-  if (lowerHost.endsWith("openai.com") || lowerHost.endsWith("chatgpt.com")) return "openai";
-  if (lowerHost.endsWith("perplexity.ai")) return "perplexity";
-  if (lowerHost.endsWith("anthropic.com") || lowerHost.endsWith("claude.ai")) return "anthropic";
-  if (lowerHost.endsWith("browserbase.com")) return "browserbase";
-  if (lowerHost.endsWith("anchorbrowser.io")) return "anchorbrowser";
-  if (lowerHost.endsWith("x.ai") || lowerHost.endsWith("grok.com")) return "xai";
-  if (lowerHost.endsWith("meta.com") || lowerHost.endsWith("facebook.com")) return "meta";
+  for (const rule of SIGNATURE_HOST_RULES) {
+    if (lowerHost === rule.host || lowerHost.endsWith(`.${rule.host}`) || lowerHost.endsWith(rule.host)) {
+      return rule.operator;
+    }
+  }
   return null;
 }
 function parseWebBotAuthHeaders(headers) {
@@ -6247,18 +10987,18 @@ function asnIn(asn, digits) {
   const value = asnDigits(asn);
   return value.length > 0 && digits.includes(value);
 }
-var GOOGLE_VERIFICATION_SUFFIXES = ["googlebot.com", "google.com"];
-var OPENAI_VERIFICATION_SUFFIXES = ["openai.com", "chatgpt.com"];
-var PERPLEXITY_VERIFICATION_SUFFIXES = ["perplexity.ai"];
-var ANTHROPIC_VERIFICATION_SUFFIXES = ["anthropic.com", "claude.ai"];
-var XAI_VERIFICATION_SUFFIXES = ["x.ai", "grok.com"];
-var META_VERIFICATION_SUFFIXES = ["facebook.com", "meta.com", "fb.com"];
-var GCP_ASNS = ["15169", "396982"];
-var XAI_ASNS = ["400562", "13414"];
-var META_ASNS = ["32934", "63293"];
-var AWS_ASNS = ["16509", "14618"];
-var AZURE_ASNS = ["8075"];
-var PERPLEXITY_ASNS = ["209242"];
+var GOOGLE_VERIFICATION_SUFFIXES = suffixesForAgent("googlebot", "google", "gemini");
+var OPENAI_VERIFICATION_SUFFIXES = suffixesForAgent("gptbot", "chatgpt-user", "openai");
+var PERPLEXITY_VERIFICATION_SUFFIXES = suffixesForAgent("perplexitybot", "perplexity");
+var ANTHROPIC_VERIFICATION_SUFFIXES = suffixesForAgent("claudebot", "anthropic");
+var XAI_VERIFICATION_SUFFIXES = suffixesForAgent("grokbot", "xai");
+var META_VERIFICATION_SUFFIXES = suffixesForAgent("muse", "meta-externalagent", "meta");
+var GCP_ASNS = asnsForAgent("googlebot", "google", "gemini");
+var XAI_ASNS = asnsForAgent("grok", "xai");
+var META_ASNS = asnsForAgent("muse", "meta");
+var AWS_ASNS = asnsForAgent("aws");
+var AZURE_ASNS = asnsForAgent("azure");
+var PERPLEXITY_ASNS = asnsForAgent("perplexitybot", "perplexity");
 var NO_AI_AGENT = {
   detected: false,
   agentId: null,
@@ -6277,9 +11017,31 @@ function aiAgentResult(partial) {
     ...partial
   };
 }
+function proofTierSatisfied(minProof, proofs) {
+  const tier = String(minProof ?? "verified").toLowerCase();
+  if (/^(none|any|0|ua_claim|automation|claim|ua)$/.test(tier)) return true;
+  if (/^(rfc9421|signed_agent|signature|wba|sail|signed|jws|4)$/.test(tier)) return proofs.signature;
+  if (/^(cidr|feed|ip|network|3)$/.test(tier)) return proofs.feed || proofs.signature;
+  if (/^(fcrdns|dns|reverse|2)$/.test(tier)) return proofs.fcrdns || proofs.signature;
+  return proofs.feed || proofs.fcrdns || proofs.signature;
+}
+function signatureMatchesAgent(webBotAuth, agent) {
+  if (!webBotAuth.present) return false;
+  const operatorId = operatorIdFromName(agent.provider || agent.id);
+  if (webBotAuth.operator === operatorId) return true;
+  const haystack = `${webBotAuth.agentHost} ${webBotAuth.keyId} ${webBotAuth.label}`.toLowerCase();
+  if (!haystack.trim()) return false;
+  if (agent.signatureHosts?.some((host) => haystack.includes(String(host).toLowerCase()))) return true;
+  if (agent.keyIdNeedles?.some((needle) => webBotAuth.keyId.toLowerCase().includes(String(needle).toLowerCase()))) {
+    return true;
+  }
+  return haystack.includes(String(agent.provider || "").toLowerCase()) || haystack.includes(agent.id.toLowerCase());
+}
 async function resolveAiAgentIdentity(input) {
   const ua = input.userAgent || readRequestHeader(input.headers, "user-agent");
   if (!ua) return NO_AI_AGENT;
+  if (isRegistryPolicyToken(ua)) return NO_AI_AGENT;
+  const registryMatch = findRegistryAgent(ua);
   const webBotAuth = parseWebBotAuthHeaders(input.headers);
   const referer = `${readRequestHeader(input.headers, "referer")} ${readRequestHeader(
     input.headers,
@@ -6649,7 +11411,7 @@ async function resolveAiAgentIdentity(input) {
     });
   }
   const cloudBrowserOperator = webBotAuth.operator === "browserbase" ? { name: "Browserbase Cloud Agent", operator: "Browserbase" } : webBotAuth.operator === "anchorbrowser" ? { name: "Anchor Browser AI Agent", operator: "Anchor Browser" } : null;
-  if (webBotAuth.present || cloudBrowserOperator) {
+  if ((webBotAuth.present || cloudBrowserOperator) && !registryMatch) {
     const handle = webBotAuth.agentHost || webBotAuth.keyId || "unattributed signer";
     return aiAgentResult({
       agentId: "cloud-browser",
@@ -6665,6 +11427,43 @@ async function resolveAiAgentIdentity(input) {
         ...networkHaystack ? [`Network identity: ${networkHaystack}`] : [],
         ...directoryEvidence
       ]
+    });
+  }
+  if (registryMatch) {
+    const agent = asLocalAgent(registryMatch);
+    if (isRegistryPolicyToken(ua) || agent.policyToken === true) {
+      return NO_AI_AGENT;
+    }
+    const agentRecord = agent;
+    const suffixesRaw = agent.fcrdnsSuffixes ?? registryLookup(agentRecord, "verificationSuffixes") ?? registryLookup(agentRecord, "fcrdnsSuffixes");
+    const suffixes = Array.isArray(suffixesRaw) ? suffixesRaw.filter((item) => typeof item === "string" && item.length > 0) : suffixesForAgent(agent.id, agent.provider);
+    const feedIdsRaw = agent.feedIds ?? registryLookup(agentRecord, "feedIds");
+    const feedIds = Array.isArray(feedIdsRaw) ? feedIdsRaw.filter((item) => typeof item === "string" && item.length > 0) : [];
+    const registryDnsNames = suffixes.length > 0 ? await confirmedNames() : [];
+    const proofs = {
+      feed: feedIds.length > 0 && matchesAiPrefixTable(input.publicIp, feedIds),
+      fcrdns: hostMatchesSuffix(registryDnsNames, suffixes),
+      signature: signatureMatchesAgent(webBotAuth, agent)
+    };
+    let verified = proofTierSatisfied(agent.minProofForVerified, proofs);
+    if (/mistral[\s_-]?ai[\s_-]?training/i.test(agent.id)) verified = false;
+    if (/manus/i.test(agent.id) && !proofs.signature) verified = false;
+    return aiAgentResult({
+      agentId: agent.id,
+      agentName: agent.displayName,
+      operator: agent.provider,
+      executionMode: agent.executionMode || "Autonomous Crawler",
+      verified,
+      confidence: verified ? "Verified" : "Medium",
+      riskScore: verified ? 2 : 8,
+      evidence: [
+        `Named agent user-agent claim: ${ua.slice(0, 120)}`,
+        proofs.feed ? "Source IP matched a registry-published crawler CIDR prefix" : "",
+        proofs.fcrdns ? "FCrDNS matched the operator verification suffix" : "",
+        proofs.signature ? "RFC 9421 / SAIL signature attributed to the operator" : "",
+        ...!verified ? ["Verification sources unavailable \u2014 identity inferred from the user-agent claim"] : [],
+        ...directoryEvidence
+      ].filter(Boolean)
     });
   }
   const officialBotClaim = /googlebot|googleother|gemini-deep-research|gptbot|chatgpt-user|perplexitybot|perplexity-user|claudebot|claude-user|grokbot|meta-externalagent|muse/i.test(
@@ -7733,6 +12532,41 @@ function retrieveLshCandidates(db2, profile) {
     return [];
   }
 }
+function structuralAnchorsMatch(db2, profile, candidateVisitorId, identityHardwareFingerprint) {
+  try {
+    const row = db2.prepare("SELECT profile_json, hardware_fingerprint FROM visitor_profiles WHERE visitor_id = ?").get(candidateVisitorId);
+    if (!row) return { matched: false, reasons: [] };
+    if (typeof row.hardware_fingerprint === "string" && row.hardware_fingerprint.length > 0 && row.hardware_fingerprint === identityHardwareFingerprint) {
+      return { matched: true, reasons: ["exact hardware fingerprint anchor"] };
+    }
+    if (typeof row.profile_json !== "string") return { matched: false, reasons: [] };
+    const stored = JSON.parse(row.profile_json);
+    const current = profile;
+    const nested = (value, key) => value && typeof value === "object" ? value[key] : void 0;
+    const pairs = [
+      { label: "gpu vendor", current: nested(current.gpu, "vendor"), stored: nested(stored.gpu, "vendor"), hard: false },
+      { label: "gpu renderer", current: nested(current.gpu, "renderer"), stored: nested(stored.gpu, "renderer"), hard: true },
+      { label: "canvas hash", current: nested(current.canvas, "hash"), stored: nested(stored.canvas, "hash"), hard: true },
+      { label: "audio hash", current: nested(current.audio, "hash"), stored: nested(stored.audio, "hash"), hard: true },
+      { label: "cpu cores", current: nested(current.cpu, "cores"), stored: nested(stored.cpu, "cores"), hard: true },
+      { label: "os family", current: nested(current.os, "family"), stored: nested(stored.os, "family"), hard: false },
+      { label: "browser family", current: nested(current.browser, "family"), stored: nested(stored.browser, "family"), hard: false }
+    ];
+    let matches = 0;
+    let hardMatches = 0;
+    const reasons = [];
+    for (const pair of pairs) {
+      if (pair.current !== void 0 && pair.current !== null && String(pair.current) === String(pair.stored)) {
+        matches += 1;
+        if (pair.hard) hardMatches += 1;
+        reasons.push(pair.label);
+      }
+    }
+    return { matched: matches >= 2 && hardMatches >= 1, reasons };
+  } catch {
+    return { matched: false, reasons: [] };
+  }
+}
 function persistRdapNetblockOrg(db2, asn, org) {
   if (!asn || asn === "Unknown" || !org || org === "Unknown") return null;
   try {
@@ -8103,7 +12937,12 @@ function sanitizeBrowserDevice(input) {
   const rawType = input?.deviceType;
   const deviceType = rawType && validDeviceTypes.includes(rawType) ? rawType : "Unknown";
   const incognitoAlias = typeof input?.incognito === "boolean" || typeof input?.isIncognito === "boolean" || typeof input?.privateMode === "boolean" ? Boolean(input?.incognito ?? input?.isIncognito ?? input?.privateMode) : void 0;
-  const incognitoMethod = typeof input?.incognitoMethod === "string" && input.incognitoMethod.trim() ? input.incognitoMethod.trim().slice(0, 120) : void 0;
+  const rawIncognitoMethod = typeof input?.incognitoMethod === "string" && input.incognitoMethod.trim() ? input.incognitoMethod.trim().slice(0, 120) : void 0;
+  const incognitoMethod = humanIncognitoMethod(
+    rawIncognitoMethod,
+    Boolean(incognitoAlias),
+    storageProbeInconclusive(rawIncognitoMethod)
+  );
   const idbDurabilityRatio = typeof input?.idbDurabilityRatio === "number" && Number.isFinite(input.idbDurabilityRatio) ? Number(input.idbDurabilityRatio) : void 0;
   const opfsFlushMs = typeof input?.opfsFlushMs === "number" && Number.isFinite(input.opfsFlushMs) ? Number(input.opfsFlushMs) : void 0;
   const deviceKind = input?.deviceKind === "mobile" || input?.deviceKind === "tablet" || input?.deviceKind === "pc" ? input.deviceKind : void 0;
@@ -8136,9 +12975,8 @@ function sanitizeBrowserDevice(input) {
     incognito: incognitoAlias,
     isIncognito: incognitoAlias,
     privateMode: incognitoAlias,
-    incognitoMethod,
-    idbDurabilityRatio,
-    opfsFlushMs
+    incognitoMethod
+    // Storage probe internals are never part of a user-visible browser payload.
   };
 }
 function detectServerRegion(req) {
@@ -8385,6 +13223,18 @@ function sanitizeHardwareSignals(raw, browserDevice) {
   const maxTouchPoints = typeof raw?.maxTouchPoints === "number" && Number.isFinite(raw.maxTouchPoints) && raw.maxTouchPoints >= 0 ? Math.min(64, Math.round(raw.maxTouchPoints)) : 0;
   const colorDepth = typeof raw?.colorDepth === "number" && Number.isFinite(raw.colorDepth) && raw.colorDepth > 0 ? Math.min(64, Math.round(raw.colorDepth)) : 24;
   const maxTextureSize = typeof raw?.maxTextureSize === "number" && Number.isFinite(raw.maxTextureSize) && raw.maxTextureSize >= 0 ? Math.round(raw.maxTextureSize) : 0;
+  const runtimeOs = inferRuntimeOsVerdict(
+    {
+      hostOs: safeStr(rawHardwareExtras.hostOs, "", 120),
+      gpuRenderer: safeStr(raw?.gpuRenderer, "", 160),
+      gpuVendor: safeStr(raw?.gpuVendor, "", 120),
+      gpuArchFamily: safeStr(rawHardwareExtras.gpuArchFamily, "", 40),
+      architectureSource: safeStr(rawHardwareExtras.architectureSource, "", 80),
+      engine: safeStr(rawHardwareExtras.engine, "", 120),
+      architecture: safeStr(raw?.architecture, "", 80)
+    },
+    browserDevice.os
+  );
   return {
     hardwareId: validHwId,
     gpuVendor: safeStr(raw?.gpuVendor, "Standard WebGL Vendor", 120),
@@ -8403,7 +13253,9 @@ function sanitizeHardwareSignals(raw, browserDevice) {
     // mismatch verdicts. These are pass-through only — never derived from the User-Agent here.
     architectureSource: safeStr(rawHardwareExtras.architectureSource, "", 80),
     claimedArchitecture: safeStr(rawHardwareExtras.claimedArchitecture, "", 80),
-    hostOs: safeStr(rawHardwareExtras.hostOs, "", 120),
+    hostOs: runtimeOs.authoritative && runtimeOs.family ? runtimeOs.family : safeStr(rawHardwareExtras.hostOs, "", 120),
+    claimedOs: safeStr(rawHardwareExtras.hostOs, "", 120),
+    osProof: runtimeOs.evidence,
     engine: safeStr(rawHardwareExtras.engine, "", 120),
     engineErrorLength: typeof rawHardwareExtras.engineErrorLength === "number" && Number.isFinite(rawHardwareExtras.engineErrorLength) ? Math.max(0, Math.min(512, Math.round(rawHardwareExtras.engineErrorLength))) : void 0,
     gpuArchFamily: safeStr(rawHardwareExtras.gpuArchFamily, "", 40),
@@ -8411,7 +13263,7 @@ function sanitizeHardwareSignals(raw, browserDevice) {
     audioNoise: Boolean(rawHardwareExtras.audioNoise),
     canvasCoarseHash: safeNullableStr(rawHardwareExtras.canvasCoarseHash, 40),
     archUaMismatch: Boolean(rawHardwareExtras.archUaMismatch),
-    osUaMismatch: Boolean(rawHardwareExtras.osUaMismatch)
+    osUaMismatch: runtimeOs.uaMismatch
   };
 }
 var AUTOMATION_TAMPERING_REASON_PATTERN = /\b(webdriver[\w$-]*|playwright[\w$-]*|puppeteer[\w$-]*|selenium[\w$-]*|cdc_[a-z0-9_$]+|cdc\b|__webdriver[\w$]*|__playwright[\w$]*|__pwInitscripts[\w$]*|__puppeteer[\w$]*|getter[\s._-]*(?:cdp|devtools|tamper|wrapper)|(?:cdp|devtools)[\s._-]*getter)\b/i;
@@ -8565,12 +13417,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   });
   const isCloudOrDatacenterNetwork = classification.isDatacenterOrHosting || Boolean(location.isVpnOrHosting);
   const datacenterAsn = classification.isConsumerBroadband ? false : isCloudOrDatacenterNetwork;
-  const vpnReasons = safeStrArray(raw?.vpnReasons);
-  if (timezoneMismatch && !vpnReasons.some((r) => r.toLowerCase().includes("timezone"))) {
-    vpnReasons.push(
-      `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})`
-    );
-  }
+  const vpnReasons = safeStrArray(raw?.vpnReasons).filter((reason) => !/time[_ -]?zone/i.test(reason));
   if (datacenterAsn && !vpnReasons.some((r) => r.toLowerCase().includes("datacenter") || r.toLowerCase().includes("asn"))) {
     vpnReasons.push(
       `Network ASN / ISP (${location.isp}${location.asn !== "Unknown" ? ` \u2022 ${location.asn}` : ""}) matches cloud/hosting or VPN infrastructure`
@@ -8625,7 +13472,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const clientReportedVm = Boolean(raw?.isVirtualMachine);
   const isOsTampered = Boolean(raw?.isOsTampered);
   const vmReason = typeof raw?.vmReason === "string" && raw.vmReason.trim() ? raw.vmReason.trim().slice(0, 200) : "";
-  const incognitoMethod = typeof raw?.incognitoMethod === "string" && raw.incognitoMethod.trim() ? raw.incognitoMethod.trim().slice(0, 120) : "";
+  const rawIncognitoMethod = typeof raw?.incognitoMethod === "string" && raw.incognitoMethod.trim() ? raw.incognitoMethod.trim().slice(0, 120) : "";
   const headroomGiB = typeof raw?.headroomGiB === "number" && Number.isFinite(raw.headroomGiB) ? Number(raw.headroomGiB) : null;
   const idbDurabilityRatio = typeof raw?.idbDurabilityRatio === "number" && Number.isFinite(raw.idbDurabilityRatio) ? Number(raw.idbDurabilityRatio) : null;
   const opfsFlushMs = typeof raw?.opfsFlushMs === "number" && Number.isFinite(raw.opfsFlushMs) ? Number(raw.opfsFlushMs) : null;
@@ -8660,6 +13507,11 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const incognitoOrCleared = Boolean(raw?.incognitoOrCleared) || recognitionSource === "Hardware Fingerprint (Cookie-less / Incognito)" || persistenceMode === "Hardware ID Recovered";
   const clientReportedIncognito = Boolean(incognitoContext.clientReportedIncognito) || incognitoLikely;
   const isIncognito = clientReportedIncognito;
+  const incognitoMethod = humanIncognitoMethod(
+    rawIncognitoMethod,
+    isIncognito,
+    storageProbeInconclusive(rawIncognitoMethod)
+  );
   const tierFor = (score) => score >= 7 ? "High" : score >= 3 ? "Medium" : "Low";
   const levelFor = (score) => score >= 7 ? "high" : score >= 3 ? "medium" : "low";
   const incognitoScore = isIncognito ? 3 : 0;
@@ -8670,16 +13522,47 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     scoreOutOf10: incognitoScore,
     riskLabel: `${tierFor(incognitoScore)} Risk \u2022 ${incognitoScore}/10`,
     level: levelFor(incognitoScore),
-    // The physical proof must match the verdict: a private tile always quotes the client's
-    // own storage-commit probe method, a normal tile quotes the verified disk-backed path.
-    detail: isIncognito ? `Ephemeral RAM storage detected (${incognitoMethod || "In-memory LevelDB / 10 GiB decoy quota"})` : `Persistent disk-backed storage verified (${incognitoMethod || "Standard profile"})`
+    // Human-readable probe outcome only. Ratio numbers, "fail-open", IDB and other diagnostic
+    // internals stay out of every user-visible surface.
+    detail: isIncognito ? "Ephemeral / private storage detected" : humanIncognitoMethod(incognitoMethod, false, storageProbeInconclusive(incognitoMethod))
   };
   const aiAgent = requestContext.aiAgent ?? null;
+  const registryAgent = requestContext.registryAgent ?? null;
   const spoofedImpostor = aiAgent?.agentId === "impostor-spoof" || botSubtype === "bad_bot" && spoofedCrawler;
-  const botScore = spoofedImpostor ? 10 : activeDeception ? 9 : botSubtype === "bad_bot" ? 7 : botSubtype === "ai_agent" ? 7 : botSubtype === "good_bot" ? 2 : 0;
-  const botStatus = spoofedImpostor ? "Spoofed AI Impostor" : stealthAutomation || botSubtype === "bad_bot" ? "Bot / Automated" : aiAgent?.detected && aiAgent.agentName ? aiAgent.agentName : botSubtype === "ai_agent" ? "AI Agent \xB7 Cloud Browser" : botSubtype === "good_bot" ? "Good Bot \xB7 Search Crawler" : "Verified Human";
+  const registryCategory = registryAgent?.category || "";
+  const verifiedNamedAgent = Boolean(registryAgent && aiAgent?.verified);
+  const verifiedGoodCrawler = verifiedNamedAgent && isGoodCrawlerCategory(registryCategory);
+  const verifiedAiAgent = verifiedNamedAgent && !isGoodCrawlerCategory(registryCategory);
+  const botScore = spoofedImpostor ? 10 : activeDeception ? 9 : botSubtype === "bad_bot" ? 7 : verifiedGoodCrawler ? 0 : verifiedAiAgent ? 2 : botSubtype === "ai_agent" ? 7 : botSubtype === "good_bot" ? 2 : 0;
+  const tileRuntimeOs = inferRuntimeOsVerdict(
+    {
+      hostOs: hardwareSignals.hostOs,
+      gpuRenderer: hardwareSignals.gpuRenderer,
+      gpuVendor: hardwareSignals.gpuVendor,
+      gpuArchFamily: hardwareSignals.gpuArchFamily,
+      architectureSource: hardwareSignals.architectureSource,
+      engine: hardwareSignals.engine,
+      architecture: hardwareSignals.architecture
+    },
+    browserDevice.os
+  );
+  const registryIdentity = spoofedImpostor ? "spoofed" : aiAgent?.verified ? /signed/i.test(String(aiAgent.executionMode || "")) ? "signed" : "verified" : "unknown";
+  const automationLabel = String(botClassification.label || "");
+  const headlessAutomation = /headless|chromium|puppeteer|playwright/i.test(automationLabel) || /headless/i.test(hardAutomationReasons.join(" "));
+  const rawBotStatus = (
+    // A named agent is ALWAYS shown by its exact registry name, including when its claim
+    // failed verification — the identity badge (Spoofed / Unverified) carries that fact.
+    registryAgent ? registryDisplay(registryAgent, registryIdentity).label : stealthAutomation || botSubtype === "bad_bot" ? headlessAutomation ? "Headless Browser Automation" : "Stealth Automation" : aiAgent?.detected && aiAgent.agentName ? aiAgent.agentName : botSubtype === "ai_agent" ? automationLabel || "AI Agent" : botSubtype === "good_bot" ? automationLabel || "Search Crawler" : "Verified Human"
+  );
+  const botStatus = crispBotStatus(rawBotStatus, tileRuntimeOs);
   const aiAgentDetail = aiAgent?.detected && aiAgent.agentName ? `${aiAgent.agentName} \u2014 ${aiAgent.operator}${aiAgent.executionMode ? ` \xB7 ${aiAgent.executionMode}` : ""} \xB7 ${aiAgent.confidence}${aiAgent.verified ? " (verified)" : ""}: ${aiAgent.evidence[0] || "agent identity attributed from request headers"}` : "";
-  const botDetail = stealthAutomation ? `${hardAutomationReasons.join("; ") || "Stealth / anti-detect automation runtime detected"} \u2014 hard automation artifact, never a verified human` : botSubtype === "human" && !aiAgent?.detected ? developerToolsAttached ? `Verified human interactive session \xB7 developer tools attached${raw?.automationEnvironment && raw.automationEnvironment !== "none" ? ` (${raw.automationEnvironment})` : ""}` : "Verified human interactive session" : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected");
+  const registryBotDetail = registryAgent && aiAgent?.detected ? `${registryAgent.displayName} \u2014 ${registryAgent.provider}${registryAgent.category ? ` \xB7 ${registryAgent.category}` : ""} \xB7 ${aiAgent.verified ? "verified by first-party evidence" : "unverified identity claim"}: ${aiAgent.evidence.find(
+    (line) => /CIDR|FCrDNS|signature|SAIL|Web Bot Auth/i.test(line)
+  ) || aiAgent.evidence[0] || "agent identity attributed from request headers"}` : "";
+  const botDetail = scrubOsClaim(
+    stealthAutomation ? `${hardAutomationReasons.join("; ") || "Stealth / anti-detect automation runtime detected"} \u2014 hard automation artifact, never a verified human` : botSubtype === "human" && !aiAgent?.detected ? developerToolsAttached ? `Verified human interactive session \xB7 developer tools attached${raw?.automationEnvironment && raw.automationEnvironment !== "none" ? ` (${raw.automationEnvironment})` : ""}` : "Verified human interactive session" : registryBotDetail ? registryBotDetail : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected"),
+    tileRuntimeOs
+  );
   const botSignal = {
     id: "bot",
     title: "Bot & Automation Detection",
@@ -8703,8 +13586,8 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     vpnMethods.public_vpn || vpnMethods.relay || vpnMethods.ml_prediction
   );
   const vpnScore = torAnonymity ? 9 : ipBlocklisted ? 9 : verifiedCrawlerNetwork ? 2 : torRelayNetwork ? 6 : aiAgent?.detected ? 7 : concreteTunnelVerdict ? 6 : isDatacenterAsn && hasTzMismatch ? 4 : isDatacenterAsn ? 3 : hasTzMismatch ? 2 : 0;
-  const vpnStatus = torAnonymity ? torExitNode && torBrowserClient ? "Tor Exit Node & Tor Browser" : torExitNode ? "Tor Exit Node" : "Tor Browser (Onion Routing / RFP)" : ipBlocklisted ? "Blocklisted IP" : verifiedCrawlerNetwork ? "Verified Crawler Network" : torRelayNetwork ? "Tor Relay (Non-Exit)" : aiAgent?.detected ? "AI Agent Cloud Network" : concreteTunnelVerdict ? "VPN / Proxy Relay" : isDatacenterAsn ? "Datacenter / Hosting Network" : hasTzMismatch ? "Timezone Mismatch (Orthogonal)" : "Standard ISP";
-  const vpnDetail = torAnonymity ? `${torExitNode ? "Confirmed active Tor exit relay" : "Tor Browser fingerprint (Gecko RFP + letterboxing)"} (${location.publicIp} \xB7 ${torOperatorLabel || asnOrOrg})${torOperatorHint ? " \u2014 DNSEL unreachable, operator attribution used" : ""}${torExitNode && torBrowserClient ? " \xB7 server exit IP and client RFP both matched" : ""}` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : verifiedCrawlerNetwork ? `${botClassification.provider} crawler operating from its own ${ispBrand}${asnSuffix} \u2014 crawler infrastructure, not a consumer proxy` : torRelayNetwork ? `Tor relay network (${torOperatorLabel || asnOrOrg}) \u2014 part of the Tor network but not an exit egress` : aiAgent?.detected ? `${aiAgent.agentName} (${aiAgent.operator}) \u2014 ${aiAgent.executionMode || "AI agent"} traffic from ${ispBrand}${asnSuffix}` : concreteTunnelVerdict ? vpnMethods.public_vpn ? `Verified commercial VPN provider on ${ispBrand}${asnSuffix}` : vpnMethods.relay ? `Tor relay / anonymity infrastructure (${torOperatorLabel || asnOrOrg})` : `Verified proxy-chain / relay evidence on ${ispBrand}${asnSuffix}` : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})` : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
+  const vpnStatus = torAnonymity ? torExitNode && torBrowserClient ? "Tor Exit Node & Tor Browser" : torExitNode ? "Tor Exit Node" : "Tor Browser (Onion Routing / RFP)" : ipBlocklisted ? "Blocklisted IP" : verifiedCrawlerNetwork ? "Verified Crawler Network" : torRelayNetwork ? "Tor Relay (Non-Exit)" : aiAgent?.detected ? "AI Agent Cloud Network" : concreteTunnelVerdict ? "VPN / Proxy Relay" : isDatacenterAsn ? "Datacenter / Hosting Network" : hasTzMismatch ? "Not detected" : "Standard ISP";
+  const vpnDetail = torAnonymity ? `${torExitNode ? "Confirmed active Tor exit relay" : "Tor Browser fingerprint (Gecko RFP + letterboxing)"} (${location.publicIp} \xB7 ${torOperatorLabel || asnOrOrg})${torOperatorHint ? " \u2014 DNSEL unreachable, operator attribution used" : ""}${torExitNode && torBrowserClient ? " \xB7 server exit IP and client RFP both matched" : ""}` : ipBlocklisted ? "IP flagged on abuse / tamper blocklist" : verifiedCrawlerNetwork ? `${botClassification.provider} crawler operating from its own ${ispBrand}${asnSuffix} \u2014 crawler infrastructure, not a consumer proxy` : torRelayNetwork ? `Tor relay network (${torOperatorLabel || asnOrOrg}) \u2014 part of the Tor network but not an exit egress` : aiAgent?.detected ? `${aiAgent.agentName} (${aiAgent.operator}) \u2014 ${aiAgent.executionMode || "AI agent"} traffic from ${ispBrand}${asnSuffix}` : concreteTunnelVerdict ? vpnMethods.public_vpn ? `Verified commercial VPN provider on ${ispBrand}${asnSuffix}` : vpnMethods.relay ? `Tor relay / anonymity infrastructure (${torOperatorLabel || asnOrOrg})` : `Verified proxy-chain / relay evidence on ${ispBrand}${asnSuffix}` : isDatacenterAsn && hasTzMismatch ? `Datacenter ASN (${ispBrand}${asnSuffix}) \u2014 network ownership observation; the timezone difference is reported on the network axis only` : isDatacenterAsn ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}` : hasTzMismatch ? "Not detected \u2014 no VPN, proxy or relay evidence. Timezone difference is a separate network observation." : `${ispBrand} \u2022 ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
   const vpnSignal = {
     id: "vpn",
     title: "VPN / Proxy & Network Type",
@@ -8868,15 +13751,20 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       // preserve it verbatim so 'low' can never be mistaken for an incognito verdict. The cast
       // bridges the legacy numeric type declaration while the shared type migrates to the label.
       incognitoConfidence: incognitoConfidenceLabel,
-      incognitoDetail: typeof raw?.incognitoDetail === "string" ? raw.incognitoDetail.trim().slice(0, 240) : "",
+      incognitoDetail: humanIncognitoMethod(
+        typeof raw?.incognitoDetail === "string" ? raw.incognitoDetail : rawIncognitoMethod,
+        isIncognito,
+        storageProbeInconclusive(rawIncognitoMethod)
+      ),
       // Final 4-signal upgrade — private browsing, bot, network, VM integrity
       isIncognito,
       incognito: isIncognito,
       privateMode: isIncognito,
       incognitoMethod,
       headroomGiB,
-      idbDurabilityRatio,
-      opfsFlushMs,
+      // Ratio / flush diagnostics stay internal: only the human storage outcome is serialized.
+      idbDurabilityRatio: null,
+      opfsFlushMs: null,
       isHeadless,
       botReason,
       webdriver,
@@ -9496,7 +14384,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     });
     const headerRequestUserAgent = readRequestHeader(rawRequestHeaders, "user-agent");
     const envelopeRequestUserAgent = typeof requestBody.securityEnvelope?.userAgent === "string" ? requestBody.securityEnvelope.userAgent.trim() : "";
-    const headerCarriesBotSignature = Boolean(headerRequestUserAgent) && (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) || GOOD_BOT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)) || AI_AGENT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)));
+    const headerCarriesBotSignature = Boolean(headerRequestUserAgent) && (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) || GOOD_BOT_UA_RULES2.some((rule) => rule.pattern.test(headerRequestUserAgent)) || AI_AGENT_UA_RULES2.some((rule) => rule.pattern.test(headerRequestUserAgent)));
     const fullRequestUserAgent = headerCarriesBotSignature ? headerRequestUserAgent : envelopeRequestUserAgent || headerRequestUserAgent;
     const rfpExemptRequest = isConfirmedTorRfpClient(rawSecuritySignals);
     const developerToolsSignals = Boolean(
@@ -9574,7 +14462,8 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       } : location.networkLocation,
       isLocationVerified: hasCountryForLocation
     };
-    const aiAgent = await resolveAiAgentIdentity({
+    void ensureAiBotCidrSync();
+    let aiAgent = await resolveAiAgentIdentity({
       headers: rawRequestHeaders,
       userAgent: fullRequestUserAgent,
       network: { isp: location.isp, org: location.org, asn: location.asn },
@@ -9597,6 +14486,15 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         automationTargetedTampering
       }
     });
+    const registryUaMatch = findRegistryAgent(fullRequestUserAgent);
+    const registryAgent = registryUaMatch ? asLocalAgent(registryUaMatch) : lookupAgent(aiAgent.agentId);
+    if (registryUaMatch) {
+      aiAgent = {
+        ...aiAgent,
+        agentName: asLocalAgent(registryUaMatch).displayName,
+        operator: asLocalAgent(registryUaMatch).provider
+      };
+    }
     const attributedBotClassification = aiAgent.detected && aiAgent.agentId === "impostor-spoof" ? {
       subtype: "bad_bot",
       label: "Spoofed AI Bot",
@@ -9605,10 +14503,10 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       confidence: 0.99,
       reasons: aiAgent.evidence.slice(0, 3)
     } : aiAgent.detected && aiAgent.agentId !== null ? {
-      subtype: "ai_agent",
+      subtype: registryAgent && aiAgent.verified && isGoodCrawlerCategory(registryAgent.category) ? "good_bot" : "ai_agent",
       label: aiAgent.agentName,
       provider: aiAgent.operator,
-      category: "AI Agent",
+      category: registryAgent?.category || "AI Agent",
       confidence: aiAgent.verified ? 0.99 : 0.85,
       reasons: aiAgent.evidence.slice(0, 3)
     } : null;
@@ -9660,6 +14558,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         torOperatorHint: torStatus.viaOperatorHint,
         clientTorBrowser: Boolean(rawSecuritySignals?.isTorBrowserClient),
         aiAgent,
+        registryAgent,
         ipBlocklisted: blocklist.blocklisted,
         ipBlocklistReasons: blocklist.reasons,
         botClassification: effectiveBotClassification,
@@ -9667,7 +14566,25 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       }
     );
     const serverVerifiedBrowser = uaIdentity.browserName && uaIdentity.browserName !== "Unknown" ? `${uaIdentity.browserName}${uaIdentity.browserFullVersion ? ` ${uaIdentity.browserFullVersion}` : ""}` : browserDevice.browser;
-    const serverVerifiedOs = uaIdentity.os && uaIdentity.os !== "Unknown" ? `${uaIdentity.os}${uaIdentity.osVersion ? ` ${uaIdentity.osVersion}` : ""}` : browserDevice.os;
+    const runtimeOsVerdict = inferRuntimeOsVerdict(
+      {
+        hostOs: hardwareSignals.hostOs,
+        gpuRenderer: hardwareSignals.gpuRenderer,
+        gpuVendor: hardwareSignals.gpuVendor,
+        gpuArchFamily: hardwareSignals.gpuArchFamily,
+        architectureSource: hardwareSignals.architectureSource,
+        engine: hardwareSignals.engine,
+        architecture: hardwareSignals.architecture
+      },
+      uaIdentity.os && uaIdentity.os !== "Unknown" ? uaIdentity.os : browserDevice.os
+    );
+    const runtimeOsAuthoritative = runtimeOsVerdict.authoritative && !rfpExemptRequest;
+    const uaOsLabel = uaIdentity.os && uaIdentity.os !== "Unknown" ? `${uaIdentity.os}${uaIdentity.osVersion ? ` ${uaIdentity.osVersion}` : ""}` : browserDevice.os;
+    const uaOsFamily = osFamilyFromText(uaOsLabel);
+    const conflictingRuntimeClaim = Boolean(
+      runtimeOsVerdict.family && uaOsFamily && uaOsFamily !== runtimeOsVerdict.family
+    );
+    const serverVerifiedOs = runtimeOsAuthoritative && runtimeOsVerdict.family ? runtimeOsVerdict.label : conflictingRuntimeClaim && !/\(claimed\)$/i.test(uaOsLabel) ? `${uaOsLabel} (claimed)` : uaOsLabel;
     const osFamilyKey = (value) => {
       const text = String(value || "").toLowerCase();
       if (!text || text === "unknown") return "";
@@ -9779,6 +14696,11 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         safariAtfp: Boolean(rawExtras.safariAtfp)
       })
     );
+    if (runtimeOsAuthoritative && runtimeOsVerdict.uaMismatch && !privacyHardened) {
+      specAssessment.hardViolations = Array.from(
+        /* @__PURE__ */ new Set([...specAssessment.hardViolations, "os_ua_mismatch"])
+      );
+    }
     const reconciledTampering = enforceTamperingInvariant({
       reasons: [
         ...tamperingAssessment?.details?.reasons || [],
@@ -9917,6 +14839,9 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     let botInfo = null;
     let botType = null;
     let botVerdict = "not_detected";
+    const positiveSpoofExclusion = (aiAgent?.evidence || []).some(
+      (line) => /is not (on|inside)\b/i.test(line)
+    );
     if (hardAutomationSignals) {
       botInfo = {
         category: "browser_automation",
@@ -9926,6 +14851,15 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       };
       botType = automationTargetedTampering ? "stealth_automation" : "browser_automation";
       botVerdict = "bad";
+    } else if (aiAgent.detected && registryAgent && aiAgent.agentId !== "impostor-spoof") {
+      botInfo = {
+        category: registryAgent.category || "ai_agent",
+        provider: registryAgent.provider || "Unknown",
+        name: registryAgent.displayName || aiAgent.agentName,
+        identity: aiAgent.verified ? /signed/i.test(String(aiAgent.executionMode || "")) ? "signed" : "verified" : "unknown"
+      };
+      botType = registryAgent.id;
+      botVerdict = aiAgent.verified && isGoodCrawlerCategory(registryAgent.category) ? "good" : "bad";
     } else if (robodexResult.detected && robodexResult.botInfo) {
       botInfo = robodexResult.botInfo;
       botType = robodexResult.botType;
@@ -9936,7 +14870,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         category: isImpostor ? "browser_automation" : "ai_agent",
         provider: aiAgent.operator || "Unknown",
         name: aiAgent.agentName,
-        identity: isImpostor ? "spoofed" : aiAgent.verified ? aiAgent.executionMode === "RFC 9421 Signed Agent" ? "signed" : "verified" : "unknown"
+        identity: isImpostor ? positiveSpoofExclusion ? "spoofed" : "unknown" : aiAgent.verified ? aiAgent.executionMode === "RFC 9421 Signed Agent" ? "signed" : "verified" : "unknown"
       };
       botType = "ai_agent";
       botVerdict = "bad";
@@ -10126,12 +15060,19 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       query: simhash512(lshIdentityProfile),
       candidates: retrieveLshCandidates(db, lshIdentityProfile)
     });
+    const freshUnanchoredContext = !existingVisitor && !verifiedVid && !storageVerified && !existingHwidVisitor;
     if (identityStage.stage === "lsh_fuzzy" && identityStage.visitorId && identityStage.visitorId !== visitorId && identityStage.visitorId !== identityStage.matchLabel) {
       try {
         const fuzzyAnchor = db.prepare(
           "SELECT MAX(distinct_storage_seeds_count) AS max_seeds FROM hardware_anchors WHERE visitor_id = ?"
         ).get(identityStage.visitorId);
-        if (fuzzyAnchor && Number(fuzzyAnchor.max_seeds ?? 0) < 2) {
+        const structuralMatch = freshUnanchoredContext ? structuralAnchorsMatch(
+          db,
+          identityProfile,
+          String(identityStage.visitorId),
+          identityHardwareFingerprint
+        ) : null;
+        if (fuzzyAnchor && Number(fuzzyAnchor.max_seeds ?? 0) < 2 && (!freshUnanchoredContext || Boolean(structuralMatch?.matched))) {
           const provisionalVisitorId = visitorId;
           visitorId = String(identityStage.visitorId);
           visitorToken = signVisitorId(visitorId);
@@ -10498,6 +15439,107 @@ app.use(
     }
   }
 );
+function osFamilyFromText(value) {
+  const text = String(value || "").toLowerCase();
+  if (!text) return null;
+  if (/iphone|ipad|ipod|ios/.test(text)) return "ios";
+  if (/android/.test(text)) return "android";
+  if (/mac ?os|macos|macintosh|\bmac\b/.test(text)) return "macos";
+  if (/windows|win32|win64|\bwin\b/.test(text)) return "windows";
+  if (/linux|ubuntu|fedora|debian|chrome ?os|\blinux\b/.test(text)) return "linux";
+  return null;
+}
+var RUNTIME_OS_LABELS = {
+  linux: "Linux",
+  macos: "macOS",
+  windows: "Windows",
+  ios: "iOS",
+  android: "Android"
+};
+function inferRuntimeOsVerdict(input, uaOs) {
+  const hostFamily = osFamilyFromText(String(input.hostOs || ""));
+  const gpuText = `${input.gpuRenderer || ""} ${input.gpuVendor || ""} ${input.gpuArchFamily || ""}`.toLowerCase();
+  let glFamily = null;
+  if (/direct3d|d3d ?1[12]|dxgi/.test(gpuText)) glFamily = "windows";
+  else if (/metal|apple gpu|apple m[1-9]/.test(gpuText)) glFamily = "macos";
+  else if (/mesa|llvmpipe|softpipe|gallium|\bx11\b|wayland/.test(gpuText)) glFamily = "linux";
+  else if (/android/.test(gpuText)) glFamily = "android";
+  else if (/ios|iphone|ipad/.test(gpuText)) glFamily = "ios";
+  const probeText = `${input.architectureSource || ""} ${input.engine || ""} ${input.architecture || ""}`.toLowerCase();
+  const highConfidenceProbe = /high[- ]?confidence|math|timing|probe|silicon/.test(probeText);
+  const probeFamily = highConfidenceProbe ? osFamilyFromText(probeText) || hostFamily : null;
+  const proofs = [];
+  if (hostFamily) proofs.push(hostFamily);
+  if (glFamily) proofs.push(glFamily);
+  if (probeFamily) proofs.push(probeFamily);
+  const counts = /* @__PURE__ */ new Map();
+  for (const proof of proofs) counts.set(proof, (counts.get(proof) ?? 0) + 1);
+  let family = null;
+  let best = 0;
+  for (const [candidate, count] of counts) {
+    if (count > best || count === best && candidate === hostFamily) {
+      family = candidate;
+      best = count;
+    }
+  }
+  const authoritative = Boolean(family && best >= 2);
+  const uaFamily = osFamilyFromText(uaOs);
+  return {
+    family,
+    label: family ? RUNTIME_OS_LABELS[family] : "",
+    authoritative,
+    uaMismatch: authoritative && Boolean(uaFamily && family && uaFamily !== family),
+    evidence: [
+      hostFamily ? `Runtime host probe: ${RUNTIME_OS_LABELS[hostFamily]}` : "",
+      glFamily ? `WebGL backend: ${RUNTIME_OS_LABELS[glFamily]}` : "",
+      probeFamily ? `High-confidence runtime probe: ${RUNTIME_OS_LABELS[probeFamily]}` : ""
+    ].filter(Boolean)
+  };
+}
+function humanIncognitoMethod(rawMethod, isIncognito, probeInconclusive) {
+  if (isIncognito) return "Ephemeral / private storage detected";
+  if (probeInconclusive) return "Storage probe inconclusive (treated as normal)";
+  return "Persistent disk-backed storage verified";
+}
+function storageProbeInconclusive(method) {
+  return /inconclusive|fail[- ]?open|indeterminate|unknown|unavailable|low[- ]?confidence/i.test(
+    String(method || "")
+  );
+}
+function scrubOsClaim(text, runtimeOs) {
+  if (!runtimeOs?.authoritative || !runtimeOs.family) return String(text || "");
+  const correct = RUNTIME_OS_LABELS[runtimeOs.family];
+  return String(text || "").replace(
+    /\b(macOS|Mac OS|Windows|Linux|iOS|Android)\b/gi,
+    (match) => match.toLowerCase() === correct.toLowerCase() ? match : correct
+  );
+}
+function crispBotStatus(status, runtimeOs) {
+  let value = String(status || "").trim();
+  value = value.replace(/\s*\(?(?:low[- ]?confidence|soft signals?|heuristic|probable|possible)\)?/gi, "").replace(/\s{2,}/g, " ").trim();
+  value = scrubOsClaim(value, runtimeOs);
+  return value || "Automated Traffic";
+}
+function documentBotVerdict(ua) {
+  if (!ua) return { verdict: "not_detected", agent: "" };
+  const match = findRegistryAgent(ua);
+  if (!match) {
+    if (GOOD_BOT_UA_RULES2.some((rule) => rule.pattern.test(ua))) return { verdict: "good", agent: "" };
+    if (AI_AGENT_UA_RULES2.some((rule) => rule.pattern.test(ua))) return { verdict: "bad", agent: "" };
+    return { verdict: AUTOMATION_UA_PATTERN.test(ua) ? "bad" : "not_detected", agent: "" };
+  }
+  const agent = asLocalAgent(match);
+  if (isRegistryPolicyToken(ua) || agent.policyToken === true) {
+    return { verdict: "not_detected", agent: "" };
+  }
+  return {
+    verdict: isGoodCrawlerCategory(agent.category) ? "good" : "bad",
+    agent: agent.displayName || ""
+  };
+}
+function escapeHtmlAttribute(value) {
+  return String(value).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 async function startStandaloneServer() {
   if (process.env.NODE_ENV !== "production") {
     const { createServer: createViteServer } = await import("vite");
@@ -10508,6 +15550,28 @@ async function startStandaloneServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
+    app.use((req, res, next) => {
+      if (req.method !== "GET" || req.path !== "/") {
+        next();
+        return;
+      }
+      const ua = String(req.headers["user-agent"] || "");
+      const verdict = documentBotVerdict(ua);
+      res.setHeader("X-Intel-Bot-Verdict", verdict.verdict);
+      res.setHeader("X-Intel-Bot-Agent", verdict.agent);
+      res.setHeader("Cache-Control", "no-store");
+      const meta = `<meta name="intel:verdict" content="${escapeHtmlAttribute(
+        verdict.verdict
+      )}" data-agent="${escapeHtmlAttribute(verdict.agent)}">`;
+      fs.readFile(path.join(distPath, "index.html"), "utf8", (readError, html) => {
+        if (readError || typeof html !== "string") {
+          next();
+          return;
+        }
+        const injected = /<\/head>/i.test(html) ? html.replace(/<\/head>/i, `${meta}</head>`) : `${meta}${html}`;
+        res.type("html").send(injected);
+      });
+    });
     app.use(express.static(distPath));
     app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));

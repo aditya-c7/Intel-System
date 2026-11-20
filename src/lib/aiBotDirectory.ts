@@ -1,10 +1,17 @@
 /**
  * AI Agent & Bot Directory - "Robodex" equivalent
  * Identifies visiting AI agents by UA, ASN, IP range, and Web Bot Auth headers.
+ *
+ * The catalog itself lives in ./agentRegistry (the single source of truth shared by the
+ * worker and UI). This module keeps the original public function signatures and consumes
+ * the registry's derived BOT_DIRECTORY view.
  */
 
+import { BOT_DIRECTORY as REGISTRY_BOT_DIRECTORY, type AgentCategory } from './agentRegistry';
+
 export type BotIdentity = 'verified' | 'signed' | 'unknown' | 'spoofed';
-export type BotCategory = 'ai_agent' | 'ai_assistant' | 'ai_search' | 'ai_crawler' | 'ai_browser' | 'browser_automation';
+/** Backwards-compatible alias: all legacy categories plus the exact named-agent categories. */
+export type BotCategory = AgentCategory;
 
 export interface BotInfo {
   category: BotCategory;
@@ -19,7 +26,7 @@ export interface BotDetectionResult {
   botInfo: BotInfo | null;
 }
 
-interface BotDirectoryEntry {
+export interface BotDirectoryEntry {
   name: string;
   provider: string;
   category: BotCategory;
@@ -31,239 +38,14 @@ interface BotDirectoryEntry {
   requiresWebBotAuth?: boolean;
 }
 
-const BOT_DIRECTORY: BotDirectoryEntry[] = [
-  // OpenAI - verified (CIDR/FCrDNS verified)
-  {
-    name: 'ChatGPT-User',
-    provider: 'OpenAI',
-    category: 'ai_assistant',
-    identity: 'verified',
-    uaPatterns: [/ChatGPT-User/i],
-  },
-  {
-    name: 'OAI-SearchBot',
-    provider: 'OpenAI',
-    category: 'ai_search',
-    identity: 'verified',
-    uaPatterns: [/OAI-SearchBot/i],
-  },
-  {
-    name: 'GPTBot',
-    provider: 'OpenAI',
-    category: 'ai_crawler',
-    identity: 'verified',
-    uaPatterns: [/GPTBot/i],
-  },
-  // OpenAI - signed (Web Bot Auth)
-  {
-    name: 'ChatGPT Agent',
-    provider: 'OpenAI',
-    category: 'ai_agent',
-    identity: 'signed',
-    requiresWebBotAuth: true,
-    asnPatterns: [/openai|azure/i],
-    uaPatterns: [/ChatGPT-Agent/i],
-  },
-  // OpenAI - unknown
-  {
-    name: 'Codex',
-    provider: 'OpenAI',
-    category: 'ai_agent',
-    identity: 'unknown',
-    uaPatterns: [/\bCodex\b/i],
-  },
-  // Google - verified
-  {
-    name: 'Gemini Deep Research',
-    provider: 'Google',
-    category: 'ai_agent',
-    identity: 'verified',
-    asnNumbers: [15169, 396982],
-    asnPatterns: [/google llc|google cloud|AS15169|AS396982/i],
-    uaPatterns: [/Googlebot|Google-Extended|Google-Agent|Mariner|Gemini/i],
-  },
-  {
-    name: 'Google-Agent',
-    provider: 'Google',
-    category: 'ai_agent',
-    identity: 'verified',
-    uaPatterns: [/Google-Agent/i],
-  },
-  {
-    name: 'Google NotebookLM',
-    provider: 'Google',
-    category: 'ai_assistant',
-    identity: 'verified',
-    uaPatterns: [/NotebookLM/i],
-  },
-  // Anthropic - verified
-  {
-    name: 'Claude-User',
-    provider: 'Anthropic',
-    category: 'ai_assistant',
-    identity: 'verified',
-    uaPatterns: [/Claude-User/i],
-  },
-  {
-    name: 'Claude-SearchBot',
-    provider: 'Anthropic',
-    category: 'ai_search',
-    identity: 'verified',
-    uaPatterns: [/Claude-SearchBot/i],
-  },
-  {
-    name: 'ClaudeBot',
-    provider: 'Anthropic',
-    category: 'ai_crawler',
-    identity: 'verified',
-    uaPatterns: [/ClaudeBot/i],
-  },
-  // Anthropic - unknown
-  {
-    name: 'Claude Code',
-    provider: 'Anthropic',
-    category: 'ai_agent',
-    identity: 'unknown',
-    uaPatterns: [/Claude Code|claude-code/i],
-  },
-  {
-    name: 'Claude Duet',
-    provider: 'Anthropic',
-    category: 'ai_agent',
-    identity: 'unknown',
-    uaPatterns: [/Claude-Duet|claude-duet/i],
-  },
-  // Perplexity - verified
-  {
-    name: 'Perplexity-User',
-    provider: 'Perplexity',
-    category: 'ai_assistant',
-    identity: 'verified',
-    uaPatterns: [/Perplexity-User/i],
-  },
-  {
-    name: 'PerplexityBot',
-    provider: 'Perplexity',
-    category: 'ai_search',
-    identity: 'verified',
-    uaPatterns: [/PerplexityBot/i],
-  },
-  // Meta
-  {
-    name: 'Muse',
-    provider: 'Meta',
-    category: 'ai_agent',
-    identity: 'unknown',
-    asnNumbers: [32934],
-    asnPatterns: [/meta platforms|AS32934/i],
-    uaPatterns: [/\bMuse\b/i],
-  },
-  {
-    name: 'Meta-ExternalAgent',
-    provider: 'Meta',
-    category: 'ai_search',
-    identity: 'verified',
-    uaPatterns: [/Meta-ExternalAgent|meta-externalagent/i],
-  },
-  {
-    name: 'Meta-WebIndexer',
-    provider: 'Meta',
-    category: 'ai_search',
-    identity: 'verified',
-    uaPatterns: [/Meta-WebIndexer/i],
-  },
-  // xAI
-  {
-    name: 'Grok Bot',
-    provider: 'xAI',
-    category: 'ai_agent',
-    identity: 'unknown',
-    uaPatterns: [/Grok-Bot|GrokBot|grok/i],
-  },
-  // Cloud Browser Agents - signed
-  {
-    name: 'Browserbase Agent',
-    provider: 'Browserbase',
-    category: 'ai_agent',
-    identity: 'signed',
-    uaPatterns: [/Browserbase/i],
-    requiresWebBotAuth: true,
-  },
-  {
-    name: 'Bedrock AgentCore',
-    provider: 'AWS',
-    category: 'ai_agent',
-    identity: 'signed',
-    asnNumbers: [16509, 14618],
-    uaPatterns: [/BedrockAgentCore|bedrock-agent/i],
-  },
-  {
-    name: 'Anchor Browser',
-    provider: 'Anchor',
-    category: 'ai_browser',
-    identity: 'signed',
-    uaPatterns: [/AnchorBrowser|anchor-browser/i],
-  },
-  {
-    name: 'Notte Browser',
-    provider: 'Notte',
-    category: 'ai_browser',
-    identity: 'signed',
-    uaPatterns: [/NotteBrowser|notte/i],
-  },
-  {
-    name: 'Manus Agent',
-    provider: 'Manus',
-    category: 'ai_agent',
-    identity: 'signed',
-    uaPatterns: [/ManusAgent|manus-agent/i],
-  },
-  {
-    name: 'AGI Agent',
-    provider: 'AGI Inc',
-    category: 'ai_agent',
-    identity: 'signed',
-    uaPatterns: [/AGIAgent|agi-agent/i],
-  },
-  // Other - unknown
-  {
-    name: 'Cursor',
-    provider: 'Anysphere',
-    category: 'ai_agent',
-    identity: 'unknown',
-    uaPatterns: [/\bCursor\b/i],
-    headerPatterns: [{ header: 'x-cursor-agent', pattern: /.*/ }],
-  },
-  {
-    name: 'DuckAssistBot',
-    provider: 'DuckDuckGo',
-    category: 'ai_assistant',
-    identity: 'verified',
-    uaPatterns: [/DuckAssistBot/i],
-  },
-  {
-    name: 'Kimi-User',
-    provider: 'Moonshot AI',
-    category: 'ai_assistant',
-    identity: 'verified',
-    uaPatterns: [/Kimi-User/i],
-  },
-  {
-    name: 'Cloudflare Browser Rendering',
-    provider: 'Cloudflare',
-    category: 'browser_automation',
-    identity: 'unknown',
-    asnNumbers: [13335],
-    uaPatterns: [/CloudflareBot|cf-browser/i],
-  },
-  {
-    name: 'Instinct',
-    provider: 'Spear Street Technology',
-    category: 'ai_agent',
-    identity: 'unknown',
-    uaPatterns: [/\bInstinct\b/i],
-  },
-];
+/**
+ * The catalog's derived robodex view. Casting only narrows the category string to the
+ * (now widened) BotCategory union; all other fields are structurally identical.
+ */
+const BOT_DIRECTORY: BotDirectoryEntry[] = REGISTRY_BOT_DIRECTORY.map((entry) => ({
+  ...entry,
+  category: entry.category as BotCategory,
+}));
 
 /**
  * 19 BotD client-side signal names (for reference / collector integration).
@@ -767,9 +549,13 @@ export function formatBotInfoForApiV4(result: BotDetectionResult): {
     return { bot: 'not_detected', bot_type: null, bot_info: null };
   }
   const cat = result.botInfo.category;
-  const isBad = cat === 'ai_agent' || cat === 'browser_automation';
+  // Only a network-verified search / link-preview crawler is a "good" bot. Every AI
+  // category (ai_crawler, ai_search, ai_assistant, ai_agent, ai_browser, automation, …
+  // including 'unknown'/'signed' crawlers) is "bad" here, regardless of the old heuristic.
+  const isGood =
+    result.botInfo.identity === 'verified' && (cat === 'search_crawler' || cat === 'link_preview');
   return {
-    bot: isBad ? 'bad' : 'good',
+    bot: isGood ? 'good' : 'bad',
     bot_type: result.botType,
     bot_info: result.botInfo,
   };

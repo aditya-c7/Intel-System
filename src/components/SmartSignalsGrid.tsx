@@ -22,6 +22,48 @@ export interface SmartSignalRowData {
   jsonAnchor?: boolean;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Human-only incognito copy                                                   */
+/* -------------------------------------------------------------------------- */
+
+const SAFE_INCOGNITO_STATUSES = new Set([
+  'not detected',
+  'likely private session',
+  'inconclusive — treated as normal',
+  'inconclusive - treated as normal',
+]);
+
+/** True for the raw diagnostic strings that must never reach a user. */
+function isIncognitoDiagnostic(value: string): boolean {
+  const lower = value.toLowerCase();
+  return (
+    /idb\b|indexeddb|opfs|fail[-\s]?open|inconclusive|indeterminate|ratio|\b\d+(?:\.\d+)?\s*x\b|\d+\.\d+/.test(
+      lower
+    ) || !SAFE_INCOGNITO_STATUSES.has(lower)
+  );
+}
+
+/** Maps any server incognito status onto one of the three allowed human labels. */
+export function safeIncognitoStatus(status: string | null | undefined, detected: boolean): string {
+  const value = (status || '').trim();
+  const lower = value.toLowerCase();
+  if (!value || /not detected|none|false|^no$/.test(lower)) return 'Not detected';
+  if (/inconclusive|indeterminate|fail[-\s]?open/.test(lower)) return 'Inconclusive — treated as normal';
+  if (SAFE_INCOGNITO_STATUSES.has(lower)) return lower.startsWith('inconclusive') ? 'Inconclusive — treated as normal' : value;
+  return detected ? 'Likely private session' : 'Not detected';
+}
+
+/** Maps any server incognito method/detail onto human copy (never raw diagnostics). */
+export function safeIncognitoDetail(
+  detail: string | null | undefined,
+  detected: boolean
+): string | undefined {
+  const value = (detail || '').trim();
+  if (!value) return undefined;
+  if (!isIncognitoDiagnostic(value)) return value;
+  return detected ? 'Likely private session' : 'Inconclusive — treated as normal';
+}
+
 const CLEAN = {
   box: 'bg-[#E6F4EA] border-[#81C995]/60 text-[#137333]',
 };
@@ -38,27 +80,77 @@ function toneClass(tone: SmartSignalRowData['tone']): string {
   return CLEAN.box;
 }
 
+/**
+ * Generic/legacy bot verdicts. The edge-computed `smartSignals.bot.status` is authoritative
+ * whenever it carries a real (non-placeholder) verdict — e.g. `Verified · Googlebot · Google`.
+ * Only these legacy placeholders may fall back to the computed verdict below.
+ */
+const GENERIC_BOT_STATUSES = new Set([
+  'not detected',
+  'you are a bot',
+  'unavailable',
+  'detected',
+  'verified crawler',
+  'ai agent',
+  'n/a',
+  'none',
+  'unknown',
+  'false',
+]);
+
 /** Short, human-readable bot verdict. Never leaks raw user-agent internals. */
 function botStatus(data: IntelVisitorResponse): { status: string; triggered: boolean; detail?: string } {
   const signals = data.securitySignals;
   const subtype = signals.botSubtype;
-  if (!signals.isBot && subtype !== 'bad_bot' && subtype !== 'good_bot' && subtype !== 'ai_agent') {
-    return { status: 'Not detected', triggered: false };
-  }
-  if (subtype === 'good_bot') {
-    return { status: 'Verified crawler', triggered: false, detail: signals.botProvider };
-  }
-  if (subtype === 'ai_agent') {
-    return { status: 'AI agent', triggered: true, detail: signals.botProvider };
-  }
-  if (signals.botSubtype === 'bad_bot') {
+
+  // Legacy fallback computation — kept verbatim for responses that still carry only the
+  // coarse subtype flags and no exact server/edge verdict.
+  const legacy = (): { status: string; triggered: boolean; detail?: string } => {
+    if (!signals.isBot && subtype !== 'bad_bot' && subtype !== 'good_bot' && subtype !== 'ai_agent') {
+      return { status: 'Not detected', triggered: false };
+    }
+    if (subtype === 'good_bot') {
+      return { status: 'Verified crawler', triggered: false, detail: signals.botProvider };
+    }
+    if (subtype === 'ai_agent') {
+      return { status: 'AI agent', triggered: true, detail: signals.botProvider };
+    }
+    if (subtype === 'bad_bot') {
+      return {
+        status: 'You are a bot',
+        triggered: true,
+        detail: signals.botReason || signals.botProvider,
+      };
+    }
+    return { status: 'You are a bot', triggered: true, detail: signals.botReason };
+  };
+
+  // Vague/soft-signal wording is never a status: an exact `bot_info.name` (or the edge verdict
+  // mirrored into the smart signal) must win instead.
+  const vague = /soft signals|low[- ]confidence|weak signals|heuristic/i;
+  const exactStatus = data.smartSignals?.bot?.status?.trim();
+  if (
+    exactStatus &&
+    !GENERIC_BOT_STATUSES.has(exactStatus.toLowerCase()) &&
+    !vague.test(exactStatus)
+  ) {
+    const fallback = legacy();
     return {
-      status: 'You are a bot',
-      triggered: true,
-      detail: signals.botReason || signals.botProvider,
+      status: exactStatus,
+      triggered: fallback.triggered,
+      detail: data.smartSignals?.bot?.detail || fallback.detail,
     };
   }
-  return { status: 'You are a bot', triggered: true, detail: signals.botReason };
+  const exactName = data.bot_info?.name?.trim();
+  if (exactName && !GENERIC_BOT_STATUSES.has(exactName.toLowerCase()) && !vague.test(exactName)) {
+    const fallback = legacy();
+    return {
+      status: exactName,
+      triggered: fallback.triggered,
+      detail: data.smartSignals?.bot?.detail || fallback.detail,
+    };
+  }
+  return legacy();
 }
 
 export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRowData[] {
@@ -86,9 +178,9 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   rows.push({
     key: 'incognito',
     label: 'Incognito Mode',
-    status: incognito ? 'You are incognito' : 'Not detected',
+    status: safeIncognitoStatus(incognito ? 'Likely private session' : 'Not detected', incognito),
     triggered: incognito,
-    detail: signals.incognitoMethod,
+    detail: safeIncognitoDetail(signals.incognitoMethod ?? signals.incognitoDetail, incognito),
   });
 
   const bot = botStatus(data);
@@ -105,22 +197,27 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   // more methods (or a different verdict) than `#raw-json`. A plain datacenter / hosting ASN is
   // explicitly NOT a commercial VPN: only the server's `public_vpn` method earns that label.
   const methods = signals.vpnMethods;
-  const vpnMethodCount = methods ? Object.values(methods).filter(Boolean).length : 0;
-  const vpnDetected = Boolean(vpnMethodCount > 0 || signals.vpnSuspected);
+  // A timezone difference is reported by the separate "Timezone" context tile. It is NOT a
+  // VPN verdict: when it is the only differing method the VPN tile must read "Not detected".
+  const vpnMethods = methods ?? {};
+  const vpnEffectiveCount = Object.entries(vpnMethods).filter(
+    ([name, active]) => name !== 'timezone_mismatch' && Boolean(active)
+  ).length;
+  const vpnDetected = Boolean(vpnEffectiveCount > 0 || signals.vpnSuspected);
   const datacenterHosting = Boolean(signals.datacenterAsn ?? signals.isDatacenterOrHosting);
   let vpnStatus = 'Not detected';
   if (vpnDetected) {
     if (methods?.public_vpn) vpnStatus = 'Commercial VPN';
     else if (methods?.relay) vpnStatus = 'Tor exit / relay';
     else if (datacenterHosting) vpnStatus = 'Datacenter / hosting';
-    else if (methods?.timezone_mismatch) vpnStatus = 'Timezone mismatch';
+    else vpnStatus = 'Detected';
   }
   rows.push({
     key: 'vpn',
     label: 'VPN',
     status: vpnStatus,
     triggered: vpnDetected,
-    detail: vpnMethodCount > 1 ? `${vpnMethodCount} matching network methods` : signals.vpnReasons?.[0],
+    detail: vpnEffectiveCount > 1 ? `${vpnEffectiveCount} matching network methods` : signals.vpnReasons?.[0],
   });
 
   const tampering = Boolean(data.tampering ?? signals.tampering);

@@ -88,6 +88,345 @@ import {
 } from './src/lib/identityEngine';
 import { decideVerdictTier } from './src/lib/verdict';
 import { resolveAgentProofMethod } from './src/lib/aiBotDirectory';
+import {
+  AGENT_REGISTRY as REGISTRY_AGENTS,
+  AGENT_BY_ID as REGISTRY_AGENT_BY_ID,
+  GOOD_BOT_UA_RULES as REGISTRY_GOOD_BOT_UA_RULES,
+  AI_AGENT_UA_RULES as REGISTRY_AI_AGENT_UA_RULES,
+  BOT_SIGNATURE_KEYID_PROVIDERS as REGISTRY_SIGNATURE_KEYID_PROVIDERS,
+  AI_BOT_CIDR_SOURCES as REGISTRY_AI_BOT_CIDR_SOURCES,
+  VERIFICATION_SUFFIXES_BY_AGENT as REGISTRY_VERIFICATION_SUFFIXES,
+  BOT_DIRECTORY as REGISTRY_BOT_DIRECTORY,
+  PILLS as REGISTRY_PILLS,
+  findAgentByUa,
+  isPolicyToken,
+  displayFor,
+  normalizeFeed,
+  PREFIX_FEEDS as REGISTRY_PREFIX_FEEDS,
+  type AgentDef,
+  type ProofTier,
+} from './src/lib/agentRegistry';
+import { PINNED_PREFIXES as REGISTRY_PINNED_PREFIXES } from './src/lib/agentFeedSnapshots';
+
+/* -------------------------------------------------------------------------- */
+/* Shared agent registry adapter                                                */
+/*   The registry is the single source of truth for every named crawler. The    */
+/*   local aliases below keep the legacy call sites stable and degrade safely    */
+/*   when a registry lookup is missing data.                                     */
+/* -------------------------------------------------------------------------- */
+
+interface GoodBotUaRule {
+  pattern: RegExp;
+  provider: string;
+  label: string;
+  category: string;
+  network: RegExp;
+}
+interface AiAgentUaRule {
+  pattern: RegExp;
+  provider: string;
+  label: string;
+}
+type SignatureKeyidProvider = [string, string];
+interface CidrFeedSource {
+  id: string;
+  url: string;
+}
+type AiBotCidrSourceId = string;
+
+/** Locally normalized view of a registry agent (extra verification metadata is optional). */
+interface LocalAgentDef {
+  id: string;
+  displayName: string;
+  provider: string;
+  category: string;
+  executionMode?: string | null;
+  policyToken?: boolean;
+  minProofForVerified?: ProofTier | string;
+  fcrdnsSuffixes?: string[];
+  asns?: string[];
+  signatureHosts?: string[];
+  keyIdNeedles?: string[];
+  feedIds?: string[];
+}
+
+const GOOD_BOT_UA_RULES: GoodBotUaRule[] = REGISTRY_GOOD_BOT_UA_RULES as unknown as GoodBotUaRule[];
+const AI_AGENT_UA_RULES: AiAgentUaRule[] = REGISTRY_AI_AGENT_UA_RULES as unknown as AiAgentUaRule[];
+const BOT_SIGNATURE_KEYID_PROVIDERS: SignatureKeyidProvider[] =
+  REGISTRY_SIGNATURE_KEYID_PROVIDERS as unknown as SignatureKeyidProvider[];
+const AI_BOT_CIDR_SOURCES: CidrFeedSource[] = REGISTRY_AI_BOT_CIDR_SOURCES as unknown as CidrFeedSource[];
+
+/** Reads a value from either a plain record or a Map without depending on its declared type. */
+function registryLookup(value: unknown, key: string): unknown {
+  if (!value || typeof value !== 'object') return undefined;
+  const asRecord = value as Record<string, unknown>;
+  if (Object.prototype.hasOwnProperty.call(asRecord, key)) return asRecord[key];
+  const getter = (value as { get?: (lookupKey: string) => unknown }).get;
+  if (typeof getter === 'function') return getter.call(value, key);
+  return undefined;
+}
+
+function asLocalAgent(agent: AgentDef): LocalAgentDef {
+  const raw = (agent && typeof agent === 'object' ? agent : {}) as AgentDef &
+    Record<string, unknown>;
+  const signature = raw.signature as
+    | { agentHosts?: readonly string[]; keyIdNeedles?: readonly string[] }
+    | undefined;
+  return {
+    ...(raw as unknown as LocalAgentDef),
+    fcrdnsSuffixes: raw.fcrdnsSuffixes ? [...raw.fcrdnsSuffixes] : undefined,
+    feedIds: raw.feedIds ? [...raw.feedIds] : undefined,
+    asns: raw.asns ? raw.asns.map(String) : undefined,
+    signatureHosts: signature?.agentHosts ? [...signature.agentHosts] : undefined,
+    keyIdNeedles: signature?.keyIdNeedles ? [...signature.keyIdNeedles] : undefined,
+  };
+}
+
+const REGISTRY_AGENT_LIST: LocalAgentDef[] = Array.isArray(REGISTRY_AGENTS)
+  ? (REGISTRY_AGENTS as unknown as AgentDef[]).map(asLocalAgent)
+  : Object.values((REGISTRY_AGENTS ?? {}) as unknown as Record<string, AgentDef>).map(asLocalAgent);
+
+function lookupAgent(id: string | null | undefined): LocalAgentDef | null {
+  if (!id) return null;
+  const direct = registryLookup(REGISTRY_AGENT_BY_ID, id);
+  if (direct) return asLocalAgent(direct as AgentDef);
+  const needle = id.toLowerCase();
+  return (
+    REGISTRY_AGENT_LIST.find(
+      (agent) =>
+        String(agent.id || '').toLowerCase() === needle ||
+        String(agent.displayName || '').toLowerCase() === needle ||
+        String(agent.provider || '').toLowerCase() === needle
+    ) ?? null
+  );
+}
+
+const findRegistryAgent = (ua: string): AgentDef | null =>
+  (findAgentByUa as unknown as (value: string) => AgentDef | null | undefined)(ua) ?? null;
+
+const isRegistryPolicyToken = (ua: string): boolean =>
+  Boolean((isPolicyToken as unknown as (value: string) => boolean | undefined)(ua));
+
+const registryDisplay = (agent: AgentDef, identity: string): { label: string } =>
+  (displayFor as unknown as (value: AgentDef, agentIdentity: string) => { label: string })(
+    agent,
+    identity
+  );
+
+const normalizeRegistryFeed = (sourceId: string, body: string): { prefixes: string[] } =>
+  (normalizeFeed as unknown as (id: string, text: string) => { prefixes: string[] })(
+    sourceId,
+    body
+  );
+
+/** Legacy operator union — widened to a string so newly registered operators stay compatible. */
+type AiAgentOperatorId =
+  | 'google'
+  | 'openai'
+  | 'perplexity'
+  | 'anthropic'
+  | 'xai'
+  | 'meta'
+  | 'browserbase'
+  | 'anchorbrowser'
+  | (string & {});
+
+function operatorIdFromName(name: string): AiAgentOperatorId {
+  const lower = name.toLowerCase();
+  if (/google/.test(lower)) return 'google';
+  if (/openai|chatgpt/.test(lower)) return 'openai';
+  if (/perplexity/.test(lower)) return 'perplexity';
+  if (/anthropic|claude/.test(lower)) return 'anthropic';
+  if (/xai|grok|\bx\b/.test(lower)) return 'xai';
+  if (/meta|facebook/.test(lower)) return 'meta';
+  if (/browserbase/.test(lower)) return 'browserbase';
+  if (/anchor\s?browser/.test(lower)) return 'anchorbrowser';
+  return lower.replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'unknown';
+}
+
+/** Fallbacks preserve the exact verification behaviour of already-handled providers. */
+const FALLBACK_VERIFICATION_SUFFIXES: Record<string, string[]> = {
+  google: ['googlebot.com', 'google.com'],
+  openai: ['openai.com', 'chatgpt.com'],
+  perplexity: ['perplexity.ai'],
+  anthropic: ['anthropic.com', 'claude.ai'],
+  xai: ['x.ai', 'grok.com'],
+  meta: ['facebook.com', 'meta.com', 'fb.com'],
+};
+const FALLBACK_ASNS: Record<string, string[]> = {
+  google: ['15169', '396982'],
+  xai: ['400562', '13414'],
+  meta: ['32934', '63293'],
+  aws: ['16509', '14618'],
+  azure: ['8075'],
+  perplexity: ['209242'],
+};
+const FALLBACK_SIGNATURE_HOSTS: Array<[string, AiAgentOperatorId]> = [
+  ['openai.com', 'openai'],
+  ['chatgpt.com', 'openai'],
+  ['perplexity.ai', 'perplexity'],
+  ['anthropic.com', 'anthropic'],
+  ['claude.ai', 'anthropic'],
+  ['browserbase.com', 'browserbase'],
+  ['anchorbrowser.io', 'anchorbrowser'],
+  ['x.ai', 'xai'],
+  ['grok.com', 'xai'],
+  ['meta.com', 'meta'],
+  ['facebook.com', 'meta'],
+];
+
+function suffixesForAgent(...keys: string[]): string[] {
+  const found: string[] = [];
+  const add = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) if (typeof item === 'string' && item.trim()) found.push(item.trim());
+    }
+  };
+  for (const key of keys) {
+    add(registryLookup(REGISTRY_VERIFICATION_SUFFIXES, key));
+    add(registryLookup(REGISTRY_VERIFICATION_SUFFIXES, key.toLowerCase()));
+    add(lookupAgent(key)?.fcrdnsSuffixes);
+  }
+  const needles = keys.map((key) => key.toLowerCase());
+  for (const agent of REGISTRY_AGENT_LIST) {
+    if (
+      needles.some(
+        (key) =>
+          key === String(agent.id || '').toLowerCase() ||
+          key === String(agent.provider || '').toLowerCase() ||
+          key === String(agent.displayName || '').toLowerCase()
+      )
+    ) {
+      add(agent.fcrdnsSuffixes);
+    }
+  }
+  if (found.length === 0) {
+    for (const key of keys) add(FALLBACK_VERIFICATION_SUFFIXES[key.toLowerCase()]);
+  }
+  return Array.from(new Set(found));
+}
+
+function asnsForAgent(...keys: string[]): string[] {
+  const found: string[] = [];
+  const add = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const digits = typeof item === 'number' ? String(item) : typeof item === 'string' ? item : '';
+        if (digits.trim()) found.push(digits.trim());
+      }
+    }
+  };
+  for (const key of keys) add(lookupAgent(key)?.asns);
+  if (found.length === 0) {
+    for (const key of keys) add(FALLBACK_ASNS[key.toLowerCase()]);
+  }
+  return Array.from(new Set(found));
+}
+
+const SIGNATURE_HOST_RULES: Array<{ host: string; operator: AiAgentOperatorId }> = (() => {
+  const rules = FALLBACK_SIGNATURE_HOSTS.map(([host, operator]) => ({ host, operator }));
+  for (const agent of REGISTRY_AGENT_LIST) {
+    const operator = operatorIdFromName(agent.provider || agent.id);
+    for (const rawHost of agent.signatureHosts ?? []) {
+      if (typeof rawHost === 'string' && rawHost.trim()) {
+        rules.push({ host: rawHost.trim().toLowerCase(), operator });
+      }
+    }
+  }
+  for (const rawEntry of (REGISTRY_BOT_DIRECTORY ?? []) as unknown as Array<unknown>) {
+    const entry = rawEntry && typeof rawEntry === 'object' ? (rawEntry as Record<string, unknown>) : {};
+    const hosts = entry.signatureHosts ?? entry.hosts ?? entry.domains ?? entry.verificationSuffixes;
+    const name = entry.provider ?? entry.operator ?? entry.name;
+    if (Array.isArray(hosts) && typeof name === 'string') {
+      const operator = operatorIdFromName(name);
+      for (const rawHost of hosts) {
+        if (typeof rawHost === 'string' && rawHost.trim()) {
+          rules.push({ host: rawHost.trim().toLowerCase(), operator });
+        }
+      }
+    }
+  }
+  return rules;
+})();
+
+/** Category helpers shared by the attribution engine, the tile and the response state machine. */
+function isGoodCrawlerCategory(category: string | undefined): boolean {
+  const value = String(category || '').toLowerCase();
+  return value === 'search_crawler' || value === 'search crawler' || value === 'link_preview' || value === 'link preview';
+}
+function isAiAgentCategory(category: string | undefined): boolean {
+  return /^ai[_\s-]/i.test(String(category || ''));
+}
+
+/** Pin the verified-prefix table at module load so the very first request already has data. */
+function pinnedPrefixEntries(): Array<[string, string[]]> {
+  const entries: Array<[string, string[]]> = [];
+  const add = (id: string, value: unknown): void => {
+    const prefixes = Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string' && item.includes('/'))
+      : [];
+    if (prefixes.length > 0) entries.push([id, prefixes]);
+  };
+  const pinned: unknown = REGISTRY_PINNED_PREFIXES;
+  if (Array.isArray(pinned)) {
+    for (const item of pinned) {
+      if (typeof item === 'string') {
+        if (item.includes('/')) add('pinned', [item]);
+        continue;
+      }
+      const record = item && typeof item === 'object' ? (item as Record<string, unknown>) : {};
+      const id =
+        typeof record.id === 'string'
+          ? record.id
+          : typeof record.sourceId === 'string'
+          ? record.sourceId
+          : typeof record.agentId === 'string'
+          ? record.agentId
+          : 'pinned';
+      add(id, record.prefixes ?? record.prefix ?? record.cidrs ?? record.ranges);
+    }
+  } else if (pinned && typeof pinned === 'object') {
+    for (const [id, prefixes] of Object.entries(pinned as Record<string, unknown>)) add(id, prefixes);
+  }
+  return entries;
+}
+
+/** Normalizes the registry feed payload into the prefix-list shape used by `AiBotCidrSource`. */
+function prefixesFromNormalizedFeed(normalized: unknown, sourceId: string): string[] {
+  const found: string[] = [];
+  const add = (value: unknown): void => {
+    if (typeof value === 'string') {
+      if (value.includes('/')) found.push(value.trim());
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) add(item);
+      return;
+    }
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      for (const key of ['prefixes', 'prefix', 'cidrs', 'ranges', 'ipv4Prefix', 'ipv6Prefix']) {
+        if (record[key] !== undefined) add(record[key]);
+      }
+    }
+  };
+  if (normalized && typeof normalized === 'object' && !Array.isArray(normalized)) {
+    const feedKey = registryLookup(REGISTRY_PREFIX_FEEDS, sourceId);
+    const match = registryLookup(normalized, sourceId) ?? (typeof feedKey === 'string' ? registryLookup(normalized, feedKey) : undefined);
+    if (match !== undefined) add(match);
+    else {
+      const compact = sourceId.replace(/[^a-z0-9]/gi, '').toLowerCase();
+      for (const [key, value] of Object.entries(normalized as Record<string, unknown>)) {
+        if (key.toLowerCase() === sourceId.toLowerCase() || key.replace(/[^a-z0-9]/gi, '').toLowerCase() === compact) {
+          add(value);
+        }
+      }
+    }
+  } else {
+    add(normalized);
+  }
+  return Array.from(new Set(found));
+}
 
 dotenv.config();
 
@@ -1686,102 +2025,7 @@ function userAgentsCompatible(headerUserAgent: string, payloadUserAgent: string)
   return true;
 }
 
-const GOOD_BOT_UA_RULES: Array<{
-  pattern: RegExp;
-  provider: string;
-  label: string;
-  category: string;
-  network: RegExp;
-}> = [
-  {
-    pattern: /googlebot/i,
-    provider: 'Google',
-    label: 'Googlebot',
-    category: 'Search Crawler',
-    network: /google/i,
-  },
-  {
-    pattern: /bingbot|bingpreview/i,
-    provider: 'Microsoft',
-    label: 'Bingbot',
-    category: 'Search Crawler',
-    network: /microsoft|\bbing\b/i,
-  },
-  {
-    pattern: /applebot/i,
-    provider: 'Apple',
-    label: 'Applebot',
-    category: 'Search Crawler',
-    network: /\bapple\b/i,
-  },
-  {
-    pattern: /duckduckbot/i,
-    provider: 'DuckDuckGo',
-    label: 'DuckDuckBot',
-    category: 'Search Crawler',
-    network: /duckduckgo/i,
-  },
-  {
-    pattern: /linkedinbot/i,
-    provider: 'LinkedIn',
-    label: 'LinkedInBot',
-    category: 'Link Preview',
-    network: /linkedin/i,
-  },
-  {
-    pattern: /twitterbot/i,
-    provider: 'X (Twitter)',
-    label: 'Twitterbot',
-    category: 'Link Preview',
-    network: /twitter|\bx corp\b/i,
-  },
-  {
-    pattern: /slackbot/i,
-    provider: 'Slack',
-    label: 'Slackbot',
-    category: 'Link Preview',
-    network: /slack/i,
-  },
-  {
-    pattern: /vercelbot/i,
-    provider: 'Vercel',
-    label: 'Vercelbot',
-    category: 'Link Preview',
-    network: /vercel/i,
-  },
-];
-
-const AI_AGENT_UA_RULES: Array<{ pattern: RegExp; provider: string; label: string }> = [
-  { pattern: /gptbot/i, provider: 'OpenAI', label: 'GPTBot' },
-  { pattern: /chatgpt-user/i, provider: 'OpenAI', label: 'ChatGPT-User' },
-  { pattern: /oai-searchbot/i, provider: 'OpenAI', label: 'OAI-SearchBot' },
-  { pattern: /claudebot/i, provider: 'Anthropic', label: 'ClaudeBot' },
-  { pattern: /claude-web/i, provider: 'Anthropic', label: 'Claude-Web' },
-  { pattern: /anthropic-ai/i, provider: 'Anthropic', label: 'Anthropic-AI' },
-  { pattern: /perplexitybot/i, provider: 'Perplexity', label: 'PerplexityBot' },
-  { pattern: /perplexity-user/i, provider: 'Perplexity', label: 'Perplexity-User' },
-  { pattern: /google-extended/i, provider: 'Google', label: 'Google-Extended' },
-  { pattern: /ccbot/i, provider: 'Common Crawl', label: 'CCBot' },
-  { pattern: /bytespider/i, provider: 'ByteDance', label: 'Bytespider' },
-  { pattern: /cohere-ai/i, provider: 'Cohere', label: 'Cohere-AI' },
-  { pattern: /meta-externalagent/i, provider: 'Meta', label: 'Meta-ExternalAgent' },
-  { pattern: /headlesschrome/i, provider: 'Cloud Browser Agent', label: 'Headless Chrome' },
-];
-
 const AUTOMATION_UA_PATTERN = /playwright|puppeteer|selenium|cypress|phantomjs/i;
-
-/** `keyid` fragments in Web Bot Auth `Signature-Input` headers → operator display names. */
-const BOT_SIGNATURE_KEYID_PROVIDERS: Array<[string, string]> = [
-  ['openai', 'OpenAI'],
-  ['anthropic', 'Anthropic'],
-  ['perplexity', 'Perplexity'],
-  ['google', 'Google'],
-  ['microsoft', 'Microsoft'],
-  ['apple', 'Apple'],
-  ['amazon', 'Amazon'],
-  ['cloudflare', 'Cloudflare'],
-  ['web-bot-auth', 'Web Bot Auth Directory'],
-];
 
 const DATACENTER_NETWORK_PATTERN =
   /\b(amazon|amazonaws|aws|google cloud|azure|microsoft azure|digitalocean|hetzner|linode|akamai|ovh|vultr|oracle cloud|alibaba|aliyun|tencent|leaseweb|contabo|m247|choopa|datacamp)\b/i;
@@ -2016,37 +2260,6 @@ function classifyBotTraffic(
 /*   official CIDR sync (OpenAI / Google JSON) + RFC 9421 Web Bot Auth + FCrDNS */
 /* -------------------------------------------------------------------------- */
 
-type AiBotCidrSourceId =
-  | 'chatgpt-user'
-  | 'gptbot'
-  | 'searchbot'
-  | 'google-common'
-  | 'google-user-triggered'
-  | 'google-user-triggered-google';
-
-interface AiBotCidrSource {
-  id: AiBotCidrSourceId;
-  url: string;
-}
-
-const AI_BOT_CIDR_SOURCES: AiBotCidrSource[] = [
-  { id: 'chatgpt-user', url: 'https://openai.com/chatgpt-user.json' },
-  { id: 'gptbot', url: 'https://openai.com/gptbot.json' },
-  { id: 'searchbot', url: 'https://openai.com/searchbot.json' },
-  {
-    id: 'google-common',
-    url: 'https://developers.google.com/static/crawling/ipranges/common-crawlers.json',
-  },
-  {
-    id: 'google-user-triggered',
-    url: 'https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers.json',
-  },
-  {
-    id: 'google-user-triggered-google',
-    url: 'https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers-google.json',
-  },
-];
-
 const AI_BOT_CIDR_SYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const AI_BOT_CIDR_TIMEOUT_MS = 10000;
 const AI_AUTH_DIRECTORY_TIMEOUT_MS = 1500;
@@ -2055,7 +2268,8 @@ const AI_FORWARD_DNS_TIMEOUT_MS = 1200;
 const AI_FORWARD_DNS_TTL_MS = 60 * 60 * 1000;
 const AI_VERDICT_TABLE_MAX_ENTRIES = 10000;
 
-let aiBotPrefixTable = new Map<string, string[]>();
+// Seeded from the registry's pinned prefixes so the first request already has verification data.
+let aiBotPrefixTable = new Map<string, string[]>(pinnedPrefixEntries());
 let aiBotCidrLastSyncMs = 0;
 let aiBotCidrSyncInFlight: Promise<void> | null = null;
 let aiBotCidrTimer: ReturnType<typeof setInterval> | null = null;
@@ -2067,7 +2281,7 @@ const aiAuthDirectoryCache = new Map<
 const aiForwardConfirmedDnsCache = new Map<string, { names: string[]; expiresAtMs: number }>();
 
 /** Extracts every `ipv4Prefix` / `ipv6Prefix` / `prefix` from a Google/OpenAI JSON payload. */
-function extractAiPrefixes(payload: unknown): string[] {
+export function extractAiPrefixes(payload: unknown): string[] {
   const prefixes: string[] = [];
   const visit = (value: unknown, depth: number): void => {
     if (depth > 4 || value === null || typeof value !== 'object') return;
@@ -2099,7 +2313,15 @@ async function syncAiBotCidrs(): Promise<void> {
       );
       if (!body) return;
       try {
-        const prefixes = extractAiPrefixes(JSON.parse(body) as unknown);
+        const parsed = JSON.parse(body) as unknown;
+        // The registry feed normalizer understands provider-specific payload shapes; the raw
+        // extractor stays as a fallback so a feed shape change cannot blank verified ranges.
+        const prefixes = Array.from(
+          new Set([
+            ...extractAiPrefixes(parsed),
+            ...prefixesFromNormalizedFeed(normalizeRegistryFeed(source.id, body), source.id),
+          ])
+        );
         if (prefixes.length > 0) next.set(source.id, prefixes);
       } catch {
         // Malformed payload: this provider keeps its previous prefix list.
@@ -2126,13 +2348,17 @@ function runAiBotCidrSync(): Promise<void> {
 
 function ensureAiBotCidrSync(): void {
   if (aiBotCidrTimer === null) {
+    // Non-blocking and deduplicated by `runAiBotCidrSync`'s in-flight guard.
     void runAiBotCidrSync();
-    aiBotCidrTimer = setInterval(() => {
-      void runAiBotCidrSync();
-    }, AI_BOT_CIDR_SYNC_INTERVAL_MS);
-    const handle = aiBotCidrTimer as unknown as { unref?: () => void };
-    if (typeof handle.unref === 'function') handle.unref();
-    return;
+    try {
+      aiBotCidrTimer = setInterval(() => {
+        void runAiBotCidrSync();
+      }, AI_BOT_CIDR_SYNC_INTERVAL_MS);
+      const handle = aiBotCidrTimer as unknown as { unref?: () => void };
+      if (typeof handle.unref === 'function') handle.unref();
+    } catch {
+      // Workers / edge isolation reject global timers; requests re-arm via the TTL check below.
+    }
   }
   if (Date.now() - aiBotCidrLastSyncMs >= AI_BOT_CIDR_SYNC_INTERVAL_MS) {
     void runAiBotCidrSync();
@@ -2149,16 +2375,6 @@ try {
 function matchesAiPrefixTable(ip: string, ids: AiBotCidrSourceId[]): boolean {
   return ids.some((id) => ipMatchesCidrList(ip, aiBotPrefixTable.get(id) ?? []));
 }
-
-type AiAgentOperatorId =
-  | 'google'
-  | 'openai'
-  | 'perplexity'
-  | 'anthropic'
-  | 'xai'
-  | 'meta'
-  | 'browserbase'
-  | 'anchorbrowser';
 
 interface WebBotAuthInfo {
   /** Both `Signature` and `Signature-Input` are present → cryptographically signed agent. */
@@ -2179,6 +2395,8 @@ function firstHttpsUrl(text: string): string | null {
 function resolveSignatureAgentOperator(host: string, label: string): AiAgentOperatorId | null {
   const lowerHost = host.toLowerCase();
   const lowerLabel = label.toLowerCase();
+  // Google's labelled `g=` signature and its `*.bot.goog` Signature-Agent hosts are a
+  // first-party special case that predates the registry.
   if (
     lowerHost === 'agent.bot.goog' ||
     lowerHost.endsWith('.bot.goog') ||
@@ -2187,13 +2405,11 @@ function resolveSignatureAgentOperator(host: string, label: string): AiAgentOper
   ) {
     return 'google';
   }
-  if (lowerHost.endsWith('openai.com') || lowerHost.endsWith('chatgpt.com')) return 'openai';
-  if (lowerHost.endsWith('perplexity.ai')) return 'perplexity';
-  if (lowerHost.endsWith('anthropic.com') || lowerHost.endsWith('claude.ai')) return 'anthropic';
-  if (lowerHost.endsWith('browserbase.com')) return 'browserbase';
-  if (lowerHost.endsWith('anchorbrowser.io')) return 'anchorbrowser';
-  if (lowerHost.endsWith('x.ai') || lowerHost.endsWith('grok.com')) return 'xai';
-  if (lowerHost.endsWith('meta.com') || lowerHost.endsWith('facebook.com')) return 'meta';
+  for (const rule of SIGNATURE_HOST_RULES) {
+    if (lowerHost === rule.host || lowerHost.endsWith(`.${rule.host}`) || lowerHost.endsWith(rule.host)) {
+      return rule.operator;
+    }
+  }
   return null;
 }
 
@@ -2358,19 +2574,20 @@ function asnIn(asn: string | undefined, digits: readonly string[]): boolean {
   return value.length > 0 && digits.includes(value);
 }
 
-const GOOGLE_VERIFICATION_SUFFIXES = ['googlebot.com', 'google.com'];
-const OPENAI_VERIFICATION_SUFFIXES = ['openai.com', 'chatgpt.com'];
-const PERPLEXITY_VERIFICATION_SUFFIXES = ['perplexity.ai'];
-const ANTHROPIC_VERIFICATION_SUFFIXES = ['anthropic.com', 'claude.ai'];
-const XAI_VERIFICATION_SUFFIXES = ['x.ai', 'grok.com'];
-const META_VERIFICATION_SUFFIXES = ['facebook.com', 'meta.com', 'fb.com'];
+// Verification metadata is derived from the shared registry (with validated legacy fallbacks).
+const GOOGLE_VERIFICATION_SUFFIXES = suffixesForAgent('googlebot', 'google', 'gemini');
+const OPENAI_VERIFICATION_SUFFIXES = suffixesForAgent('gptbot', 'chatgpt-user', 'openai');
+const PERPLEXITY_VERIFICATION_SUFFIXES = suffixesForAgent('perplexitybot', 'perplexity');
+const ANTHROPIC_VERIFICATION_SUFFIXES = suffixesForAgent('claudebot', 'anthropic');
+const XAI_VERIFICATION_SUFFIXES = suffixesForAgent('grokbot', 'xai');
+const META_VERIFICATION_SUFFIXES = suffixesForAgent('muse', 'meta-externalagent', 'meta');
 
-const GCP_ASNS = ['15169', '396982'];
-const XAI_ASNS = ['400562', '13414'];
-const META_ASNS = ['32934', '63293'];
-const AWS_ASNS = ['16509', '14618'];
-const AZURE_ASNS = ['8075'];
-const PERPLEXITY_ASNS = ['209242'];
+const GCP_ASNS = asnsForAgent('googlebot', 'google', 'gemini');
+const XAI_ASNS = asnsForAgent('grok', 'xai');
+const META_ASNS = asnsForAgent('muse', 'meta');
+const AWS_ASNS = asnsForAgent('aws');
+const AZURE_ASNS = asnsForAgent('azure');
+const PERPLEXITY_ASNS = asnsForAgent('perplexitybot', 'perplexity');
 
 interface AiAgentResolverClient {
   isBot?: boolean;
@@ -2409,15 +2626,54 @@ const NO_AI_AGENT: AiAgentAttribution = {
   evidence: [],
 };
 
+/** Registry agents introduce new agent ids / execution modes beyond the legacy union. */
+type ExtendedAgentAttribution = Omit<AiAgentAttribution, 'agentId' | 'executionMode'> & {
+  agentId: string | null;
+  executionMode: string | null;
+};
+
 function aiAgentResult(
-  partial: Omit<AiAgentAttribution, 'detected' | 'riskScore'> &
-    Partial<Pick<AiAgentAttribution, 'riskScore'>>
+  partial: Omit<ExtendedAgentAttribution, 'detected' | 'riskScore'> &
+    Partial<Pick<ExtendedAgentAttribution, 'riskScore'>>
 ): AiAgentAttribution {
   return {
     detected: true,
     riskScore: partial.riskScore ?? (partial.agentId === 'impostor-spoof' ? 10 : 8),
     ...partial,
-  };
+  } as unknown as AiAgentAttribution;
+}
+
+/**
+ * Decides whether the registry's minimum proof tier is satisfied. String tiers are compared by
+ * rank; numeric tiers (0..4) and uncommon aliases are handled as well so a registry change in
+ * proof-tier naming cannot silently over-verify an agent.
+ */
+function proofTierSatisfied(
+  minProof: ProofTier | string | undefined,
+  proofs: { feed: boolean; fcrdns: boolean; signature: boolean }
+): boolean {
+  const tier = String(minProof ?? 'verified').toLowerCase();
+  // Legacy aliases plus the registry's ProofTier union ('rfc9421' | 'signed_agent' | 'cidr' |
+  // 'fcrdns' | 'allowlist' | 'ua_claim' | 'automation').
+  if (/^(none|any|0|ua_claim|automation|claim|ua)$/.test(tier)) return true;
+  if (/^(rfc9421|signed_agent|signature|wba|sail|signed|jws|4)$/.test(tier)) return proofs.signature;
+  if (/^(cidr|feed|ip|network|3)$/.test(tier)) return proofs.feed || proofs.signature;
+  if (/^(fcrdns|dns|reverse|2)$/.test(tier)) return proofs.fcrdns || proofs.signature;
+  return proofs.feed || proofs.fcrdns || proofs.signature;
+}
+
+/** True when a signed agent's Signature-Agent / keyid belongs to this registry agent. */
+function signatureMatchesAgent(webBotAuth: WebBotAuthInfo, agent: LocalAgentDef): boolean {
+  if (!webBotAuth.present) return false;
+  const operatorId = operatorIdFromName(agent.provider || agent.id);
+  if (webBotAuth.operator === operatorId) return true;
+  const haystack = `${webBotAuth.agentHost} ${webBotAuth.keyId} ${webBotAuth.label}`.toLowerCase();
+  if (!haystack.trim()) return false;
+  if (agent.signatureHosts?.some((host) => haystack.includes(String(host).toLowerCase()))) return true;
+  if (agent.keyIdNeedles?.some((needle) => webBotAuth.keyId.toLowerCase().includes(String(needle).toLowerCase()))) {
+    return true;
+  }
+  return haystack.includes(String(agent.provider || '').toLowerCase()) || haystack.includes(agent.id.toLowerCase());
 }
 
 /**
@@ -2429,6 +2685,11 @@ function aiAgentResult(
 export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promise<AiAgentAttribution> {
   const ua = input.userAgent || readRequestHeader(input.headers, 'user-agent');
   if (!ua) return NO_AI_AGENT;
+  // Robots.txt policy tokens are directives, never HTTP visits.
+  if (isRegistryPolicyToken(ua)) return NO_AI_AGENT;
+  // Named registry agents are resolved by Rule H below (with their own proof-tier rules), so a
+  // generic signed-browser rule must not pre-empt their exact identity or verification verdict.
+  const registryMatch = findRegistryAgent(ua);
 
   const webBotAuth = parseWebBotAuthHeaders(input.headers);
   const referer = `${readRequestHeader(input.headers, 'referer')} ${readRequestHeader(
@@ -2959,7 +3220,7 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
       : webBotAuth.operator === 'anchorbrowser'
       ? { name: 'Anchor Browser AI Agent', operator: 'Anchor Browser' }
       : null;
-  if (webBotAuth.present || cloudBrowserOperator) {
+  if ((webBotAuth.present || cloudBrowserOperator) && !registryMatch) {
     const handle = webBotAuth.agentHost || webBotAuth.keyId || 'unattributed signer';
     return aiAgentResult({
       agentId: 'cloud-browser',
@@ -2978,6 +3239,59 @@ export async function resolveAiAgentIdentity(input: AiAgentResolverInput): Promi
         ...(networkHaystack ? [`Network identity: ${networkHaystack}`] : []),
         ...directoryEvidence,
       ],
+    });
+  }
+
+  /* ---------- Rule H — registry-backed generic agent attribution ----------- */
+  // Every named crawler in the shared registry must be attributable with its exact display
+  // name, even when it has no bespoke rule above. Only first-party proof (a published CIDR
+  // prefix, forward-confirmed reverse DNS or a matching RFC 9421 / SAIL signature) can turn
+  // the UA claim into a verified identity; the registry's minimum proof tier is honoured.
+  if (registryMatch) {
+    const agent = asLocalAgent(registryMatch);
+    if (isRegistryPolicyToken(ua) || agent.policyToken === true) {
+      return NO_AI_AGENT;
+    }
+    const agentRecord = agent as unknown as Record<string, unknown>;
+    const suffixesRaw =
+      agent.fcrdnsSuffixes ??
+      registryLookup(agentRecord, 'verificationSuffixes') ??
+      registryLookup(agentRecord, 'fcrdnsSuffixes');
+    const suffixes = Array.isArray(suffixesRaw)
+      ? suffixesRaw.filter((item): item is string => typeof item === 'string' && item.length > 0)
+      : suffixesForAgent(agent.id, agent.provider);
+    const feedIdsRaw = agent.feedIds ?? registryLookup(agentRecord, 'feedIds');
+    const feedIds = Array.isArray(feedIdsRaw)
+      ? feedIdsRaw.filter((item): item is string => typeof item === 'string' && item.length > 0)
+      : [];
+    const registryDnsNames = suffixes.length > 0 ? await confirmedNames() : [];
+    const proofs = {
+      feed: feedIds.length > 0 && matchesAiPrefixTable(input.publicIp, feedIds),
+      fcrdns: hostMatchesSuffix(registryDnsNames, suffixes),
+      signature: signatureMatchesAgent(webBotAuth, agent),
+    };
+    let verified = proofTierSatisfied(agent.minProofForVerified, proofs);
+    // Training scrapers hold no first-party verification path here, and an unsigned browser
+    // harness may only ever be an unproven claim.
+    if (/mistral[\s_-]?ai[\s_-]?training/i.test(agent.id)) verified = false;
+    if (/manus/i.test(agent.id) && !proofs.signature) verified = false;
+
+    return aiAgentResult({
+      agentId: agent.id,
+      agentName: agent.displayName,
+      operator: agent.provider,
+      executionMode: agent.executionMode || 'Autonomous Crawler',
+      verified,
+      confidence: verified ? 'Verified' : 'Medium',
+      riskScore: verified ? 2 : 8,
+      evidence: [
+        `Named agent user-agent claim: ${ua.slice(0, 120)}`,
+        proofs.feed ? 'Source IP matched a registry-published crawler CIDR prefix' : '',
+        proofs.fcrdns ? 'FCrDNS matched the operator verification suffix' : '',
+        proofs.signature ? 'RFC 9421 / SAIL signature attributed to the operator' : '',
+        ...(!verified ? ['Verification sources unavailable — identity inferred from the user-agent claim'] : []),
+        ...directoryEvidence,
+      ].filter(Boolean),
     });
   }
 
@@ -4560,6 +4874,66 @@ function retrieveLshCandidates(
 }
 
 /**
+ * A fresh, storage-less context may only inherit a canonical visitor through the fuzzy path when
+ * stable structural anchors actually agree with the candidate's stored profile. Volatile axes
+ * (screen, DPR, touch, IP, timezone) are deliberately excluded: they change between reloads and
+ * resizes and must never mint a returning visitor out of an unrelated fresh profile.
+ */
+function structuralAnchorsMatch(
+  db: DatabaseAdapter,
+  profile: ResolverProfile,
+  candidateVisitorId: string,
+  identityHardwareFingerprint: string
+): { matched: boolean; reasons: string[] } {
+  try {
+    const row = db
+      .prepare('SELECT profile_json, hardware_fingerprint FROM visitor_profiles WHERE visitor_id = ?')
+      .get(candidateVisitorId) as
+      | { profile_json?: unknown; hardware_fingerprint?: unknown }
+      | undefined;
+    if (!row) return { matched: false, reasons: [] };
+    if (
+      typeof row.hardware_fingerprint === 'string' &&
+      row.hardware_fingerprint.length > 0 &&
+      row.hardware_fingerprint === identityHardwareFingerprint
+    ) {
+      return { matched: true, reasons: ['exact hardware fingerprint anchor'] };
+    }
+    if (typeof row.profile_json !== 'string') return { matched: false, reasons: [] };
+    const stored = JSON.parse(row.profile_json) as Record<string, unknown>;
+    const current = profile as unknown as Record<string, unknown>;
+    const nested = (value: unknown, key: string): unknown =>
+      value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined;
+    const pairs: Array<{ label: string; current: unknown; stored: unknown; hard: boolean }> = [
+      { label: 'gpu vendor', current: nested(current.gpu, 'vendor'), stored: nested(stored.gpu, 'vendor'), hard: false },
+      { label: 'gpu renderer', current: nested(current.gpu, 'renderer'), stored: nested(stored.gpu, 'renderer'), hard: true },
+      { label: 'canvas hash', current: nested(current.canvas, 'hash'), stored: nested(stored.canvas, 'hash'), hard: true },
+      { label: 'audio hash', current: nested(current.audio, 'hash'), stored: nested(stored.audio, 'hash'), hard: true },
+      { label: 'cpu cores', current: nested(current.cpu, 'cores'), stored: nested(stored.cpu, 'cores'), hard: true },
+      { label: 'os family', current: nested(current.os, 'family'), stored: nested(stored.os, 'family'), hard: false },
+      { label: 'browser family', current: nested(current.browser, 'family'), stored: nested(stored.browser, 'family'), hard: false },
+    ];
+    let matches = 0;
+    let hardMatches = 0;
+    const reasons: string[] = [];
+    for (const pair of pairs) {
+      if (
+        pair.current !== undefined &&
+        pair.current !== null &&
+        String(pair.current) === String(pair.stored)
+      ) {
+        matches += 1;
+        if (pair.hard) hardMatches += 1;
+        reasons.push(pair.label);
+      }
+    }
+    return { matched: matches >= 2 && hardMatches >= 1, reasons };
+  } catch {
+    return { matched: false, reasons: [] };
+  }
+}
+
+/**
  * Persist the BGP ASN and its resolved RDAP netblock organisation in the same cache row so
  * both facts are always read back together; a reassignment mismatch is reported when the
  * cached netblock org diverges from the live ASN org.
@@ -5112,10 +5486,15 @@ function sanitizeBrowserDevice(input: Partial<BrowserDeviceInfo> | undefined): B
     typeof input?.privateMode === 'boolean'
       ? Boolean(input?.incognito ?? input?.isIncognito ?? input?.privateMode)
       : undefined;
-  const incognitoMethod =
+  const rawIncognitoMethod =
     typeof input?.incognitoMethod === 'string' && input.incognitoMethod.trim()
       ? input.incognitoMethod.trim().slice(0, 120)
       : undefined;
+  const incognitoMethod = humanIncognitoMethod(
+    rawIncognitoMethod,
+    Boolean(incognitoAlias),
+    storageProbeInconclusive(rawIncognitoMethod)
+  );
   const idbDurabilityRatio =
     typeof input?.idbDurabilityRatio === 'number' && Number.isFinite(input.idbDurabilityRatio)
       ? Number(input.idbDurabilityRatio)
@@ -5166,8 +5545,7 @@ function sanitizeBrowserDevice(input: Partial<BrowserDeviceInfo> | undefined): B
     isIncognito: incognitoAlias,
     privateMode: incognitoAlias,
     incognitoMethod,
-    idbDurabilityRatio,
-    opfsFlushMs,
+    // Storage probe internals are never part of a user-visible browser payload.
   };
 }
 
@@ -5523,6 +5901,10 @@ function normalizeServerTimezoneId(tz: string | null | undefined): string {
  */
 type ExtendedHardwareSignals = HardwareSignals & {
   incognitoConfidence?: number;
+  /** Original client OS claim, retained for telemetry only (never used for display). */
+  claimedOs?: string;
+  /** Human-readable evidence for the runtime OS authority (telemetry only). */
+  osProof?: string[];
 };
 
 function sanitizeHardwareSignals(
@@ -5578,6 +5960,21 @@ function sanitizeHardwareSignals(
       ? Math.round(raw.maxTextureSize)
       : 0;
 
+  // Runtime evidence (WebGL backend + host/math probes) owns the OS label. A lone client
+  // `hostOs` claim stays telemetry-only and never promotes a UA OS to "(verified)".
+  const runtimeOs = inferRuntimeOsVerdict(
+    {
+      hostOs: safeStr(rawHardwareExtras.hostOs, '', 120),
+      gpuRenderer: safeStr(raw?.gpuRenderer, '', 160),
+      gpuVendor: safeStr(raw?.gpuVendor, '', 120),
+      gpuArchFamily: safeStr(rawHardwareExtras.gpuArchFamily, '', 40),
+      architectureSource: safeStr(rawHardwareExtras.architectureSource, '', 80),
+      engine: safeStr(rawHardwareExtras.engine, '', 120),
+      architecture: safeStr(raw?.architecture, '', 80),
+    },
+    browserDevice.os
+  );
+
   return {
     hardwareId: validHwId,
     gpuVendor: safeStr(raw?.gpuVendor, 'Standard WebGL Vendor', 120),
@@ -5599,7 +5996,9 @@ function sanitizeHardwareSignals(
     // mismatch verdicts. These are pass-through only — never derived from the User-Agent here.
     architectureSource: safeStr(rawHardwareExtras.architectureSource, '', 80),
     claimedArchitecture: safeStr(rawHardwareExtras.claimedArchitecture, '', 80),
-    hostOs: safeStr(rawHardwareExtras.hostOs, '', 120),
+    hostOs: runtimeOs.authoritative && runtimeOs.family ? runtimeOs.family : safeStr(rawHardwareExtras.hostOs, '', 120),
+    claimedOs: safeStr(rawHardwareExtras.hostOs, '', 120),
+    osProof: runtimeOs.evidence,
     engine: safeStr(rawHardwareExtras.engine, '', 120),
     engineErrorLength:
       typeof rawHardwareExtras.engineErrorLength === 'number' &&
@@ -5611,7 +6010,7 @@ function sanitizeHardwareSignals(
     audioNoise: Boolean(rawHardwareExtras.audioNoise),
     canvasCoarseHash: safeNullableStr(rawHardwareExtras.canvasCoarseHash, 40),
     archUaMismatch: Boolean(rawHardwareExtras.archUaMismatch),
-    osUaMismatch: Boolean(rawHardwareExtras.osUaMismatch),
+    osUaMismatch: runtimeOs.uaMismatch,
   };
 }
 
@@ -5652,6 +6051,8 @@ interface RequestIntegrityContext {
   clientTorBrowser?: boolean;
   /** Granular AI-agent attribution resolved by the AI attribution engine. */
   aiAgent?: AiAgentAttribution | null;
+  /** Shared-registry definition behind the attributed agent (exact display name + category). */
+  registryAgent?: LocalAgentDef | null;
   /** Canonical bot verdict resolved before sanitization; the single source of truth for isBot. */
   botVerdict?: string;
   /** Automation-targeted tampering escalation resolved from reasons + botSignals. */
@@ -6002,15 +6403,8 @@ function sanitizeAndReinforceSecuritySignals(
   const datacenterAsn = classification.isConsumerBroadband
     ? false
     : isCloudOrDatacenterNetwork;
-  const vpnReasons = safeStrArray(raw?.vpnReasons);
-  if (
-    timezoneMismatch &&
-    !vpnReasons.some((r) => r.toLowerCase().includes('timezone'))
-  ) {
-    vpnReasons.push(
-      `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})`
-    );
-  }
+  // Timezone difference is an orthogonal network-axis note, never a VPN / proxy method.
+  const vpnReasons = safeStrArray(raw?.vpnReasons).filter((reason) => !/time[_ -]?zone/i.test(reason));
   if (
     datacenterAsn &&
     !vpnReasons.some((r) => r.toLowerCase().includes('datacenter') || r.toLowerCase().includes('asn'))
@@ -6153,7 +6547,7 @@ function sanitizeAndReinforceSecuritySignals(
     typeof raw?.vmReason === 'string' && raw.vmReason.trim()
       ? raw.vmReason.trim().slice(0, 200)
       : '';
-  const incognitoMethod =
+  const rawIncognitoMethod =
     typeof raw?.incognitoMethod === 'string' && raw.incognitoMethod.trim()
       ? raw.incognitoMethod.trim().slice(0, 120)
       : '';
@@ -6247,6 +6641,12 @@ function sanitizeAndReinforceSecuritySignals(
   const clientReportedIncognito =
     Boolean(incognitoContext.clientReportedIncognito) || incognitoLikely;
   const isIncognito = clientReportedIncognito;
+  // Storage diagnostics are reduced to one of three human outcomes before serialization.
+  const incognitoMethod = humanIncognitoMethod(
+    rawIncognitoMethod,
+    isIncognito,
+    storageProbeInconclusive(rawIncognitoMethod)
+  );
 
   const tierFor = (score: number): RiskLevel =>
     score >= 7 ? 'High' : score >= 3 ? 'Medium' : 'Low';
@@ -6264,49 +6664,86 @@ function sanitizeAndReinforceSecuritySignals(
     scoreOutOf10: incognitoScore,
     riskLabel: `${tierFor(incognitoScore)} Risk • ${incognitoScore}/10`,
     level: levelFor(incognitoScore),
-    // The physical proof must match the verdict: a private tile always quotes the client's
-    // own storage-commit probe method, a normal tile quotes the verified disk-backed path.
+    // Human-readable probe outcome only. Ratio numbers, "fail-open", IDB and other diagnostic
+    // internals stay out of every user-visible surface.
     detail: isIncognito
-      ? `Ephemeral RAM storage detected (${
-          incognitoMethod || 'In-memory LevelDB / 10 GiB decoy quota'
-        })`
-      : `Persistent disk-backed storage verified (${incognitoMethod || 'Standard profile'})`,
+      ? 'Ephemeral / private storage detected'
+      : humanIncognitoMethod(incognitoMethod, false, storageProbeInconclusive(incognitoMethod)),
   };
 
   // Tile 2 — Bot & Automation Detection (10 spoofed impostor / 9 stealth automation /
-  // 7 automation or AI agent / 2 good bot / 0). The attribution engine names the exact agent
-  // and quotes its evidence.
+  // 7 unverified automation / 2 verified AI agent / 0 verified search crawler).
+  // A registry-named crawler is shown with its exact display name, provider and proof.
   const aiAgent = requestContext.aiAgent ?? null;
+  const registryAgent = requestContext.registryAgent ?? null;
   const spoofedImpostor =
     aiAgent?.agentId === 'impostor-spoof' ||
     (botSubtype === 'bad_bot' && spoofedCrawler);
+  const registryCategory = registryAgent?.category || '';
+  const verifiedNamedAgent = Boolean(registryAgent && aiAgent?.verified);
+  const verifiedGoodCrawler = verifiedNamedAgent && isGoodCrawlerCategory(registryCategory);
+  const verifiedAiAgent = verifiedNamedAgent && !isGoodCrawlerCategory(registryCategory);
   // Calibrated scale: a spoofed impostor is 10, hard automation artifacts (stealth plugins,
-  // CDP leak, anti-detect browser, ML score >= 0.5) are 9, plain automation and a named AI
-  // agent are 7, a verified crawler is 2. Only 9-10 means confirmed active deception. The
-  // hard-automation check comes first so a stale human / good-bot / agent classification can
-  // never suppress the escalation on the tile.
+  // CDP leak, anti-detect browser, ML score >= 0.5) are 9, an unverified automation or agent
+  // claim is 7, a verified named AI agent is 2 and a verified search crawler is 0. Only 9-10
+  // means confirmed active deception. The hard-automation check comes first so a stale
+  // human / good-bot / agent classification can never suppress the escalation on the tile.
   const botScore = spoofedImpostor
     ? 10
     : activeDeception
     ? 9
     : botSubtype === 'bad_bot'
     ? 7
+    : verifiedGoodCrawler
+    ? 0
+    : verifiedAiAgent
+    ? 2
     : botSubtype === 'ai_agent'
     ? 7
     : botSubtype === 'good_bot'
     ? 2
     : 0;
-  const botStatus = spoofedImpostor
-    ? 'Spoofed AI Impostor'
-    : stealthAutomation || botSubtype === 'bad_bot'
-    ? 'Bot / Automated'
-    : aiAgent?.detected && aiAgent.agentName
+  const tileRuntimeOs = inferRuntimeOsVerdict(
+    {
+      hostOs: (hardwareSignals as ExtendedHardwareSignals).hostOs,
+      gpuRenderer: hardwareSignals.gpuRenderer,
+      gpuVendor: hardwareSignals.gpuVendor,
+      gpuArchFamily: (hardwareSignals as ExtendedHardwareSignals).gpuArchFamily,
+      architectureSource: (hardwareSignals as ExtendedHardwareSignals).architectureSource,
+      engine: (hardwareSignals as ExtendedHardwareSignals).engine,
+      architecture: hardwareSignals.architecture,
+    },
+    browserDevice.os
+  );
+  const registryIdentity = spoofedImpostor
+    ? 'spoofed'
+    : aiAgent?.verified
+    ? /signed/i.test(String(aiAgent.executionMode || ''))
+      ? 'signed'
+      : 'verified'
+    : 'unknown';
+  const automationLabel = String(botClassification.label || '');
+  const headlessAutomation =
+    /headless|chromium|puppeteer|playwright/i.test(automationLabel) ||
+    /headless/i.test(hardAutomationReasons.join(' '));
+  // The tile status is always an exact bot / agent type — never a vague confidence phrase.
+  const rawBotStatus =
+    // A named agent is ALWAYS shown by its exact registry name, including when its claim
+    // failed verification — the identity badge (Spoofed / Unverified) carries that fact.
+    registryAgent
+      ? registryDisplay(registryAgent as unknown as AgentDef, registryIdentity).label
+      : stealthAutomation || botSubtype === 'bad_bot'
+      ? headlessAutomation
+        ? 'Headless Browser Automation'
+        : 'Stealth Automation'
+      : aiAgent?.detected && aiAgent.agentName
     ? aiAgent.agentName
     : botSubtype === 'ai_agent'
-    ? 'AI Agent · Cloud Browser'
+    ? automationLabel || 'AI Agent'
     : botSubtype === 'good_bot'
-    ? 'Good Bot · Search Crawler'
+    ? automationLabel || 'Search Crawler'
     : 'Verified Human';
+  const botStatus = crispBotStatus(rawBotStatus, tileRuntimeOs);
   const aiAgentDetail =
     aiAgent?.detected && aiAgent.agentName
       ? `${aiAgent.agentName} — ${aiAgent.operator}${
@@ -6315,7 +6752,20 @@ function sanitizeAndReinforceSecuritySignals(
           aiAgent.evidence[0] || 'agent identity attributed from request headers'
         }`
       : '';
-  const botDetail = stealthAutomation
+  const registryBotDetail =
+    registryAgent && aiAgent?.detected
+      ? `${registryAgent.displayName} — ${registryAgent.provider}${
+          registryAgent.category ? ` · ${registryAgent.category}` : ''
+        } · ${aiAgent.verified ? 'verified by first-party evidence' : 'unverified identity claim'}: ${
+          aiAgent.evidence.find((line) =>
+            /CIDR|FCrDNS|signature|SAIL|Web Bot Auth/i.test(line)
+          ) ||
+          aiAgent.evidence[0] ||
+          'agent identity attributed from request headers'
+        }`
+      : '';
+  const botDetail = scrubOsClaim(
+    stealthAutomation
     ? `${hardAutomationReasons.join('; ') || 'Stealth / anti-detect automation runtime detected'} — hard automation artifact, never a verified human`
     : botSubtype === 'human' && !aiAgent?.detected
       ? developerToolsAttached
@@ -6325,6 +6775,8 @@ function sanitizeAndReinforceSecuritySignals(
               : ''
           }`
         : 'Verified human interactive session'
+      : registryBotDetail
+      ? registryBotDetail
       : aiAgentDetail
       ? aiAgentDetail
       : botSubtype === 'ai_agent'
@@ -6339,7 +6791,9 @@ function sanitizeAndReinforceSecuritySignals(
         botClassification.reasons[0] ||
         (spoofedCrawler
           ? 'Crawler user-agent claimed from a network that does not belong to the operator'
-          : 'WebDriver / CDP automation runtime detected');
+          : 'WebDriver / CDP automation runtime detected'),
+    tileRuntimeOs
+  );
 
   const botSignal: SmartSignal = {
     id: 'bot',
@@ -6421,7 +6875,7 @@ function sanitizeAndReinforceSecuritySignals(
     : isDatacenterAsn
     ? 'Datacenter / Hosting Network'
     : hasTzMismatch
-    ? 'Timezone Mismatch (Orthogonal)'
+    ? 'Not detected'
     : 'Standard ISP';
   const vpnDetail = torAnonymity
     ? `${torExitNode ? 'Confirmed active Tor exit relay' : 'Tor Browser fingerprint (Gecko RFP + letterboxing)'} (${
@@ -6444,11 +6898,11 @@ function sanitizeAndReinforceSecuritySignals(
       ? `Tor relay / anonymity infrastructure (${torOperatorLabel || asnOrOrg})`
       : `Verified proxy-chain / relay evidence on ${ispBrand}${asnSuffix}`
     : isDatacenterAsn && hasTzMismatch
-    ? `Datacenter ASN (${ispBrand}${asnSuffix}) combined with a browser/IP timezone mismatch (${clientTzCanonical} vs ${ipTzCanonical})`
+    ? `Datacenter ASN (${ispBrand}${asnSuffix}) — network ownership observation; the timezone difference is reported on the network axis only`
     : isDatacenterAsn
     ? `Datacenter / hosting ASN detected on ${ispBrand}${asnSuffix}`
     : hasTzMismatch
-    ? `Browser timezone (${browserTimezone}) differs from IP geolocation timezone (${ipTimezone})`
+    ? 'Not detected — no VPN, proxy or relay evidence. Timezone difference is a separate network observation.'
     : `${ispBrand} • ${classification.networkType} (${asnLabel}) verified against browser timezone ${browserTimezone}`;
 
   const vpnSignal: SmartSignal = {
@@ -6722,16 +7176,20 @@ function sanitizeAndReinforceSecuritySignals(
       // preserve it verbatim so 'low' can never be mistaken for an incognito verdict. The cast
       // bridges the legacy numeric type declaration while the shared type migrates to the label.
       incognitoConfidence: incognitoConfidenceLabel as unknown as number,
-      incognitoDetail:
-        typeof raw?.incognitoDetail === 'string' ? raw.incognitoDetail.trim().slice(0, 240) : '',
+      incognitoDetail: humanIncognitoMethod(
+        typeof raw?.incognitoDetail === 'string' ? raw.incognitoDetail : rawIncognitoMethod,
+        isIncognito,
+        storageProbeInconclusive(rawIncognitoMethod)
+      ),
       // Final 4-signal upgrade — private browsing, bot, network, VM integrity
       isIncognito,
       incognito: isIncognito,
       privateMode: isIncognito,
       incognitoMethod,
       headroomGiB,
-      idbDurabilityRatio,
-      opfsFlushMs,
+      // Ratio / flush diagnostics stay internal: only the human storage outcome is serialized.
+      idbDurabilityRatio: null,
+      opfsFlushMs: null,
       isHeadless,
       botReason,
       webdriver,
@@ -7828,8 +8286,10 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
 
     // Phase 1b — granular AI-agent attribution. CIDR / FCrDNS / RFC 9421 verification is only
     // attempted when the request actually claims an agent identity, so a normal page load pays
-    // no DNS cost.
-    const aiAgent = await resolveAiAgentIdentity({
+    // no DNS cost. Workers reject global timers, so re-arm the TTL-guarded, non-blocking feed
+    // sync here as well; Node keeps its module-load daemon.
+    void ensureAiBotCidrSync();
+    let aiAgent = await resolveAiAgentIdentity({
       headers: rawRequestHeaders,
       userAgent: fullRequestUserAgent,
       network: { isp: location.isp, org: location.org, asn: location.asn },
@@ -7855,9 +8315,30 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       },
     });
 
+    // Resolve the registry definition behind the attributed agent. A User-Agent match is the
+    // most specific source (e.g. GPTBot instead of a generic OpenAI operator), with the agent
+    // id as a fallback for signed / telemetry-only attributions.
+    // Match the registry from the UA even for a failed/spoofed claim. The identity badge
+    // carries the verification failure; the NAME must still be the exact agent token so the
+    // dashboard never falls back to a generic "Spoofed AI Impostor" string.
+    const registryUaMatch = findRegistryAgent(fullRequestUserAgent);
+    const registryAgent = registryUaMatch
+      ? asLocalAgent(registryUaMatch)
+      : lookupAgent(aiAgent.agentId);
+    if (registryUaMatch) {
+      // The exact registry display name and provider must reach every surface: the smart-signal
+      // card, securitySignals.aiAgent, bot_info and the response mirrors.
+      aiAgent = {
+        ...aiAgent,
+        agentName: asLocalAgent(registryUaMatch).displayName,
+        operator: asLocalAgent(registryUaMatch).provider,
+      };
+    }
+
     // The attribution engine is authoritative over the generic classifier for AI identities:
     // a named agent replaces the generic label, and a failed official-bot claim becomes a
-    // spoofed impostor (10/10) instead of a neutral crawler verdict.
+    // spoofed impostor (10/10) instead of a neutral crawler verdict. Verified search crawlers
+    // and link previews keep their legitimate good_bot subtype; every ai_* category stays bad.
     const attributedBotClassification: BotClassification | null =
       aiAgent.detected && aiAgent.agentId === 'impostor-spoof'
         ? {
@@ -7870,10 +8351,13 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
           }
         : aiAgent.detected && aiAgent.agentId !== null
         ? {
-            subtype: 'ai_agent',
+            subtype:
+              registryAgent && aiAgent.verified && isGoodCrawlerCategory(registryAgent.category)
+                ? 'good_bot'
+                : 'ai_agent',
             label: aiAgent.agentName,
             provider: aiAgent.operator,
-            category: 'AI Agent',
+            category: registryAgent?.category || 'AI Agent',
             confidence: aiAgent.verified ? 0.99 : 0.85,
             reasons: aiAgent.evidence.slice(0, 3),
           }
@@ -7941,6 +8425,7 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         torOperatorHint: torStatus.viaOperatorHint,
         clientTorBrowser: Boolean(rawSecuritySignals?.isTorBrowserClient),
         aiAgent,
+        registryAgent,
         ipBlocklisted: blocklist.blocklisted,
         ipBlocklistReasons: blocklist.reasons,
         botClassification: effectiveBotClassification,
@@ -7958,10 +8443,34 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
             uaIdentity.browserFullVersion ? ` ${uaIdentity.browserFullVersion}` : ''
           }`
         : browserDevice.browser;
-    const serverVerifiedOs =
+    // Runtime OS authority: when two independent runtime proofs agree, the host OS wins over
+    // the UA / Sec-CH-UA claim. Otherwise the UA value is a claim only and is labelled as such.
+    const runtimeOsVerdict = inferRuntimeOsVerdict(
+      {
+        hostOs: (hardwareSignals as ExtendedHardwareSignals).hostOs,
+        gpuRenderer: hardwareSignals.gpuRenderer,
+        gpuVendor: hardwareSignals.gpuVendor,
+        gpuArchFamily: (hardwareSignals as ExtendedHardwareSignals).gpuArchFamily,
+        architectureSource: (hardwareSignals as ExtendedHardwareSignals).architectureSource,
+        engine: (hardwareSignals as ExtendedHardwareSignals).engine,
+        architecture: hardwareSignals.architecture,
+      },
+      uaIdentity.os && uaIdentity.os !== 'Unknown' ? uaIdentity.os : browserDevice.os
+    );
+    const runtimeOsAuthoritative = runtimeOsVerdict.authoritative && !rfpExemptRequest;
+    const uaOsLabel =
       uaIdentity.os && uaIdentity.os !== 'Unknown'
         ? `${uaIdentity.os}${uaIdentity.osVersion ? ` ${uaIdentity.osVersion}` : ''}`
         : browserDevice.os;
+    const uaOsFamily = osFamilyFromText(uaOsLabel);
+    const conflictingRuntimeClaim = Boolean(
+      runtimeOsVerdict.family && uaOsFamily && uaOsFamily !== runtimeOsVerdict.family
+    );
+    const serverVerifiedOs = runtimeOsAuthoritative && runtimeOsVerdict.family
+      ? runtimeOsVerdict.label
+      : conflictingRuntimeClaim && !/\(claimed\)$/i.test(uaOsLabel)
+      ? `${uaOsLabel} (claimed)`
+      : uaOsLabel;
     const osFamilyKey = (value: string): string => {
       const text = String(value || '').toLowerCase();
       if (!text || text === 'unknown') return '';
@@ -8130,6 +8639,13 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
           safariAtfp: Boolean(rawExtras.safariAtfp),
         })
     );
+    // A UA OS that contradicts two agreeing runtime proofs is a spec violation. Privacy-hardened
+    // / Tor / RFP sessions are exempt: reduced-entropy probes cannot authoritatively name an OS.
+    if (runtimeOsAuthoritative && runtimeOsVerdict.uaMismatch && !privacyHardened) {
+      specAssessment.hardViolations = Array.from(
+        new Set([...specAssessment.hardViolations, 'os_ua_mismatch'])
+      );
+    }
     const reconciledTampering = enforceTamperingInvariant({
       reasons: [
         ...(tamperingAssessment?.details?.reasons || []),
@@ -8328,6 +8844,11 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     let botInfo: BotInfo | null = null;
     let botType: string | null = null;
     let botVerdict = 'not_detected';
+    // A "spoofed" identity needs a loaded feed / DNS answer that positively excludes the IP;
+    // unavailable verification sources alone must degrade to "unknown", never to a spoof.
+    const positiveSpoofExclusion = (aiAgent?.evidence || []).some((line) =>
+      /is not (on|inside)\b/i.test(line)
+    );
 
     if (hardAutomationSignals) {
       // A stealth / anti-detect runtime is always an automation verdict — never let a crawler
@@ -8340,6 +8861,24 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       };
       botType = automationTargetedTampering ? 'stealth_automation' : 'browser_automation';
       botVerdict = 'bad';
+    } else if (aiAgent.detected && registryAgent && aiAgent.agentId !== 'impostor-spoof') {
+      // Registry-backed named agent: the exact display name, provider and category flow into
+      // bot_info / bot_type / botVerdict so every bot surface agrees with the smart-signal tile.
+      botInfo = {
+        category: registryAgent.category || 'ai_agent',
+        provider: registryAgent.provider || 'Unknown',
+        name: registryAgent.displayName || aiAgent.agentName,
+        identity: aiAgent.verified
+          ? /signed/i.test(String(aiAgent.executionMode || ''))
+            ? 'signed'
+            : 'verified'
+          : 'unknown',
+      };
+      botType = registryAgent.id;
+      // Every ai_* category is always bad; only verified search crawlers / link previews
+      // may receive the good verdict.
+      botVerdict =
+        aiAgent.verified && isGoodCrawlerCategory(registryAgent.category) ? 'good' : 'bad';
     } else if (robodexResult.detected && robodexResult.botInfo) {
       botInfo = robodexResult.botInfo;
       botType = robodexResult.botType;
@@ -8359,7 +8898,15 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         category: isImpostor ? 'browser_automation' : 'ai_agent',
         provider: aiAgent.operator || 'Unknown',
         name: aiAgent.agentName,
-        identity: isImpostor ? 'spoofed' : aiAgent.verified ? (aiAgent.executionMode === 'RFC 9421 Signed Agent' ? 'signed' : 'verified') : 'unknown',
+        identity: isImpostor
+          ? positiveSpoofExclusion
+            ? 'spoofed'
+            : 'unknown'
+          : aiAgent.verified
+          ? aiAgent.executionMode === 'RFC 9421 Signed Agent'
+            ? 'signed'
+            : 'verified'
+          : 'unknown',
       };
       botType = 'ai_agent';
       botVerdict = 'bad';
@@ -8650,6 +9197,10 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     // returned identity agrees with its telemetry. The locked distinct_storage_seeds_count < 2
     // guard is preserved: a single-seed anchor is safe, while a multi-seed (shared hardware class)
     // anchor can never become canonical through this path.
+    // A genuinely fresh context (no cookie / storage token / signed backup and no exact hardware
+    // anchor hit) must not silently adopt an old visitor from a probabilistic LSH match alone.
+    const freshUnanchoredContext =
+      !existingVisitor && !verifiedVid && !storageVerified && !existingHwidVisitor;
     if (
       identityStage.stage === 'lsh_fuzzy' &&
       identityStage.visitorId &&
@@ -8664,9 +9215,18 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
             'SELECT MAX(distinct_storage_seeds_count) AS max_seeds FROM hardware_anchors WHERE visitor_id = ?'
           )
           .get(identityStage.visitorId) as { max_seeds?: number } | undefined;
+        const structuralMatch = freshUnanchoredContext
+          ? structuralAnchorsMatch(
+              db,
+              identityProfile,
+              String(identityStage.visitorId),
+              identityHardwareFingerprint
+            )
+          : null;
         if (
           fuzzyAnchor &&
-          Number(fuzzyAnchor.max_seeds ?? 0) < 2
+          Number(fuzzyAnchor.max_seeds ?? 0) < 2 &&
+          (!freshUnanchoredContext || Boolean(structuralMatch?.matched))
         ) {
           // The visit row was already inserted under the freshly minted ID earlier in this
           // request. Re-key it to the recovered visitor so history/velocity and the response
@@ -9174,6 +9734,163 @@ app.use(
   }
 );
 
+/* -------------------------------------------------------------------------- */
+/* Runtime OS authority + user-facing text normalization                       */
+/* -------------------------------------------------------------------------- */
+
+type RuntimeOsFamily = 'linux' | 'macos' | 'windows' | 'ios' | 'android';
+
+interface RuntimeOsVerdict {
+  family: RuntimeOsFamily | null;
+  label: string;
+  /** True only when two independent runtime proofs agree. */
+  authoritative: boolean;
+  uaMismatch: boolean;
+  evidence: string[];
+}
+
+function osFamilyFromText(value: string): RuntimeOsFamily | null {
+  const text = String(value || '').toLowerCase();
+  if (!text) return null;
+  if (/iphone|ipad|ipod|ios/.test(text)) return 'ios';
+  if (/android/.test(text)) return 'android';
+  if (/mac ?os|macos|macintosh|\bmac\b/.test(text)) return 'macos';
+  if (/windows|win32|win64|\bwin\b/.test(text)) return 'windows';
+  if (/linux|ubuntu|fedora|debian|chrome ?os|\blinux\b/.test(text)) return 'linux';
+  return null;
+}
+
+const RUNTIME_OS_LABELS: Record<RuntimeOsFamily, string> = {
+  linux: 'Linux',
+  macos: 'macOS',
+  windows: 'Windows',
+  ios: 'iOS',
+  android: 'Android',
+};
+
+/**
+ * Runtime OS evidence must outrank UA / Sec-CH-UA claims. A single probe is only a claim;
+ * `authoritative` requires two independent runtime proofs (host probe + WebGL backend, or
+ * host probe + high-confidence math/timing probe, or two agreeing backend probes).
+ */
+function inferRuntimeOsVerdict(
+  input: {
+    hostOs?: string;
+    gpuRenderer?: string;
+    gpuVendor?: string;
+    gpuArchFamily?: string;
+    architectureSource?: string;
+    engine?: string;
+    architecture?: string;
+  },
+  uaOs: string
+): RuntimeOsVerdict {
+  const hostFamily = osFamilyFromText(String(input.hostOs || ''));
+  const gpuText = `${input.gpuRenderer || ''} ${input.gpuVendor || ''} ${input.gpuArchFamily || ''}`.toLowerCase();
+  let glFamily: RuntimeOsFamily | null = null;
+  if (/direct3d|d3d ?1[12]|dxgi/.test(gpuText)) glFamily = 'windows';
+  else if (/metal|apple gpu|apple m[1-9]/.test(gpuText)) glFamily = 'macos';
+  else if (/mesa|llvmpipe|softpipe|gallium|\bx11\b|wayland/.test(gpuText)) glFamily = 'linux';
+  else if (/android/.test(gpuText)) glFamily = 'android';
+  else if (/ios|iphone|ipad/.test(gpuText)) glFamily = 'ios';
+
+  const probeText = `${input.architectureSource || ''} ${input.engine || ''} ${input.architecture || ''}`.toLowerCase();
+  const highConfidenceProbe = /high[- ]?confidence|math|timing|probe|silicon/.test(probeText);
+  const probeFamily = highConfidenceProbe ? osFamilyFromText(probeText) || hostFamily : null;
+
+  const proofs: RuntimeOsFamily[] = [];
+  if (hostFamily) proofs.push(hostFamily);
+  if (glFamily) proofs.push(glFamily);
+  if (probeFamily) proofs.push(probeFamily);
+  const counts = new Map<RuntimeOsFamily, number>();
+  for (const proof of proofs) counts.set(proof, (counts.get(proof) ?? 0) + 1);
+  let family: RuntimeOsFamily | null = null;
+  let best = 0;
+  for (const [candidate, count] of counts) {
+    if (count > best || (count === best && candidate === hostFamily)) {
+      family = candidate;
+      best = count;
+    }
+  }
+  const authoritative = Boolean(family && best >= 2);
+  const uaFamily = osFamilyFromText(uaOs);
+  return {
+    family,
+    label: family ? RUNTIME_OS_LABELS[family] : '',
+    authoritative,
+    uaMismatch: authoritative && Boolean(uaFamily && family && uaFamily !== family),
+    evidence: [
+      hostFamily ? `Runtime host probe: ${RUNTIME_OS_LABELS[hostFamily]}` : '',
+      glFamily ? `WebGL backend: ${RUNTIME_OS_LABELS[glFamily]}` : '',
+      probeFamily ? `High-confidence runtime probe: ${RUNTIME_OS_LABELS[probeFamily]}` : '',
+    ].filter(Boolean),
+  };
+}
+
+/** Internal storage diagnostics never reach a user-visible string. */
+function humanIncognitoMethod(
+  rawMethod: string | null | undefined,
+  isIncognito: boolean,
+  probeInconclusive: boolean
+): string {
+  if (isIncognito) return 'Ephemeral / private storage detected';
+  if (probeInconclusive) return 'Storage probe inconclusive (treated as normal)';
+  return 'Persistent disk-backed storage verified';
+}
+
+function storageProbeInconclusive(method: string | null | undefined): boolean {
+  return /inconclusive|fail[- ]?open|indeterminate|unknown|unavailable|low[- ]?confidence/i.test(
+    String(method || '')
+  );
+}
+
+/** Replaces a stale OS claim with the runtime-proven OS when runtime evidence is authoritative. */
+function scrubOsClaim(text: string, runtimeOs: RuntimeOsVerdict | null): string {
+  if (!runtimeOs?.authoritative || !runtimeOs.family) return String(text || '');
+  const correct = RUNTIME_OS_LABELS[runtimeOs.family];
+  return String(text || '').replace(/\b(macOS|Mac OS|Windows|Linux|iOS|Android)\b/gi, (match) =>
+    match.toLowerCase() === correct.toLowerCase() ? match : correct
+  );
+}
+
+/** Removes vague confidence language and a stale OS claim from a tile status. */
+function crispBotStatus(status: string, runtimeOs: RuntimeOsVerdict | null): string {
+  let value = String(status || '').trim();
+  value = value
+    .replace(/\s*\(?(?:low[- ]?confidence|soft signals?|heuristic|probable|possible)\)?/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  value = scrubOsClaim(value, runtimeOs);
+  return value || 'Automated Traffic';
+}
+
+/** UA-only verdict for the served document; no network lookups, so it never delays navigation. */
+function documentBotVerdict(ua: string): { verdict: string; agent: string } {
+  if (!ua) return { verdict: 'not_detected', agent: '' };
+  const match = findRegistryAgent(ua);
+  if (!match) {
+    if (GOOD_BOT_UA_RULES.some((rule) => rule.pattern.test(ua))) return { verdict: 'good', agent: '' };
+    if (AI_AGENT_UA_RULES.some((rule) => rule.pattern.test(ua))) return { verdict: 'bad', agent: '' };
+    return { verdict: AUTOMATION_UA_PATTERN.test(ua) ? 'bad' : 'not_detected', agent: '' };
+  }
+  const agent = asLocalAgent(match);
+  if (isRegistryPolicyToken(ua) || agent.policyToken === true) {
+    return { verdict: 'not_detected', agent: '' };
+  }
+  return {
+    verdict: isGoodCrawlerCategory(agent.category) ? 'good' : 'bad',
+    agent: agent.displayName || '',
+  };
+}
+
+function escapeHtmlAttribute(value: string): string {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 async function startStandaloneServer() {
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
@@ -9184,6 +9901,33 @@ async function startStandaloneServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
+    // Document-visibility instrumentation: expose the registry UA verdict to crawlers and to
+    // the page itself. Runs before express.static so it applies to the served index.html only
+    // for GET /; the Worker bundle has its own equivalent and is untouched by this middleware.
+    app.use((req, res, next) => {
+      if (req.method !== 'GET' || req.path !== '/') {
+        next();
+        return;
+      }
+      const ua = String(req.headers['user-agent'] || '');
+      const verdict = documentBotVerdict(ua);
+      res.setHeader('X-Intel-Bot-Verdict', verdict.verdict);
+      res.setHeader('X-Intel-Bot-Agent', verdict.agent);
+      res.setHeader('Cache-Control', 'no-store');
+      const meta = `<meta name="intel:verdict" content="${escapeHtmlAttribute(
+        verdict.verdict
+      )}" data-agent="${escapeHtmlAttribute(verdict.agent)}">`;
+      fs.readFile(path.join(distPath, 'index.html'), 'utf8', (readError, html) => {
+        if (readError || typeof html !== 'string') {
+          next();
+          return;
+        }
+        const injected = /<\/head>/i.test(html)
+          ? html.replace(/<\/head>/i, `${meta}</head>`)
+          : `${meta}${html}`;
+        res.type('html').send(injected);
+      });
+    });
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
