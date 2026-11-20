@@ -23,6 +23,15 @@ import {
 } from '../src/shared/matching/compareFingerprints';
 import { scoreConfidence } from '../src/server/identity/confidenceScorer';
 import { normalizeGpuRenderer } from '../src/client/signals/webgl';
+import {
+  RISK_FAMILY_CAPS,
+  LSH_CONFIG,
+  buildRiskLedger,
+  clopperPearsonUpperBound,
+  decideRarity,
+  isSecureRequest,
+  type RiskEvidenceLine,
+} from '../src/lib/telemetryContract';
 
 let passed = 0;
 const failures: string[] = [];
@@ -350,6 +359,44 @@ for (const mode of modes) {
   const result = compareFingerprints(windowsProfile(), windowsProfile(), mode);
   check(`identical profiles match in ${mode} mode`, result.match, `score ${result.matchScore}`);
 }
+
+/* -------------------------------------------------------------------------- */
+/* Phase 0 — frozen canonical contract baseline                               */
+/* -------------------------------------------------------------------------- */
+
+section('Phase 0 canonical contract baseline');
+
+const capSum = Object.values(RISK_FAMILY_CAPS).reduce((sum, value) => sum + value, 0);
+check('risk caps sum to 130 (clamp required)', capSum === 130, String(capSum));
+
+function ledgerFrom(tuple: readonly [number, number, number, number, number]) {
+  const names = ['automation', 'tampering', 'network', 'environment', 'velocity'] as const;
+  const lines: RiskEvidenceLine[] = [];
+  tuple.forEach((points, index) => {
+    if (points > 0) {
+      lines.push({ family: names[index], component: `baseline_${names[index]}`, points, reason: 'phase-0 fixture' });
+    }
+  });
+  return buildRiskLedger(lines);
+}
+
+const mcpLedger = ledgerFrom([45, 0, 12, 10, 0]);
+check('MCP Playwright ledger raw 67 / High', mcpLedger.raw_score === 67 && mcpLedger.score_0_100 === 67 && mcpLedger.tier === 'High', JSON.stringify(mcpLedger));
+const specLedger = ledgerFrom([0, 35, 0, 0, 0]);
+check('spec fuzz ledger raw 35 / Elevated', specLedger.raw_score === 35 && specLedger.tier === 'Elevated', JSON.stringify(specLedger));
+const driftLedger = ledgerFrom([35, 35, 18, 4, 12]);
+check('drift+proxy ledger raw 104 clamped 100 / Critical', driftLedger.raw_score === 104 && driftLedger.score_0_100 === 100 && driftLedger.tier === 'Critical', JSON.stringify(driftLedger));
+const cleanLedger = ledgerFrom([0, 0, 0, 0, 0]);
+check('clean human ledger 0 / Low', cleanLedger.raw_score === 0 && cleanLedger.tier === 'Low');
+
+check('512-bit SimHash config locked', LSH_CONFIG.bits === 512 && LSH_CONFIG.bands === 32 && LSH_CONFIG.rows === 16);
+check('singleton Clopper-Pearson upper ~4.74/n', Math.abs(clopperPearsonUpperBound(1, 1000, 0.05) - 0.00474) < 0.0005, String(clopperPearsonUpperBound(1, 1000, 0.05)));
+check('rarity suppressed below N=250', decideRarity(249).status === 'suppressed');
+check('rarity p95 allowed at N=250', decideRarity(250).percentile === 'p95');
+check('rarity p99 unlocked at N=1000', decideRarity(1000).percentile === 'p99_plus');
+check('cookie secure from forwarded https', isSecureRequest({ xForwardedProto: 'https' }) === true);
+check('cookie insecure on local http', isSecureRequest({ xForwardedProto: 'http', secure: false }) === false);
+check('audio baseline fixture unchanged', AUDIO_SUM === 124.04347745512496);
 
 /* -------------------------------------------------------------------------- */
 
