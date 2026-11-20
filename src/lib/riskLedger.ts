@@ -182,7 +182,12 @@ export const GRADED_RISK_FIXTURES: ReadonlyArray<{
   },
 ];
 
-export function verifyGradedRiskFixtures(): { name: string; ok: boolean; ledger: OrthogonalRiskLedger }[] {
+export function verifyGradedRiskFixtures(): {
+  name: string;
+  ok: boolean;
+  ledger: OrthogonalRiskLedger;
+  expected: readonly [number, number, number, number, number];
+}[] {
   return GRADED_RISK_FIXTURES.map((fixture) => {
     const ledger = buildGradedRiskLedger(fixture.input);
     const actual: [number, number, number, number, number] = [
@@ -193,6 +198,6 @@ export function verifyGradedRiskFixtures(): { name: string; ok: boolean; ledger:
       ledger.velocity,
     ];
     const ok = actual.every((value, index) => value === fixture.expected[index]);
-    return { name: fixture.name, ok, ledger };
+    return { name: fixture.name, ok, ledger, expected: fixture.expected };
   });
 }

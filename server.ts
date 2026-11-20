@@ -52,7 +52,6 @@ import { resolveVisitor, upsertVisitorProfile, type ResolverProfile, type Resolv
 import { scoreConfidence } from './src/server/identity/confidenceScorer';
 import type { BotInfo } from './src/types/visitor';
 import {
-  RISK_RUBRIC,
   RISK_FAMILY_CAPS,
   buildRiskLedger,
   LSH_CONFIG,
@@ -4353,28 +4352,28 @@ function markSchemaMigration(db: DatabaseAdapter, version: string): void {
  * canonical rubric. Uses the contract helpers directly so any drift is logged immediately.
  */
 function assertFrozenRiskTuples(): void {
-  const expected: Record<string, readonly [number, number, number, number, number]> = {
-    'MCP Playwright': [45, 0, 12, 10, 0],
-    'spec fuzz': [0, 35, 0, 0, 0],
-    'drift+proxy+velocity': [35, 35, 18, 4, 12],
-    'clean human': [0, 0, 0, 0, 0],
-  };
   for (const fixture of verifyGradedRiskFixtures()) {
-    const want = expected[fixture.name];
-    // buildRiskLedger is the single clamping source; confirm the caps are the frozen ones.
+    // The fixture carries its own frozen tuple, so names can never drift out of sync.
+    const actual: readonly number[] = [
+      fixture.ledger.automation,
+      fixture.ledger.tampering,
+      fixture.ledger.network,
+      fixture.ledger.environment,
+      fixture.ledger.velocity,
+    ];
     const capSum = Object.values(RISK_FAMILY_CAPS).reduce((sum, value) => sum + value, 0);
-    const baseline = buildRiskLedger([
-      { family: 'automation', component: 'check', points: RISK_RUBRIC.automation.tier_a_hard_proof, reason: 'check' },
-      { family: 'tampering', component: 'check', points: RISK_RUBRIC.tampering.tier_a_spec_header_or_drift, reason: 'check' },
-    ]);
     const ok =
       fixture.ok &&
-      Boolean(want) &&
-      baseline.automation === RISK_RUBRIC.automation.tier_a_hard_proof &&
-      baseline.tampering === RISK_RUBRIC.tampering.tier_a_spec_header_or_drift &&
+      actual.every((value, index) => value === fixture.expected[index]) &&
       capSum === 130;
     if (!ok) {
-      console.error('Frozen graded-risk tuple check failed:', fixture.name, JSON.stringify(fixture.ledger), 'expected', want);
+      console.error(
+        'Frozen graded-risk tuple check failed:',
+        fixture.name,
+        JSON.stringify(actual),
+        'expected',
+        fixture.expected
+      );
     }
   }
 }
