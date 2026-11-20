@@ -28,7 +28,7 @@ Every analysis runs through a signed first-party API request, is scored across g
 - **First-party and transparent:** visitor signals are collected and processed through your own API, with no third-party tracking dependency.
 - **Tri-layer identity:** a persistent Visitor ID, a hardware-only fingerprint, and a browser-only fingerprint are matched independently, so a visitor is still recognised after a browser change while a genuinely new device stays new.
 - **Multi-layer analysis:** combines browser identity, hardware fingerprints, network intelligence, privacy settings, and behavioural signals.
-- **Explainable scoring:** each signal has a visible status and score, the four core cards rate `0/10` to `10/10`, and the API payload also carries a `0-100` composite with the velocity, rarity and tampering evidence behind it.
+- **Explainable scoring:** the canonical 0-100 orthogonal risk ledger (`score_0_100`, `raw_score`, `evidence_ledger`) is the single risk truth, with tiers `Low` / `Elevated` / `High` / `Critical`. The four core cards keep their own explicitly labelled `0/10`–`10/10` per-card scale. The dashboard binds every panel to the one canonical API envelope and never recomputes a score client-side.
 - **Persistent visitor history:** a storage waterfall (localStorage, IndexedDB, cookie mirror, HTTP cache) keeps the visitor ID through storage wipes, a server-signed backup restores history when the store is empty, and hardware-ID recovery covers private windows where DOM storage starts blank.
 - **Serverless with a write budget:** only `POST /api/visitor/identify` writes to the Durable Object; health and RTT ping are answered statelessly, and every read and write degrades gracefully instead of returning a `500` when the daily write quota is exhausted.
 
@@ -55,7 +55,7 @@ Verify the Worker locally with `node scripts/test-worker.mjs`, and build it with
 | Privacy settings | Tor Browser RFP, letterboxed viewports, Brave Shields, and canvas anti-fingerprinting noise |
 | Behaviour and rarity | Distinct IPs, linked sessions, countries, and events across 5-minute, 1-hour, and 24-hour windows; high activity at 20+ events in 24 hours and rare-device comparison against a 30-day baseline with at least 20 visits |
 
-The four core cards and the granular signal grid rate visits from `0/10` to `10/10`. The server computes both views, and the dashboard mirrors the same rules client-side so the displayed scores stay consistent. The payload also exposes the `0-100` composite and the velocity, rarity and tampering inputs behind it.
+The four core cards keep their explicitly labelled `0/10`–`10/10` per-card scale. Risk is reported by one canonical `0-100` orthogonal ledger with a capped family breakdown and an evidence ledger; the dashboard binds every panel and the Event JSON inspector to that single envelope, so no displayed value is re-derived in the browser. Rarity is published only at a sufficient corpus (`Corpus Warmup (N / 1,000)` otherwise), proximity requires browser geolocation permission, and identification confidence is a categorical tier (null on unseen profiles) rather than an invented percentage.
 
 <details>
 <summary><strong>Sealed request and tamper protection</strong></summary>
@@ -74,8 +74,9 @@ Location is resolved from Cloudflare `request.cf` first, then a provider consens
 
 ## Dashboard
 
-- **Identity header:** visitor and hardware identity, returning or first-seen state, calibrated confidence with version, the winning match mode, and the consistency verdict.
-- **Risk meter:** the Suspect Score and risk tier, next to the four core cards for incognito, automation, network, and virtualisation.
+- **Identity header:** visitor and hardware identity, returning or first-seen state, a categorical confidence tier (with calibration state), the winning match mode, and the consistency verdict.
+- **Risk meter:** the canonical 0-100 ledger score and its `Low` / `Elevated` / `High` / `Critical` tier, next to the four core cards for incognito, automation, network, and virtualisation. Tampering reasons force a `Browser Tampering: Detected` header badge.
+- **Canonical telemetry:** verdict state headline with human corroboration, orthogonal risk families, four separate network provenance axes, permission-gated proximity, corpus-gated rarity, and explicit unavailable states (Active Call, JA3/JA4T, raw TCP SYN os_mismatch). SwiftShader is reported as Software-Rendered Graphics (SwiftShader) — never tampering, never proof of a VM.
 - **Visitor overview:** device tiles for browser, OS and device, display, locale and timezone, active session, first and last seen, plus public IP, location, ISP and ASN, recognition source, and phone model when the device exposes one.
 - **Hardware & rendering entropy:** browser, OS, CPU, GPU, memory, display, fonts, emoji metrics, canvas stability, WebGL hashes, and math-vector attributes.
 - **Smart Signals & threat analysis:** deterministic signal rows, four core risk cards, and a granular signal grid.
@@ -158,4 +159,4 @@ Open the [live demo](https://intel.adityahq.me) and select **Analyze my browser*
 
 ## Deployment
 
-Deployment, storage, and cost details are documented in [CLOUDFLARE.md](./CLOUDFLARE.md). Only `/api/visitor/*` and `/api/intel/geolocation` reach the Durable Object; `/api/health` and `/api/network/ping` are answered statelessly, so periodic monitors and the 5-second RTT probe never consume row writes.
+Deployment, storage, and cost details are documented in [CLOUDFLARE.md](./CLOUDFLARE.md). Cloudflare Workers is the only deploy target; there is no Vercel deploy path (legacy `vercel.json` is retained untouched as a historical artifact). Only `/api/visitor/*` and `/api/intel/geolocation` reach the Durable Object; `/api/health` and `/api/network/ping` are answered statelessly, so periodic monitors and the 5-second RTT probe never consume row writes.

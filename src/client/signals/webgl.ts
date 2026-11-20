@@ -372,6 +372,14 @@ const ANGLE_SHAPE = /^angle\s*\((.*)\)\s*$/i;
  * driver"). Collapsing them to one canonical label keeps virtual machines
  * fingerprinted consistently instead of by driver build detail.
  */
+/**
+ * Display label for software rasterizers. SwiftShader is a legitimate software
+ * GL implementation (common when hardware acceleration is disabled on a real
+ * development machine): it is reported transparently, but it is NEVER browser
+ * tampering and NEVER, by itself, proof of a virtual machine. See f851c63 / f7d6900.
+ */
+export const SOFTWARE_RENDERED_LABEL = 'Software-Rendered Graphics (SwiftShader)';
+
 const SOFTWARE_RENDERERS: Array<[RegExp, string]> = [
   [/swiftshader/i, 'SwiftShader'],
   [/llvmpipe/i, 'llvmpipe'],

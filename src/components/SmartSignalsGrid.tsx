@@ -1,4 +1,6 @@
 import type { IntelVisitorResponse } from '../types/visitor';
+import type { CanonicalView } from './canonical';
+import { ACTIVE_CALL_UNAVAILABLE, LOCATION_PERMISSION_REQUIRED } from './canonical';
 
 /**
  * Smart Signals grid.
@@ -60,7 +62,10 @@ function botStatus(data: IntelVisitorResponse): { status: string; triggered: boo
   return { status: 'You are a bot', triggered: true, detail: signals.botReason };
 }
 
-export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRowData[] {
+export function buildSmartSignalRows(
+  data: IntelVisitorResponse,
+  view?: CanonicalView | null
+): SmartSignalRowData[] {
   const signals = data.securitySignals;
   const rows: SmartSignalRowData[] = [];
 
@@ -76,7 +81,7 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     status: geoParts.length > 0 ? geoParts.join(', ') : 'Unavailable',
     triggered: false,
     tone: geoParts.length > 0 ? 'clean' : 'neutral',
-    detail: data.location.isLocationVerified ? 'Verified geolocation' : 'IP derived location',
+    detail: 'IP Geolocation Estimate',
   });
 
   const incognito = Boolean(
@@ -122,11 +127,12 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     detail: vpnMethodCount > 1 ? `${vpnMethodCount} matching network methods` : signals.vpnReasons?.[0],
   });
 
-  const tampering = Boolean(data.tampering ?? signals.tampering);
+  const tampering =
+    Boolean(view?.tamperingReasons?.length) || Boolean(data.tampering ?? signals.tampering);
   rows.push({
     key: 'tampering',
     label: 'Browser Tampering',
-    status: tampering ? 'Yes' : 'Not detected',
+    status: tampering ? 'Detected' : 'Not detected',
     triggered: tampering,
     detail: data.tamperingDetails?.devtools_device_emulation
       ? 'DevTools device emulation'
@@ -208,23 +214,21 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     label: 'Rare Device',
     status: rare ? 'Yes' : 'Not detected',
     triggered: rare,
-    detail: data.rareDevicePercentileBucket
-      ? `Hardware rarity ${data.rareDevicePercentileBucket}`
-      : undefined,
+    detail: view?.rarity.label ?? undefined,
   });
 
-  // Active call: pruned unless the runtime can observe call state at all.
+  // Active call state is observable only in native/mobile runtimes. On a web browser the
+  // capability is reported honestly instead of being silently pruned from the grid.
   const activeCallSupported = Boolean(data.activeCallSupported ?? signals.activeCallSupported);
-  if (activeCallSupported) {
-    const activeCall = Boolean(data.activeCall ?? signals.activeCall);
-    rows.push({
-      key: 'activeCall',
-      label: 'Active Call Detection',
-      status: activeCall ? 'Yes' : 'Not detected',
-      triggered: activeCall,
-      detail: signals.activeCallReasons?.[0],
-    });
-  }
+  const activeCall = Boolean(data.activeCall ?? signals.activeCall);
+  rows.push({
+    key: 'activeCall',
+    label: 'Active Call Detection',
+    status: activeCallSupported ? (activeCall ? 'Yes' : 'Not detected') : ACTIVE_CALL_UNAVAILABLE,
+    triggered: activeCallSupported && activeCall,
+    tone: activeCallSupported ? undefined : 'neutral',
+    detail: activeCallSupported ? signals.activeCallReasons?.[0] : undefined,
+  });
 
   const velocity = data.velocity;
   const velocityStatus = velocity
@@ -242,32 +246,29 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     tone: 'clean',
   });
 
-  const suspectScore = Math.max(
-    0,
-    Math.min(10, Number(data.suspectScore ?? data.securitySignals?.suspectScore ?? 0) || 0)
-  );
+  // The canonical 0-100 ledger is the only risk score on the dashboard. The four core
+  // cards above keep their own explicitly labelled 0-10 scale; no value is recomputed here.
+  const ledgerScore = view?.risk.score_0_100 ?? data.suspectScore100 ?? 0;
   rows.push({
     key: 'suspectScore',
-    label: 'Suspect Score',
-    status: `${suspectScore}/10`,
-    triggered: suspectScore >= 5,
-    tone: suspectScore >= 5 ? 'trigger' : suspectScore > 0 ? 'neutral' : 'clean',
+    label: 'Canonical Risk Score (0-100)',
+    status: `${ledgerScore}/100 · ${view?.risk.tier ?? 'Low'}`,
+    triggered: ledgerScore >= 50,
+    tone: ledgerScore >= 50 ? 'trigger' : ledgerScore > 0 ? 'neutral' : 'clean',
   });
 
   // Fix 5 — the server always computes the metro-zone geohash synchronously, so this tile
   // never waits on a browser geolocation callback and never says "Collecting location...".
-  const proximityResolved = Boolean(data.proximity?.resolved);
-  const proximityStatus =
-    data.proximity?.zone_label ||
-    (data.location.isLocationVerified
-      ? `${city || region || country || 'Verified zone'}`
-      : 'Zone Unresolved (IP-only)');
+  // Proximity is gated on browser geolocation permission. IP coordinates are never printed
+  // in this panel; the map tile separately renders an IP Geolocation Estimate.
+  const proximityLabel = view?.proximity.label ?? LOCATION_PERMISSION_REQUIRED;
+  const proximityGranted = Boolean(view?.proximity.granted);
   rows.push({
     key: 'proximity',
     label: 'Proximity Detection',
-    status: proximityStatus,
+    status: proximityLabel,
     triggered: false,
-    tone: proximityResolved ? 'clean' : 'neutral',
+    tone: proximityGranted ? 'clean' : 'neutral',
   });
 
   rows.push({
@@ -282,8 +283,14 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   return rows;
 }
 
-export function SmartSignalsGrid({ data }: { data: IntelVisitorResponse }) {
-  const rows = buildSmartSignalRows(data);
+export function SmartSignalsGrid({
+  data,
+  view,
+}: {
+  data: IntelVisitorResponse;
+  view?: CanonicalView | null;
+}) {
+  const rows = buildSmartSignalRows(data, view);
 
   return (
     <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-2">

@@ -27,7 +27,7 @@ If the existing site is a Cloudflare Pages project, create a Workers application
 
 Visitor and health routes use the SQLite-backed `VisitorStore` Durable Object. Network RTT monitoring calls GET/HEAD `/api/network/ping`, which does not touch SQLite or Durable Objects.
 
-The build-time adapter reads server.ts, reuses its schema and route logic, and substitutes request-scoped SQLite storage only in the Worker bundle. It fails if expected source markers change. Existing Node/Vercel source and lockfiles remain unchanged. Express is bundled using Node package resolution so browser mappings do not disable its stream dependencies. Native better-sqlite3 is not executed by the Worker.
+The build-time adapter reads server.ts, reuses its schema and route logic, and substitutes request-scoped SQLite storage only in the Worker bundle. It fails if expected source markers change. Cloudflare Workers is the only deployment target: there is no Vercel deploy path (legacy `vercel.json` is retained only as an untouched historical artifact). Express is bundled using Node package resolution so browser mappings do not disable its stream dependencies. Native better-sqlite3 is not executed by the Worker.
 
 Static assets are served before the Worker unless the path is under `/api`, so asset requests do not consume Worker invocations.
 

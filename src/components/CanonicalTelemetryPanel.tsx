@@ -1,0 +1,247 @@
+/**
+ * Phase 7 — canonical telemetry panels.
+ *
+ * Every value rendered here is read from the single `CanonicalView` resolved by
+ * `resolveCanonical`, the same object the Event JSON inspector prints. Nothing in
+ * this file derives a score, tier or verdict from raw signals. Until the Worker
+ * supplies the canonical axes, each panel shows an explicit honest state.
+ */
+
+import {
+  Activity,
+  AlertTriangle,
+  Compass,
+  Fingerprint,
+  Gauge,
+  Globe2,
+  Layers,
+  MapPin,
+  Radio,
+  ShieldAlert,
+  ShieldCheck,
+} from 'lucide-react';
+import { RISK_FAMILY_CAPS } from '../lib/telemetryContract';
+import type { CanonicalView } from './canonical';
+import {
+  ACTIVE_CALL_UNAVAILABLE,
+  WORKER_UNAVAILABLE,
+  networkAxes,
+} from './canonical';
+
+const CARD = 'bg-white border border-[#E5E7EB] rounded-2xl p-4 sm:p-6';
+const TITLE = 'flex items-center gap-2 text-sm sm:text-base font-semibold text-slate-900';
+const KEY = 'block text-[11px] text-slate-500';
+const VALUE = 'block text-xs sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5';
+
+function Scalar({ label, value, detail }: { label: string; value: string; detail?: string }) {
+  return (
+    <div className="p-3 rounded-xl bg-slate-50/70 border border-[#E5E7EB] min-w-0">
+      <span className={KEY}>{label}</span>
+      <span className={VALUE} title={detail ?? value}>
+        {value}
+      </span>
+      {detail && <span className="block text-[10px] text-slate-400 mt-0.5">{detail}</span>}
+    </div>
+  );
+}
+
+/** Exact Verdict State Machine headline + human corroboration. */
+export function VerdictBannerPanel({ view }: { view: CanonicalView }) {
+  const tamperingDetected = view.tamperingReasons.length > 0;
+  const headline = view.verdictTier ?? 'Awaiting canonical verdict from Worker';
+  return (
+    <section className={CARD} aria-label="Verdict state">
+      <div className="flex items-center justify-between gap-3 pb-3.5 border-b border-[#E5E7EB] flex-wrap">
+        <div className="flex items-center gap-2">
+          {tamperingDetected ? (
+            <ShieldAlert className="w-4 h-4 text-rose-600 shrink-0" />
+          ) : (
+            <ShieldCheck className="w-4 h-4 text-[#2563EB] shrink-0" />
+          )}
+          <h2 className={TITLE}>Verdict State Machine</h2>
+        </div>
+        <span
+          className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+            tamperingDetected
+              ? 'border-rose-200 bg-rose-50 text-rose-700'
+              : 'border-slate-200 bg-slate-50 text-slate-600'
+          }`}
+        >
+          {tamperingDetected ? 'Browser Tampering: Detected' : 'Browser Tampering: Not detected'}
+        </span>
+      </div>
+      <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <Scalar label="Verdict headline" value={headline} detail="Exact canonical verdict tier" />
+        <Scalar
+          label="Human corroboration"
+          value={view.humanCorroboration === null ? '—' : String(view.humanCorroboration)}
+          detail="0 or 1, from the canonical automation axis"
+        />
+        <Scalar
+          label="Calibration"
+          value={view.calibrationStatus === 'calibrated' ? 'Calibrated' : 'Uncalibrated'}
+          detail="Identification confidence calibration gate"
+        />
+      </div>
+    </section>
+  );
+}
+
+/** 0-100 orthogonal ledger — the single canonical risk truth. */
+export function RiskLedgerPanel({ view }: { view: CanonicalView }) {
+  const r = view.risk;
+  const families: Array<[keyof typeof RISK_FAMILY_CAPS, number]> = [
+    ['automation', r.automation],
+    ['tampering', r.tampering],
+    ['network', r.network],
+    ['environment', r.environment],
+    ['velocity', r.velocity],
+  ];
+  return (
+    <section className={CARD} aria-label="Canonical risk ledger">
+      <div className="flex items-center justify-between gap-3 pb-3.5 border-b border-[#E5E7EB] flex-wrap">
+        <div className="flex items-center gap-2">
+          <Gauge className="w-4 h-4 text-[#F05A28] shrink-0" />
+          <h2 className={TITLE}>Risk Ledger (0–100)</h2>
+        </div>
+        <span className="text-xs font-mono tabular-nums text-slate-500">
+          {r.tier} • {r.score_0_100}/100
+        </span>
+      </div>
+      <div className="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <Scalar label="Canonical score" value={`${r.score_0_100} / 100`} />
+        <Scalar label="Raw (pre-ceiling)" value={String(r.raw_score)} />
+        <Scalar label="Tier" value={r.tier} detail="Low / Elevated / High / Critical" />
+        <Scalar label="Evidence lines" value={String(r.evidence_ledger.length)} />
+      </div>
+      <div className="mt-4 space-y-2">
+        {families.map(([family, total]) => {
+          const cap = RISK_FAMILY_CAPS[family];
+          const pct = cap > 0 ? Math.min(100, Math.round((total / cap) * 100)) : 0;
+          return (
+            <div key={family} className="flex items-center gap-3">
+              <span className="w-20 shrink-0 text-[11px] font-mono capitalize text-slate-500">
+                {family}
+              </span>
+              <div className="flex-1 h-2 rounded-full bg-slate-200 overflow-hidden">
+                <div
+                  className={`h-full ${total > 0 ? 'bg-[#D93025]' : 'bg-[#81C995]'}`}
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <span className="w-12 text-right text-[11px] font-mono tabular-nums text-slate-600">
+                {total}/{cap}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      {r.evidence_ledger.length > 0 && (
+        <ul className="mt-4 pt-3 border-t border-[#E5E7EB] space-y-1">
+          {r.evidence_ledger.map((line, index) => (
+            <li key={`${line.component}-${index}`} className="text-[11px] text-slate-600 break-words">
+              <span className="font-mono text-[#F05A28]">+{line.points}</span> {line.component} —{' '}
+              {line.reason}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+/** Four orthogonal network axes plus the RDAP netblock comparison. */
+export function NetworkAxesPanel({ view }: { view: CanonicalView }) {
+  const axes = networkAxes(view);
+  return (
+    <section className={CARD} aria-label="Network provenance">
+      <div className="flex items-center gap-2 pb-3.5 border-b border-[#E5E7EB]">
+        <Globe2 className="w-4 h-4 text-indigo-600 shrink-0" />
+        <h2 className={TITLE}>Network Provenance (orthogonal axes)</h2>
+      </div>
+      <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <Scalar label="Hosting / datacenter ASN" value={axes.hosting} />
+        <Scalar
+          label="RDAP netblock org"
+          value={axes.rdap}
+          detail={axes.rdapDiffers ? 'Differs from BGP ASN org' : undefined}
+        />
+        <Scalar label="VPN status" value={axes.vpn} />
+        <Scalar label="Proxy rotation" value={axes.proxy} />
+        <Scalar label="Timezone discrepancy" value={axes.timezone} />
+      </div>
+    </section>
+  );
+}
+
+/** Proximity, rarity and confidence — all honest, all categorical. */
+export function ProximityRarityConfidencePanel({ view }: { view: CanonicalView }) {
+  return (
+    <section className={CARD} aria-label="Proximity, rarity and confidence">
+      <div className="flex items-center gap-2 pb-3.5 border-b border-[#E5E7EB]">
+        <Layers className="w-4 h-4 text-[#2563EB] shrink-0" />
+        <h2 className={TITLE}>Proximity, Rarity &amp; Confidence</h2>
+      </div>
+      <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <div className="p-3 rounded-xl bg-slate-50/70 border border-[#E5E7EB] min-w-0">
+          <span className={`${KEY} inline-flex items-center gap-1`}>
+            <MapPin className="w-3 h-3" /> Proximity
+          </span>
+          <span className={VALUE}>{view.proximity.label}</span>
+          <span className="block text-[10px] text-slate-400 mt-0.5">
+            Browser permission; IP coordinates are never shown here
+          </span>
+        </div>
+        <div className="p-3 rounded-xl bg-slate-50/70 border border-[#E5E7EB] min-w-0">
+          <span className={`${KEY} inline-flex items-center gap-1`}>
+            <Activity className="w-3 h-3" /> Device rarity
+          </span>
+          <span className={VALUE}>{view.rarity.label}</span>
+          <span className="block text-[10px] text-slate-400 mt-0.5">
+            Percentile published only at a sufficient corpus
+          </span>
+        </div>
+        <div className="p-3 rounded-xl bg-slate-50/70 border border-[#E5E7EB] min-w-0">
+          <span className={`${KEY} inline-flex items-center gap-1`}>
+            <Fingerprint className="w-3 h-3" /> Identification confidence
+          </span>
+          <span className={VALUE}>{view.confidenceTier}</span>
+          <span className="block text-[10px] text-slate-400 mt-0.5">
+            {view.calibrationStatus === 'calibrated'
+              ? 'Calibrated tier'
+              : 'Uncalibrated — no numeric confidence published'}
+          </span>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+/** Capabilities the browser/Worker cannot observe are reported, not hidden. */
+export function CapabilityAvailabilityPanel() {
+  const rows = [
+    { label: 'Active Call Detection', value: ACTIVE_CALL_UNAVAILABLE, icon: Radio },
+    { label: 'JA3 / JA4T TLS fingerprint', value: WORKER_UNAVAILABLE, icon: Compass },
+    { label: 'Raw TCP SYN os_mismatch', value: WORKER_UNAVAILABLE, icon: AlertTriangle },
+  ];
+  return (
+    <section className={CARD} aria-label="Capability availability">
+      <div className="flex items-center gap-2 pb-3.5 border-b border-[#E5E7EB]">
+        <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+        <h2 className={TITLE}>Capability Availability</h2>
+      </div>
+      <div className="mt-4 grid grid-cols-1 sm:grid-cols-3 gap-3">
+        {rows.map(({ label, value, icon: Icon }) => (
+          <div key={label} className="p-3 rounded-xl bg-slate-50/70 border border-[#E5E7EB] min-w-0">
+            <span className={`${KEY} inline-flex items-center gap-1`}>
+              <Icon className="w-3 h-3" /> {label}
+            </span>
+            <span className="block text-[11px] font-mono text-amber-700 break-words leading-snug mt-0.5">
+              {value}
+            </span>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}

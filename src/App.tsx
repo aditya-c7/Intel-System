@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
-import { identifyCurrentVisitor, detectIncognitoMode, detectEmulatorEvidence } from './lib/collector';
-import type { EmulatorEvidence } from './lib/collector';
+import { identifyCurrentVisitor, detectIncognitoMode } from './lib/collector';
 import type {
-  BotSubtype,
   IntelVisitorResponse,
   LocationInfo,
   NetworkType,
@@ -22,6 +20,20 @@ import {
   CursorAttributionOverlay,
   resolveCursorIdentity,
 } from './components/CursorAttributionOverlay';
+import {
+  resolveCanonical,
+  quarantineClaim,
+  quarantineAttributes,
+  isSwiftShader,
+  SWIFTSHADER_LABEL,
+} from './components/canonical';
+import {
+  VerdictBannerPanel,
+  RiskLedgerPanel,
+  NetworkAxesPanel,
+  ProximityRarityConfidencePanel,
+  CapabilityAvailabilityPanel,
+} from './components/CanonicalTelemetryPanel';
 import {
   Copy,
   Check,
@@ -435,230 +447,41 @@ function SignalRow(row: SignalRowModel & { className?: string }) {
 }
 
 /**
- * Client-side fallback mirror of the server's 4-signal engine. Only used when the API
- * response predates `smartSignals`; scores, statuses and labels match server.ts exactly.
- * `clientEmulator` carries the GAP-1 emulator derivation so Tile 4 reaches the same
- * verdict the server would reach from the same device values.
- */
-function buildClientSignalRows(
-  signals: SecuritySignals,
-  incognitoConfirmed = false,
-  clientEmulator?: EmulatorEvidence | null
-): SignalRowModel[] {
-  const botSubtype: BotSubtype = signals.botSubtype ?? 'human';
-  // The gated server verdict is authoritative. Raw client booleans are only a fallback for
-  // legacy payloads that predate `botSubtype`; a privacy extension patching a getter (or a
-  // tampered CDP report) must never relabel a person as automated on its own.
-  const isBotDetected =
-    botSubtype === 'bad_bot' ||
-    botSubtype === 'ai_agent' ||
-    (!signals.botSubtype &&
-      Boolean(signals.isBot || signals.webdriver || signals.cdpDetected));
-  const isHeadlessDetected = Boolean(signals.isHeadless) && isBotDetected;
-  const isDatacenterAsn = Boolean(signals.datacenterAsn);
-  const hasTzMismatch = Boolean(signals.timezoneMismatch);
-  const isVm = Boolean(signals.isVirtualMachine);
-  const isTampered = Boolean(signals.isOsTampered);
-  const isEmulator = Boolean(signals.emulatorDetected) || Boolean(clientEmulator?.detected);
-  const isRequestTampered = Boolean(signals.tamperedRequest || signals.replayDetected);
-  const isTorExit = Boolean(signals.torExitNode);
-  const isBlocklisted = Boolean(signals.ipBlocklisted);
-  const isSpoofedCrawler =
-    botSubtype === 'bad_bot' && /spoof/i.test(`${signals.botCategory || ''} ${signals.botReason || ''}`);
-  const isIncognito =
-    incognitoConfirmed ||
-    Boolean(
-      signals.isIncognito ??
-        (signals.incognitoLikely || signals.persistenceMode === 'Hardware ID Recovered')
-    );
-  const ispBrand = signals.brandName?.trim() || '';
-
-  const incognitoScore = isIncognito ? 4 : 0;
-  const botScore =
-    botSubtype === 'good_bot'
-      ? 2
-      : botSubtype === 'ai_agent'
-      ? 8
-      : botSubtype === 'bad_bot'
-      ? isSpoofedCrawler
-        ? 10
-        : 9
-      : isBotDetected
-      ? 9
-      : isHeadlessDetected
-      ? 7
-      : 0;
-  const vpnScore = isTorExit
-    ? 10
-    : isBlocklisted
-    ? 9
-    : isDatacenterAsn && hasTzMismatch
-    ? 8
-    : isDatacenterAsn
-    ? 6
-    : hasTzMismatch
-    ? 5
-    : 0;
-  const vmScore = isRequestTampered
-    ? 10
-    : isEmulator
-    ? 8
-    : isVm
-    ? 7
-    : isTampered
-    ? 6
-    : 0;
-
-  const incognitoDetail = isIncognito
-    ? `Ephemeral RAM storage detected (${
-        signals.incognitoMethod || 'In-memory LevelDB / Cookie-less known hwid'
-      })`
-    : `Persistent disk-backed storage verified (${
-        signals.incognitoMethod || 'Standard profile'
-      })`;
-  const botDetail =
-    signals.botReason ||
-    (botSubtype === 'good_bot'
-      ? 'Verified crawler operating from its official provider network'
-      : botSubtype === 'ai_agent'
-      ? `${signals.botProvider || 'AI agent'} autonomous crawler signature`
-      : botSubtype === 'bad_bot'
-      ? 'Browser automation / spoofed crawler identity detected'
-      : isBotDetected
-      ? 'WebDriver / CDP automation runtime detected'
-      : isHeadlessDetected
-      ? 'Headless rendering context without an attached physical display'
-      : 'No automation, WebDriver, CDP hooks, or headless runtime detected');
-  const vpnDetail = isTorExit
-    ? 'Confirmed active Tor exit relay (Tor Project DNSEL + bulk exit list)'
-    : isBlocklisted
-    ? (signals.ipBlocklistReasons?.[0] || 'IP flagged on the abuse / tamper blocklist')
-    : vpnScore > 0
-    ? signals.vpnReasons[0] ||
-      (isDatacenterAsn
-        ? `Datacenter / hosting ASN detected on ${ispBrand || 'this network'}`
-        : `Browser timezone (${signals.browserTimezone}) differs from IP geolocation timezone (${signals.ipTimezone})`)
-    : `${ispBrand || 'Standard ISP'} • ${
-        signals.networkType ?? 'Residential Broadband'
-      } verified against browser timezone ${signals.browserTimezone}`;
-  const vmDetail = isRequestTampered
-    ? signals.requestIntegrityReason ||
-      (signals.replayDetected
-        ? 'Duplicate payload nonce (replay attack detected)'
-        : 'Payload integrity hash mismatch')
-    : isEmulator
-    ? signals.emulatorReason ||
-      clientEmulator?.reason ||
-      'Mobile UA backed by a desktop architecture or emulator GPU'
-    : signals.vmReason ||
-      (isTampered
-        ? signals.tamperReasons[0] || 'Operating-system / User-Agent tampering detected'
-        : 'Unmasked physical GPU & consistent OS platform verified');
-
-  return [
-    createSignalRow({
-      key: 'incognito',
-      tone: toneForScore(incognitoScore),
-      title: 'Incognito / Private Browsing',
-      caption: incognitoDetail,
-      statusLabel: isIncognito ? 'Incognito / Private Mode' : 'Standard Window',
-      tooltip: `Persistence Mode: ${signals.persistenceMode}`,
-      riskScore: incognitoScore,
-    }),
-    createSignalRow({
-      key: 'bot',
-      tone: toneForScore(botScore),
-      title: 'Bot & Automation Detection',
-      caption: botDetail,
-      statusLabel:
-        botSubtype === 'good_bot'
-          ? 'Good Bot · Search Crawler'
-          : botSubtype === 'ai_agent'
-          ? 'AI Agent · Cloud Browser'
-          : botSubtype === 'bad_bot'
-          ? isSpoofedCrawler
-            ? 'Spoofed Crawler'
-            : 'Bot / Automated'
-          : isBotDetected
-          ? 'Bot / Automated'
-          : isHeadlessDetected
-          ? 'Cloud / Headless'
-          : 'Verified Human',
-      tooltip: signals.botSignals.length > 0 ? signals.botSignals.join(' • ') : botDetail,
-      riskScore: botScore,
-    }),
-    createSignalRow({
-      key: 'vpn',
-      tone: toneForScore(vpnScore),
-      title: 'VPN / Proxy & Network Type',
-      caption: vpnDetail,
-      statusLabel: isTorExit
-        ? 'Tor Exit Node'
-        : isBlocklisted
-        ? 'Blocklisted IP'
-        : isDatacenterAsn
-        ? 'VPN / Datacenter Proxy'
-        : hasTzMismatch
-        ? 'VPN / Timezone Relay'
-        : ispBrand
-        ? `Standard ISP (${ispBrand})`
-        : 'Standard ISP',
-      tooltip: signals.vpnReasons.length > 0 ? signals.vpnReasons.join(' • ') : vpnDetail,
-      riskScore: vpnScore,
-    }),
-    createSignalRow({
-      key: 'vm',
-      tone: toneForScore(vmScore),
-      title: 'Virtual Machine & OS Integrity',
-      caption: vmDetail,
-      statusLabel: isRequestTampered
-        ? 'Tampered / Replayed'
-        : isEmulator
-        ? 'Mobile Emulator'
-        : isVm
-        ? 'Virtual Machine / VM'
-        : isTampered
-        ? 'Spoofed Environment'
-        : 'Physical Hardware',
-      tooltip: vmDetail,
-      riskScore: vmScore,
-    }),
-  ];
-}
-
-/**
- * Builds the 4-signal core grid. The server-computed smart signals win whenever present;
- * otherwise the identical client-side derivation is used as an accurate fallback.
+ * Builds the 4-signal core grid strictly from the server-computed smart signals.
  *
- * A confirmed incognito verdict (from either side of the payload) may never be downgraded
- * by a stale server tile: when the server still reports a 0/10 incognito tile the row is
- * MERGED — server wording/detail kept, status + score + label forced to the private verdict.
+ * Phase 7 single-truth rule: the client never recomputes a per-card score or a composite
+ * score, and never force-overrides a server tile (the old incognito 4/10 override is gone).
+ * When the Worker has not yet supplied the grid, each tile reports an honest
+ * "Unavailable" state rather than a fabricated number.
  */
-function buildSignalRows(
-  signals: SecuritySignals,
-  serverSignals?: SmartSignals | null,
-  incognitoConfirmed = false,
-  clientEmulator?: EmulatorEvidence | null
-): SignalRowModel[] {
+const UNAVAILABLE_CARD_TITLES = [
+  'Incognito / Private Browsing',
+  'Bot & Automation Detection',
+  'VPN / Proxy & Network Type',
+  'Virtual Machine & OS Integrity',
+] as const;
+
+function buildSignalRows(serverSignals?: SmartSignals | null): SignalRowModel[] {
   if (serverSignals) {
-    const rows = [
+    return [
       serverSignals.incognito,
       serverSignals.bot,
       serverSignals.vpn,
       serverSignals.vm,
     ].map(smartSignalToRow);
-    if (incognitoConfirmed && rows[0].riskScore <= 0) {
-      rows[0] = {
-        ...rows[0],
-        statusLabel: 'Incognito / Private Mode',
-        riskScore: 4,
-        riskLabel: 'Medium Risk • 4/10',
-        dotClass: TONE_DOT_CLASS[toneForScore(4)],
-      };
-    }
-    return rows;
   }
-  return buildClientSignalRows(signals, incognitoConfirmed, clientEmulator);
+  return UNAVAILABLE_CARD_TITLES.map((title) =>
+    createSignalRow({
+      key: title,
+      tone: 'ok',
+      title,
+      caption: 'Awaiting canonical signal grid from the Worker',
+      statusLabel: 'Unavailable',
+      tooltip: 'Server-computed signal grid not present in this response',
+      riskScore: 0,
+      riskLabel: 'Unavailable',
+    })
+  );
 }
 
 interface JsonTreeNodeProps {
@@ -1060,7 +883,8 @@ export default function App() {
             language: data.browserDevice.language,
             timezone: data.browserDevice.timezone,
             suspectScore: data.suspectScore,
-            score10: Math.max(0, Math.min(10, Math.round(data.suspectScore ?? 0))),
+            // Server-provided history score is echoed verbatim — no client rescoring.
+            score10: data.suspectScore,
             riskLevel: data.riskLevel,
             recognitionSource: data.recognitionSource,
           },
@@ -1099,9 +923,12 @@ export default function App() {
       ? activeVisit.longitude
       : data?.location.longitude ?? null;
 
-  const cleanGpuName = data?.hardwareSignals
-    ? formatCleanGpuName(data.hardwareSignals.gpuRenderer, data.hardwareSignals.gpuVendor)
-    : 'Standard GPU';
+  const swiftShader = isSwiftShader(data?.hardwareSignals?.gpuRenderer);
+  const cleanGpuName = !data?.hardwareSignals
+    ? 'Standard GPU'
+    : swiftShader
+    ? SWIFTSHADER_LABEL
+    : formatCleanGpuName(data.hardwareSignals.gpuRenderer, data.hardwareSignals.gpuVendor);
   const rawGpuTooltip = data?.hardwareSignals
     ? `${data.hardwareSignals.gpuVendor} • ${data.hardwareSignals.gpuRenderer}`
     : '';
@@ -1109,11 +936,16 @@ export default function App() {
   // high tampering-ML score are present, the cores / RAM / GPU numbers come from the very
   // getters that were patched, so the dashboard tags them as unverified instead of facts.
   const tamperingMlScore = data?.securitySignals?.tamperingMlScore;
+  // The single canonical envelope. Every panel and the Event JSON below read this object —
+  // no client code recomputes a composite score, tier, verdict or quarantine decision.
+  const canonical = useMemo(() => resolveCanonical(data), [data]);
   const spoofedSpecs = Boolean(
     data?.tamperingDetails?.anti_detect_browser ||
       data?.tamperingDetails?.devtools_device_emulation ||
       data?.securitySignals?.stealthPluginDetected ||
-      (typeof tamperingMlScore === 'number' && tamperingMlScore >= 0.8)
+      (typeof tamperingMlScore === 'number' && tamperingMlScore >= 0.8) ||
+      canonical.tampering?.anti_detect_browser ||
+      canonical.tampering?.hard_spec_violation
   );
   const spoofedSpecTag = spoofedSpecs ? ' (Spoofed / Unverified)' : '';
 
@@ -1156,77 +988,26 @@ export default function App() {
         data?.securitySignals?.stealthPluginDetected ||
         data?.tamperingDetails?.anti_detect_browser ||
         data?.tamperingDetails?.devtools_device_emulation ||
-        (typeof tamperingMlScore === 'number' && tamperingMlScore >= 0.8))
+        (typeof tamperingMlScore === 'number' && tamperingMlScore >= 0.8) ||
+        canonical.tamperingReasons.length > 0)
   );
 
-  // 4-signal core grid model (null-safe: renders only inside the data block). The server's
-  // computed grid is preferred; the client mirror covers older responses.
-  const activeSignals = data?.securitySignals ?? null;
+  // 4-signal core grid model (null-safe: renders only inside the data block). Only the
+  // server-computed grid is displayed; a legacy response gets explicit unavailable tiles.
   const serverSmartSignals = data?.smartSignals ?? data?.securitySignals?.smartSignals ?? null;
-  // GAP 1 — emulator evidence derived on the client from the same values the server sees,
-  // so the Tile 4 fallback can never disagree with the server's own verdict.
-  const clientEmulatorEvidence: EmulatorEvidence | null = data
-    ? detectEmulatorEvidence({
-        platform: data.browserDevice.platform,
-        maxTouchPoints: data.hardwareSignals.maxTouchPoints,
-        gpuVendor: data.hardwareSignals.gpuVendor,
-        gpuRenderer: data.hardwareSignals.gpuRenderer,
-        screenResolution: data.browserDevice.screenResolution,
-      })
-    : null;
-  // A private verdict from either side wins — the incognito tile must never fall back to
-  // "Standard Window" when the client device object, the client signals, or either server
-  // smart-signal copy reports an incognito score.
-  const incognitoConfirmed = Boolean(
-    data &&
-      (data.browserDevice?.incognito ||
-        data.browserDevice?.isIncognito ||
-        data.browserDevice?.privateMode ||
-        data.securitySignals?.isIncognito ||
-        data.securitySignals?.incognito ||
-        data.securitySignals?.privateMode ||
-        data.securitySignals?.incognitoLikely ||
-        (data.smartSignals?.incognito?.scoreOutOf10 ?? 0) > 0 ||
-        (data.securitySignals?.smartSignals?.incognito?.scoreOutOf10 ?? 0) > 0)
-  );
-  const signalRows = activeSignals
-    ? buildSignalRows(
-        activeSignals,
-        serverSmartSignals,
-        incognitoConfirmed,
-        clientEmulatorEvidence
-      )
-    : [];
+  const signalRows = buildSignalRows(serverSmartSignals);
 
-  // Normalized 0..10 threat score + derived risk tier (legacy scale converted). The server's
-  // top-level mirrors win; older payloads fall back to securitySignals.
-  const normalizedSuspectScore = normalizeLegacyScore(
-    data?.suspectScore ?? data?.securitySignals?.suspectScore
-  );
-  const serverRiskBadgeText =
-    data?.riskBadgeText ?? data?.securitySignals?.riskBadgeText ?? null;
-  // The header may never advertise a lower tier than the worst card: without a server badge,
-  // the displayed composite applies the same monotonic card-floor invariant as the server
-  // (max card + 1 for two elevated cards, +2 for three or more).
-  const worstTileScore = signalRows.reduce((max, row) => Math.max(max, row.riskScore), 0);
-  const elevatedTileCount = signalRows.filter((row) => row.riskScore >= 4).length;
-  const tileSynergyBonus = elevatedTileCount >= 3 ? 2 : elevatedTileCount === 2 ? 1 : 0;
-  const tileFloorScore = Math.min(10, worstTileScore + tileSynergyBonus);
-  const displayedRiskScore = serverRiskBadgeText
-    ? normalizedSuspectScore
-    : Math.max(normalizedSuspectScore, tileFloorScore);
-  const riskTier: RiskLevel = serverRiskBadgeText
-    ? data?.riskLevel ?? resolveRiskTier(normalizedSuspectScore)
-    : resolveRiskTier(displayedRiskScore);
-  const riskBadgeText = serverRiskBadgeText ?? `${riskTier} Risk • ${displayedRiskScore}/10`;
+  // The 0-100 ledger is the canonical risk truth. The 0-10 figures survive only as
+  // explicitly labelled per-card scores inside the Smart Signals grid.
+  const displayedSuspectScore = canonical.risk.score_0_100;
+  const riskTier = canonical.risk.tier;
+  const riskIsHigh = riskTier === 'High' || riskTier === 'Critical';
+  const riskIsElevated = riskTier === 'Elevated';
+  const riskTone = riskIsHigh ? 'text-rose-700' : riskIsElevated ? 'text-amber-700' : 'text-emerald-700';
+  const riskBadgeText = `${riskTier} Risk • ${displayedSuspectScore}/100`;
 
-  // Calibrated 0-100 composite for the top-centered Risk Meter. Older payloads fall back to
-  // the 0-10 card-floor score scaled by ten so the meter always has a value.
-  // The dashboard reads every score on the 0-10 scale.
-  const displayedSuspectScore = Math.max(
-    0,
-    Math.min(10, Math.round(displayedRiskScore * 10) / 10)
-  );
+  // Whenever the canonical tampering axis reports reasons, the header must say so.
+  const tamperingDetected = canonical.tamperingReasons.length > 0;
 
   // Cursor attribution pill: resolved from the first-party bot / agent verdicts. Human
   // visitors resolve to null, so the overlay never mounts for them.
@@ -1283,6 +1064,24 @@ export default function App() {
     const osVersion = uaIdentity.os_version;
     const rawAttributes =
       data.rawDeviceAttributes ?? (s as { rawDeviceAttributes?: unknown }).rawDeviceAttributes ?? null;
+    const rawRecord =
+      rawAttributes && typeof rawAttributes === 'object' && !Array.isArray(rawAttributes)
+        ? (rawAttributes as Record<string, unknown>)
+        : {};
+    const pickClaim = (...keys: string[]): unknown => {
+      for (const key of keys) {
+        const value = rawRecord[key];
+        if (value !== undefined && value !== null && value !== '') return value;
+      }
+      return null;
+    };
+    const claimedBrowser = data.browserDevice?.browser ?? null;
+    const claimedTimezone =
+      data.browserDevice?.timezone ?? pickClaim('timezone', 'browser_timezone');
+    const claimedFont = pickClaim('fonts', 'font', 'font_family');
+    const claimedCanvas = pickClaim('canvas', 'canvas_hash');
+    const claimedWebgl =
+      pickClaim('webgl', 'webgl_renderer', 'gpu_renderer') ?? data.hardwareSignals?.gpuRenderer ?? null;
     const phoneDetails =
       data.browserDevice.genuineMobile && data.browserDevice.phoneModel
         ? {
@@ -1302,7 +1101,7 @@ export default function App() {
         platform: 'js',
         version: '2.1.0',
         integrations: [
-          { name: 'intel-system-express-vercel', version: '2.1.0' },
+          { name: 'intel-system-cloudflare-worker', version: '2.1.0' },
           { name: 'intel-system-react', version: '19.0.0' },
         ],
       },
@@ -1310,7 +1109,13 @@ export default function App() {
       identification: {
         visitor_id: data.visitorId,
         hardware_id: data.hardwareId,
-        confidence: data.identification?.confidence ?? { score: 1, version: '2.1' },
+        // Categorical tier only; no numeric confidence is invented on the client and an
+        // unseen profile keeps confidence_score null.
+        confidence: {
+          score: canonical.confidenceScore,
+          tier: canonical.confidenceTier,
+          calibration_status: canonical.calibrationStatus,
+        },
         visitor_found: data.identification?.visitor_found ?? data.isReturning,
         recognition_mode:
           s.persistenceMode === 'Hardware ID Recovered'
@@ -1351,8 +1156,7 @@ export default function App() {
       } : null),
       developer_tools: Boolean(s.developerTools ?? s.cdpRuntimeLeak),
       automation_environment: s.automationEnvironment ?? 'none',
-      human_corroboration:
-        typeof s.humanCorroboration === 'number' ? s.humanCorroboration : null,
+      human_corroboration: canonical.humanCorroboration,
       ip_blocklist: {
         email_spam: false,
         attack_source: Boolean(s.ipBlocklisted),
@@ -1416,15 +1220,88 @@ export default function App() {
       rare_device: Boolean(data.rareDevice ?? s.rareDevice),
       rare_device_percentile_bucket:
         data.rareDevicePercentileBucket ?? s.rareDevicePercentileBucket ?? '<p95',
-      raw_device_attributes:
-        rawAttributes && typeof rawAttributes === 'object'
-          ? { ...(rawAttributes as Record<string, unknown>), ...phoneDetails }
-          : rawAttributes,
+      // Spoof quarantine: client-reported browser / timezone / font / canvas / WebGL claims
+      // are blocked when the session is tampered. Server-verified browser / OS above stay
+      // authoritative, so "Headless Chrome <full_version>" is surfaced consistently.
+      spoof_quarantine: spoofedSpecs
+        ? {
+            status: 'Quarantined - Tampered Session',
+            client_claimed_browser: quarantineClaim(claimedBrowser, true),
+            client_claimed_timezone: quarantineClaim(claimedTimezone, true),
+            font: quarantineClaim(claimedFont, true),
+            canvas: quarantineClaim(claimedCanvas, true),
+            webgl: quarantineClaim(claimedWebgl, true),
+            label: '[Unverified - Tampered Session]',
+          }
+        : { status: 'None' },
+      raw_device_attributes: quarantineAttributes(
+        { ...rawRecord, ...phoneDetails },
+        spoofedSpecs
+      ),
+      // Everything below is the single canonical envelope, identical to the DOM panels.
+      canonical: {
+        source: canonical.source,
+        risk: {
+          score_0_100: canonical.risk.score_0_100,
+          raw_score: canonical.risk.raw_score,
+          tier: canonical.risk.tier,
+          automation: canonical.risk.automation,
+          tampering: canonical.risk.tampering,
+          network: canonical.risk.network,
+          environment: canonical.risk.environment,
+          velocity: canonical.risk.velocity,
+          evidence_ledger: canonical.risk.evidence_ledger,
+        },
+        verdict_tier: canonical.verdictTier,
+        browser_tampering: tamperingDetected ? 'Detected' : 'Not detected',
+        human_corroboration: canonical.humanCorroboration,
+        identity: {
+          match_stage: canonical.identity?.match_stage ?? null,
+          match_label: canonical.identity?.match_label ?? null,
+          confidence_tier: canonical.confidenceTier,
+          confidence_score: canonical.confidenceScore,
+          calibration_status: canonical.calibrationStatus,
+        },
+        network: {
+          hosting_asn: (() => {
+            const n = canonical.network;
+            return n?.network_ownership === 'hosting_datacenter'
+              ? `Hosting / Datacenter ASN${n.bgp_asn ? ` · ${n.bgp_asn}` : ''}${
+                  n.bgp_asn_org ? ` · ${n.bgp_asn_org}` : ''
+                }`
+              : n?.bgp_asn
+              ? `ASN ${n.bgp_asn}${n.bgp_asn_org ? ` · ${n.bgp_asn_org}` : ''}`
+              : 'Unavailable';
+          })(),
+          rdap_netblock_org: canonical.network?.rdap_netblock_org ?? null,
+          vpn_status: canonical.network?.vpn
+            ? `VPN / relay detected (${canonical.network.vpn_confidence ?? 'low'} confidence)`
+            : canonical.network?.vpn_confidence === 'high'
+            ? 'No VPN detected (high confidence)'
+            : 'No VPN detected (low confidence)',
+          proxy_rotation: canonical.network?.proxy ? 'Detected' : 'Not detected',
+          timezone_discrepancy: canonical.network?.timezone_mismatch ? 'Detected' : 'Not detected',
+        },
+        proximity: { status: canonical.proximity.status, label: canonical.proximity.label },
+        rarity: {
+          corpus_n: canonical.rarity.corpus_n,
+          status: canonical.rarity.status,
+          percentile: canonical.rarity.percentile,
+          label: canonical.rarity.label,
+        },
+        capabilities: {
+          active_call: 'Unavailable in Web Browser',
+          ja3_ja4t: 'Unavailable - requires Cloudflare Bot Management / not observable on Workers',
+          tcp_syn_os_mismatch:
+            'Unavailable - requires Cloudflare Bot Management / not observable on Workers',
+        },
+        software_renderer: swiftShader ? SWIFTSHADER_LABEL : null,
+      },
       // Tri-layer identity evidence from the server resolver + calibrated confidence v2.0.
       identity_layers: data.identity_layers ?? null,
       consistency: data.consistency ?? null,
     };
-  }, [data, displayedSuspectScore]);
+  }, [data, displayedSuspectScore, canonical, spoofedSpecs, tamperingDetected, swiftShader]);
 
   // Tor / AI attribution surface — rendered above the Smart Signals grid whenever any
   // first-party anonymity or agent identity was resolved for this visit.
@@ -1477,7 +1354,7 @@ export default function App() {
       </header>
 
       <main className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-6 py-4 sm:py-7 space-y-6">
-        {/* Top-centered Risk Meter: calibrated 0-100 Suspect Score */}
+        {/* Top-centered Risk Meter: canonical 0-100 orthogonal ledger */}
         <section className="w-full max-w-2xl mx-auto flex flex-col items-center justify-center text-center pt-4 pb-2 px-4">
           <span className="text-[10px] font-mono uppercase tracking-[0.18em] text-slate-500">
             Device Intelligence
@@ -1485,36 +1362,37 @@ export default function App() {
           <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
             <span
               className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold ${
-                displayedSuspectScore === 0
-                  ? 'bg-[#E6F4EA] border-[#81C995] text-[#137333]'
-                  : riskTier === 'High'
+                riskIsHigh
                   ? 'bg-[#FCE8E6] border-[#D93025]/40 text-[#D93025]'
-                  : riskTier === 'Medium'
+                  : riskIsElevated
                   ? 'bg-[#FEF7E0] border-[#F9AB00]/50 text-[#B06000]'
                   : 'bg-[#E6F4EA] border-[#81C995] text-[#137333]'
               }`}
             >
-              {riskTier === 'High' ? (
+              {riskIsHigh ? (
                 <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
               ) : (
                 <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
               )}
-              {displayedSuspectScore === 0 ? 'Not detected' : `Suspect Score \u2022 ${displayedSuspectScore}/10`}
+              {riskBadgeText}
             </span>
-            {displayedSuspectScore > 0 && (
-              <span className="text-[11px] font-mono text-slate-500">{riskTier} Risk</span>
+            {tamperingDetected && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[10px] font-semibold text-rose-700">
+                <ShieldAlert className="w-3 h-3 shrink-0" />
+                Browser Tampering: Detected
+              </span>
             )}
           </div>
           <div className="w-full max-w-md h-2.5 bg-slate-200 rounded-full overflow-hidden mt-3">
             <div
               className={`h-full transition-all duration-300 ${
-                riskTier === 'High'
+                riskIsHigh
                   ? 'bg-[#D93025]'
-                  : riskTier === 'Medium'
+                  : riskIsElevated
                   ? 'bg-[#F9AB00]'
                   : 'bg-[#81C995]'
               }`}
-              style={{ width: `${Math.max(2, displayedSuspectScore * 10)}%` }}
+              style={{ width: `${Math.max(2, displayedSuspectScore)}%` }}
             />
           </div>
           <div className="mt-3 flex items-center justify-center gap-3">
@@ -1715,21 +1593,20 @@ export default function App() {
                 <p className="text-xs sm:text-[13px] text-slate-500 mt-1">
                   Real-time browser identity, hardware fingerprint, and live connection telemetry.
                 </p>
-                {data.identification ? (
+                {data.identification || canonical.identity ? (
                   <div className="mt-2 flex items-center gap-1.5 flex-wrap">
                     <span
-                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
-                        data.identification.confidence.score >= 0.9
-                          ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
-                          : data.identification.confidence.score >= 0.7
-                          ? 'border-amber-200 bg-amber-50 text-amber-700'
-                          : 'border-rose-200 bg-rose-50 text-rose-700'
-                      }`}
-                      title="Calibrated identification confidence (v2.0)"
+                      className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-700"
+                      title={`Categorical confidence tier · ${canonical.calibrationStatus}`}
                     >
-                      Confidence {(data.identification.confidence.score * 100).toFixed(1)}% · v
-                      {data.identification.confidence.version}
+                      {canonical.confidenceTier} ·{' '}
+                      {canonical.calibrationStatus === 'calibrated' ? 'Calibrated' : 'Uncalibrated'}
                     </span>
+                    {tamperingDetected && (
+                      <span className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[10px] font-semibold text-rose-700">
+                        Browser Tampering: Detected
+                      </span>
+                    )}
                     {data.identity_layers ? (
                       <span
                         className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-600"
@@ -2101,9 +1978,13 @@ export default function App() {
                         </span>
                         <span
                           className="block text-[11px] sm:text-sm font-semibold text-[#111827] break-words leading-snug mt-0.5"
-                          title={`${data.browserDevice.language} • ${data.browserDevice.timezone}`}
+                          title={`${data.browserDevice.language} • ${String(
+                            quarantineClaim(data.browserDevice.timezone, spoofedSpecs)
+                          )}`}
                         >
-                          {data.browserDevice.language} • {data.browserDevice.timezone}
+                          {data.browserDevice.language} • {String(
+                            quarantineClaim(data.browserDevice.timezone, spoofedSpecs)
+                          )}
                         </span>
                       </div>
                     </div>
@@ -2297,7 +2178,7 @@ export default function App() {
                       </div>
                       <span className="block text-xs sm:text-sm font-semibold text-[#111827] truncate mt-0.5">
                         {cleanGpuName}
-                        {spoofedSpecs && (
+                        {spoofedSpecs && !swiftShader && (
                           <span className="ml-1.5 text-[9px] font-sans font-medium text-amber-600">
                             (Spoofed / Unverified)
                           </span>
@@ -2451,21 +2332,13 @@ export default function App() {
                     </h2>
                   </div>
 
-                  <span
-                    className={`inline-flex items-center gap-1.5 text-xs font-mono font-semibold ${
-                      riskTier === 'High'
-                        ? 'text-rose-700'
-                        : riskTier === 'Medium'
-                        ? 'text-amber-700'
-                        : 'text-emerald-700'
-                    }`}
-                  >
-                    {riskTier === 'High' ? (
+                  <span className={`inline-flex items-center gap-1.5 text-xs font-mono font-semibold ${riskTone}`}>
+                    {riskIsHigh ? (
                       <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
                     ) : (
                       <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
                     )}
-                    <span>{`${riskTier} Risk \u2022 ${displayedSuspectScore}/10`}</span>
+                    <span>{riskBadgeText}</span>
                   </span>
                 </div>
 
@@ -2504,12 +2377,23 @@ export default function App() {
                       {data.visitHistory.length} {data.visitHistory.length === 1 ? 'record' : 'records'} persisted
                     </span>
                   </div>
-                  <SmartSignalsGrid data={data} />
+                  <SmartSignalsGrid data={data} view={canonical} />
                 </div>
               </div>
             </div>
 
           </section>
+        )}
+
+        {/* Phase 7 canonical telemetry: one envelope, no recomputed scores. */}
+        {data && (
+          <div className="space-y-6">
+            <VerdictBannerPanel view={canonical} />
+            <RiskLedgerPanel view={canonical} />
+            <NetworkAxesPanel view={canonical} />
+            <ProximityRarityConfidencePanel view={canonical} />
+            <CapabilityAvailabilityPanel />
+          </div>
         )}
 
         {/* Network Stability & System CPU Pressure (Responsive Side-by-Side Grid) */}
