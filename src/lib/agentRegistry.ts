@@ -617,6 +617,10 @@ const REGISTRY_LITERAL = [
   },
   {
     // Unsigned UA claim only: no ASN / network corroboration is assumed for xAI traffic.
+    // The GrokBot token is version-anchored: the reported xAI crawler string is
+    // `Mozilla/5.0 (compatible; GrokBot/1.0; +x.ai/)`. A bare `GrokBot` substring is
+    // deliberately NOT accepted — it false-positives on third-party UAs such as
+    // `news-tracker/1.0 (...mail.grokbot.com)` and `GrokBot-ArticleSaver/1.0`.
     id: 'grok_bot',
     provider: 'xAI',
     displayName: 'Grok Bot',
@@ -624,7 +628,7 @@ const REGISTRY_LITERAL = [
     bucket: 'grok',
     rank: 815,
     which: ['robodex'],
-    ua: { patterns: [/GrokBot/i, /\bxAI-GrokBot\b/i, /\bxAI-Bot\b/i, /GrokAgent/i] },
+    ua: { patterns: [/\bGrokBot\/\d/i, /\bxAI-GrokBot\b/i, /\bxAI-Bot\b/i, /GrokAgent/i] },
     minProofForVerified: 'ua_claim',
     executionMode: 'Cloud Browser Agent',
   },

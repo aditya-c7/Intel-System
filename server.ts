@@ -5106,6 +5106,45 @@ function structuralAnchorsMatch(
 }
 
 /**
+ * Independent-axis corroboration for a storage-less hardware / LSH match. A homogeneous
+ * software-rendered cloud container can clone the same WebGL / canvas / audio hashes across
+ * unrelated visitors, so a bare hardware hit may only inherit another visitor's canonical id
+ * when the stored profile's browser + OS family AND the visitor's ASN history agree. The gate
+ * fails closed: any missing, unreadable or disagreeing axis blocks the adoption.
+ */
+function hardwareOnlyMatchCorroborated(
+  db: DatabaseAdapter,
+  candidateVisitorId: string,
+  browserFamily: string,
+  osFamily: string,
+  asn: string
+): boolean {
+  if (!candidateVisitorId || !browserFamily || !osFamily || !asn || asn === 'Unknown') return false;
+  try {
+    const row = db
+      .prepare('SELECT profile_json FROM visitor_profiles WHERE visitor_id = ?')
+      .get(candidateVisitorId) as { profile_json?: unknown } | undefined;
+    if (typeof row?.profile_json !== 'string') return false;
+    const stored = JSON.parse(row.profile_json) as Record<string, unknown>;
+    const nested = (value: unknown, key: string): unknown =>
+      value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined;
+    const storedBrowserFamily = browserFamilyKey(
+      String(nested(nested(stored, 'browser'), 'family') ?? '')
+    );
+    const storedOsFamily = osFamilyKey(String(nested(nested(stored, 'os'), 'family') ?? ''));
+    if (!storedBrowserFamily || !storedOsFamily) return false;
+    if (storedBrowserFamily !== browserFamily || storedOsFamily !== osFamily) return false;
+    return Boolean(
+      db
+        .prepare('SELECT 1 FROM visits WHERE visitor_id = ? AND asn = ? LIMIT 1')
+        .get(candidateVisitorId, asn)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Persist the BGP ASN and its resolved RDAP netblock organisation in the same cache row so
  * both facts are always read back together; a reassignment mismatch is reported when the
  * cached netblock org diverges from the live ASN org.
@@ -6167,8 +6206,8 @@ function sanitizeHardwareSignals(
   const archTruthValue = safeStr(raw?.architecture, '', 80).trim().toLowerCase();
   const untrustedArchTruth =
     archTruthSource === 'nan-sign-bit' ||
-    /^(unknown|software)$/.test(archTruthValue) ||
-    /^(unknown|software)$/.test(gpuArchFamily.toLowerCase());
+    /^(unknown|software|nan)$/.test(archTruthValue) ||
+    /^(unknown|software|nan)$/.test(gpuArchFamily.toLowerCase());
 
   return {
     hardwareId: validHwId,
@@ -6693,8 +6732,14 @@ function sanitizeAndReinforceSecuritySignals(
   const rawTamperReasons = safeStrArray(raw?.tamperReasons);
   const timezoneOnlyTamper =
     rawTamperReasons.length > 0 && rawTamperReasons.every((reason) => isTimezoneMismatchReason(reason));
+  // A genuine client-reported OS/UA-vs-platform contradiction is tampering evidence, not just a
+  // VM/environment note. It must set the boolean so the +3 "tampered OS" risk factor can never
+  // be charged without a matching tamper verdict (points-without-boolean).
+  const clientOsTampered = Boolean(raw?.isOsTampered);
   const tamperDetected = Boolean(
-    (!timezoneOnlyTamper && raw?.tamperDetected) || requestContext.tamperedRequest
+    (!timezoneOnlyTamper && raw?.tamperDetected) ||
+      requestContext.tamperedRequest ||
+      clientOsTampered
   );
   const tamperReasons = rawTamperReasons.filter((reason) => !isTimezoneMismatchReason(reason));
   if (
@@ -6748,7 +6793,7 @@ function sanitizeAndReinforceSecuritySignals(
   // Raw client claim only — re-verified against host-level proof in the VM tile before it is
   // allowed to reach `securitySignals.isVirtualMachine` or the envelope.
   const clientReportedVm = Boolean(raw?.isVirtualMachine);
-  const isOsTampered = Boolean(raw?.isOsTampered);
+  const isOsTampered = clientOsTampered;
   const vmReason =
     typeof raw?.vmReason === 'string' && raw.vmReason.trim()
       ? raw.vmReason.trim().slice(0, 200)
@@ -7328,7 +7373,14 @@ function sanitizeAndReinforceSecuritySignals(
     const duplicatesIntegrityReason =
       integrityViolation && vmSignal.detail === (requestIntegrityReason || 'tampered or replayed payload');
     if (!duplicatesIntegrityReason) {
-      riskFactors.push(`Virtual machine / tampered OS (+3): ${vmSignal.detail}`);
+      // "tampered OS" is only asserted when the tampering boolean actually fired (the client
+      // reported a genuine UA/platform contradiction). A bare VM / software-rendered cloud
+      // environment is a lower-confidence environment observation, never an OS-deception claim.
+      riskFactors.push(
+        isTampered
+          ? `Tampered OS (+3): ${vmSignal.detail}`
+          : `Virtual machine / software-rendered environment (+3): ${vmSignal.detail}`
+      );
     }
   }
   if (isIncognito) {
@@ -7770,6 +7822,9 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     // True only when this request recovered an ALREADY EXISTING row purely by hardware
     // fingerprint — i.e. no cookie / localStorage identity survived.
     let existingHwidVisitor = false;
+    // A storage-less hardware hit that failed the corroboration gate must still be reported
+    // honestly as a possible hardware match, never as a verified returning device.
+    let rejectedHardwareOnlyMatch = false;
 
     const cookieVerified = Boolean(cookieVid && verifyVisitorToken(cookieVid, cookieToken));
     const storageVerified = Boolean(
@@ -7909,9 +7964,31 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       }
 
       if (hwMatchedVisitor) {
-        existingVisitor = hwMatchedVisitor;
-        existingHwidVisitor = true;
-        recognitionSource = 'Hardware Fingerprint (Cookie-less / Incognito)';
+        // A storage-less hardware hit inherits another visitor's id only when independent axes
+        // agree. Software-rendered cloud containers clone hardware hashes across unrelated
+        // visitors, so they are never allowed to adopt a foreign canonical id here.
+        const softwareRenderer = /swiftshader|llvmpipe|softpipe|software|masked|unavailable/i.test(
+          String(hardwareSignals.gpuRenderer || '') + ' ' + String(hardwareSignals.gpuVendor || '')
+        );
+        const homogeneousContainer =
+          softwareRenderer &&
+          (classification.isDatacenterOrHosting || Boolean(rawSecuritySignals?.isHeadless));
+        const corroborated =
+          !homogeneousContainer &&
+          hardwareOnlyMatchCorroborated(
+            db,
+            hwMatchedVisitor.visitor_id,
+            browserFamilyKey(browserDevice.browser),
+            osFamilyKey(browserDevice.os),
+            location.asn
+          );
+        if (corroborated) {
+          existingVisitor = hwMatchedVisitor;
+          existingHwidVisitor = true;
+          recognitionSource = 'Hardware Fingerprint (Cookie-less / Incognito)';
+        } else {
+          rejectedHardwareOnlyMatch = true;
+        }
       }
     }
 
@@ -8756,26 +8833,6 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       : conflictingRuntimeClaim && !/\(claimed\)$/i.test(uaOsLabel)
       ? `${uaOsLabel} (claimed)`
       : uaOsLabel;
-    const osFamilyKey = (value: string): string => {
-      const text = String(value || '').toLowerCase();
-      if (!text || text === 'unknown') return '';
-      if (/mac os x|macos|macintosh|\bmac\b/.test(text)) return 'macos';
-      if (/iphone|ipad|ipod|ipados|\bios\b/.test(text)) return 'ios';
-      if (/android/.test(text)) return 'android';
-      if (/windows|win32|win64/.test(text)) return 'windows';
-      if (/linux|ubuntu|fedora|debian|chrome ?os/.test(text)) return 'linux';
-      return text.replace(/[^a-z0-9]/g, '');
-    };
-    const browserFamilyKey = (value: string): string => {
-      const text = String(value || '').toLowerCase();
-      if (!text || text === 'unknown') return '';
-      if (/edg(e|a|ios)?\b|edge/.test(text)) return 'edge';
-      if (/opera|\bopr\b/.test(text)) return 'opera';
-      if (/firefox|fxios/.test(text)) return 'firefox';
-      if (/crios|chrome|chromium/.test(text)) return 'chrome';
-      if (/safari/.test(text)) return 'safari';
-      return text.replace(/[^a-z0-9]/g, '');
-    };
     const serverOsFamily = osFamilyKey(serverVerifiedOs);
     const clientOsFamily = osFamilyKey(browserDevice.os);
     const serverBrowserFamily = browserFamilyKey(serverVerifiedBrowser);
@@ -8936,8 +8993,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     ).toLowerCase();
     const untrustedArchTruth =
       archTruthSource === 'nan-sign-bit' ||
-      /^(unknown|software)$/.test(archTruthValue) ||
-      /^(unknown|software)$/.test(gpuArchTruth);
+      /^(unknown|software|nan)$/.test(archTruthValue) ||
+      /^(unknown|software|nan)$/.test(gpuArchTruth);
     if (
       runtimeOsAuthoritative &&
       runtimeOsVerdict.uaMismatch &&
@@ -9531,6 +9588,51 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       candidates: retrieveLshCandidates(db, lshIdentityProfile),
     });
 
+    // Recognition honesty — resolved BEFORE any hardware / LSH adoption so the corroboration
+    // gate can refuse to mint a returning visitor out of a cross-cloud collision. A hardware-only
+    // anchor is not a verified "Returning Device" unless independent axes agree: browser family,
+    // platform/OS family and the matched visitor's ASN history. In a homogeneous cloud/headless
+    // container with software rendering even structural matches are collision-prone, so the
+    // label is downgraded to "possible hardware match" at <= 0.6 confidence. A stable
+    // first-party-cookie / persistent-profile return is never hardware-only and is untouched.
+    const hardwareOnlyMatch =
+      rejectedHardwareOnlyMatch ||
+      identityStage.stage === 'lsh_fuzzy' ||
+      recognitionSource === 'Hardware Fingerprint (Cookie-less / Incognito)';
+    const browserFamilyCorroborated = Boolean(
+      serverBrowserFamily && clientBrowserFamily && serverBrowserFamily === clientBrowserFamily
+    );
+    const osFamilyCorroborated = Boolean(
+      serverOsFamily && clientOsFamily && serverOsFamily === clientOsFamily
+    );
+    // Corroborate against the visitor we would actually adopt (the LSH candidate, or the
+    // storage-less hardware hit), not against a cookie visitor that may not exist here.
+    const corroboratingVisitorId =
+      identityStage.stage === 'lsh_fuzzy' && identityStage.visitorId
+        ? String(identityStage.visitorId)
+        : existingVisitor?.visitor_id ?? null;
+    const recognitionCorroborated = Boolean(
+      browserFamilyCorroborated &&
+        osFamilyCorroborated &&
+        corroboratingVisitorId &&
+        hardwareOnlyMatchCorroborated(
+          db,
+          corroboratingVisitorId,
+          serverBrowserFamily || clientBrowserFamily,
+          serverOsFamily || clientOsFamily,
+          location.asn
+        )
+    );
+    const softwareRenderedEnvironment = Boolean(
+      specAssessment.software_renderer ||
+        /swiftshader|llvmpipe|softpipe|software|masked|unavailable/i.test(
+          String(hardwareSignals.gpuRenderer || '') + ' ' + String(hardwareSignals.gpuVendor || '')
+        )
+    );
+    const homogeneousContainer =
+      softwareRenderedEnvironment && (hostingDatacenter || Boolean(securitySignals.isHeadless));
+    const downgradeRecognition = hardwareOnlyMatch && (!recognitionCorroborated || homogeneousContainer);
+
     // A probabilistic fuzzy match must supply the final visitor ID. When a screen/DPR change makes
     // blockKeysFor miss, an earlier lookup mints a fresh ID while the envelope still reports
     // "Probabilistic Fuzzy Match". Adopt the matched hardware anchor's canonical visitor so the
@@ -9566,7 +9668,12 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         if (
           fuzzyAnchor &&
           Number(fuzzyAnchor.max_seeds ?? 0) < 2 &&
-          (!freshUnanchoredContext || Boolean(structuralMatch?.matched))
+          (!freshUnanchoredContext || Boolean(structuralMatch?.matched)) &&
+          // A hardware-only / LSH anchor may adopt another visitor's id only when the
+          // browser + OS + ASN-history axes agree, and never inside a homogeneous
+          // software-rendered cloud container.
+          recognitionCorroborated &&
+          !homogeneousContainer
         ) {
           // The visit row was already inserted under the freshly minted ID earlier in this
           // request. Re-key it to the recovered visitor so history/velocity and the response
@@ -9607,44 +9714,9 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       calibratedScore: identityConfidence.score,
     });
 
-    // Recognition honesty — a hardware / LSH-only anchor is not a verified "Returning Device"
-    // unless independent axes agree: browser major family, platform/OS family and IP/ASN history.
-    // In a homogeneous cloud/headless container with software rendering even those structural
-    // matches are collision-prone, so downgrade to a possible hardware match at <= 0.6
-    // confidence. A stable first-party-cookie / persistent-profile return is left untouched.
-    const hardwareOnlyMatch =
-      identityStage.stage === 'lsh_fuzzy' ||
-      recognitionSource === 'Hardware Fingerprint (Cookie-less / Incognito)';
-    const browserFamilyCorroborated = Boolean(
-      serverBrowserFamily && clientBrowserFamily && serverBrowserFamily === clientBrowserFamily
-    );
-    const osFamilyCorroborated = Boolean(
-      serverOsFamily && clientOsFamily && serverOsFamily === clientOsFamily
-    );
-    let asnHistoryCorroborated = false;
-    try {
-      asnHistoryCorroborated = Boolean(
-        existingVisitor &&
-          location.asn &&
-          location.asn !== 'Unknown' &&
-          db
-            .prepare('SELECT 1 FROM visits WHERE visitor_id = ? AND asn = ? LIMIT 1')
-            .get(existingVisitor.visitor_id, location.asn)
-      );
-    } catch {
-      asnHistoryCorroborated = false;
-    }
-    const recognitionCorroborated =
-      browserFamilyCorroborated && osFamilyCorroborated && asnHistoryCorroborated;
-    const softwareRenderedEnvironment = Boolean(
-      specAssessment.software_renderer ||
-        /swiftshader|llvmpipe|softpipe|software|masked|unavailable/i.test(
-          String(hardwareSignals.gpuRenderer || '') + ' ' + String(hardwareSignals.gpuVendor || '')
-        )
-    );
-    const homogeneousContainer =
-      softwareRenderedEnvironment && (hostingDatacenter || Boolean(securitySignals.isHeadless));
-    const downgradeRecognition = hardwareOnlyMatch && (!recognitionCorroborated || homogeneousContainer);
+    // Recognition label / confidence downgrade uses the corroboration resolved above (before
+    // any hardware / LSH adoption), so a rejected cross-cloud match can never be reported as a
+    // verified returning device.
     if (downgradeRecognition) {
       identityConfidenceHonest = {
         ...identityConfidenceHonest,
@@ -10172,6 +10244,32 @@ function osFamilyFromText(value: string): RuntimeOsFamily | null {
   if (/windows|win32|win64|\bwin\b/.test(text)) return 'windows';
   if (/linux|ubuntu|fedora|debian|chrome ?os|\blinux\b/.test(text)) return 'linux';
   return null;
+}
+
+/**
+ * Coarse, stable family keys shared by the header-mismatch verdict and the storage-less
+ * hardware-match corroboration gate. Both paths must normalize browser / OS labels the same way.
+ */
+function osFamilyKey(value: string): string {
+  const text = String(value || '').toLowerCase();
+  if (!text || text === 'unknown') return '';
+  if (/mac os x|macos|macintosh|\bmac\b/.test(text)) return 'macos';
+  if (/iphone|ipad|ipod|ipados|\bios\b/.test(text)) return 'ios';
+  if (/android/.test(text)) return 'android';
+  if (/windows|win32|win64/.test(text)) return 'windows';
+  if (/linux|ubuntu|fedora|debian|chrome ?os/.test(text)) return 'linux';
+  return text.replace(/[^a-z0-9]/g, '');
+}
+
+function browserFamilyKey(value: string): string {
+  const text = String(value || '').toLowerCase();
+  if (!text || text === 'unknown') return '';
+  if (/edg(e|a|ios)?\b|edge/.test(text)) return 'edge';
+  if (/opera|\bopr\b/.test(text)) return 'opera';
+  if (/firefox|fxios/.test(text)) return 'firefox';
+  if (/crios|chrome|chromium/.test(text)) return 'chrome';
+  if (/safari/.test(text)) return 'safari';
+  return text.replace(/[^a-z0-9]/g, '');
 }
 
 const RUNTIME_OS_LABELS: Record<RuntimeOsFamily, string> = {

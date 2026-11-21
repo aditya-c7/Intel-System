@@ -1120,6 +1120,10 @@ var REGISTRY_LITERAL = [
   },
   {
     // Unsigned UA claim only: no ASN / network corroboration is assumed for xAI traffic.
+    // The GrokBot token is version-anchored: the reported xAI crawler string is
+    // `Mozilla/5.0 (compatible; GrokBot/1.0; +x.ai/)`. A bare `GrokBot` substring is
+    // deliberately NOT accepted — it false-positives on third-party UAs such as
+    // `news-tracker/1.0 (...mail.grokbot.com)` and `GrokBot-ArticleSaver/1.0`.
     id: "grok_bot",
     provider: "xAI",
     displayName: "Grok Bot",
@@ -1127,7 +1131,7 @@ var REGISTRY_LITERAL = [
     bucket: "grok",
     rank: 815,
     which: ["robodex"],
-    ua: { patterns: [/GrokBot/i, /\bxAI-GrokBot\b/i, /\bxAI-Bot\b/i, /GrokAgent/i] },
+    ua: { patterns: [/\bGrokBot\/\d/i, /\bxAI-GrokBot\b/i, /\bxAI-Bot\b/i, /GrokAgent/i] },
     minProofForVerified: "ua_claim",
     executionMode: "Cloud Browser Agent"
   },
@@ -13099,6 +13103,26 @@ function structuralAnchorsMatch(db2, profile, candidateVisitorId, identityHardwa
     return { matched: false, reasons: [] };
   }
 }
+function hardwareOnlyMatchCorroborated(db2, candidateVisitorId, browserFamily, osFamily, asn) {
+  if (!candidateVisitorId || !browserFamily || !osFamily || !asn || asn === "Unknown") return false;
+  try {
+    const row = db2.prepare("SELECT profile_json FROM visitor_profiles WHERE visitor_id = ?").get(candidateVisitorId);
+    if (typeof row?.profile_json !== "string") return false;
+    const stored = JSON.parse(row.profile_json);
+    const nested = (value, key) => value && typeof value === "object" ? value[key] : void 0;
+    const storedBrowserFamily = browserFamilyKey(
+      String(nested(nested(stored, "browser"), "family") ?? "")
+    );
+    const storedOsFamily = osFamilyKey(String(nested(nested(stored, "os"), "family") ?? ""));
+    if (!storedBrowserFamily || !storedOsFamily) return false;
+    if (storedBrowserFamily !== browserFamily || storedOsFamily !== osFamily) return false;
+    return Boolean(
+      db2.prepare("SELECT 1 FROM visits WHERE visitor_id = ? AND asn = ? LIMIT 1").get(candidateVisitorId, asn)
+    );
+  } catch {
+    return false;
+  }
+}
 function persistRdapNetblockOrg(db2, asn, org) {
   if (!asn || asn === "Unknown" || !org || org === "Unknown") return null;
   try {
@@ -13775,7 +13799,7 @@ function sanitizeHardwareSignals(raw, browserDevice) {
   const gpuArchFamily = softwareRendererTruth ? /^(software|unknown)$/i.test(rawGpuArchFamily) ? rawGpuArchFamily.toLowerCase() : "software" : rawGpuArchFamily;
   const archTruthSource = safeStr(rawHardwareExtras.architectureSource, "", 80).toLowerCase();
   const archTruthValue = safeStr(raw?.architecture, "", 80).trim().toLowerCase();
-  const untrustedArchTruth = archTruthSource === "nan-sign-bit" || /^(unknown|software)$/.test(archTruthValue) || /^(unknown|software)$/.test(gpuArchFamily.toLowerCase());
+  const untrustedArchTruth = archTruthSource === "nan-sign-bit" || /^(unknown|software|nan)$/.test(archTruthValue) || /^(unknown|software|nan)$/.test(gpuArchFamily.toLowerCase());
   return {
     hardwareId: validHwId,
     gpuVendor: safeStr(raw?.gpuVendor, "Standard WebGL Vendor", 120),
@@ -13997,8 +14021,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const vpnSuspected = vpnMethods.public_vpn || vpnMethods.relay || vpnMethods.ml_prediction || vpnMethods.os_mismatch;
   const rawTamperReasons = safeStrArray(raw?.tamperReasons);
   const timezoneOnlyTamper = rawTamperReasons.length > 0 && rawTamperReasons.every((reason) => isTimezoneMismatchReason(reason));
+  const clientOsTampered = Boolean(raw?.isOsTampered);
   const tamperDetected = Boolean(
-    !timezoneOnlyTamper && raw?.tamperDetected || requestContext.tamperedRequest
+    !timezoneOnlyTamper && raw?.tamperDetected || requestContext.tamperedRequest || clientOsTampered
   );
   const tamperReasons = rawTamperReasons.filter((reason) => !isTimezoneMismatchReason(reason));
   if (requestContext.tamperedRequest && requestContext.requestIntegrityReason && !tamperReasons.includes(requestContext.requestIntegrityReason)) {
@@ -14016,7 +14041,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const privacyDetail = typeof raw?.privacyDetail === "string" && raw.privacyDetail.trim() ? raw.privacyDetail.trim().slice(0, 200) : "";
   const canvasFarblingDetected = Boolean(raw?.canvasFarblingDetected);
   const clientReportedVm = Boolean(raw?.isVirtualMachine);
-  const isOsTampered = Boolean(raw?.isOsTampered);
+  const isOsTampered = clientOsTampered;
   const vmReason = typeof raw?.vmReason === "string" && raw.vmReason.trim() ? raw.vmReason.trim().slice(0, 200) : "";
   const rawIncognitoMethod = typeof raw?.incognitoMethod === "string" && raw.incognitoMethod.trim() ? raw.incognitoMethod.trim().slice(0, 120) : "";
   const headroomGiB = typeof raw?.headroomGiB === "number" && Number.isFinite(raw.headroomGiB) ? Number(raw.headroomGiB) : null;
@@ -14239,7 +14264,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   if (vmScore > 0) {
     const duplicatesIntegrityReason = integrityViolation && vmSignal.detail === (requestIntegrityReason || "tampered or replayed payload");
     if (!duplicatesIntegrityReason) {
-      riskFactors.push(`Virtual machine / tampered OS (+3): ${vmSignal.detail}`);
+      riskFactors.push(
+        isTampered ? `Tampered OS (+3): ${vmSignal.detail}` : `Virtual machine / software-rendered environment (+3): ${vmSignal.detail}`
+      );
     }
   }
   if (isIncognito) {
@@ -14507,6 +14534,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     let existingVisitor;
     let recognitionSource = "New First-Party ID";
     let existingHwidVisitor = false;
+    let rejectedHardwareOnlyMatch = false;
     const cookieVerified = Boolean(cookieVid && verifyVisitorToken(cookieVid, cookieToken));
     const storageVerified = Boolean(
       storedVisitorId && verifyVisitorToken(storedVisitorId, storedVisitorToken)
@@ -14597,9 +14625,24 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         hwMatchedVisitor = void 0;
       }
       if (hwMatchedVisitor) {
-        existingVisitor = hwMatchedVisitor;
-        existingHwidVisitor = true;
-        recognitionSource = "Hardware Fingerprint (Cookie-less / Incognito)";
+        const softwareRenderer = /swiftshader|llvmpipe|softpipe|software|masked|unavailable/i.test(
+          String(hardwareSignals.gpuRenderer || "") + " " + String(hardwareSignals.gpuVendor || "")
+        );
+        const homogeneousContainer2 = softwareRenderer && (classification.isDatacenterOrHosting || Boolean(rawSecuritySignals?.isHeadless));
+        const corroborated = !homogeneousContainer2 && hardwareOnlyMatchCorroborated(
+          db,
+          hwMatchedVisitor.visitor_id,
+          browserFamilyKey(browserDevice.browser),
+          osFamilyKey(browserDevice.os),
+          location.asn
+        );
+        if (corroborated) {
+          existingVisitor = hwMatchedVisitor;
+          existingHwidVisitor = true;
+          recognitionSource = "Hardware Fingerprint (Cookie-less / Incognito)";
+        } else {
+          rejectedHardwareOnlyMatch = true;
+        }
       }
     }
     const nowUtc = (/* @__PURE__ */ new Date()).toISOString();
@@ -15175,26 +15218,6 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       runtimeOsVerdict.family && uaOsFamily && uaOsFamily !== runtimeOsVerdict.family
     );
     const serverVerifiedOs = runtimeOsAuthoritative && runtimeOsVerdict.family ? runtimeOsVerdict.label : conflictingRuntimeClaim && !/\(claimed\)$/i.test(uaOsLabel) ? `${uaOsLabel} (claimed)` : uaOsLabel;
-    const osFamilyKey = (value) => {
-      const text = String(value || "").toLowerCase();
-      if (!text || text === "unknown") return "";
-      if (/mac os x|macos|macintosh|\bmac\b/.test(text)) return "macos";
-      if (/iphone|ipad|ipod|ipados|\bios\b/.test(text)) return "ios";
-      if (/android/.test(text)) return "android";
-      if (/windows|win32|win64/.test(text)) return "windows";
-      if (/linux|ubuntu|fedora|debian|chrome ?os/.test(text)) return "linux";
-      return text.replace(/[^a-z0-9]/g, "");
-    };
-    const browserFamilyKey = (value) => {
-      const text = String(value || "").toLowerCase();
-      if (!text || text === "unknown") return "";
-      if (/edg(e|a|ios)?\b|edge/.test(text)) return "edge";
-      if (/opera|\bopr\b/.test(text)) return "opera";
-      if (/firefox|fxios/.test(text)) return "firefox";
-      if (/crios|chrome|chromium/.test(text)) return "chrome";
-      if (/safari/.test(text)) return "safari";
-      return text.replace(/[^a-z0-9]/g, "");
-    };
     const serverOsFamily = osFamilyKey(serverVerifiedOs);
     const clientOsFamily = osFamilyKey(browserDevice.os);
     const serverBrowserFamily = browserFamilyKey(serverVerifiedBrowser);
@@ -15293,7 +15316,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const gpuArchTruth = String(
       hardwareSignals.gpuArchFamily || ""
     ).toLowerCase();
-    const untrustedArchTruth = archTruthSource === "nan-sign-bit" || /^(unknown|software)$/.test(archTruthValue) || /^(unknown|software)$/.test(gpuArchTruth);
+    const untrustedArchTruth = archTruthSource === "nan-sign-bit" || /^(unknown|software|nan)$/.test(archTruthValue) || /^(unknown|software|nan)$/.test(gpuArchTruth);
     if (runtimeOsAuthoritative && runtimeOsVerdict.uaMismatch && !privacyHardened && !untrustedArchTruth) {
       specAssessment.hardViolations = Array.from(
         /* @__PURE__ */ new Set([...specAssessment.hardViolations, "os_ua_mismatch"])
@@ -15679,6 +15702,30 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       query: simhash512(lshIdentityProfile),
       candidates: retrieveLshCandidates(db, lshIdentityProfile)
     });
+    const hardwareOnlyMatch = rejectedHardwareOnlyMatch || identityStage.stage === "lsh_fuzzy" || recognitionSource === "Hardware Fingerprint (Cookie-less / Incognito)";
+    const browserFamilyCorroborated = Boolean(
+      serverBrowserFamily && clientBrowserFamily && serverBrowserFamily === clientBrowserFamily
+    );
+    const osFamilyCorroborated = Boolean(
+      serverOsFamily && clientOsFamily && serverOsFamily === clientOsFamily
+    );
+    const corroboratingVisitorId = identityStage.stage === "lsh_fuzzy" && identityStage.visitorId ? String(identityStage.visitorId) : existingVisitor?.visitor_id ?? null;
+    const recognitionCorroborated = Boolean(
+      browserFamilyCorroborated && osFamilyCorroborated && corroboratingVisitorId && hardwareOnlyMatchCorroborated(
+        db,
+        corroboratingVisitorId,
+        serverBrowserFamily || clientBrowserFamily,
+        serverOsFamily || clientOsFamily,
+        location.asn
+      )
+    );
+    const softwareRenderedEnvironment = Boolean(
+      specAssessment.software_renderer || /swiftshader|llvmpipe|softpipe|software|masked|unavailable/i.test(
+        String(hardwareSignals.gpuRenderer || "") + " " + String(hardwareSignals.gpuVendor || "")
+      )
+    );
+    const homogeneousContainer = softwareRenderedEnvironment && (hostingDatacenter || Boolean(securitySignals.isHeadless));
+    const downgradeRecognition = hardwareOnlyMatch && (!recognitionCorroborated || homogeneousContainer);
     const freshUnanchoredContext = !existingVisitor && !verifiedVid && !storageVerified && !existingHwidVisitor;
     if (identityStage.stage === "lsh_fuzzy" && identityStage.visitorId && identityStage.visitorId !== visitorId && identityStage.visitorId !== identityStage.matchLabel) {
       try {
@@ -15691,7 +15738,10 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
           String(identityStage.visitorId),
           identityHardwareFingerprint
         ) : null;
-        if (fuzzyAnchor && Number(fuzzyAnchor.max_seeds ?? 0) < 2 && (!freshUnanchoredContext || Boolean(structuralMatch?.matched))) {
+        if (fuzzyAnchor && Number(fuzzyAnchor.max_seeds ?? 0) < 2 && (!freshUnanchoredContext || Boolean(structuralMatch?.matched)) && // A hardware-only / LSH anchor may adopt another visitor's id only when the
+        // browser + OS + ASN-history axes agree, and never inside a homogeneous
+        // software-rendered cloud container.
+        recognitionCorroborated && !homogeneousContainer) {
           const provisionalVisitorId = visitorId;
           visitorId = String(identityStage.visitorId);
           visitorToken = signVisitorId(visitorId);
@@ -15724,29 +15774,6 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       matchStage: identityStage.stage,
       calibratedScore: identityConfidence.score
     });
-    const hardwareOnlyMatch = identityStage.stage === "lsh_fuzzy" || recognitionSource === "Hardware Fingerprint (Cookie-less / Incognito)";
-    const browserFamilyCorroborated = Boolean(
-      serverBrowserFamily && clientBrowserFamily && serverBrowserFamily === clientBrowserFamily
-    );
-    const osFamilyCorroborated = Boolean(
-      serverOsFamily && clientOsFamily && serverOsFamily === clientOsFamily
-    );
-    let asnHistoryCorroborated = false;
-    try {
-      asnHistoryCorroborated = Boolean(
-        existingVisitor && location.asn && location.asn !== "Unknown" && db.prepare("SELECT 1 FROM visits WHERE visitor_id = ? AND asn = ? LIMIT 1").get(existingVisitor.visitor_id, location.asn)
-      );
-    } catch {
-      asnHistoryCorroborated = false;
-    }
-    const recognitionCorroborated = browserFamilyCorroborated && osFamilyCorroborated && asnHistoryCorroborated;
-    const softwareRenderedEnvironment = Boolean(
-      specAssessment.software_renderer || /swiftshader|llvmpipe|softpipe|software|masked|unavailable/i.test(
-        String(hardwareSignals.gpuRenderer || "") + " " + String(hardwareSignals.gpuVendor || "")
-      )
-    );
-    const homogeneousContainer = softwareRenderedEnvironment && (hostingDatacenter || Boolean(securitySignals.isHeadless));
-    const downgradeRecognition = hardwareOnlyMatch && (!recognitionCorroborated || homogeneousContainer);
     if (downgradeRecognition) {
       identityConfidenceHonest = {
         ...identityConfidenceHonest,
@@ -16115,6 +16142,26 @@ function osFamilyFromText(value) {
   if (/windows|win32|win64|\bwin\b/.test(text)) return "windows";
   if (/linux|ubuntu|fedora|debian|chrome ?os|\blinux\b/.test(text)) return "linux";
   return null;
+}
+function osFamilyKey(value) {
+  const text = String(value || "").toLowerCase();
+  if (!text || text === "unknown") return "";
+  if (/mac os x|macos|macintosh|\bmac\b/.test(text)) return "macos";
+  if (/iphone|ipad|ipod|ipados|\bios\b/.test(text)) return "ios";
+  if (/android/.test(text)) return "android";
+  if (/windows|win32|win64/.test(text)) return "windows";
+  if (/linux|ubuntu|fedora|debian|chrome ?os/.test(text)) return "linux";
+  return text.replace(/[^a-z0-9]/g, "");
+}
+function browserFamilyKey(value) {
+  const text = String(value || "").toLowerCase();
+  if (!text || text === "unknown") return "";
+  if (/edg(e|a|ios)?\b|edge/.test(text)) return "edge";
+  if (/opera|\bopr\b/.test(text)) return "opera";
+  if (/firefox|fxios/.test(text)) return "firefox";
+  if (/crios|chrome|chromium/.test(text)) return "chrome";
+  if (/safari/.test(text)) return "safari";
+  return text.replace(/[^a-z0-9]/g, "");
 }
 var RUNTIME_OS_LABELS = {
   linux: "Linux",
