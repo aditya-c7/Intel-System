@@ -1680,6 +1680,8 @@ export interface IncognitoDetectionResult {
   headroomGiB: number | null;
   idbDurabilityRatio: number | null;
   opfsFlushMs: number | null;
+  /** Weak Chromium-only off-the-record context hints; telemetry, never a verdict input. */
+  storagePrivateHints?: boolean;
 }
 
 /**
@@ -3240,6 +3242,74 @@ function errorLooksLike(error: unknown, pattern: RegExp): boolean {
 }
 
 /**
+ * A rejection that literally names private browsing / off-the-record storage.
+ * A normal profile never produces such a string, so this is DECISIVE evidence —
+ * never a heuristic. It is the only class of signal allowed to decide incognito
+ * on its own outside a decisive OPFS entry-point/write rejection.
+ */
+const PRIVATE_MODE_ERROR_PATTERN =
+  /incognito|off[\s-]?the[\s-]?record|private[\s-]?(?:browsing|mode|window|context|storage|profile)/i;
+
+/**
+ * Broader off-the-record rejection language (SecurityError / NotAllowedError /
+ * permission-denied / transient / disabled-storage). Ambiguous on its own —
+ * corroboration only, never decisive.
+ */
+const OTR_REJECTION_PATTERN =
+  /SecurityError|NotAllowedError|InvalidStateError|NotSupportedError|permission|denied|not allowed|blocked|transient|ephemeral|storage\s+(?:is\s+)?disabled/i;
+
+interface PrivateErrorClass {
+  /** The error literally names private/incognito browsing — decisive. */
+  literal: boolean;
+  /** The error looks like an off-the-record storage restriction. */
+  restricted: boolean;
+}
+
+const NO_PRIVATE_SIGNAL: PrivateErrorClass = { literal: false, restricted: false };
+
+function classifyPrivateError(error: unknown): PrivateErrorClass {
+  if (!error) return NO_PRIVATE_SIGNAL;
+  let name = '';
+  let message = '';
+  if (error instanceof Error) {
+    name = error.name || '';
+    message = error.message || '';
+  } else if (typeof error === 'object') {
+    const record = error as Record<string, unknown>;
+    name = typeof record.name === 'string' ? record.name : '';
+    message = typeof record.message === 'string' ? record.message : '';
+  } else {
+    message = String(error);
+  }
+  const literal = PRIVATE_MODE_ERROR_PATTERN.test(name) || PRIVATE_MODE_ERROR_PATTERN.test(message);
+  const restricted =
+    literal || OTR_REJECTION_PATTERN.test(name) || OTR_REJECTION_PATTERN.test(message);
+  return { literal, restricted };
+}
+
+function mergePrivateSignals(...signals: PrivateErrorClass[]): PrivateErrorClass {
+  return {
+    literal: signals.some((signal) => signal.literal),
+    restricted: signals.some((signal) => signal.restricted),
+  };
+}
+
+/** Resolves `work`, or `fallback` inside `ms`; a late rejection is swallowed. */
+function withDeadline<T>(work: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => finish(fallback), ms);
+    function finish(value: T): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    }
+    work.then(finish, () => finish(fallback));
+  });
+}
+
+/**
  * Layer 1 — Chromium IndexedDB commit-durability physics (detectIncognito v1.9.0).
  *
  * A normal profile fsyncs `strict` transactions to disk, so `strict` commits are
@@ -3514,6 +3584,266 @@ async function probeOpfsDirectory(): Promise<
 }
 
 /**
+ * True when an OPFS entry-point rejection is a decisive off-the-record denial.
+ * A literal private-mode string is always decisive; a bare SecurityError /
+ * NotAllowedError is decisive too because a top-level, non-persistent context
+ * cannot produce it for any ordinary reason. `InvalidStateError` is noisier and
+ * needs OTR wording before it can decide anything.
+ */
+function opfsRejectionIsDecisive(
+  probe: Awaited<ReturnType<typeof probeOpfsDirectory>>
+): boolean {
+  if (probe.status !== 'rejected') return false;
+  const classified = classifyPrivateError(probe.error);
+  if (classified.literal) return true;
+  if (errorLooksLike(probe.error, /SecurityError|NotAllowedError/i)) return true;
+  return errorLooksLike(probe.error, /InvalidStateError/i) && classified.restricted;
+}
+
+/**
+ * An OPFS *write* attempt. In modern Chrome incognito `getDirectory()` frequently
+ * resolves, so the entry point alone is not enough; a denied file write inside a
+ * top-level, non-persistent context is an equally deterministic private signal.
+ * Any timeout, unrelated quota failure or missing API yields "no evidence".
+ */
+async function probeChromiumOpfsWrite(): Promise<PrivateErrorClass> {
+  const storage =
+    typeof navigator !== 'undefined'
+      ? (navigator.storage as (StorageManager & { getDirectory?: () => Promise<unknown> }) | undefined)
+      : undefined;
+  if (!storage || typeof storage.getDirectory !== 'function') return NO_PRIVATE_SIGNAL;
+
+  const name = '__intel_pb_opfs_' + Math.random().toString(36).slice(2);
+  let failure: unknown = null;
+  try {
+    failure = await withDeadline<unknown>(
+      (async () => {
+        const root = (await storage.getDirectory()) as {
+          getFileHandle?: (
+            name: string,
+            options?: { create?: boolean }
+          ) => Promise<{
+            createWritable?: () => Promise<{
+              write: (data: string) => Promise<void>;
+              close: () => Promise<void>;
+            }>;
+          }>;
+        } | null;
+        const handle = await root?.getFileHandle?.(name, { create: true });
+        const writable = await handle?.createWritable?.();
+        if (!writable) return null;
+        await writable.write('1');
+        await writable.close();
+        return null;
+      })().then(
+        () => null,
+        (error) => error
+      ),
+      300,
+      null
+    );
+  } catch {
+    failure = null;
+  }
+  try {
+    const root = (await storage.getDirectory()) as
+      | { removeEntry?: (name: string) => Promise<void> }
+      | undefined;
+    await root?.removeEntry?.(name);
+  } catch {
+    /* best-effort cleanup */
+  }
+  if (!failure) return NO_PRIVATE_SIGNAL;
+  const classified = classifyPrivateError(failure);
+  if (errorLooksLike(failure, /SecurityError|NotAllowedError/i)) {
+    return { literal: classified.literal, restricted: true };
+  }
+  return classified;
+}
+
+interface ChromiumAuxiliarySignals {
+  /** Decisive: an API rejection literally named private browsing. */
+  literal: boolean;
+  /** Corroboration: an OTR-consistent API restriction, never sufficient alone. */
+  restricted: boolean;
+  /** Weak context (quota / UA-CH / legacy chrome surface) — telemetry only. */
+  weak: boolean;
+}
+
+/**
+ * Chromium-only, strictly FAIL-OPEN auxiliary private-browsing probes.
+ *
+ * Every sub-probe contributes evidence ONLY when an API that works in a normal
+ * profile is restricted, or when an error literally names private browsing.
+ * Missing APIs, silence, timeouts and unrelated failures always mean
+ * "no evidence" — never "normal", never "private". Generic OTR-shaped denials
+ * can only corroborate the IndexedDB ratio; only literal private-mode wording
+ * may decide incognito outright. No mobile/desktop assumptions are involved.
+ */
+async function probeChromiumAuxiliarySignals(
+  ua: string,
+  quotaBytes: number | null
+): Promise<ChromiumAuxiliarySignals> {
+  const errors: PrivateErrorClass[] = [];
+  let weak = false;
+
+  // (a) Storage estimate: legacy OTR reported a quota far below the JS heap limit,
+  // while the modern static quota (usage + ~10 GiB) always sits well above it in a
+  // normal profile. Weak context only — never allowed to decide anything.
+  try {
+    const heap = readJsHeapSizeLimit();
+    if (quotaBytes !== null && heap !== null && quotaBytes < heap * 0.8) weak = true;
+  } catch {
+    /* ignore */
+  }
+
+  // (b) Credential Management and CookieStore restrictions in off-the-record
+  // profiles. Silent password-only reads; no UI, writes or side effects.
+  try {
+    const credentials = typeof navigator !== 'undefined' ? navigator.credentials : undefined;
+    if (credentials && typeof credentials.get === 'function') {
+      const requestOptions = { password: true, mediation: 'silent' } as CredentialRequestOptions;
+      const failure = await withDeadline<unknown>(
+        Promise.resolve()
+          .then(() => credentials.get(requestOptions))
+          .then(
+            () => null,
+            (error) => error
+          ),
+        250,
+        null
+      );
+      if (failure) {
+        const classified = classifyPrivateError(failure);
+        if (classified.literal) errors.push(classified);
+        else if (classified.restricted && errorLooksLike(failure, /NotAllowedError|SecurityError/i)) {
+          errors.push({ literal: false, restricted: true });
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const cookieStore =
+      typeof window !== 'undefined'
+        ? (window as unknown as { cookieStore?: { getAll?: () => Promise<unknown> } }).cookieStore
+        : undefined;
+    if (cookieStore && typeof cookieStore.getAll === 'function') {
+      const failure = await withDeadline<unknown>(
+        Promise.resolve()
+          .then(() => cookieStore.getAll!())
+          .then(
+            () => null,
+            (error) => error
+          ),
+        250,
+        null
+      );
+      if (failure) {
+        const classified = classifyPrivateError(failure);
+        if (classified.literal) errors.push(classified);
+        else if (classified.restricted && errorLooksLike(failure, /NotAllowedError|SecurityError/i)) {
+          errors.push({ literal: false, restricted: true });
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // (c) User-Agent Client Hints: literal private-mode rejections are decisive;
+  // a missing low-entropy brand list on a UA-CH-capable engine is weak context.
+  try {
+    const uaData =
+      typeof navigator !== 'undefined'
+        ? (navigator as unknown as {
+            userAgentData?: {
+              brands?: unknown;
+              getHighEntropyValues?: (hints: string[]) => Promise<unknown>;
+            };
+          }).userAgentData
+        : undefined;
+    if (uaData) {
+      if (typeof uaData.getHighEntropyValues === 'function') {
+        const failure = await withDeadline<unknown>(
+          Promise.resolve()
+            .then(() =>
+              uaData.getHighEntropyValues!(['architecture', 'bitness', 'model', 'platformVersion'])
+            )
+            .then(
+              () => null,
+              (error) => error
+            ),
+          250,
+          null
+        );
+        if (failure) {
+          const classified = classifyPrivateError(failure);
+          if (classified.literal) errors.push(classified);
+        }
+      }
+      if (!Array.isArray(uaData.brands) || uaData.brands.length === 0) weak = true;
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // (d) Legacy Chrome surface: Chrome <= 71 hides `chrome.loadTimes` in incognito
+  // but exposes it in ordinary windows. Newer Chrome removed it for everyone, so
+  // absence there is never evidence. No mobile/desktop assumptions here.
+  try {
+    const chromeObject =
+      typeof window !== 'undefined'
+        ? (window as unknown as { chrome?: Record<string, unknown> }).chrome
+        : undefined;
+    if (chromeObject) {
+      const match = /(?:Chrome|Chromium)\/(\d+)/.exec(ua);
+      const major = match ? Number.parseInt(match[1], 10) : 0;
+      if (major > 0 && major <= 71 && !('loadTimes' in chromeObject)) weak = true;
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // (e) Cache Storage writes (and OPFS writes via `probeChromiumOpfsWrite`):
+  // a literal private-mode rejection decides, a generic security denial only
+  // corroborates, quota failures and timeouts mean "no evidence".
+  try {
+    const cacheStorage = typeof caches !== 'undefined' ? caches : undefined;
+    if (cacheStorage && typeof cacheStorage.open === 'function') {
+      const name = '__intel_pb_cache_' + Math.random().toString(36).slice(2);
+      const failure = await withDeadline<unknown>(
+        Promise.resolve()
+          .then(() => cacheStorage.open(name))
+          .then((cache) =>
+            cache.put('intel-pb-probe', new Response('1'))
+          )
+          .then(
+            () => null,
+            (error) => error
+          ),
+        300,
+        null
+      );
+      void Promise.resolve(cacheStorage.delete(name)).catch(() => {
+        /* best-effort cleanup */
+      });
+      if (failure && !errorLooksLike(failure, /QuotaExceededError/i)) {
+        const classified = classifyPrivateError(failure);
+        if (classified.literal) errors.push(classified);
+        else if (classified.restricted) errors.push({ literal: false, restricted: true });
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  const merged = mergePrivateSignals(...errors);
+  return { literal: merged.literal, restricted: merged.restricted, weak };
+}
+
+/**
  * Firefox IndexedDB probe: a private window refuses the open with
  * `InvalidStateError`. Returns `null` when the probe is inconclusive.
  */
@@ -3756,8 +4086,8 @@ function resolveBrowserName(
  * that must invalidate verdicts cached by an earlier version of the app. All loads of
  * the same tab in the same app version read this cache FIRST and return it verbatim.
  */
-const INCOGNITO_SESSION_LOCK_KEY = 'intel_fp_incognito_lock_v4';
-const INCOGNITO_LOCK_VERSION = 4;
+const INCOGNITO_SESSION_LOCK_KEY = 'intel_fp_incognito_lock_v5';
+const INCOGNITO_LOCK_VERSION = 5;
 
 /**
  * Reads the authoritative per-tab verdict.
@@ -3783,9 +4113,11 @@ function readIncognitoSessionLock(): IncognitoDetectionResult | null {
       typeof parsed.browserName === 'string' &&
       (parsed.confidence === 'high' || parsed.confidence === 'low')
     ) {
-      // Enforce the low-confidence invariant even on cached entries from an older write
-      // path: low confidence can never mean incognito.
-      return { ...parsed, isPrivate: parsed.confidence === 'high' && parsed.isPrivate };
+      // Only a HIGH-confidence verdict is authoritative. Low-confidence
+      // "inconclusive"/"normal" entries must NEVER pin a tab: a fresh run with
+      // decisive private-storage evidence has to be able to override them.
+      if (parsed.confidence !== 'high') return null;
+      return { ...parsed, isPrivate: Boolean(parsed.isPrivate) };
     }
   } catch {
     // Storage blocked or a corrupt entry: ignore and re-probe.
@@ -3794,14 +4126,35 @@ function readIncognitoSessionLock(): IncognitoDetectionResult | null {
 }
 
 /**
- * Writes the authoritative per-tab verdict. Called on EVERY return path (deterministic
- * Firefox/WebKit paths, Chromium physics, and fail-open branches alike) via the
- * `.then()` on the probe promise, so the lock is never left empty after a successful
- * detect. This is monotonic: once written, later loads read it instead of re-probing.
+ * Re-check used ONLY when a high-confidence *normal* lock would otherwise
+ * short-circuit detection. A decisive OPFS entry-point rejection in a top-level,
+ * non-persistent context cannot occur in an ordinary profile, so it proves the
+ * cached normal verdict is stale and forces a fresh probe. Fails open in every
+ * ambiguous case (the cache stands).
+ */
+async function cachedNormalIsStale(): Promise<boolean> {
+  try {
+    if (await hasPersistedStorageGrant()) return false;
+    if (isIsolatedStorageContext()) return false;
+    if (opfsRejectionIsDecisive(await probeOpfsDirectory())) return true;
+    // getDirectory() often resolves in modern incognito, so also re-check the
+    // OPFS write path before honoring a cached "normal" verdict.
+    const write = await probeChromiumOpfsWrite();
+    return write.literal || write.restricted;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Writes the authoritative per-tab verdict. Only HIGH-confidence verdicts are cached:
+ * a low-confidence "inconclusive"/"normal" result is intentionally NOT made
+ * authoritative, so a later run in the same tab can still pick up decisive evidence.
  */
 function writeIncognitoSessionLock(result: IncognitoDetectionResult): void {
   try {
     if (typeof sessionStorage === 'undefined') return;
+    if (result.confidence !== 'high') return;
     sessionStorage.setItem(
       INCOGNITO_SESSION_LOCK_KEY,
       JSON.stringify({ ...result, lockVersion: INCOGNITO_LOCK_VERSION })
@@ -3890,9 +4243,11 @@ function finalizeIncognitoVerdict(result: IncognitoDetectionResult): IncognitoDe
 export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
   if (cachedIncognitoPromise) return cachedIncognitoPromise;
 
-  // Deterministic per-session lock: reuse the verdict computed earlier in this tab.
+  // Deterministic per-session lock: reuse a HIGH-confidence verdict computed earlier
+  // in this tab — unless a fresh decisive OPFS rejection proves a cached "normal"
+  // verdict stale. Low-confidence entries are never returned by the reader.
   const locked = readIncognitoSessionLock();
-  if (locked) {
+  if (locked && (locked.isPrivate || !(await cachedNormalIsStale()))) {
     cachedIncognitoPromise = Promise.resolve(locked);
     return cachedIncognitoPromise;
   }
@@ -3960,6 +4315,9 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
     const headroomBytes = quotaBytes !== null ? quotaBytes - usageBytes : null;
     const headroomGiB =
       headroomBytes !== null ? Number((Math.max(0, headroomBytes) / GIB_BYTES).toFixed(2)) : null;
+    // Weak Chromium-only context hints, reported for telemetry but never used as
+    // verdict evidence (see `probeChromiumAuxiliarySignals`).
+    let storagePrivateHints = false;
 
     try {
       if (engine === 'firefox') {
@@ -4068,20 +4426,20 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       // and never leak into the (jargon-free) method string. `headroomGiB` stays as telemetry.
 
       // 3C — storage physics (best-effort, fail-open for humans). Chromium no longer
-      // differs in raw quota, so we combine independent physics vectors:
-      //   (a) OPFS getDirectory() rejection strings — a deterministic private signal,
-      //   (b) IndexedDB strict-commit durability ratio with interleaved rounds + deadband,
-      //   (c) OPFS sync-access-handle flush timing (memory-backed flush is near-instant).
-      // A private verdict requires OPFS (a or c) AND IDB (b) agreement — a single vector
-      // can be produced by an isolated/partitioned storage context, so it never suffices.
-      // The ambiguous band and any single-vector-only result fail open.
+      // differs in raw quota, so we combine independent vectors:
+      //   (a) OPFS getDirectory() rejection strings — a decisive private signal on their own,
+      //   (b) OPFS file-write denial (getDirectory() often RESOLVES in modern incognito),
+      //   (c) IndexedDB strict-commit durability ratio with interleaved rounds + deadband,
+      //   (d) OPFS sync-access-handle flush timing + auxiliary fail-open API restrictions.
+      // A SINGLE deterministic OPFS-family denial (a or b), or any rejection that
+      // literally names private browsing, is sufficient for a high-confidence verdict.
+      // Noisy vectors (c, d) still corroborate each other via the original AND gate, so
+      // the deadband / high-variance case remains inconclusive rather than a false positive.
       const opfsDir = await probeOpfsDirectory();
-      const opfsDirPrivate =
-        opfsDir.status === 'rejected' &&
-        errorLooksLike(
-          opfsDir.error,
-          /SecurityError|InvalidStateError|NotAllowedError|transient|permission|denied|access|incognito|private/i
-        );
+      const opfsDirClass = classifyPrivateError(
+        opfsDir.status === 'rejected' ? opfsDir.error : null
+      );
+      const opfsDirDecisive = opfsRejectionIsDecisive(opfsDir);
 
       const idbProbe = await probeChromiumIdbDurability();
       const idbRatio = idbProbe.ratio;
@@ -4104,19 +4462,30 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         opfsProbe !== null &&
         (opfsProbe.medianFlushMs < 0.12 || opfsProbe.flushToWriteRatio < 0.85);
 
-      // Tightened private-mode gate. An isolated / partitioned storage context can show
-      // OPFS rejection or RAM-backed IndexedDB timing WITHOUT being real private browsing,
-      // so a private verdict now requires BOTH an OPFS-family signal and an IDB-family
-      // signal. A granted persistent-storage privilege and an opaque/cross-origin context
-      // are hard vetoes; any inconclusive combination fails open with low confidence below.
-      // Real OTR windows still satisfy both families, so genuine incognito is preserved.
+      // The OPFS write and auxiliary API probes are independent and parallel; all of
+      // them fail open (no API, timeout or unrelated error = "no evidence").
+      const [opfsWrite, auxiliary] = await Promise.all([
+        probeChromiumOpfsWrite(),
+        probeChromiumAuxiliarySignals(ua, quotaBytes),
+      ]);
+      storagePrivateHints = auxiliary.weak;
+
+      // A granted persistent-storage privilege and an opaque/cross-origin context remain
+      // hard vetoes. Only deterministic denials may decide incognito alone; timing and
+      // generic OTR-shaped restrictions must still agree with the IndexedDB ratio.
       const idbConclusivePrivate = idbVerdict === 'private' && !idbHighVariance;
       const persistentGrant = await hasPersistedStorageGrant();
-      const opfsPrivateEvidence = opfsDirPrivate || opfsIndicatesIncognito;
-      const idbPrivateEvidence = idbConclusivePrivate || (idbLowRatio && !idbHighVariance);
       const isolatedContext = isIsolatedStorageContext();
+      const idbPrivateEvidence = idbConclusivePrivate || (idbLowRatio && !idbHighVariance);
+      const opfsDecisive = opfsDirDecisive || opfsWrite.literal || opfsWrite.restricted;
+      const opfsCorroboration =
+        opfsDirClass.restricted || opfsIndicatesIncognito || auxiliary.restricted;
       const incognitoDetected =
-        !persistentGrant && !isolatedContext && opfsPrivateEvidence && idbPrivateEvidence;
+        !persistentGrant &&
+        !isolatedContext &&
+        (opfsDecisive ||
+          auxiliary.literal ||
+          (opfsCorroboration && idbPrivateEvidence));
 
       if (incognitoDetected) {
         return {
@@ -4129,6 +4498,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
           idbHighVariance,
           idbDurabilityRatio: idbRatio,
           opfsFlushMs,
+          storagePrivateHints,
         };
       }
 
@@ -4147,6 +4517,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         headroomGiB,
         idbDurabilityRatio: idbRatio,
         opfsFlushMs,
+        storagePrivateHints,
       };
     } catch {
       return {
@@ -4158,6 +4529,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         headroomGiB,
         idbDurabilityRatio: null,
         opfsFlushMs: null,
+        storagePrivateHints,
       };
     }
   })().then((result) => {
@@ -4198,15 +4570,10 @@ function isIsolatedStorageContext(): boolean {
   try {
     if (typeof window === 'undefined') return false;
     if (typeof location !== 'undefined' && location.origin === 'null') return true;
-    // Touching a cross-origin frame's location throws; that is the partition signal.
+    // Any embedded frame has partitioned / delegated storage permissions, so it
+    // must abstain even when it happens to be same-origin with the top window.
     const top = window.top;
-    if (top && top !== window) {
-      try {
-        void top.location.href;
-      } catch {
-        return true;
-      }
-    }
+    if (top && top !== window) return true;
   } catch {
     return false;
   }
@@ -5939,8 +6306,12 @@ export async function identifyCurrentVisitor(options?: {
         // forced false whenever the stable confidence is 'low'.
         incognito: incognitoVerified,
         isIncognito: incognitoVerified,
+        isPrivate: incognitoVerified,
+        incognitoLikely: incognitoVerified,
         privateMode: incognitoVerified,
         incognitoMethod: incog.method,
+        // 'high' for a genuine incognito verdict (the decisive storage-denial gate);
+        // 'low' verdicts are always emitted as false above.
         incognitoConfidence: incog.confidence,
         idbDurabilityRatio: incog.idbDurabilityRatio,
         opfsFlushMs: incog.opfsFlushMs,

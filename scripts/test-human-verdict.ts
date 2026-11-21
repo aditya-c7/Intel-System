@@ -16,6 +16,12 @@
 
 import assert from 'node:assert/strict';
 import { buildGradedRiskLedger, riskTierFromScore100, score10FromScore100 } from '../src/lib/riskLedger';
+import {
+  CALIBRATION_MAX_ECE,
+  CALIBRATION_MIN_LABELED_PAIRS,
+  computeHonestIdentityConfidence,
+  confidenceBandForScore,
+} from '../src/lib/rarityHonesty';
 
 /* -------------------------------------------------------------------------- */
 /* Browser globals                                                            */
@@ -338,6 +344,42 @@ section('G. Canonical risk headline math (shared with the graded ledger)');
 const humanGraded = buildGradedRiskLedger({});
 check('clean human graded ledger -> score10 0 / Low', humanGraded.score10 === 0 && humanGraded.risk_tier === 'Low');
 check('score10/tier derive from 67 composite', score10FromScore100(67) === 7 && riskTierFromScore100(67) === 'High');
+
+/* -------------------------------------------------------------------------- */
+/* H. Confidence score mirrors are single-sourced                              */
+/* -------------------------------------------------------------------------- */
+
+section('H. Confidence score mirror consistency');
+
+const humanMirrorGate = {
+  labeledPairs: CALIBRATION_MIN_LABELED_PAIRS + 300,
+  heldOutEce: CALIBRATION_MAX_ECE / 5,
+};
+const unseenMirror = computeHonestIdentityConfidence({
+  ...humanMirrorGate,
+  matchStage: 'new_enrollment',
+});
+check(
+  'unseen human profile publishes no numeric confidence',
+  unseenMirror.confidence_score === null && unseenMirror.confidence_tier === 'New Unobserved Profile',
+  unseenMirror,
+);
+check('band mirror of a zero score stays New/Unobserved', confidenceBandForScore(0) === 'New/Unobserved');
+const matchedMirror = computeHonestIdentityConfidence({
+  ...humanMirrorGate,
+  matchStage: 'lsh_fuzzy',
+  matchScore: 100,
+  structuralAnchorRatio: 1,
+  distinctStorageSeedsCount: 0,
+  browserFamilyConsensus: true,
+  osFamilyConsensus: true,
+});
+check(
+  'matched profile mirror is a real number with an agreeing band',
+  matchedMirror.confidence_score === 0.65 &&
+    confidenceBandForScore(matchedMirror.confidence_score ?? 0) === matchedMirror.confidence_tier,
+  matchedMirror,
+);
 
 console.log(`\nHuman-verdict suite: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exitCode = 1;

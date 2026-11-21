@@ -314,8 +314,26 @@ const EVIDENCE_ONLY_KEYS = [
 ] as const;
 
 function finiteNumber(value: unknown): number | null {
-  const num = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(num) ? num : null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  // Numeric strings are tolerated for wire compatibility; booleans, null, arrays and
+  // objects are malformed evidence and must contribute zero.
+  if (typeof value === 'string' && value.trim() !== '') {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  }
+  return null;
+}
+
+/**
+ * Seed counts are valid non-negative integers. A missing/null field is "no evidence"
+ * (zero weight), while a *present but invalid* value (NaN, Infinity, negative, fractional,
+ * non-numeric) is defensively treated as a single corroborating seed — never a collision.
+ */
+function effectiveSeedCount(value: unknown): number | null {
+  if (value === undefined || value === null) return null;
+  const parsed = finiteNumber(value);
+  if (parsed === null || !Number.isInteger(parsed) || parsed < 0) return 1;
+  return parsed;
 }
 
 function clamp01(value: number): number {
@@ -384,7 +402,8 @@ export function scoreConfidenceBreakdown(input: EvidenceConfidenceInput = {}): C
   });
 
   /* 4 — distinct storage seeds: one corroborates, two or more is a collision. */
-  const seeds = finiteNumber(source.distinct_storage_seeds_count);
+  const rawSeeds = source.distinct_storage_seeds_count;
+  const seeds = effectiveSeedCount(rawSeeds);
   let seedAdjustment = 0;
   let seedDetail = 'storage seed count missing; zero weight';
   if (seeds === 1) {
@@ -396,13 +415,17 @@ export function scoreConfidenceBreakdown(input: EvidenceConfidenceInput = {}): C
   } else if (seeds !== null) {
     seedDetail = `distinct_storage_seeds_count=${seeds}`;
   }
-  components.push({
+  if (rawSeeds !== undefined && rawSeeds !== null && seeds !== finiteNumber(rawSeeds)) {
+    seedDetail += '; invalid count defaulted to 1';
+  }
+  const seedComponent: ConfidenceComponent = {
     name: 'distinct_storage_seeds',
     evidence: seeds ?? 0,
     weight: seedAdjustment,
     contribution: round4(seedAdjustment),
     detail: seedDetail,
-  });
+  };
+  components.push(seedComponent);
 
   /* 5 — browser-family consensus. */
   const browser = hasConsensus(source.browser_family_consensus);
@@ -423,6 +446,17 @@ export function scoreConfidenceBreakdown(input: EvidenceConfidenceInput = {}): C
     contribution: os ? EVIDENCE_CONFIDENCE_WEIGHTS.os_family : 0,
     detail: os ? 'OS family agrees' : 'no OS-family consensus',
   });
+
+  // The published score is the clamp of these exact contributions. Fold any clamp
+  // adjustment into the single signed component so the six-item audit trail always sums
+  // to the published score — no hidden terms, no reconciliation drift.
+  const rawTotal = round4(components.reduce((sum, item) => sum + item.contribution, 0));
+  const clampedTotal = clamp01(rawTotal);
+  const delta = round4(clampedTotal - rawTotal);
+  if (delta !== 0) {
+    seedComponent.contribution = round4(seedComponent.contribution + delta);
+    seedComponent.detail += `; clamp reconciliation ${delta > 0 ? '+' : ''}${delta}`;
+  }
 
   return components;
 }

@@ -4316,8 +4316,18 @@ var EVIDENCE_ONLY_KEYS = [
   "os_family_consensus"
 ];
 function finiteNumber(value) {
-  const num = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(num) ? num : null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim() !== "") {
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  }
+  return null;
+}
+function effectiveSeedCount(value) {
+  if (value === void 0 || value === null) return null;
+  const parsed = finiteNumber(value);
+  if (parsed === null || !Number.isInteger(parsed) || parsed < 0) return 1;
+  return parsed;
 }
 function clamp01(value) {
   if (!Number.isFinite(value)) return 0;
@@ -4364,7 +4374,8 @@ function scoreConfidenceBreakdown(input = {}) {
     contribution: round4(ratio * EVIDENCE_CONFIDENCE_WEIGHTS.structural_anchor),
     detail: directRatio !== null ? `structural_anchor_ratio=${directRatio}` : derivedRatio !== null ? `matched_anchors=${matched}, total_anchors=${total}` : "anchor evidence missing; zero weight"
   });
-  const seeds = finiteNumber(source.distinct_storage_seeds_count);
+  const rawSeeds = source.distinct_storage_seeds_count;
+  const seeds = effectiveSeedCount(rawSeeds);
   let seedAdjustment = 0;
   let seedDetail = "storage seed count missing; zero weight";
   if (seeds === 1) {
@@ -4376,13 +4387,17 @@ function scoreConfidenceBreakdown(input = {}) {
   } else if (seeds !== null) {
     seedDetail = `distinct_storage_seeds_count=${seeds}`;
   }
-  components.push({
+  if (rawSeeds !== void 0 && rawSeeds !== null && seeds !== finiteNumber(rawSeeds)) {
+    seedDetail += "; invalid count defaulted to 1";
+  }
+  const seedComponent = {
     name: "distinct_storage_seeds",
     evidence: seeds ?? 0,
     weight: seedAdjustment,
     contribution: round4(seedAdjustment),
     detail: seedDetail
-  });
+  };
+  components.push(seedComponent);
   const browser = hasConsensus(source.browser_family_consensus);
   components.push({
     name: "browser_family_consensus",
@@ -4399,6 +4414,13 @@ function scoreConfidenceBreakdown(input = {}) {
     contribution: os2 ? EVIDENCE_CONFIDENCE_WEIGHTS.os_family : 0,
     detail: os2 ? "OS family agrees" : "no OS-family consensus"
   });
+  const rawTotal = round4(components.reduce((sum, item) => sum + item.contribution, 0));
+  const clampedTotal = clamp01(rawTotal);
+  const delta = round4(clampedTotal - rawTotal);
+  if (delta !== 0) {
+    seedComponent.contribution = round4(seedComponent.contribution + delta);
+    seedComponent.detail += `; clamp reconciliation ${delta > 0 ? "+" : ""}${delta}`;
+  }
   return components;
 }
 function evidenceScore(input) {
@@ -5304,15 +5326,20 @@ function confidenceBandForScore(score) {
 }
 function computeHonestIdentityConfidence(input) {
   const source = input && typeof input === "object" ? input : {};
-  const stage = typeof source.matchStage === "string" ? source.matchStage : "new_enrollment";
-  const stageTier = TIER_BY_STAGE[stage] || "New Unobserved Profile";
-  if (!MATCH_STAGES_WITH_EVIDENCE.has(stage)) {
+  const stage = typeof source.matchStage === "string" ? source.matchStage.trim().toLowerCase() : "new_enrollment";
+  const explicitTier = typeof source.matchTier === "string" ? source.matchTier.trim().toLowerCase() : "";
+  const effectiveTier = explicitTier || stage;
+  const displayStage = MATCH_STAGES_WITH_EVIDENCE.has(effectiveTier) ? stage : effectiveTier;
+  const stageTier = TIER_BY_STAGE[displayStage] || "New Unobserved Profile";
+  if (!MATCH_STAGES_WITH_EVIDENCE.has(stage) || !MATCH_STAGES_WITH_EVIDENCE.has(effectiveTier)) {
     return { confidence_score: null, confidence_tier: stageTier, calibration_status: "uncalibrated" };
   }
   const fallbackMatchScore = typeof source.calibratedScore === "number" && Number.isFinite(source.calibratedScore) ? Math.max(0, Math.min(1, source.calibratedScore)) * 100 : 0;
+  const explicitMatchScore = source.matchScore;
+  const matchScore = explicitMatchScore === void 0 || explicitMatchScore === null ? fallbackMatchScore : typeof explicitMatchScore === "number" && Number.isFinite(explicitMatchScore) && explicitMatchScore >= 0 ? explicitMatchScore : 0;
   const score = scoreConfidence({
-    match_tier: source.matchTier || stage,
-    match_score: source.matchScore ?? fallbackMatchScore,
+    match_tier: effectiveTier,
+    match_score: matchScore,
     structural_anchor_ratio: source.structuralAnchorRatio,
     matched_anchors: source.matchedAnchors,
     total_anchors: source.totalAnchors,
@@ -13698,7 +13725,7 @@ function sanitizeBrowserDevice(input) {
   const validDeviceTypes = ["Desktop", "Mobile", "Tablet", "Unknown"];
   const rawType = input?.deviceType;
   const deviceType = rawType && validDeviceTypes.includes(rawType) ? rawType : "Unknown";
-  const incognitoAlias = typeof input?.incognito === "boolean" || typeof input?.isIncognito === "boolean" || typeof input?.privateMode === "boolean" ? Boolean(input?.incognito ?? input?.isIncognito ?? input?.privateMode) : void 0;
+  const incognitoAlias = typeof input?.incognito === "boolean" || typeof input?.isIncognito === "boolean" || typeof input?.privateMode === "boolean" ? Boolean(input?.incognito || input?.isIncognito || input?.privateMode) : void 0;
   const rawIncognitoMethod = typeof input?.incognitoMethod === "string" && input.incognitoMethod.trim() ? input.incognitoMethod.trim().slice(0, 120) : void 0;
   const incognitoMethod = humanIncognitoMethod(
     rawIncognitoMethod,
@@ -14287,9 +14314,14 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     tamperReasons.unshift(requestContext.requestIntegrityReason);
     tamperReasons.splice(10);
   }
-  const rawIncognitoConfidence = raw?.incognitoConfidence;
-  const incognitoConfidenceHigh = rawIncognitoConfidence === "high" || typeof rawIncognitoConfidence === "number" && rawIncognitoConfidence >= 0.9;
-  const incognitoLikely = incognitoConfidenceHigh && Boolean(raw?.incognitoLikely);
+  const rawIncognito = raw;
+  const rawIncognitoConfidence = rawIncognito?.incognitoConfidence;
+  const lowConfidenceVeto = rawIncognitoConfidence === "low" || typeof rawIncognitoConfidence === "number" && rawIncognitoConfidence < 0.9;
+  const incognitoConfidenceHigh = !lowConfidenceVeto && (incognitoContext.incognitoConfidenceHigh === true || rawIncognitoConfidence === "high" || typeof rawIncognitoConfidence === "number" && rawIncognitoConfidence >= 0.9);
+  const clientIncognitoClaim = Boolean(
+    incognitoContext.clientReportedIncognito || rawIncognito?.isIncognito || rawIncognito?.incognito || rawIncognito?.privateMode || rawIncognito?.incognitoLikely
+  );
+  const incognitoLikely = incognitoConfidenceHigh && clientIncognitoClaim;
   const incognitoConfidenceLabel = incognitoConfidenceHigh ? "high" : "low";
   const storageQuotaMb = typeof raw?.storageQuotaMb === "number" && Number.isFinite(raw.storageQuotaMb) && raw.storageQuotaMb > 0 ? Math.round(raw.storageQuotaMb) : null;
   const webrtcCandidateIp = typeof raw?.webrtcCandidateIp === "string" && raw.webrtcCandidateIp.trim() ? raw.webrtcCandidateIp.trim().slice(0, 64) : null;
@@ -14333,7 +14365,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     persistenceMode = "Private / Restricted Storage";
   }
   const incognitoOrCleared = Boolean(raw?.incognitoOrCleared) || recognitionSource === "Hardware Fingerprint (Cookie-less / Incognito)" || persistenceMode === "Hardware ID Recovered";
-  const clientReportedIncognito = Boolean(incognitoContext.clientReportedIncognito) || incognitoLikely;
+  const clientReportedIncognito = incognitoLikely;
   const isIncognito = clientReportedIncognito;
   const incognitoMethod = humanIncognitoMethod(
     rawIncognitoMethod,
@@ -15188,9 +15220,10 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const historyBackupValid = Boolean(validBackupForStats);
     const hadPersistentClientState = Boolean(cookieVid || bodyVisitorId || historyBackupValid);
     const rawIncognitoConfidence = rawSecuritySignals?.incognitoConfidence ?? requestBody.incognitoConfidence;
-    const incognitoConfidenceHigh = rawIncognitoConfidence === "high" || typeof rawIncognitoConfidence === "number" && rawIncognitoConfidence >= 0.9;
+    const lowConfidenceVeto = rawIncognitoConfidence === "low" || typeof rawIncognitoConfidence === "number" && rawIncognitoConfidence < 0.9;
+    const incognitoConfidenceHigh = !lowConfidenceVeto && (rawIncognitoConfidence === "high" || typeof rawIncognitoConfidence === "number" && rawIncognitoConfidence >= 0.9);
     const clientReportedIncognito = incognitoConfidenceHigh && Boolean(
-      requestBody.incognito ?? requestBody.isIncognito ?? requestBody.privateMode ?? requestBody.browserInfo?.incognito ?? requestBody.browserInfo?.isIncognito ?? requestBody.telemetry?.incognito ?? requestBody.telemetry?.isIncognito ?? rawSecuritySignals?.isIncognito ?? rawSecuritySignals?.incognito ?? rawSecuritySignals?.privateMode ?? rawSecuritySignals?.incognitoLikely
+      requestBody.incognito || requestBody.isIncognito || requestBody.privateMode || requestBody.browserInfo?.incognito || requestBody.browserInfo?.isIncognito || requestBody.telemetry?.incognito || requestBody.telemetry?.isIncognito || rawSecuritySignals?.isIncognito || rawSecuritySignals?.incognito || rawSecuritySignals?.privateMode || rawSecuritySignals?.incognitoLikely
     );
     let crossSessionEphemeral = false;
     if (!hadPersistentClientState && !existingHwidVisitor && hardwareId) {
@@ -15489,6 +15522,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         hadPersistentClientState,
         existingHwidVisitor,
         clientReportedIncognito,
+        incognitoConfidenceHigh,
         crossSessionEphemeral
       },
       {
@@ -16150,27 +16184,21 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     );
     const deterministicConfidenceScore = Math.max(0, Math.min(1, identityConfidence.score));
     const genuinelyNewProfile = !storageValidForConfidence && !hardwareMatchForConfidence && !probabilisticMatchForConfidence;
-    let finalIdentityConfidenceScore;
-    if (genuinelyNewProfile) {
-      finalIdentityConfidenceScore = null;
-    } else {
+    const capsAtZeroSix = probabilisticMatchForConfidence || downgradeRecognition;
+    let finalIdentityConfidenceScore = null;
+    if (!genuinelyNewProfile) {
       const seeded = typeof honestConfidenceSeed.confidence_score === "number" && Number.isFinite(honestConfidenceSeed.confidence_score) ? honestConfidenceSeed.confidence_score : deterministicConfidenceScore;
       const clamped = Math.max(0, Math.min(1, seeded));
-      finalIdentityConfidenceScore = probabilisticMatchForConfidence ? Math.min(0.6, clamped) : clamped;
+      finalIdentityConfidenceScore = capsAtZeroSix ? Math.min(0.6, clamped) : clamped;
     }
-    let identityConfidenceHonest = {
+    const identityConfidenceHonest = {
       ...honestConfidenceSeed,
-      confidence_score: finalIdentityConfidenceScore
+      confidence_score: finalIdentityConfidenceScore,
+      calibration_status: "uncalibrated",
+      ...downgradeRecognition ? { confidence_tier: "Shared Hardware Class - Ambiguous" } : {}
     };
     if (downgradeRecognition) {
       isReturning = false;
-      identityConfidenceHonest = {
-        ...identityConfidenceHonest,
-        confidence_tier: "Shared Hardware Class - Ambiguous"
-        // No artificial numeric cap here: the categorical tier carries the ambiguity warning,
-        // while the numeric score stays the real deterministic confidence. Only genuinely
-        // unseen / unverified matches are capped (see finalIdentityConfidenceScore above).
-      };
     }
     const recognitionLabel = downgradeRecognition ? "possible hardware match" : "returning device";
     const networkOwnership = hostingDatacenter ? "hosting_datacenter" : /cellular|mobile|5g|carrier/i.test(networkTypeLabel) ? "mobile_carrier" : /enterprise|business/i.test(networkTypeLabel) ? "enterprise" : /broadband|residential|consumer/i.test(networkTypeLabel) ? "residential_isp" : "unknown";
@@ -16613,7 +16641,10 @@ function inferRuntimeOsVerdict(input, uaOs) {
 }
 function humanIncognitoMethod(rawMethod, isIncognito, probeInconclusive) {
   if (isIncognito) return "Ephemeral / private storage detected";
-  if (probeInconclusive) return "Storage probe inconclusive (treated as normal)";
+  const method = String(rawMethod || "").trim().toLowerCase();
+  if (probeInconclusive || method === "storage-check-inconclusive") {
+    return "Storage probe inconclusive (treated as normal)";
+  }
   return "Persistent disk-backed storage verified";
 }
 function storageProbeInconclusive(method) {

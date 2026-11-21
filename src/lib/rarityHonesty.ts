@@ -146,11 +146,21 @@ export function confidenceBandForScore(score: number): NumericConfidenceTier {
  */
 export function computeHonestIdentityConfidence(input: CalibrationInput): HonestIdentityConfidence {
   const source: CalibrationInput = input && typeof input === 'object' ? input : ({} as CalibrationInput);
-  const stage = typeof source.matchStage === 'string' ? source.matchStage : 'new_enrollment';
-  const stageTier = TIER_BY_STAGE[stage as IdentityAxes['match_stage']] || 'New Unobserved Profile';
+  const stage =
+    typeof source.matchStage === 'string' ? source.matchStage.trim().toLowerCase() : 'new_enrollment';
+  const explicitTier =
+    typeof source.matchTier === 'string' ? source.matchTier.trim().toLowerCase() : '';
+  // An explicit match tier is the authoritative evidence discriminator; the resolved stage
+  // is the fallback for legacy callers that do not supply one.
+  const effectiveTier = explicitTier || stage;
+  const displayStage = MATCH_STAGES_WITH_EVIDENCE.has(effectiveTier) ? stage : effectiveTier;
+  const stageTier = TIER_BY_STAGE[displayStage as IdentityAxes['match_stage']] || 'New Unobserved Profile';
 
   // Genuinely unseen / non-identifying: preserve the historical null score and stage tier.
-  if (!MATCH_STAGES_WITH_EVIDENCE.has(stage)) {
+  // Both the resolved stage AND the effective tier must carry real evidence — an explicit
+  // `new_enrollment` never publishes a number, even if the stage claims a match (and vice
+  // versa). No fabricated probability is ever emitted for these profiles.
+  if (!MATCH_STAGES_WITH_EVIDENCE.has(stage) || !MATCH_STAGES_WITH_EVIDENCE.has(effectiveTier)) {
     return { confidence_score: null, confidence_tier: stageTier, calibration_status: 'uncalibrated' };
   }
 
@@ -160,9 +170,22 @@ export function computeHonestIdentityConfidence(input: CalibrationInput): Honest
     typeof source.calibratedScore === 'number' && Number.isFinite(source.calibratedScore)
       ? Math.max(0, Math.min(1, source.calibratedScore)) * 100
       : 0;
+
+  // Exactly one match-score signal is used — never both (no double counting). A present
+  // but non-finite/negative explicit score is zeroed rather than replaced by a guess.
+  const explicitMatchScore = source.matchScore;
+  const matchScore =
+    explicitMatchScore === undefined || explicitMatchScore === null
+      ? fallbackMatchScore
+      : typeof explicitMatchScore === 'number' &&
+        Number.isFinite(explicitMatchScore) &&
+        explicitMatchScore >= 0
+      ? explicitMatchScore
+      : 0;
+
   const score = scoreConfidence({
-    match_tier: (source.matchTier || stage) as EvidenceMatchTier,
-    match_score: source.matchScore ?? fallbackMatchScore,
+    match_tier: effectiveTier as EvidenceMatchTier,
+    match_score: matchScore,
     structural_anchor_ratio: source.structuralAnchorRatio,
     matched_anchors: source.matchedAnchors,
     total_anchors: source.totalAnchors,

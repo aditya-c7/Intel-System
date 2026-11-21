@@ -23,45 +23,100 @@ export interface SmartSignalRowData {
 }
 
 /* -------------------------------------------------------------------------- */
-/* Human-only incognito copy                                                   */
+/* Incognito — one canonical, jargon-free verdict for every surface            */
 /* -------------------------------------------------------------------------- */
 
-const SAFE_INCOGNITO_STATUSES = new Set([
-  'not detected',
-  'likely private session',
-  'inconclusive — treated as normal',
-  'inconclusive - treated as normal',
-]);
+/**
+ * The only strings a user ever sees for this axis. Raw probe names, ratios, OPFS /
+ * IndexedDB internals and quota numbers are never printed — the server detail is
+ * reduced to one of these three sanctioned outcomes before it reaches the DOM.
+ */
+const INCOGNITO_STATUS_ON = 'You are incognito';
+const INCOGNITO_STATUS_OFF = 'Not detected';
+const INCOGNITO_DETAIL_PRIVATE = 'Ephemeral / private storage detected';
+const INCOGNITO_DETAIL_NORMAL = 'Persistent disk-backed storage verified';
+const INCOGNITO_DETAIL_INCONCLUSIVE = 'Inconclusive — treated as normal';
 
-/** True for the raw diagnostic strings that must never reach a user. */
-function isIncognitoDiagnostic(value: string): boolean {
-  const lower = value.toLowerCase();
-  return (
-    /idb\b|indexeddb|opfs|fail[-\s]?open|inconclusive|indeterminate|ratio|\b\d+(?:\.\d+)?\s*x\b|\d+\.\d+/.test(
-      lower
-    ) || !SAFE_INCOGNITO_STATUSES.has(lower)
+export interface IncognitoVerdict {
+  /** Server-canonical verdict. Drives the tile label, the chip and the Event JSON. */
+  isIncognito: boolean;
+  /** A negative verdict from an inconclusive / fail-open probe. */
+  lowConfidence: boolean;
+  /** Jargon-free status label shared by the grid rows and the Event JSON. */
+  status: string;
+  /** Exactly one of the three sanctioned storage outcomes. */
+  detail: string;
+}
+
+/** Reads the canonical Smart Signal wording as a boolean (never echoed verbatim). */
+function statusSaysIncognito(status: string | null | undefined): boolean {
+  const s = (status || '').trim().toLowerCase();
+  if (!s) return false;
+  // Explicit negative verdicts win over a stray "private" token in surrounding prose.
+  if (/not detected|standard window|not incognito|not private|^no$|^false$|^none$|unavailable/.test(s))
+    return false;
+  return /incognito|private|ephemeral|detected|^yes$|^true$/.test(s);
+}
+
+/** True only for a negative probe whose result was inconclusive / low-confidence. */
+function detailIsInconclusive(detail: string | null | undefined): boolean {
+  return /inconclusive|indeterminate|fail[-\s]?open|low[-\s]?confidence|unknown|unavailable|storage-check-inconclusive/i.test(
+    detail || ''
   );
 }
 
-/** Maps any server incognito status onto one of the three allowed human labels. */
-export function safeIncognitoStatus(status: string | null | undefined, detected: boolean): string {
-  const value = (status || '').trim();
-  const lower = value.toLowerCase();
-  if (!value || /not detected|none|false|^no$/.test(lower)) return 'Not detected';
-  if (/inconclusive|indeterminate|fail[-\s]?open/.test(lower)) return 'Inconclusive — treated as normal';
-  if (SAFE_INCOGNITO_STATUSES.has(lower)) return lower.startsWith('inconclusive') ? 'Inconclusive — treated as normal' : value;
-  return detected ? 'Likely private session' : 'Not detected';
-}
+/**
+ * Single source of truth for the incognito verdict. The server's canonical boolean is
+ * read from `smartSignals.incognito.status`, `securitySignals.isIncognito` and the
+ * top-level `isIncognito` mirror. A positive source always wins: a genuine private
+ * window can never render "Not detected" because one mirror looked stale. Every
+ * consumer (both grids, the title chip and the Event JSON) reads this same object.
+ */
+export function resolveIncognitoVerdict(
+  data: IntelVisitorResponse | null | undefined
+): IncognitoVerdict {
+  const s = data?.securitySignals;
+  const signal = data?.smartSignals?.incognito ?? s?.smartSignals?.incognito ?? null;
 
-/** Maps any server incognito method/detail onto human copy (never raw diagnostics). */
-export function safeIncognitoDetail(
-  detail: string | null | undefined,
-  detected: boolean
-): string | undefined {
-  const value = (detail || '').trim();
-  if (!value) return undefined;
-  if (!isIncognitoDiagnostic(value)) return value;
-  return detected ? 'Likely private session' : 'Inconclusive — treated as normal';
+  const statusPositive = statusSaysIncognito(signal?.status);
+  const booleanMirrors: Array<boolean | undefined> = [
+    s?.isIncognito,
+    data?.isIncognito,
+    s?.incognito,
+    data?.incognito,
+    s?.privateMode,
+    s?.incognitoLikely,
+  ];
+  // A positive canonical boolean outranks a stale negative status string — the exact
+  // false-negative that made genuine Chrome Incognito read "Not detected".
+  const isIncognito = statusPositive || booleanMirrors.some((value) => value === true);
+
+  const rawConfidence = (
+    s as { incognitoConfidence?: 'high' | 'low' | number | null } | undefined
+  )?.incognitoConfidence;
+  const rawDetail =
+    (s as { incognitoDetail?: string } | undefined)?.incognitoDetail ??
+    (s as { incognitoMethod?: string } | undefined)?.incognitoMethod ??
+    signal?.detail ??
+    '';
+  const lowConfidence =
+    !isIncognito &&
+    (rawConfidence === 'low' ||
+      (typeof rawConfidence === 'number' &&
+        Number.isFinite(rawConfidence) &&
+        rawConfidence < 0.9) ||
+      detailIsInconclusive(rawDetail));
+
+  return {
+    isIncognito,
+    lowConfidence,
+    status: isIncognito ? INCOGNITO_STATUS_ON : INCOGNITO_STATUS_OFF,
+    detail: isIncognito
+      ? INCOGNITO_DETAIL_PRIVATE
+      : lowConfidence
+      ? INCOGNITO_DETAIL_INCONCLUSIVE
+      : INCOGNITO_DETAIL_NORMAL,
+  };
 }
 
 const CLEAN = {
@@ -298,15 +353,13 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     detail: 'IP Geolocation Estimate',
   });
 
-  const incognito = Boolean(
-    signals.isIncognito ?? signals.incognito ?? signals.privateMode ?? signals.incognitoLikely
-  );
+  const incognito = resolveIncognitoVerdict(data);
   rows.push({
     key: 'incognito',
     label: 'Incognito Mode',
-    status: safeIncognitoStatus(incognito ? 'Likely private session' : 'Not detected', incognito),
-    triggered: incognito,
-    detail: safeIncognitoDetail(signals.incognitoMethod ?? signals.incognitoDetail, incognito),
+    status: incognito.status,
+    triggered: incognito.isIncognito,
+    detail: incognito.detail,
   });
 
   const bot = botStatus(data);

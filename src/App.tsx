@@ -17,9 +17,9 @@ import { isMobileDevice } from './lib/deviceClass';
 import { normalizeIdentity } from './shared/normalization/uaNormalizer';
 import {
   SmartSignalsGrid,
-  safeIncognitoStatus,
-  safeIncognitoDetail,
+  resolveIncognitoVerdict,
   resolveVmVerdict,
+  type IncognitoVerdict,
 } from './components/SmartSignalsGrid';
 import {
   CursorAttributionOverlay,
@@ -58,6 +58,7 @@ import {
   HardDrive,
   Palette,
   Bot,
+  EyeOff,
   ChevronRight,
 } from 'lucide-react';
 
@@ -474,29 +475,29 @@ function createSignalRow(
  * Converts one server-computed Smart Signal into the shared tile model, preserving the
  * server's exact status wording and out-of-10 rating line.
  */
-function smartSignalToRow(signal: SmartSignal): SignalRowModel {
-  // Incognito copy is sanitized to the three allowed human labels; every other signal keeps
-  // the server's exact status/detail verbatim (including the bot's exact agent name).
-  const isIncognito = signal.id === 'incognito';
-  const detected =
-    isIncognito &&
-    /incognito|private|detected|yes/i.test(signal.status) &&
-    !/not detected/i.test(signal.status);
-  const statusLabel = isIncognito
-    ? safeIncognitoStatus(signal.status, detected)
-    : signal.status;
-  const caption = isIncognito
-    ? safeIncognitoDetail(signal.detail, detected) ?? statusLabel
-    : signal.detail;
+function smartSignalToRow(signal: SmartSignal, incognito?: IncognitoVerdict): SignalRowModel {
+  // Incognito is the one tile whose raw server status must be mapped onto the canonical
+  // verdict instead of echoed: a stale "Standard Window" status must never read
+  // "Not detected" when the server's boolean says private. Every other signal keeps the
+  // server's exact status/detail verbatim (including the bot's exact agent name).
+  const verdict = signal.id === 'incognito' ? incognito : undefined;
+  const statusLabel = verdict?.status ?? signal.status;
+  const caption = verdict?.detail ?? signal.detail;
+  // Mirror the same canonical verdict on the 0..10 axis (3 private / 0 normal). The server
+  // grid already carries these values; this only heals a stale mirror.
+  const riskScore = verdict ? (verdict.isIncognito ? 3 : 0) : signal.scoreOutOf10;
+  const riskLabel = verdict
+    ? `${resolveSignalRiskTier(riskScore)} Risk • ${riskScore}/10`
+    : signal.riskLabel;
   return {
     key: signal.id,
-    dotClass: TONE_DOT_CLASS[toneForScore(signal.scoreOutOf10)],
+    dotClass: TONE_DOT_CLASS[toneForScore(riskScore)],
     title: signal.title,
     caption,
     statusLabel,
     tooltip: `${signal.title} • ${caption}`,
-    riskScore: signal.scoreOutOf10,
-    riskLabel: signal.riskLabel,
+    riskScore,
+    riskLabel,
   };
 }
 
@@ -572,11 +573,12 @@ const GENERIC_BOT_STATUSES = new Set([
 
 function buildSignalRows(
   serverSignals?: SmartSignals | null,
-  exactBotName?: string | null
+  exactBotName?: string | null,
+  incognito?: IncognitoVerdict
 ): SignalRowModel[] {
   const rows: SignalRowModel[] = serverSignals
     ? [serverSignals.incognito, serverSignals.bot, serverSignals.vpn, serverSignals.vm].map(
-        smartSignalToRow
+        (signal) => smartSignalToRow(signal, incognito)
       )
     : UNAVAILABLE_CARD_TITLES.map((title) =>
         createSignalRow({
@@ -1254,7 +1256,10 @@ export default function App() {
   // 4-signal core grid model (null-safe: renders only inside the data block). Only the
   // server-computed grid is displayed; a legacy response gets explicit unavailable tiles.
   const serverSmartSignals = data?.smartSignals ?? data?.securitySignals?.smartSignals ?? null;
-  const signalRows = buildSignalRows(serverSmartSignals, exactBotName);
+  // One server-canonical incognito verdict feeds the core grid, the Smart Signals grid, the
+  // title chip and the Event JSON, so none of those surfaces can disagree with the server.
+  const incognitoVerdict = useMemo(() => resolveIncognitoVerdict(data), [data]);
+  const signalRows = buildSignalRows(serverSmartSignals, exactBotName, incognitoVerdict);
 
   // User-visible risk stays on the 0-10 suspect-score scale. The normalizer converts any
   // legacy 0-100 mirror back to 0-10; the tier follows that same displayed score.
@@ -1518,14 +1523,9 @@ export default function App() {
       },
       proxy: Boolean(canonical?.network?.proxy ?? (s as unknown as { proxyDetected?: boolean }).proxyDetected ?? false),
       proxy_confidence: canonical?.network?.proxy ? 'high' : 'low',
-      incognito: Boolean(s.isIncognito ?? s.incognito ?? s.privateMode),
+      incognito: incognitoVerdict.isIncognito,
       // Human-only copy in the Event JSON: no IDB ratios / fail-open / raw method strings.
-      incognito_status: safeIncognitoStatus(
-        (s as { incognitoDetail?: string }).incognitoDetail ??
-          (s as { incognitoMethod?: string }).incognitoMethod ??
-          '',
-        Boolean(s.isIncognito ?? s.incognito ?? s.privateMode)
-      ),
+      incognito_status: incognitoVerdict.status,
       incognito_confidence:
         (s as { incognitoConfidence?: 'high' | 'low' }).incognitoConfidence ?? null,
       privacy_settings: Boolean(
@@ -1647,6 +1647,7 @@ export default function App() {
     };
   }, [
     data,
+    incognitoVerdict,
     displayedSuspectScore,
     canonical,
     displayBotType,
@@ -1965,6 +1966,15 @@ export default function App() {
                   <span className="text-xs font-medium text-slate-500">
                     • {data.isReturning ? 'Returning Device' : 'First Observed Visit'}
                   </span>
+                  {incognitoVerdict.isIncognito && (
+                    <span
+                      className="inline-flex items-center gap-1 rounded-full border border-violet-200 bg-violet-50 px-2 py-0.5 text-[10px] font-semibold text-violet-700"
+                      title="Private browsing window detected"
+                    >
+                      <EyeOff className="w-3 h-3 shrink-0" />
+                      Private window
+                    </span>
+                  )}
                 </div>
                 <p className="text-xs sm:text-[13px] text-slate-500 mt-1">
                   Real-time browser identity, hardware fingerprint, and live connection telemetry.

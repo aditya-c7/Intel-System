@@ -22,6 +22,12 @@ import {
   type MatchMode,
 } from '../src/shared/matching/compareFingerprints';
 import { scoreConfidence } from '../src/server/identity/confidenceScorer';
+import {
+  CALIBRATION_MAX_ECE,
+  CALIBRATION_MIN_LABELED_PAIRS,
+  computeHonestIdentityConfidence,
+  confidenceBandForScore,
+} from '../src/lib/rarityHonesty';
 import { buildGradedRiskLedger } from '../src/lib/riskLedger';
 import { normalizeGpuRenderer } from '../src/client/signals/webgl';
 import {
@@ -417,6 +423,70 @@ check('rarity p99 unlocked at N=1000', decideRarity(1000).percentile === 'p99_pl
 check('cookie secure from forwarded https', isSecureRequest({ xForwardedProto: 'https' }) === true);
 check('cookie insecure on local http', isSecureRequest({ xForwardedProto: 'http', secure: false }) === false);
 check('audio baseline fixture unchanged', AUDIO_SUM === 124.04347745512496);
+
+/* -------------------------------------------------------------------------- */
+/* Confidence score mirrors — single-sourced, no fabricated numbers            */
+/* -------------------------------------------------------------------------- */
+
+section('Confidence score mirror consistency');
+
+const mirrorGate = {
+  labeledPairs: CALIBRATION_MIN_LABELED_PAIRS + 300,
+  heldOutEce: CALIBRATION_MAX_ECE / 5,
+};
+const mirrorEvidence = {
+  matchScore: 100,
+  structuralAnchorRatio: 1,
+  browserFamilyConsensus: true,
+  osFamilyConsensus: true,
+} as const;
+const mirrorClean = computeHonestIdentityConfidence({
+  ...mirrorGate,
+  ...mirrorEvidence,
+  matchStage: 'lsh_fuzzy',
+  distinctStorageSeedsCount: 0,
+});
+const mirrorCollision = computeHonestIdentityConfidence({
+  ...mirrorGate,
+  ...mirrorEvidence,
+  matchStage: 'lsh_fuzzy',
+  distinctStorageSeedsCount: 2,
+});
+check(
+  'honest confidence mirror matches the raw evidence score',
+  mirrorClean.confidence_score === 0.65 && mirrorCollision.confidence_score === 0.45,
+  `${mirrorClean.confidence_score}/${mirrorCollision.confidence_score}`,
+);
+check(
+  'collision mirror differs by exactly 0.20',
+  Math.round(
+    ((mirrorClean.confidence_score ?? 0) - (mirrorCollision.confidence_score ?? 0)) * 10000
+  ) / 10000 === 0.2,
+);
+check(
+  'confidence band mirror agrees with the published tier',
+  confidenceBandForScore(mirrorClean.confidence_score ?? 0) === mirrorClean.confidence_tier &&
+    confidenceBandForScore(mirrorCollision.confidence_score ?? 0) === mirrorCollision.confidence_tier,
+);
+check(
+  'new profile keeps confidence_score null in the mirror',
+  computeHonestIdentityConfidence({ ...mirrorGate, matchStage: 'new_enrollment' }).confidence_score ===
+    null,
+);
+check(
+  'legacy scoreConfidence callers still get spoof/tampering fields',
+  (() => {
+    const result = scoreConfidence({ match_mode: 'exact', match_score: 100, storage_healed: true });
+    return (
+      result.version === '2.0' &&
+      typeof result.tampering === 'boolean' &&
+      typeof result.tampering_ml_score === 'number' &&
+      (result.spoof_likelihood === 'low' ||
+        result.spoof_likelihood === 'medium' ||
+        result.spoof_likelihood === 'high')
+    );
+  })(),
+);
 
 /* -------------------------------------------------------------------------- */
 

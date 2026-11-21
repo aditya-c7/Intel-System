@@ -5739,7 +5739,7 @@ function sanitizeBrowserDevice(input: Partial<BrowserDeviceInfo> | undefined): B
     typeof input?.incognito === 'boolean' ||
     typeof input?.isIncognito === 'boolean' ||
     typeof input?.privateMode === 'boolean'
-      ? Boolean(input?.incognito ?? input?.isIncognito ?? input?.privateMode)
+      ? Boolean(input?.incognito || input?.isIncognito || input?.privateMode)
       : undefined;
   const rawIncognitoMethod =
     typeof input?.incognitoMethod === 'string' && input.incognitoMethod.trim()
@@ -6301,7 +6301,10 @@ function sanitizeHardwareSignals(
 interface IncognitoCrossModeContext {
   hadPersistentClientState?: boolean;
   existingHwidVisitor?: boolean;
+  /** Any high-confidence client incognito spelling (resolved by the identify handler). */
   clientReportedIncognito?: boolean;
+  /** The resolver's stable confidence label, so top-level-only claims stay consistent in the sanitizer. */
+  incognitoConfidenceHigh?: boolean;
   /** Case B — an earlier visit by this same physical device (last 7 days) used a different visitor id. */
   crossSessionEphemeral?: boolean;
 }
@@ -6935,17 +6938,35 @@ function sanitizeAndReinforceSecuritySignals(
     tamperReasons.splice(10);
   }
 
-  // Only the collector's stable high-confidence private-mode verdict is accepted. The client
-  // emits an 'high' | 'low' label and already pins `incognitoLikely` false whenever confidence
-  // is 'low'. A low-confidence probe, a new/cleared profile, or a touch/geometry change is never
-  // incognito proof on the server either. (Legacy numeric >= 0.9 is treated as high.)
-  const rawIncognitoConfidence: unknown = (
-    raw as (Partial<SecuritySignals> & { incognitoConfidence?: unknown }) | null | undefined
-  )?.incognitoConfidence;
+  // Accept ANY client incognito spelling when the collector's stable label is 'high'. A genuine
+  // Chrome private window posts `isIncognito` / `incognito` / `privateMode` (top-level,
+  // browserInfo, telemetry or securitySignals) without necessarily setting the legacy
+  // `incognitoLikely` flag, so that single field is never required. A 'low' label / numeric < 0.9
+  // is a hard veto: a new/cleared profile, a context change or a touch/geometry probe is never
+  // incognito proof. The identify handler passes its gated verdict + label through the context so
+  // top-level-only claims (whose confidence lives outside `securitySignals`) stay consistent too.
+  const rawIncognito = raw as
+    | (Partial<SecuritySignals> & { incognitoConfidence?: unknown })
+    | null
+    | undefined;
+  const rawIncognitoConfidence: unknown = rawIncognito?.incognitoConfidence;
+  const lowConfidenceVeto =
+    rawIncognitoConfidence === 'low' ||
+    (typeof rawIncognitoConfidence === 'number' && rawIncognitoConfidence < 0.9);
   const incognitoConfidenceHigh =
-    rawIncognitoConfidence === 'high' ||
-    (typeof rawIncognitoConfidence === 'number' && rawIncognitoConfidence >= 0.9);
-  const incognitoLikely = incognitoConfidenceHigh && Boolean(raw?.incognitoLikely);
+    !lowConfidenceVeto &&
+    (incognitoContext.incognitoConfidenceHigh === true ||
+      rawIncognitoConfidence === 'high' ||
+      (typeof rawIncognitoConfidence === 'number' && rawIncognitoConfidence >= 0.9));
+  // OR, never `??`: an explicit false on one spelling must not shadow a true on another.
+  const clientIncognitoClaim = Boolean(
+    incognitoContext.clientReportedIncognito ||
+      rawIncognito?.isIncognito ||
+      rawIncognito?.incognito ||
+      rawIncognito?.privateMode ||
+      rawIncognito?.incognitoLikely
+  );
+  const incognitoLikely = incognitoConfidenceHigh && clientIncognitoClaim;
   // Echo the same stable label the collector emits; 'low' never reads as incognito downstream.
   const incognitoConfidenceLabel: 'high' | 'low' = incognitoConfidenceHigh ? 'high' : 'low';
   const storageQuotaMb =
@@ -7073,8 +7094,10 @@ function sanitizeAndReinforceSecuritySignals(
   // server-side "known hardware without cookies" correlation is deliberately not enough on
   // its own: a brand-new browser profile, cleared cookies or a cookie-blocking extension is
   // indistinguishable from a private window and must not be labelled Incognito.
-  const clientReportedIncognito =
-    Boolean(incognitoContext.clientReportedIncognito) || incognitoLikely;
+  // Every downstream mirror (top-level isIncognito, securitySignals.*, envelope, smart signal and
+  // history) derives from this single gated verdict so they can never disagree. The context flag
+  // is already confidence-gated by the identify handler and is re-gated here via incognitoLikely.
+  const clientReportedIncognito = incognitoLikely;
   const isIncognito = clientReportedIncognito;
   // Storage diagnostics are reduced to one of three human outcomes before serialization.
   const incognitoMethod = humanIncognitoMethod(
@@ -8563,23 +8586,28 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     const hadPersistentClientState = Boolean(cookieVid || bodyVisitorId || historyBackupValid);
 
     // Accept every incognito spelling this app (and its legacy payloads) can post:
-    // top-level, browserInfo.*, telemetry.*, securitySignals.* and any alias.
-    // The collector emits a stable 'high' | 'low' confidence label and pins its incognito verdict
-    // false whenever the label is 'low'. Volatile context (a new / cleared profile, touch or
-    // geometry changes) never reaches 'high', so gate every client spelling on that label before
-    // it can become an incognito verdict. Legacy numeric confidence >= 0.9 is treated as high.
+    // top-level, browserInfo.*, telemetry.*, securitySignals.* and any alias. The stable
+    // 'high' | 'low' label gates them all; a 'low' label / numeric < 0.9 is a hard veto that a
+    // fresh / cleared profile or a touch/geometry probe can never override.
+    // Use OR (never `??`): an explicit false on one spelling must not shadow a genuine true on
+    // another. This is what lets a real Chrome private window (`isIncognito: true`, high label,
+    // no legacy `incognitoLikely`) survive into every mirror. Legacy numeric >= 0.9 is 'high'.
     const rawIncognitoConfidence: unknown = (
       rawSecuritySignals as (Partial<SecuritySignals> & { incognitoConfidence?: unknown }) | null | undefined
     )?.incognitoConfidence ?? requestBody.incognitoConfidence;
+    const lowConfidenceVeto =
+      rawIncognitoConfidence === 'low' ||
+      (typeof rawIncognitoConfidence === 'number' && rawIncognitoConfidence < 0.9);
     const incognitoConfidenceHigh =
-      rawIncognitoConfidence === 'high' ||
-      (typeof rawIncognitoConfidence === 'number' && rawIncognitoConfidence >= 0.9);
+      !lowConfidenceVeto &&
+      (rawIncognitoConfidence === 'high' ||
+        (typeof rawIncognitoConfidence === 'number' && rawIncognitoConfidence >= 0.9));
     const clientReportedIncognito = incognitoConfidenceHigh && Boolean(
-      requestBody.incognito ?? requestBody.isIncognito ?? requestBody.privateMode ??
-      requestBody.browserInfo?.incognito ?? requestBody.browserInfo?.isIncognito ??
-      requestBody.telemetry?.incognito ?? requestBody.telemetry?.isIncognito ??
-      rawSecuritySignals?.isIncognito ?? rawSecuritySignals?.incognito ??
-      rawSecuritySignals?.privateMode ?? rawSecuritySignals?.incognitoLikely
+      requestBody.incognito || requestBody.isIncognito || requestBody.privateMode ||
+      requestBody.browserInfo?.incognito || requestBody.browserInfo?.isIncognito ||
+      requestBody.telemetry?.incognito || requestBody.telemetry?.isIncognito ||
+      rawSecuritySignals?.isIncognito || rawSecuritySignals?.incognito ||
+      rawSecuritySignals?.privateMode || rawSecuritySignals?.incognitoLikely
     );
 
     // Fingerprint.com-style ephemeral-storage correlation. Only meaningful when NO persistent
@@ -9075,6 +9103,7 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         hadPersistentClientState,
         existingHwidVisitor,
         clientReportedIncognito,
+        incognitoConfidenceHigh,
         crossSessionEphemeral,
       },
       {
@@ -10064,11 +10093,10 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       }
     }
 
-    // The honest identity-confidence wrapper is now fed the *real* resolver evidence instead of
-    // an uncalibrated guess: match stage, resolver match score, structural-anchor agreement,
-    // distinct storage-seed count, browser/OS family consensus and storage validity. The
-    // deterministic v2 score from `scoreConfidence` stays the numeric source of truth; the
-    // honest wrapper contributes the categorical tier and the honest calibration status.
+    // The honest identity-confidence wrapper is fed the *real* resolver evidence: match stage,
+    // resolver match score, structural-anchor agreement, distinct storage-seed count,
+    // browser/OS family consensus and storage validity. Its finite score is the single
+    // authoritative value; the deterministic scoreConfidence result is only the fallback.
     const storageValidForConfidence = Boolean(existingVisitor || verifiedVid);
     const hardwareMatchForConfidence = identityStage.stage === 'exact_hardware';
     const probabilisticMatchForConfidence = identityStage.stage === 'lsh_fuzzy';
@@ -10142,41 +10170,33 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     // hardware/fuzzy anchor) has no evidence for a numeric probability and stays `null`.
     const genuinelyNewProfile =
       !storageValidForConfidence && !hardwareMatchForConfidence && !probabilisticMatchForConfidence;
-    let finalIdentityConfidenceScore: number | null;
-    if (genuinelyNewProfile) {
-      finalIdentityConfidenceScore = null;
-    } else {
+    // Caps expressed exactly once: probabilistic/ambiguous matches are capped at 0.6; verified
+    // first-party-cookie and exact-hardware returning visits keep their real score.
+    const capsAtZeroSix = probabilisticMatchForConfidence || downgradeRecognition;
+    let finalIdentityConfidenceScore: number | null = null;
+    if (!genuinelyNewProfile) {
       const seeded =
         typeof honestConfidenceSeed.confidence_score === 'number' &&
         Number.isFinite(honestConfidenceSeed.confidence_score)
           ? honestConfidenceSeed.confidence_score
           : deterministicConfidenceScore;
       const clamped = Math.max(0, Math.min(1, seeded));
-      // Cap only unseen/unverified cases (probabilistic fuzzy / ambiguous hardware-class
-      // matches). Verified first-party-cookie and exact-hardware returning visits keep their
-      // real deterministic score — the old blanket `Math.min(0.6, ...)` suppressed them.
-      finalIdentityConfidenceScore = probabilisticMatchForConfidence ? Math.min(0.6, clamped) : clamped;
+      finalIdentityConfidenceScore = capsAtZeroSix ? Math.min(0.6, clamped) : clamped;
     }
 
-    let identityConfidenceHonest = {
+    const identityConfidenceHonest = {
       ...honestConfidenceSeed,
       confidence_score: finalIdentityConfidenceScore,
+      calibration_status: 'uncalibrated' as const,
+      ...(downgradeRecognition
+        ? { confidence_tier: 'Shared Hardware Class - Ambiguous' as const }
+        : {}),
     };
 
-    // Recognition label / confidence downgrade uses the corroboration resolved above (before
-    // any hardware / LSH adoption), so a rejected cross-cloud match can never be reported as a
-    // verified returning device. `isReturning` also drives the UI's "Returning Device" chip, so
-    // a downgraded storage-less cloud collision must clear it too. Stable first-party cookie
-    // returns are never hardware-only and are therefore untouched.
+    // A downgraded storage-less cloud / hardware-class collision must never be reported as a
+    // verified returning device (this also clears the UI's "Returning Device" chip).
     if (downgradeRecognition) {
       isReturning = false;
-      identityConfidenceHonest = {
-        ...identityConfidenceHonest,
-        confidence_tier: 'Shared Hardware Class - Ambiguous' as const,
-        // No artificial numeric cap here: the categorical tier carries the ambiguity warning,
-        // while the numeric score stays the real deterministic confidence. Only genuinely
-        // unseen / unverified matches are capped (see finalIdentityConfidenceScore above).
-      };
     }
     const recognitionLabel = downgradeRecognition
       ? 'possible hardware match'
@@ -10807,8 +10827,16 @@ function humanIncognitoMethod(
   isIncognito: boolean,
   probeInconclusive: boolean
 ): string {
+  // The collector's stable method strings map to fixed, jargon-free labels: no probe names,
+  // ratios or byte figures are ever printed. The boolean verdict stays authoritative for the
+  // incognito claim, so a bare method string (or a low-confidence probe) cannot manufacture one;
+  // `private-storage-detected` simply resolves to the same safe label as a true verdict,
+  // `standard-storage` to the normal one and `storage-check-inconclusive` to the inconclusive one.
   if (isIncognito) return 'Ephemeral / private storage detected';
-  if (probeInconclusive) return 'Storage probe inconclusive (treated as normal)';
+  const method = String(rawMethod || '').trim().toLowerCase();
+  if (probeInconclusive || method === 'storage-check-inconclusive') {
+    return 'Storage probe inconclusive (treated as normal)';
+  }
   return 'Persistent disk-backed storage verified';
 }
 

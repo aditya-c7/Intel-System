@@ -16,6 +16,7 @@ import {
   scoreConfidence,
   scoreConfidenceBreakdown,
   type ConfidenceComponent,
+  type ConfidenceResult,
   type EvidenceConfidenceInput,
   type EvidenceMatchTier,
 } from '../src/server/identity/confidenceScorer';
@@ -144,6 +145,68 @@ check('breakdown components sum exactly to the score', () => {
   assert.equal(Math.round(summed * 10000) / 10000, evidenceScore(input));
 });
 
+check('exact per-component contributions and sum (mixed evidence, single seed)', () => {
+  const input: ScoredEvidence = {
+    match_tier: 'lsh_fuzzy',
+    match_score: 80,
+    structural_anchor_ratio: 0.5,
+    distinct_storage_seeds_count: 1,
+    browser_family_consensus: true,
+    os_family_consensus: false,
+  };
+  const components = scoreConfidenceBreakdown(input);
+  const expected: Record<string, { evidence: number; weight: number; contribution: number }> = {
+    match_tier_base: { evidence: 0.2, weight: 1, contribution: 0.2 },
+    match_score: { evidence: 0.8, weight: 0.25, contribution: 0.2 },
+    structural_anchor_ratio: { evidence: 0.5, weight: 0.15, contribution: 0.075 },
+    distinct_storage_seeds: { evidence: 1, weight: 0.1, contribution: 0.1 },
+    browser_family_consensus: { evidence: 1, weight: 0.025, contribution: 0.025 },
+    os_family_consensus: { evidence: 0, weight: 0.025, contribution: 0 },
+  };
+  assert.equal(components.length, Object.keys(expected).length);
+  for (const component of components) {
+    const want = expected[component.name];
+    assert.ok(want, `unexpected component ${component.name}`);
+    assert.equal(component.evidence, want.evidence, `${component.name}.evidence`);
+    assert.equal(component.weight, want.weight, `${component.name}.weight`);
+    assert.equal(component.contribution, want.contribution, `${component.name}.contribution`);
+  }
+  const summed = components.reduce((total, item) => total + item.contribution, 0);
+  assert.equal(Math.round(summed * 10000) / 10000, 0.6);
+  assert.equal(evidenceScore(input), 0.6);
+});
+
+check('exact per-component contributions and sum (collision evidence)', () => {
+  const input: ScoredEvidence = {
+    match_tier: 'exact_hardware',
+    match_score: 90,
+    structural_anchor_ratio: 1,
+    distinct_storage_seeds_count: 2,
+    browser_family_consensus: true,
+    os_family_consensus: true,
+  };
+  const components = scoreConfidenceBreakdown(input);
+  const expected: Record<string, { evidence: number; weight: number; contribution: number }> = {
+    match_tier_base: { evidence: 0.35, weight: 1, contribution: 0.35 },
+    match_score: { evidence: 0.9, weight: 0.25, contribution: 0.225 },
+    structural_anchor_ratio: { evidence: 1, weight: 0.15, contribution: 0.15 },
+    distinct_storage_seeds: { evidence: 2, weight: -0.2, contribution: -0.2 },
+    browser_family_consensus: { evidence: 1, weight: 0.025, contribution: 0.025 },
+    os_family_consensus: { evidence: 1, weight: 0.025, contribution: 0.025 },
+  };
+  assert.equal(components.length, Object.keys(expected).length);
+  for (const component of components) {
+    const want = expected[component.name];
+    assert.ok(want, `unexpected component ${component.name}`);
+    assert.equal(component.evidence, want.evidence, `${component.name}.evidence`);
+    assert.equal(component.weight, want.weight, `${component.name}.weight`);
+    assert.equal(component.contribution, want.contribution, `${component.name}.contribution`);
+  }
+  const summed = components.reduce((total, item) => total + item.contribution, 0);
+  assert.equal(Math.round(summed * 10000) / 10000, 0.575);
+  assert.equal(evidenceScore(input), 0.575);
+});
+
 check('storage_continuity exact -> high score (>0.85) and tier base 0.45', () => {
   const input: ScoredEvidence = { match_tier: 'storage_continuity', ...FULL_EVIDENCE };
   const score = evidenceScore(input);
@@ -199,6 +262,41 @@ check('lsh_fuzzy with density>=2 -> collision penalty applied, score is lower', 
   assert.equal(seeds.contribution, -0.2);
 });
 
+check('single seed adds exactly +0.10 and every collision subtracts exactly -0.20', () => {
+  const base = {
+    match_tier: 'lsh_fuzzy' as const,
+    match_score: 100,
+    structural_anchor_ratio: 1,
+    browser_family_consensus: false,
+    os_family_consensus: false,
+  };
+  const zero = evidenceScore({ ...base, distinct_storage_seeds_count: 0 });
+  const one = evidenceScore({ ...base, distinct_storage_seeds_count: 1 });
+  assert.equal(Math.round((one - zero) * 10000) / 10000, 0.1);
+  const single = componentOf(
+    scoreConfidenceBreakdown({ ...base, distinct_storage_seeds_count: 1 }),
+    'distinct_storage_seeds'
+  );
+  assert.equal(single.weight, 0.1);
+  assert.equal(single.contribution, 0.1);
+  assert.equal(single.evidence, 1);
+
+  for (const seeds of [2, 3, 5, 100]) {
+    const collision = evidenceScore({ ...base, distinct_storage_seeds_count: seeds });
+    assert.equal(
+      Math.round((zero - collision) * 10000) / 10000,
+      0.2,
+      `seeds=${seeds}: collision must cost exactly 0.20`,
+    );
+    const component = componentOf(
+      scoreConfidenceBreakdown({ ...base, distinct_storage_seeds_count: seeds }),
+      'distinct_storage_seeds'
+    );
+    assert.equal(component.weight, -0.2, `seeds=${seeds} weight`);
+    assert.equal(component.contribution, -0.2, `seeds=${seeds} contribution`);
+  }
+});
+
 check('anchor ratio can be derived from matched/total counts', () => {
   const score = evidenceScore({
     match_tier: 'exact_hardware',
@@ -238,6 +336,74 @@ check('missing / malformed fields never throw and simply contribute zero', () =>
   }
   assert.doesNotThrow(() => scoreConfidence(null as any));
   assert.equal(evidenceScore({ match_tier: 'privacy_hardened' }), 0);
+});
+
+check('NaN / Infinity / wrong-type evidence never throws and never fabricates a collision', () => {
+  const input: ScoredEvidence = {
+    match_tier: 'lsh_fuzzy',
+    match_score: Number.NaN,
+    structural_anchor_ratio: Number.POSITIVE_INFINITY,
+    matched_anchors: Number.NaN,
+    total_anchors: Number.POSITIVE_INFINITY,
+    distinct_storage_seeds_count: Number.NaN,
+    browser_family_consensus: 'yes' as unknown as boolean,
+    os_family_consensus: 'off' as unknown as boolean,
+  };
+  assert.doesNotThrow(() => scoreConfidenceBreakdown(input));
+  const components = scoreConfidenceBreakdown(input);
+  assert.equal(components.length, 6);
+  // Malformed match/anchor evidence contributes zero.
+  assert.equal(componentOf(components, 'match_score').evidence, 0);
+  assert.equal(componentOf(components, 'match_score').contribution, 0);
+  assert.equal(componentOf(components, 'structural_anchor_ratio').evidence, 0);
+  assert.equal(componentOf(components, 'structural_anchor_ratio').contribution, 0);
+  assert.equal(componentOf(components, 'browser_family_consensus').contribution, 0);
+  assert.equal(componentOf(components, 'os_family_consensus').contribution, 0);
+  // A PRESENT but invalid seed count is defensively one corroborating seed, never a collision.
+  const seeds = componentOf(components, 'distinct_storage_seeds');
+  assert.equal(seeds.evidence, 1);
+  assert.equal(seeds.weight, 0.1);
+  assert.equal(seeds.contribution, 0.1);
+  assert.match(seeds.detail, /defaulted to 1/);
+  // lsh_fuzzy base 0.20 + the single seed 0.10 = 0.30; no fabricated collision penalty.
+  assert.equal(evidenceScore(input), 0.3);
+  assert.doesNotThrow(() => scoreConfidence(input));
+});
+
+check('malformed seed variants default to +0.10 while missing seeds stay at zero', () => {
+  const base = {
+    match_tier: 'lsh_fuzzy' as const,
+    match_score: 100,
+    structural_anchor_ratio: 1,
+    browser_family_consensus: false,
+    os_family_consensus: false,
+  };
+  assert.equal(evidenceScore({ ...base }), 0.6); // 0.20 + 0.25 + 0.15, no seed evidence
+  assert.equal(evidenceScore({ ...base, distinct_storage_seeds_count: null }), 0.6);
+  for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5, 'abc']) {
+    const input = { ...base, distinct_storage_seeds_count: bad as unknown as number };
+    const component = componentOf(scoreConfidenceBreakdown(input), 'distinct_storage_seeds');
+    assert.equal(component.weight, 0.1, `bad seed ${String(bad)} must not be a collision`);
+    assert.equal(component.contribution, 0.1, `bad seed ${String(bad)} contribution`);
+    assert.equal(evidenceScore(input), 0.7, `bad seed ${String(bad)} score`);
+  }
+});
+
+check('consensus flags accept only the locked truthy tokens', () => {
+  for (const value of [true, 1, '1', 'true']) {
+    const component = componentOf(
+      scoreConfidenceBreakdown({ os_family_consensus: value as unknown as boolean }),
+      'os_family_consensus'
+    );
+    assert.equal(component.contribution, 0.025, `truthy ${String(value)}`);
+  }
+  for (const value of [false, 0, '0', 'yes', '', null, undefined]) {
+    const component = componentOf(
+      scoreConfidenceBreakdown({ os_family_consensus: value as unknown as boolean }),
+      'os_family_consensus'
+    );
+    assert.equal(component.contribution, 0, `falsy ${String(value)}`);
+  }
 });
 
 check('all evidence outputs are rounded to <= 4 decimals', () => {
@@ -368,6 +534,74 @@ check('numeric display bands use the locked boundaries', () => {
   assert.equal(confidenceBandForScore(1), 'High');
 });
 
+check('boundary bands are exact on both sides of 0 / 0.4 / 0.65 / 0.85', () => {
+  assert.equal(confidenceBandForScore(-1), 'New/Unobserved');
+  assert.equal(confidenceBandForScore(Number.NaN), 'New/Unobserved');
+  assert.equal(confidenceBandForScore(0.3999), 'Low');
+  assert.equal(confidenceBandForScore(0.4), 'Medium');
+  assert.equal(confidenceBandForScore(0.6499), 'Medium');
+  assert.equal(confidenceBandForScore(0.65), 'Medium-High');
+  assert.equal(confidenceBandForScore(0.8499), 'Medium-High');
+  assert.equal(confidenceBandForScore(0.85), 'High');
+});
+
+check('non-matching stages stay null even with strong-looking evidence', () => {
+  const strongEvidence = {
+    matchScore: 100,
+    structuralAnchorRatio: 1,
+    distinctStorageSeedsCount: 1,
+    browserFamilyConsensus: true,
+    osFamilyConsensus: true,
+  };
+  for (const matchStage of ['new_enrollment', 'privacy_hardened'] as const) {
+    const result = computeHonestIdentityConfidence({ ...CALIBRATED_GATE, ...strongEvidence, matchStage });
+    assert.equal(result.confidence_score, null, `${matchStage} must stay null`);
+    assert.equal(result.calibration_status, 'uncalibrated', matchStage);
+  }
+  // A matching stage with no evidence still publishes an honest, non-null number.
+  const fuzzyNoEvidence = computeHonestIdentityConfidence({ ...CALIBRATED_GATE, matchStage: 'lsh_fuzzy' });
+  assert.equal(fuzzyNoEvidence.confidence_score, 0.2);
+  assert.equal(fuzzyNoEvidence.confidence_tier, 'Low');
+});
+
+check('confidence_score mirrors agree across the scorer, honest publisher and band', () => {
+  const cases: ReadonlyArray<{
+    stage: EvidenceMatchTier;
+    seeds: number;
+    score: number;
+    band: 'High' | 'Medium-High' | 'Medium';
+  }> = [
+    { stage: 'storage_continuity', seeds: 1, score: 1, band: 'High' },
+    { stage: 'exact_hardware', seeds: 0, score: 0.8, band: 'Medium-High' },
+    { stage: 'exact_hardware', seeds: 1, score: 0.9, band: 'High' },
+    { stage: 'lsh_fuzzy', seeds: 0, score: 0.65, band: 'Medium-High' },
+    { stage: 'lsh_fuzzy', seeds: 2, score: 0.45, band: 'Medium' },
+  ];
+  for (const c of cases) {
+    const raw = evidenceScore({
+      match_tier: c.stage,
+      match_score: 100,
+      structural_anchor_ratio: 1,
+      distinct_storage_seeds_count: c.seeds,
+      browser_family_consensus: true,
+      os_family_consensus: true,
+    });
+    const honest = computeHonestIdentityConfidence({
+      ...CALIBRATED_GATE,
+      matchStage: c.stage,
+      matchScore: 100,
+      structuralAnchorRatio: 1,
+      distinctStorageSeedsCount: c.seeds,
+      browserFamilyConsensus: true,
+      osFamilyConsensus: true,
+    });
+    assert.equal(honest.confidence_score, raw, `${c.stage}/${c.seeds}: raw vs honest mirror`);
+    assert.equal(honest.confidence_score, c.score, `${c.stage}/${c.seeds}: exact score`);
+    assert.equal(confidenceBandForScore(honest.confidence_score ?? 0), c.band, `${c.stage}/${c.seeds}: band`);
+    assert.equal(honest.confidence_tier, c.band, `${c.stage}/${c.seeds}: honest tier mirror`);
+  }
+});
+
 /* -------------------------------------------------------------------------- */
 /* 3. Risk math                                                                */
 /* -------------------------------------------------------------------------- */
@@ -436,6 +670,73 @@ check('verifyGradedRiskFixtures validates every frozen tuple', () => {
   for (const result of results) {
     assert.equal(result.ok, true, `${result.name} fixture drifted`);
   }
+});
+
+/* -------------------------------------------------------------------------- */
+/* 4. Legacy scorer contract — ConfidenceResult must keep its full shape       */
+/* -------------------------------------------------------------------------- */
+
+section('4. Legacy scoreConfidence callers still receive ConfidenceResult');
+
+check('evidence-shape scoreConfidence still returns a number (dispatch lock)', () => {
+  const value = scoreConfidence({ match_tier: 'storage_continuity', ...FULL_EVIDENCE });
+  assert.equal(typeof value, 'number');
+  assert.equal(value as number, 1);
+});
+
+check('legacy scoreConfidence returns a complete ConfidenceResult', () => {
+  const result: ConfidenceResult = scoreConfidence({
+    match_mode: 'exact',
+    match_score: 100,
+    storage_healed: true,
+    entropy: {
+      deterministicCanvas: true,
+      unmaskedWebgl: true,
+      fontsCount: 12,
+      deterministicAudio: true,
+    },
+  });
+  assert.equal(typeof result, 'object');
+  assert.ok(!Array.isArray(result));
+  assert.equal(result.version, '2.0');
+  assert.equal(typeof result.score, 'number');
+  assert.ok(Number.isFinite(result.score));
+  assert.equal(typeof result.tampering, 'boolean');
+  assert.equal(typeof result.tampering_ml_score, 'number');
+  assert.ok(
+    result.spoof_likelihood === 'low' ||
+      result.spoof_likelihood === 'medium' ||
+      result.spoof_likelihood === 'high',
+    `bad spoof_likelihood ${result.spoof_likelihood}`,
+  );
+  assert.equal(typeof result.breakdown.base_tier, 'number');
+  assert.equal(typeof result.breakdown.entropy_bonus, 'number');
+  assert.equal(typeof result.breakdown.penalty, 'number');
+  assert.ok(Array.isArray(result.breakdown.reasons));
+  // Exact, auditable legacy math: 0.985 base + 0.014 entropy - 0 penalty, clamped to 0.999.
+  assert.equal(result.breakdown.base_tier, 0.985);
+  assert.equal(result.breakdown.entropy_bonus, 0.014);
+  assert.equal(result.breakdown.penalty, 0);
+  assert.equal(result.score, 0.999);
+  assert.equal(result.tampering, false);
+  assert.equal(result.spoof_likelihood, 'low');
+});
+
+check('legacy genuine-spoof input reports tampering + high spoof fields', () => {
+  const result: ConfidenceResult = scoreConfidence({
+    match_mode: 'none',
+    match_score: 0,
+    genuineSpoof: true,
+    consistencyFlags: ['gpu_vendor_mismatch', 'canvas_noise_uniform'],
+  });
+  assert.equal(result.tampering, true);
+  assert.equal(result.spoof_likelihood, 'high');
+  assert.equal(result.tampering_ml_score, 0.9);
+  assert.equal(result.breakdown.penalty, 0.35);
+  assert.ok(result.breakdown.reasons.includes('consistency_genuine_spoof'));
+  // Clean first-visit base 0.900 + 0 entropy - 0.35 penalty -> 0.55 (above the 0.10 floor).
+  assert.equal(result.breakdown.base_tier, 0.9);
+  assert.equal(result.score, 0.55);
 });
 
 /* -------------------------------------------------------------------------- */
