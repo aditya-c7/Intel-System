@@ -15,6 +15,7 @@ import type {
   CanonicalTelemetryEnvelope,
   EnvironmentAxes,
   IdentityAxes,
+  InspectorState,
   NetworkAxes,
   OrthogonalRiskLedger,
   RiskTier,
@@ -72,6 +73,16 @@ export interface CanonicalView {
   serverVerified: Record<string, unknown>;
   clientClaimed: Record<string, unknown>;
   reconciledDisplay: Record<string, unknown>;
+  /* Additive agent-identification mirrors (all OPTIONAL — legacy payloads stay valid).
+     Read straight from the canonical envelope; the client never re-derives an identity.
+     `source` above already carries the envelope resolution source. */
+  bot_info?: AutomationAxes['bot_info'];
+  aiAgent?: AutomationAxes['aiAgent'];
+  verifiedAgentId?: string | null;
+  signatureStatus?: string;
+  cdpAttached?: boolean;
+  inspectorState?: InspectorState | null;
+  osTruth?: Record<string, unknown>;
 }
 
 /** Resolve the one canonical envelope from every supported response shape. */
@@ -196,6 +207,26 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     serverVerified: asRecord(env?.server_verified) ?? {},
     clientClaimed: asRecord(env?.client_claimed) ?? {},
     reconciledDisplay: asRecord(env?.reconciled_display) ?? {},
+    // Additive mirrors — no recomputation, only pass-through from the one canonical axes.
+    bot_info: automation?.bot_info ?? null,
+    aiAgent: automation?.aiAgent ?? null,
+    verifiedAgentId: automation?.verifiedAgentId ?? null,
+    signatureStatus: automation?.signatureStatus,
+    cdpAttached: automation?.cdp_attached,
+    inspectorState: automation?.inspector_state ?? null,
+    osTruth: automation
+      ? {
+          serverVerifiedOs: automation.serverVerifiedOs,
+          serverVerifiedBrowser: automation.serverVerifiedBrowser,
+          hostOs: automation.hostOs,
+          architecture: automation.architecture,
+          architectureSource: automation.architectureSource,
+          osUaMismatch: automation.osUaMismatch,
+          archUaMismatch: automation.archUaMismatch,
+          headerMismatch: automation.headerMismatch,
+          engine: automation.engine,
+        }
+      : {},
   };
 }
 

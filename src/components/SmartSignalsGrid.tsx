@@ -153,6 +153,20 @@ function botStatus(data: IntelVisitorResponse): { status: string; triggered: boo
   return legacy();
 }
 
+/**
+ * Single source of truth for the Browser Tampering row status. The server's canonical
+ * boolean is mirrored at `smartSignals.tampering` / `data.tampering`; the coarse
+ * `securitySignals.tampering` is kept only as a legacy fallback. This function deliberately
+ * does NOT look at `tamperingDetails` or risk-factor prose, so the tile can never disagree
+ * with the authoritative verdict or contradict the surrounding risk text.
+ */
+function serverTampering(data: IntelVisitorResponse): boolean {
+  const smart = data.smartSignals as { tampering?: boolean } | undefined;
+  if (typeof smart?.tampering === 'boolean') return smart.tampering;
+  if (typeof data.tampering === 'boolean') return data.tampering;
+  return Boolean(data.securitySignals?.tampering);
+}
+
 export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRowData[] {
   const signals = data.securitySignals;
   const rows: SmartSignalRowData[] = [];
@@ -220,17 +234,27 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     detail: vpnEffectiveCount > 1 ? `${vpnEffectiveCount} matching network methods` : signals.vpnReasons?.[0],
   });
 
-  const tampering = Boolean(data.tampering ?? signals.tampering);
+  // The tampering row mirrors the server's canonical verdict; it never recomputes one from
+  // raw evidence. `smartSignals.tampering` (when a backend supplies it) and `data.tampering`
+  // are both server mirrors; the coarse `securitySignals.tampering` is the legacy fallback.
+  const tampering = serverTampering(data);
+  // Detail may only describe CONFIRMED tampering. A privacy-hardening exemption reason is
+  // not tampering evidence — printing it under "Not detected" would contradict the verdict.
+  const tamperReason = data.tamperingDetails?.reasons?.find(
+    (reason) => !/privacy[- ]hardened|exempt/i.test(reason)
+  );
   rows.push({
     key: 'tampering',
     label: 'Browser Tampering',
     status: tampering ? 'Detected' : 'Not detected',
     triggered: tampering,
-    detail: data.tamperingDetails?.devtools_device_emulation
-      ? 'DevTools device emulation'
-      : data.tamperingDetails?.anti_detect_browser
-      ? 'Anti-detect browser'
-      : data.tamperingDetails?.reasons?.[0],
+    detail: tampering
+      ? data.tamperingDetails?.devtools_device_emulation
+        ? 'DevTools device emulation'
+        : data.tamperingDetails?.anti_detect_browser
+        ? 'Anti-detect browser'
+        : tamperReason
+      : undefined,
   });
 
   // DevTools is reported only when the canonical inspector state verifies an actively docked

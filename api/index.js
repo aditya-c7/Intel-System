@@ -13094,7 +13094,7 @@ function structuralAnchorsMatch(db2, profile, candidateVisitorId, identityHardwa
         reasons.push(pair.label);
       }
     }
-    return { matched: matches >= 2 && hardMatches >= 1, reasons };
+    return { matched: matches >= 3 && hardMatches >= 1, reasons };
   } catch {
     return { matched: false, reasons: [] };
   }
@@ -13767,6 +13767,15 @@ function sanitizeHardwareSignals(raw, browserDevice) {
     },
     browserDevice.os
   );
+  const gpuTruthText = `${safeStr(raw?.gpuVendor, "", 120)} ${safeStr(raw?.gpuRenderer, "", 160)}`.toLowerCase();
+  const softwareRendererTruth = /swiftshader|llvmpipe|softpipe|software|masked|unavailable/.test(
+    gpuTruthText
+  );
+  const rawGpuArchFamily = safeStr(rawHardwareExtras.gpuArchFamily, "", 40);
+  const gpuArchFamily = softwareRendererTruth ? /^(software|unknown)$/i.test(rawGpuArchFamily) ? rawGpuArchFamily.toLowerCase() : "software" : rawGpuArchFamily;
+  const archTruthSource = safeStr(rawHardwareExtras.architectureSource, "", 80).toLowerCase();
+  const archTruthValue = safeStr(raw?.architecture, "", 80).trim().toLowerCase();
+  const untrustedArchTruth = archTruthSource === "nan-sign-bit" || /^(unknown|software)$/.test(archTruthValue) || /^(unknown|software)$/.test(gpuArchFamily.toLowerCase());
   return {
     hardwareId: validHwId,
     gpuVendor: safeStr(raw?.gpuVendor, "Standard WebGL Vendor", 120),
@@ -13790,12 +13799,13 @@ function sanitizeHardwareSignals(raw, browserDevice) {
     osProof: runtimeOs.evidence,
     engine: safeStr(rawHardwareExtras.engine, "", 120),
     engineErrorLength: typeof rawHardwareExtras.engineErrorLength === "number" && Number.isFinite(rawHardwareExtras.engineErrorLength) ? Math.max(0, Math.min(512, Math.round(rawHardwareExtras.engineErrorLength))) : void 0,
-    gpuArchFamily: safeStr(rawHardwareExtras.gpuArchFamily, "", 40),
+    gpuArchFamily,
     canvasNoise: Boolean(rawHardwareExtras.canvasNoise),
     audioNoise: Boolean(rawHardwareExtras.audioNoise),
     canvasCoarseHash: safeNullableStr(rawHardwareExtras.canvasCoarseHash, 40),
-    archUaMismatch: Boolean(rawHardwareExtras.archUaMismatch),
-    osUaMismatch: runtimeOs.uaMismatch
+    // Never raise an arch/OS spoof banner from a nan-derived or software "architecture".
+    archUaMismatch: untrustedArchTruth ? false : Boolean(rawHardwareExtras.archUaMismatch),
+    osUaMismatch: untrustedArchTruth ? false : runtimeOs.uaMismatch
   };
 }
 var AUTOMATION_TAMPERING_REASON_PATTERN = /\b(webdriver[\w$-]*|playwright[\w$-]*|puppeteer[\w$-]*|selenium[\w$-]*|cdc_[a-z0-9_$]+|cdc\b|__webdriver[\w$]*|__playwright[\w$]*|__pwInitscripts[\w$]*|__puppeteer[\w$]*|getter[\s._-]*(?:cdp|devtools|tamper|wrapper)|(?:cdp|devtools)[\s._-]*getter)\b/i;
@@ -13936,6 +13946,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const serverTzMismatch = Boolean(normBrowserTz && normIpTz && normBrowserTz !== normIpTz);
   const timezoneMismatch = Boolean(raw?.timezoneMismatch) || serverTzMismatch;
   const isGpuMaskedOrUnavailable = !hardwareSignals.gpuVendor || hardwareSignals.gpuVendor === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuVendor) || !hardwareSignals.gpuRenderer || hardwareSignals.gpuRenderer === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuRenderer);
+  const SOFTWARE_GPU_PATTERN = /swiftshader|llvmpipe|softpipe|software|masked|unavailable/i;
+  const vmGpuSignatureText = `${hardwareSignals.gpuVendor || ""} ${hardwareSignals.gpuRenderer || ""}`;
+  const softwareRenderedGpu = SOFTWARE_GPU_PATTERN.test(vmGpuSignatureText);
+  const hasRealUnmaskedGpu = !isGpuMaskedOrUnavailable && !softwareRenderedGpu;
   const concreteVpnNetworkEvidence = Boolean(requestContext.torExitNode || requestContext.torRelay) || !baseClassification.isConsumerBroadband && Boolean(baseClassification.isDatacenterOrHosting || location.isVpnOrHosting);
   const classification = applyNetworkOverrides(baseClassification, {
     torExit: Boolean(requestContext.torExitNode || requestContext.torRelay),
@@ -14135,14 +14149,14 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const cloudContainerVmReason = /cloud container|datacenter asn|masked webgl|software renderer/i.test(
     vmReason
   );
-  const hostVirtualizationProof = hypervisorGpuProof || clientReportedVm && !cloudContainerVmReason && !isGpuMaskedOrUnavailable;
+  const hostVirtualizationProof = hypervisorGpuProof || clientReportedVm && !cloudContainerVmReason && !isGpuMaskedOrUnavailable && !softwareRenderedGpu;
   const isVm = hostVirtualizationProof && !emulatorDetected;
   const vmReasonVerdict = isVm ? vmReason && !cloudContainerVmReason ? vmReason : hypervisorGpuProof ? "Hypervisor-specific GPU signature detected in the WebGL vendor / renderer" : "Host-level virtualization evidence detected" : "";
   const isTampered = isOsTampered;
   const vmLike = isVm;
-  const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : vmLike || isTampered ? 6 : 0;
-  const vmStatus = tamperedRequest || replayDetected ? "Tampered / Replayed" : emulatorDetected ? "Mobile Emulator" : vmLike ? "Virtual Machine / VM" : isTampered ? "Spoofed Environment" : "Physical Hardware";
-  const vmDetail = tamperedRequest || replayDetected ? requestIntegrityReason || "Sealed request envelope failed verification" : emulatorDetected ? emulatorReason || vmReason || "Mobile emulator / simulator runtime detected" : vmLike ? vmReasonVerdict : isTampered ? vmReason || tamperReasons[0] || "Operating-system / User-Agent tampering detected" : "Unmasked physical GPU & consistent OS platform verified";
+  const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : softwareRenderedGpu ? 3 : vmLike || isTampered ? 6 : hasRealUnmaskedGpu ? 0 : 3;
+  const vmStatus = tamperedRequest || replayDetected ? "Tampered / Replayed" : emulatorDetected ? "Mobile Emulator" : softwareRenderedGpu ? "Software-Rendered Graphics (SwiftShader)" : vmLike ? "Virtual Machine / VM" : isTampered ? "Spoofed Environment" : hasRealUnmaskedGpu ? "Physical Hardware" : "GPU Masked / Unavailable";
+  const vmDetail = tamperedRequest || replayDetected ? requestIntegrityReason || "Sealed request envelope failed verification" : emulatorDetected ? emulatorReason || vmReason || "Mobile emulator / simulator runtime detected" : softwareRenderedGpu ? "Software-rendered graphics \u2014 virtualization likely, not proven" : vmLike ? vmReasonVerdict : isTampered ? vmReason || tamperReasons[0] || "Operating-system / User-Agent tampering detected" : hasRealUnmaskedGpu ? "Unmasked physical GPU & consistent OS platform verified" : "GPU vendor / renderer unavailable \u2014 physical hardware cannot be verified";
   const vmSignal = {
     id: "vm",
     title: "Virtual Machine & OS Integrity",
@@ -15140,6 +15154,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         automationTargetedTampering
       }
     );
+    location = { ...location, isVpnOrHosting: Boolean(securitySignals.datacenterAsn) };
     const serverVerifiedBrowser = uaIdentity.browserName && uaIdentity.browserName !== "Unknown" ? `${uaIdentity.browserName}${uaIdentity.browserFullVersion ? ` ${uaIdentity.browserFullVersion}` : ""}` : browserDevice.browser;
     const runtimeOsVerdict = inferRuntimeOsVerdict(
       {
@@ -15271,7 +15286,15 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         safariAtfp: Boolean(rawExtras.safariAtfp)
       })
     );
-    if (runtimeOsAuthoritative && runtimeOsVerdict.uaMismatch && !privacyHardened) {
+    const archTruthSource = String(
+      hardwareSignals.architectureSource || ""
+    ).toLowerCase();
+    const archTruthValue = String(hardwareSignals.architecture || "").toLowerCase();
+    const gpuArchTruth = String(
+      hardwareSignals.gpuArchFamily || ""
+    ).toLowerCase();
+    const untrustedArchTruth = archTruthSource === "nan-sign-bit" || /^(unknown|software)$/.test(archTruthValue) || /^(unknown|software)$/.test(gpuArchTruth);
+    if (runtimeOsAuthoritative && runtimeOsVerdict.uaMismatch && !privacyHardened && !untrustedArchTruth) {
       specAssessment.hardViolations = Array.from(
         /* @__PURE__ */ new Set([...specAssessment.hardViolations, "os_ua_mismatch"])
       );
@@ -15286,6 +15309,27 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       privacy_hardened: privacyHardened,
       software_renderer: specAssessment.software_renderer
     });
+    const tamperingFactorReasons = Array.from(
+      new Set(
+        [
+          ...headerMismatch && securitySignals.headerMismatchReason ? [securitySignals.headerMismatchReason] : [],
+          ...hardwareSignals.canvasNoise ? ["Canvas read noise detected"] : [],
+          ...securitySignals.emulatorDetected && securitySignals.emulatorReason && /gpu|renderer|webgl/i.test(securitySignals.emulatorReason) ? [securitySignals.emulatorReason] : [],
+          ...specAssessment.softViolations,
+          ...specAssessment.hardViolations
+        ].filter((reason) => typeof reason === "string" && reason.length > 0)
+      )
+    );
+    let effectiveTamperingDetected = Boolean(
+      tamperingAssessment?.tampering || securitySignals.tamperDetected || securitySignals.tamperedRequest || reconciledTampering.detected
+    );
+    if (tamperingFactorReasons.length > 0 && !effectiveTamperingDetected) {
+      effectiveTamperingDetected = true;
+      securitySignals.tamperDetected = true;
+      securitySignals.tamperReasons = Array.from(
+        /* @__PURE__ */ new Set([...securitySignals.tamperReasons || [], ...tamperingFactorReasons])
+      ).slice(0, 10);
+    }
     const agentProofMethod = resolveAgentProofMethod(rawRequestHeaders);
     const rfc9421SignedAgent = Boolean(
       aiAgent?.detected && (agentProofMethod === "rfc9421" || agentProofMethod === "signed_agent" || aiAgent.executionMode === "RFC 9421 Signed Agent")
@@ -15311,7 +15355,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       !tamperingTierA && reconciledTampering.detected && securitySignals.tamperDetected
     );
     const tamperingSoft = Boolean(
-      !tamperingTierA && !tamperingTierB && specAssessment.softViolations.length > 0
+      !tamperingTierA && !tamperingTierB && specAssessment.softViolations.length > 0 && effectiveTamperingDetected
     );
     const riskLedger = computeCanonicalRiskLedger({
       automation: {
@@ -15674,12 +15718,43 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       } catch {
       }
     }
-    const identityConfidenceHonest = computeHonestIdentityConfidence({
+    let identityConfidenceHonest = computeHonestIdentityConfidence({
       labeledPairs: Number(rawExtras.calibrationLabeledPairs ?? 0),
       heldOutEce: Number(rawExtras.calibrationHeldOutEce ?? 1),
       matchStage: identityStage.stage,
       calibratedScore: identityConfidence.score
     });
+    const hardwareOnlyMatch = identityStage.stage === "lsh_fuzzy" || recognitionSource === "Hardware Fingerprint (Cookie-less / Incognito)";
+    const browserFamilyCorroborated = Boolean(
+      serverBrowserFamily && clientBrowserFamily && serverBrowserFamily === clientBrowserFamily
+    );
+    const osFamilyCorroborated = Boolean(
+      serverOsFamily && clientOsFamily && serverOsFamily === clientOsFamily
+    );
+    let asnHistoryCorroborated = false;
+    try {
+      asnHistoryCorroborated = Boolean(
+        existingVisitor && location.asn && location.asn !== "Unknown" && db.prepare("SELECT 1 FROM visits WHERE visitor_id = ? AND asn = ? LIMIT 1").get(existingVisitor.visitor_id, location.asn)
+      );
+    } catch {
+      asnHistoryCorroborated = false;
+    }
+    const recognitionCorroborated = browserFamilyCorroborated && osFamilyCorroborated && asnHistoryCorroborated;
+    const softwareRenderedEnvironment = Boolean(
+      specAssessment.software_renderer || /swiftshader|llvmpipe|softpipe|software|masked|unavailable/i.test(
+        String(hardwareSignals.gpuRenderer || "") + " " + String(hardwareSignals.gpuVendor || "")
+      )
+    );
+    const homogeneousContainer = softwareRenderedEnvironment && (hostingDatacenter || Boolean(securitySignals.isHeadless));
+    const downgradeRecognition = hardwareOnlyMatch && (!recognitionCorroborated || homogeneousContainer);
+    if (downgradeRecognition) {
+      identityConfidenceHonest = {
+        ...identityConfidenceHonest,
+        confidence_tier: "Shared Hardware Class - Ambiguous",
+        confidence_score: typeof identityConfidenceHonest.confidence_score === "number" ? Math.min(0.6, identityConfidenceHonest.confidence_score) : null
+      };
+    }
+    const recognitionLabel = downgradeRecognition ? "possible hardware match" : "returning device";
     const networkOwnership = hostingDatacenter ? "hosting_datacenter" : /cellular|mobile|5g|carrier/i.test(networkTypeLabel) ? "mobile_carrier" : /enterprise|business/i.test(networkTypeLabel) ? "enterprise" : /broadband|residential|consumer/i.test(networkTypeLabel) ? "residential_isp" : "unknown";
     const vpnConfidence = isTorExit || torStatus.isRelay ? "high" : vpnOrRelay && Array.isArray(securitySignals.vpnReasons) && securitySignals.vpnReasons.length > 1 ? "medium" : vpnOrRelay ? "low" : "low";
     const asnOrg = String(normalizeAsnLabel(location.asn) || location.org || "");
@@ -15745,13 +15820,13 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         developer_tools: inspectorState === "automation_protocol_attached" ? false : inspectorFlags.developer_tools || developerToolsSignals
       },
       tampering: {
-        detected: reconciledTampering.detected,
+        detected: reconciledTampering.detected || effectiveTamperingDetected,
         anti_detect_browser: Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
         privacy_hardened: privacyHardened,
         tampering_confidence: tamperingAssessment?.confidence || "high",
         tampering_ml_score: tamperingAssessment?.mlScore || 0,
         spec_violations: specAssessment.hardViolations,
-        reasons: reconciledTampering.reasons,
+        reasons: Array.from(/* @__PURE__ */ new Set([...reconciledTampering.reasons, ...tamperingFactorReasons])),
         hard_spec_violation: reconciledTampering.hard_spec_violation
       },
       network: {
@@ -15790,6 +15865,11 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       hardwareId,
       isReturning,
       recognitionSource,
+      // Recognition honesty mirror for the UI: "possible hardware match" when an LSH /
+      // hardware-only anchor lacks browser + OS + ASN-history corroboration (or sits in a
+      // software-rendered cloud container), otherwise "returning device".
+      recognitionLabel,
+      recognitionCorroborated,
       location,
       // Phase 6 — proximity is permission-gated. IP coordinates are never proximity evidence;
       // the canonical envelope and this mirror share the same honest result.
@@ -15837,9 +15917,21 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       inspector_state: inspectorState,
       rareDevice: rarityReport.rareDevice,
       rareDevicePercentileBucket: rarityReport.bucket,
-      tampering: tamperingAssessment?.tampering ?? false,
+      tampering: effectiveTamperingDetected,
       tamperingConfidence: tamperingAssessment?.confidence ?? "high",
-      tamperingDetails: tamperingAssessment?.details,
+      tamperingDetails: tamperingFactorReasons.length ? {
+        anomaly_score: tamperingAssessment?.details?.anomaly_score ?? 0,
+        anti_detect_browser: Boolean(tamperingAssessment?.details?.anti_detect_browser),
+        devtools_device_emulation: Boolean(
+          tamperingAssessment?.details?.devtools_device_emulation
+        ),
+        reasons: Array.from(
+          /* @__PURE__ */ new Set([
+            ...tamperingAssessment?.details?.reasons ?? [],
+            ...tamperingFactorReasons
+          ])
+        )
+      } : tamperingAssessment?.details,
       activeCall,
       activeCallSupported,
       rawDeviceAttributes: rawSecuritySignals?.rawDeviceAttributes ?? null,

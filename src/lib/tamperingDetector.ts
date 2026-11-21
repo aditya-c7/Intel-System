@@ -18,6 +18,10 @@
  *
  * Hard evidence only: a genuine iPadOS 13+ device reports `MacIntel` **with** real touch
  * points and is never flagged, and desktop browsers never trigger a mobile rule.
+ *
+ * Privacy hardening (Tor RFP, Firefox FPP, Brave shields, Safari 26 ATFP) is never granted
+ * from a UA token alone: a Gecko-only or JavaScriptCore-only claim executing on Chromium's
+ * V8 engine is a UA spoof and is flagged as tampering instead of earning an exemption.
  */
 
 export type TamperingConfidence = 'low' | 'medium' | 'high';
@@ -125,11 +129,13 @@ function detectEngine(): { evalLen: number; isV8: boolean } {
   let isV8 = evalLen === 33;
   try {
     const scope = window as unknown as Record<string, unknown>;
-    const nav = navigator as unknown as Record<string, unknown>;
-    if ('webkitPersistentStorage' in nav || 'chrome' in scope) {
-      isV8 = true;
-    } else if (typeof scope.webkitConvertPointFromNodeToPage === 'function') {
+    // A WebKit-only binding is decisive JavaScriptCore evidence and vetoes V8: Safari also
+    // exposes the ambiguous `webkitPersistentStorage` prefix, so that token must never be
+    // used to assert Chromium (it would misclassify genuine Safari ATFP as a UA spoof).
+    if (typeof scope.webkitConvertPointFromNodeToPage === 'function') {
       isV8 = false;
+    } else if ('chrome' in scope) {
+      isV8 = true;
     }
   } catch {
     // Engine probes unavailable (SSR / sandboxed frame): keep the eval-length verdict.
@@ -224,10 +230,35 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
   let anomalyPoints = 0;
   let devtoolsEmulation = false;
   let antiDetect = false;
+
+  // Engine cross-check runs BEFORE any privacy exemption is granted. A privacy-hardened
+  // runtime is an intentional defence only when the claimed browser family matches the
+  // engine actually executing the page. Firefox/Tor (Gecko) and Safari (JavaScriptCore)
+  // UAs never run on Chromium's V8 — that combination is a one-line UA spoof, not FPP/RFP/
+  // ATFP. Genuine Tor/FPP (Gecko), Brave shields (Chromium) and Safari 26 ATFP (JSC)
+  // profiles stay exempt because their UA and engine agree.
+  const engine = detectEngine();
+  const claimsFirefox = /Firefox\/|FxiOS\//i.test(ua);
+  const claimsSafari =
+    /Safari\//i.test(ua) && !/Chrome|Chromium|Edg|OPR|CriOS|FxiOS|Firefox/i.test(ua);
+  const firefoxOnV8 = claimsFirefox && engine.isV8;
+  const safariOnV8 = claimsSafari && engine.isV8;
+  let privacyHardened = input.privacyHardened === true;
+  // A UA token alone can never earn the exemption when the engine contradicts it.
+  if (privacyHardened && (firefoxOnV8 || safariOnV8)) privacyHardened = false;
+  if (firefoxOnV8) {
+    reasons.push('Firefox UA on Chromium V8 engine — not a genuine Gecko/FPP profile');
+    antiDetect = true;
+    anomalyPoints += 55;
+  } else if (safariOnV8) {
+    reasons.push('Safari UA on Chromium V8 engine — not a genuine JavaScriptCore/ATFP profile');
+    antiDetect = true;
+    anomalyPoints += 55;
+  }
+
   // Confirmed privacy hardening (Tor/RFP, Firefox FPP, Brave shields, Safari 26 ATFP) is
   // an intentional defence, not active spoofing. Suppress ONLY the rules whose evidence is
   // a known anti-fingerprinting measure; hard device-emulation evidence still stands.
-  const privacyHardened = input.privacyHardened === true;
   if (privacyHardened) {
     reasons.push('Privacy-hardened browser (RFP/FPP/farbling/ATFP) — anti-detect rules exempt');
   }
@@ -248,7 +279,6 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
   }
 
   // 2. iOS user-agent claim executing inside Chromium's V8 engine.
-  const engine = detectEngine();
   if (claimsIOS && engine.isV8 && !isLegitIpadOs) {
     devtoolsEmulation = true;
     anomalyPoints += 60;

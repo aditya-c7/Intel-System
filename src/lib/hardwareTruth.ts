@@ -5,18 +5,21 @@
  * rewritten by a DevTools device preset or an anti-detect browser. This module derives
  * host facts from runtime physics instead, using three independent probes:
  *
- *   1. IEEE754 NaN sign-bit probe — the high byte of a NaN produced by `Math.sqrt(-1)`
- *      is implementation/architecture dependent (x86 tends to set the sign bit,
- *      ARM/aarch64 to clear it). Corroborates the GPU-derived CPU family.
+ *   1. IEEE754 NaN sign-bit probe — RETAINED AS TELEMETRY ONLY. Live audits showed it
+ *      reports `arm` on real x86_64 Xeon hardware, so it is NEVER an architecture anchor
+ *      and can NEVER create an architecture mismatch. See `nanProbe` on the result.
  *   2. `(-1).toFixed(-1)` engine-length probe — the RangeError message length identifies
  *      the JS engine (51 = V8/Chromium, 25 = SpiderMonkey/Firefox, 43/44 = JavaScriptCore).
  *   3. `Math.tanh(0.8)` ULP probe — since Chromium 148 V8 calls the host libm directly, so
  *      a single transcendental result separates the host OS (Linux glibc, macOS libsystem_m,
  *      Windows UCRT).
  *
- * A fourth, non-JS probe — the WebGL renderer string — is the strongest silicon signal
- * (a real Adreno/Mali/Apple GPU cannot be faked by a desktop UA). It is cross-checked
- * against both the NaN probe and the claimed architecture.
+ * Architecture resolution is a strict consensus of three trustworthy sources: the
+ * WebGL silicon family (only when a real manufacturer GPU is exposed), the UA-CH
+ * architecture/bitness claim and `navigator.platform`. A software rasteriser such as
+ * SwiftShader offers no silicon clue and is ignored. The result is reported as
+ * `architectureSource: 'webgl-silicon' | 'platform-consensus' | 'ua-ch-consensus'` —
+ * NEVER 'nan-sign-bit' — and a platform/UA-CH consensus never yields a mismatch.
  *
  * Pure, dependency-free and total: every probe is wrapped in try/catch and the
  * resolver never throws. A missing/unavailable probe degrades to `unknown`, which never
@@ -49,8 +52,12 @@ export interface HardwareTruthInput {
   gpuRenderer?: string;
   /** UA-CH / `sec-ch-ua-arch` architecture claim (e.g. 'x86', 'arm', 'arm64'). */
   claimedArchitecture?: string;
+  /** UA-CH `sec-ch-ua-bitness` claim ('64' / '32'); used only for the 32/64 label. */
+  claimedBitness?: string;
   /** `navigator.platform` / UA-CH platform claim. */
   claimedPlatform?: string;
+  /** Capability-derived software-rasteriser verdict (SwiftShader / masked / low-tier GPU). */
+  softwareRenderer?: boolean;
   /** The UA-derived OS family label (e.g. 'Windows 11', 'Android 14', 'iOS 18'). */
   claimedOs?: string;
   userAgent?: string;
@@ -104,7 +111,14 @@ function ulpDistance(a: number, b: number): number {
  * asserted as verified. Software renderers (SwiftShader/llvmpipe) give no reliable host
  * clue and therefore return 'unknown'.
  */
-function hostOsFromGpuBackend(vendor: string, renderer: string): HostOsFamily {
+function hostOsFromGpuBackend(
+  vendor: string,
+  renderer: string,
+  softwareRenderer = false
+): HostOsFamily {
+  // A software / masked rasteriser (including a spoofed hardware renderer on software
+  // silicon) runs unchanged on every host OS and can never corroborate a math-ULP hint.
+  if (softwareRenderer) return 'unknown';
   const text = `${vendor || ''} ${renderer || ''}`;
   if (/Direct3D|D3D11|D3D12|ANGLE\s*\([^)]*Direct3D|Microsoft Basic Render/i.test(text)) {
     return 'windows';
@@ -205,18 +219,41 @@ export function probeTanhUlp(): TanhUlpProbe {
   }
 }
 
-/** WebGL silicon family. Software rasterisers are classified separately (no CPU hint). */
+/** Software / masked rasteriser signatures: these expose no CPU architecture clue. */
+const SOFTWARE_GPU_PATTERN =
+  /swiftshader|llvmpipe|softpipe|mesa offscreen|software rasterizer|software renderer|basic render driver|microsoft basic render|apple software renderer|virgl|goldfish|ranchu/i;
+
+/** A discrete-GPU renderer token, used to detect a spoofed renderer on software silicon. */
+const DISCRETE_GPU_RENDERER_PATTERN =
+  /nvidia|geforce|quadro|\brtx\b|\bgtx\b|radeon|\bamd\b|intel|iris|uhd graphics|hd graphics|arc graphics|apple m[1-9]/i;
+
+/** A known software vendor token — deliberately excludes ANGLE's `Google Inc. (NVIDIA)`. */
+function isSoftwareGpuVendor(vendor: string): boolean {
+  const value = (vendor || '').trim();
+  if (/google inc\.?\s*\(\s*google\s*\)|swiftshader|^google$|^webkit$|^mozilla$|^mesa/i.test(value)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * WebGL silicon family. Software rasterisers and inconsistent (spoofed) signatures are
+ * classified as 'software'/'unknown' — NEVER as a manufacturer family. A spoofed renderer
+ * that claims an RTX 4090 while the vendor is still the ANGLE/Google software vendor, or
+ * while the capability-derived `softwareRenderer` hint is set, is reported as software.
+ */
 export function classifyGpuArchFamily(
   gpuVendor?: string,
-  gpuRenderer?: string
+  gpuRenderer?: string,
+  softwareRenderer = false
 ): GpuArchFamily {
   const signature = `${gpuVendor || ''} ${gpuRenderer || ''}`.trim();
+  if (softwareRenderer) return 'software';
   if (!signature) return 'unknown';
-  if (
-    /swiftshader|llvmpipe|softpipe|mesa offscreen|software rasterizer|basic render driver|microsoft basic render/i.test(
-      signature
-    )
-  ) {
+  if (SOFTWARE_GPU_PATTERN.test(signature)) return 'software';
+  // A software vendor claiming a discrete desktop GPU is an inconsistent (spoofed)
+  // signature: never mint an x86/arm manufacturer family from it.
+  if (isSoftwareGpuVendor(gpuVendor || '') && DISCRETE_GPU_RENDERER_PATTERN.test(gpuRenderer || '')) {
     return 'software';
   }
   if (
@@ -282,46 +319,91 @@ function isKnownArchTranslation(silicon: ArchFamily, claimed: ArchFamily, ua: st
  *
  * `archUaMismatch` / `osUaMismatch` are intentionally conservative: they only fire when
  * BOTH the silicon/host probe and the claim resolved to a known family that disagree,
- * and no legitimate translation layer explains the difference.
+ * and no legitimate translation layer explains the difference. The NaN sign-bit probe is
+ * telemetry only and can never manufacture an architecture mismatch (live x86_64 audits
+ * showed it reporting `arm`).
  */
 export function resolveHardwareTruth(input: HardwareTruthInput = {}): HardwareTruth {
-  const nan = probeNanSignArch();
+  const nan = probeNanSignArch(); // TELEMETRY ONLY — never an architecture anchor.
   const engineLength = probeEngineLength();
   const engine = resolveEngineFamily(engineLength);
   const tanh = probeTanhUlp();
-  const gpuArchFamily = classifyGpuArchFamily(input.gpuVendor, input.gpuRenderer);
+  const gpuArchFamily = classifyGpuArchFamily(
+    input.gpuVendor,
+    input.gpuRenderer,
+    input.softwareRenderer
+  );
   const claimedArchitecture = (input.claimedArchitecture || '').trim();
-  const reasons: string[] = [nan.reason, tanh.reason];
+  const reasons: string[] = [tanh.reason];
 
-  // Silicon architecture: the GPU string is the strongest physical signal; the NaN
-  // sign-bit probe corroborates when the GPU is masked/software.
+  // UA-CH architecture + navigator.platform consensus. When both are known and agree they
+  // are the authoritative claim; when they disagree the claim is treated as unknown.
+  const uaArchFamily = archFamilyFromClaim(claimedArchitecture);
+  const platformArchFamily = archFamilyFromClaim(input.claimedPlatform || '');
+  const claimedArchFamily: ArchFamily =
+    uaArchFamily !== 'unknown' && platformArchFamily !== 'unknown'
+      ? uaArchFamily === platformArchFamily
+        ? uaArchFamily
+        : 'unknown'
+      : uaArchFamily !== 'unknown'
+      ? uaArchFamily
+      : platformArchFamily;
+
+  // Architecture resolution — three trustworthy sources, strictly ranked:
+  //   (a) a real WebGL silicon family (manufacturer GPU exposed), else
+  //   (b) the UA-CH architecture/bitness + navigator.platform consensus.
+  // A software/unavailable rasteriser offers no silicon clue; the NaN sign-bit probe is
+  // telemetry only and is deliberately NEVER a source.
   let silicon: ArchFamily = 'unknown';
-  let architectureSource = 'unavailable';
+  // Only these three labels are ever emitted; 'nan-sign-bit' and 'unavailable' are retired.
+  let architectureSource: 'webgl-silicon' | 'platform-consensus' | 'ua-ch-consensus' =
+    'ua-ch-consensus';
+  let hardwareAnchored = false;
   if (gpuArchFamily === 'x86' || gpuArchFamily === 'arm') {
     silicon = gpuArchFamily;
     architectureSource = 'webgl-silicon';
+    hardwareAnchored = true;
     reasons.push(`GPU silicon family ${gpuArchFamily} is the architecture anchor`);
     if (nan.family !== 'unknown' && nan.family !== silicon) {
-      reasons.push(`NaN sign-bit probe disagrees with GPU family (${nan.family} vs ${silicon})`);
+      reasons.push(
+        `NaN sign-bit ${nan.family} disagrees with GPU family ${silicon}; ignored (NaN is telemetry only)`
+      );
     }
-  } else if (nan.family !== 'unknown') {
-    silicon = nan.family;
-    architectureSource = 'nan-sign-bit';
-    reasons.push(`NaN sign-bit probe is the architecture anchor (${silicon})`);
+  } else if (claimedArchFamily !== 'unknown') {
+    silicon = claimedArchFamily;
+    // UA-CH architecture + navigator.platform agreement is a UA-CH consensus. A family
+    // recovered from navigator.platform alone is reported as a platform consensus.
+    architectureSource = uaArchFamily !== 'unknown' ? 'ua-ch-consensus' : 'platform-consensus';
+    reasons.push(
+      `No GPU silicon clue (${gpuArchFamily}); architecture resolved from UA-CH/platform consensus (${silicon})`
+    );
+    reasons.push('NaN sign-bit probe retained as telemetry only; never an architecture anchor');
+  } else {
+    reasons.push('No trustworthy architecture source (NaN sign-bit deliberately ignored)');
   }
 
-  const claimedArchFamily = archFamilyFromClaim(claimedArchitecture || input.claimedPlatform || '');
-  const archLabel = architectureLabel(silicon, `${claimedArchitecture} ${input.claimedPlatform || ''}`);
+  const archLabel = architectureLabel(
+    silicon,
+    `${input.claimedBitness || ''} ${claimedArchitecture} ${input.claimedPlatform || ''}`
+  );
   const gpuSignature = `${input.gpuVendor || ''} ${input.gpuRenderer || ''}`;
+  // A mismatch can only be asserted from corroborated hardware evidence. Platform-consensus
+  // resolution (software GPU) and the ignored NaN probe can NEVER create a mismatch.
   const archUaMismatch =
-    silicon !== 'unknown' &&
+    hardwareAnchored &&
     claimedArchFamily !== 'unknown' &&
     silicon !== claimedArchFamily &&
     !isKnownArchTranslation(silicon, claimedArchFamily, input.userAgent || '', gpuSignature);
-  if (archUaMismatch) reasons.push(`Silicon ${silicon} contradicts claimed architecture ${claimedArchFamily}`);
+  if (archUaMismatch) {
+    reasons.push(`GPU silicon ${silicon} contradicts claimed architecture ${claimedArchFamily}`);
+  }
 
   const claimedOsFamily = osFamilyFromClaim(input.claimedOs || '', input.userAgent || '');
-  const gpuHostOs = hostOsFromGpuBackend(input.gpuVendor || '', input.gpuRenderer || '');
+  const gpuHostOs = hostOsFromGpuBackend(
+    input.gpuVendor || '',
+    input.gpuRenderer || '',
+    input.softwareRenderer
+  );
 
   // The `Math.tanh` ULP probe is only one-ULP separated between Linux/macOS/Windows and
   // V8/libm changes can shift it. It is NEVER sufficient on its own. Require agreement

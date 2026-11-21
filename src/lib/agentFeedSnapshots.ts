@@ -3936,4 +3936,9 @@ export const FEED_METADATA: Record<string, { creationTime: string | null; note?:
   'amzn-user': { creationTime: '2025-11-04T15:57:38.092840+00:00', note: "Official Amzn-User (Amazonbot Live) feed: https://developer.amazon.com/amazonbot/live-ip-addresses/ (bare IPs normalized to /32)" },
   'claude': { creationTime: '2026-10-20T00:00:00Z', note: "Official Anthropic feed: https://claude.com/crawling/bots.json" },
   'claude-agent-sail': { creationTime: '2026-11-14T02:20:00Z', note: "SAIL document https://claude.com/.well-known/sail (draft-kelley-webbotauth-sail-00, modified 2026-11-14T02:20:00Z). Bare IPs normalized to /32." },
+  // Web Bot Auth JWK directories, NOT CIDR feeds: these publish signing keys only, never IP
+  // prefixes. They are intentionally format 'none' in PREFIX_FEEDS and are excluded from
+  // AI_BOT_CIDR_SOURCES. No prefixes have been fabricated for either operator.
+  'manus-wba': { creationTime: null, note: 'Web Bot Auth HTTP Message Signatures key directory (NOT a CIDR feed; no IP prefixes published): https://api.manus.im/.well-known/http-message-signatures-directory' },
+  'grok-wba': { creationTime: null, note: 'Web Bot Auth HTTP Message Signatures key directory (NOT a CIDR feed; no IP prefixes published): https://cursorusercontent.com/.well-known/http-message-signatures-directory' },
 };

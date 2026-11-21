@@ -131,6 +131,48 @@ export interface AutomationAxes {
   inspector_probes: Record<string, unknown>;
   cdp_attached: boolean;
   developer_tools: boolean;
+
+  /* ------------------------------------------------------------------------ */
+  /* Additive agent-identification mirrors (all OPTIONAL — legacy payloads stay valid).
+  /* These let the canonical envelope carry the exact named-agent verdict so the
+  /* dashboard never re-derives an identity on the client. No envelope shape change.
+  /* ------------------------------------------------------------------------ */
+  /** Structured bot / AI-agent identification (mirrors the response's `bot_info`). */
+  bot_info?: {
+    category: string;
+    provider: string;
+    name: string;
+    identity: 'verified' | 'signed' | 'unknown' | 'spoofed';
+  } | null;
+  /** Granular AI-agent attribution (mirrors `securitySignals.aiAgent`). */
+  aiAgent?: {
+    detected: boolean;
+    agentId: string | null;
+    agentName: string;
+    operator: string;
+    executionMode: string | null;
+    verified: boolean;
+    confidence: 'Verified' | 'High' | 'Medium';
+    riskScore: number;
+    evidence: string[];
+  } | null;
+  /** Which proof source produced the agent verdict (rfc9421 | signed_agent | cidr | fcrdns | ua_claim). */
+  source?: string;
+  /** Exact canonical registry id of the verified agent, when resolution succeeded. */
+  verifiedAgentId?: string | null;
+  /** Signature verification status (e.g. `verified` | `signed` | `none`). */
+  signatureStatus?: string;
+
+  /* OS / platform truth carried beside the automation verdict. */
+  serverVerifiedOs?: string;
+  serverVerifiedBrowser?: string;
+  hostOs?: string | null;
+  architecture?: string;
+  architectureSource?: string;
+  osUaMismatch?: boolean;
+  archUaMismatch?: boolean;
+  headerMismatch?: boolean;
+  engine?: string;
 }
 
 export interface TamperingAxes {

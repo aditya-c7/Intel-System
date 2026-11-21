@@ -2,7 +2,7 @@ import { createServer } from 'node:http';
 import { handleAsNodeRequest } from 'cloudflare:node';
 import { DurableObject } from 'cloudflare:workers';
 import app, { initializeDatabaseSchema, withDatabase } from '../server.ts';
-import { findAgentByUa, displayFor, PILLS } from '../src/lib/agentRegistry.ts';
+import { findAgentByUa, displayFor, PILLS, AGENT_BY_ID } from '../src/lib/agentRegistry.ts';
 import { verifyWebBotAuth, WBA_TRUSTED_SIGNERS } from '../src/lib/wbaVerifier.ts';
 
 // Workers' node:http adapter uses this as a routing key, not a public TCP port.
@@ -425,7 +425,20 @@ async function computeEdgeVerdict(request) {
   // When the signature is genuine, the verified identity is authoritative for the name shown
   // in the verdict (and therefore in the X-Intel-Bot-* headers and SSR payload).
   if (signedAgent && (verifiedAgentId || verifiedOperator)) {
-    const verifiedInfo = { id: verifiedAgentId, agentId: verifiedAgentId, name: verifiedAgentId, operator: verifiedOperator };
+    // `displayFor()` reads `displayName` / `provider`, so passing a bare synthesized record
+    // (with only `name` / `operator`) produced a vague "Signed · undefined" label. Resolve the
+    // verified id through the canonical registry so the SSR name/provider are exact (e.g.
+    // "Signed · Manus Bot · Manus"). Fall back to a fully-populated record for future signers
+    // that are not yet in the registry, never to one with undefined fields.
+    const verifiedAgentDef = (verifiedAgentId && AGENT_BY_ID[verifiedAgentId]) || null;
+    const verifiedInfo = verifiedAgentDef || {
+      id: verifiedAgentId,
+      agentId: verifiedAgentId,
+      name: verifiedAgentId,
+      displayName: verifiedAgentId || verifiedOperator,
+      provider: verifiedOperator,
+      operator: verifiedOperator,
+    };
     let verifiedDisplay = null;
     try {
       verifiedDisplay = displayFor(verifiedInfo, identity);
@@ -433,7 +446,7 @@ async function computeEdgeVerdict(request) {
       verifiedDisplay = null;
     }
     name = verdictName(verifiedDisplay, verifiedInfo, identity, pillLabelFor(verifiedInfo));
-    provider = verifiedOperator || provider;
+    provider = verifiedAgentDef?.provider || verifiedOperator || provider;
     botType = verifiedAgentId || botType;
   }
 

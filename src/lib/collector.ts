@@ -502,18 +502,42 @@ function generateEnvelopeNonce(): string {
   return fallback.slice(0, 32);
 }
 
-/**
- * 1. Native WebGL GPU Inspector:
- * Queries WEBGL_debug_renderer_info for UNMASKED_VENDOR_WEBGL and UNMASKED_RENDERER_WEBGL,
- * plus MAX_TEXTURE_SIZE.
- */
-function inspectWebGlGpu(): {
+/** Stable, capability-derived GPU probe used by both device classification and the hwid seed. */
+interface WebGlGpuProbe {
   gpuVendor: string;
   gpuRenderer: string;
   maxTextureSize: number;
-} {
+  /**
+   * Coarse GPU class derived from WebGL *capabilities* (max texture size, shader precision,
+   * extension count) — NOT from the raw, spoofable vendor/renderer strings. Stable across
+   * renderer spoofing (e.g. SwiftShader masquerading as an RTX 4090).
+   */
+  gpuClass: string;
+  /** True when strings or capabilities indicate a software / masked rasteriser. */
+  softwareRenderer: boolean;
+}
+
+const SOFTWARE_GPU_RENDERER_PATTERN =
+  /swiftshader|llvmpipe|softpipe|mesa offscreen|software rasterizer|software renderer|basic render driver|microsoft basic render|apple software renderer|virgl/i;
+const HIGH_END_GPU_RENDERER_PATTERN =
+  /\brtx\b|\bgtx\b|geforce|radeon rx|quadro|\bapple m[1-9]\b/i;
+
+/**
+ * 1. Native WebGL GPU Inspector:
+ * Queries WEBGL_debug_renderer_info for UNMASKED_VENDOR_WEBGL and UNMASKED_RENDERER_WEBGL,
+ * plus capability limits (MAX_TEXTURE_SIZE, shader precision, extension count). The raw
+ * strings remain telemetry; `gpuClass` is the coarse, spoof-resistant seed anchor.
+ */
+function inspectWebGlGpu(): WebGlGpuProbe {
+  const unavailable: WebGlGpuProbe = {
+    gpuVendor: 'Unavailable',
+    gpuRenderer: 'Unavailable',
+    maxTextureSize: 0,
+    gpuClass: 'na',
+    softwareRenderer: false,
+  };
   if (typeof document === 'undefined') {
-    return { gpuVendor: 'Unavailable', gpuRenderer: 'Unavailable', maxTextureSize: 0 };
+    return unavailable;
   }
 
   try {
@@ -524,7 +548,7 @@ function inspectWebGlGpu(): {
       (canvas.getContext('experimental-webgl') as WebGLRenderingContext | null);
 
     if (!gl) {
-      return { gpuVendor: 'Unavailable', gpuRenderer: 'Unavailable', maxTextureSize: 0 };
+      return unavailable;
     }
 
     const debugExt = gl.getExtension('WEBGL_debug_renderer_info');
@@ -535,22 +559,57 @@ function inspectWebGlGpu(): {
       ? gl.getParameter(debugExt.UNMASKED_RENDERER_WEBGL)
       : gl.getParameter(gl.RENDERER);
     const rawMaxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    const gpuVendor =
+      typeof rawVendor === 'string' && rawVendor.trim() ? rawVendor.trim() : 'Standard WebGL Vendor';
+    const gpuRenderer =
+      typeof rawRenderer === 'string' && rawRenderer.trim()
+        ? rawRenderer.trim()
+        : 'Standard WebGL Renderer';
+    const maxTextureSize =
+      typeof rawMaxTex === 'number' && Number.isFinite(rawMaxTex) ? rawMaxTex : 0;
+
+    // Capability reads — these reflect the *actual* driver, not the spoofable strings.
+    let fragmentPrecision = 0;
+    let vertexPrecision = 0;
+    let extensionCount = 0;
+    try {
+      fragmentPrecision =
+        gl.getShaderPrecisionFormat?.(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT)?.precision ?? 0;
+      vertexPrecision = gl.getShaderPrecisionFormat?.(gl.VERTEX_SHADER, gl.HIGH_FLOAT)?.precision ?? 0;
+      extensionCount = gl.getSupportedExtensions?.()?.length ?? 0;
+    } catch {
+      // Capability probe unavailable: degrade to a conservative coarse class.
+    }
 
     const loseExt = gl.getExtension('WEBGL_lose_context');
     if (loseExt && typeof loseExt.loseContext === 'function') {
       loseExt.loseContext();
     }
 
-    return {
-      gpuVendor: typeof rawVendor === 'string' && rawVendor.trim() ? rawVendor.trim() : 'Standard WebGL Vendor',
-      gpuRenderer:
-        typeof rawRenderer === 'string' && rawRenderer.trim()
-          ? rawRenderer.trim()
-          : 'Standard WebGL Renderer',
-      maxTextureSize: typeof rawMaxTex === 'number' && Number.isFinite(rawMaxTex) ? rawMaxTex : 0,
-    };
+    // Software detection: explicit software strings, OR a hardware-string spoof on a
+    // low-capability driver (e.g. SwiftShader reporting 8192px claiming an RTX 4090).
+    const softwareByString =
+      SOFTWARE_GPU_RENDERER_PATTERN.test(`${gpuVendor} ${gpuRenderer}`) ||
+      /^google inc\.?\s*\(\s*google\s*\)$/i.test(gpuVendor);
+    const spoofedHighEnd =
+      HIGH_END_GPU_RENDERER_PATTERN.test(gpuRenderer) && maxTextureSize > 0 && maxTextureSize <= 8192;
+    const softwareRenderer = softwareByString || spoofedHighEnd;
+
+    const texBucket =
+      maxTextureSize >= 16384
+        ? 't16'
+        : maxTextureSize >= 8192
+        ? 't8'
+        : maxTextureSize >= 4096
+        ? 't4'
+        : 't0';
+    const precisionBucket = fragmentPrecision > 0 && vertexPrecision > 0 ? 'h' : 'l';
+    const extBucket = extensionCount >= 40 ? 'e3' : extensionCount >= 20 ? 'e2' : extensionCount >= 8 ? 'e1' : 'e0';
+    const gpuClass = `${texBucket}|${precisionBucket}|${extBucket}`;
+
+    return { gpuVendor, gpuRenderer, maxTextureSize, gpuClass, softwareRenderer };
   } catch {
-    return { gpuVendor: 'Unavailable', gpuRenderer: 'Unavailable', maxTextureSize: 0 };
+    return unavailable;
   }
 }
 
@@ -664,6 +723,17 @@ async function computeCanvas2dSignature(): Promise<CanvasSignatureResult> {
 interface AudioSignatureResult {
   signature: string;
   noise: boolean;
+}
+
+/**
+ * Coarse, farbling-resistant audio stability class for the hardware-id seed. It is derived
+ * ONLY from the dual-render comparison and the probe's availability state — never from the
+ * raw rendered float or its hash, both of which drift under Brave/Safari/Tor farbling.
+ */
+function audioStabilityClass(audio: AudioSignatureResult): 'stable' | 'noisy' | 'unavailable' {
+  if (audio.noise) return 'noisy';
+  if (/timeout|unsupported|unavailable|restricted/i.test(audio.signature)) return 'unavailable';
+  return 'stable';
 }
 
 /**
@@ -1282,17 +1352,53 @@ export function collectClientHints(): Promise<ClientHintsPayload | null> {
 }
 
 /**
+ * Low-volatility structural anchors for the hardware id seed. Font metrics are measured
+ * in the same isolated 16px iframe contract used by the rest of the app, and the math
+ * anchor is a fixed transcendentals vector. Neither drifts under canvas farbling, GPU
+ * renderer spoofing, resize, touch toggles or UA swaps. Never throws.
+ */
+function stableStructuralAnchors(): { fontMetric: string; mathAnchor: string } {
+  let fontMetric = 'na';
+  try {
+    const measurer = createIsolatedFontMeasurer();
+    if (measurer) {
+      const widths = [
+        measurer.width(FONT_MEASURE_TEST_STRING, 'sans-serif'),
+        measurer.width(FONT_MEASURE_TEST_STRING, 'serif'),
+        measurer.width(FONT_MEASURE_TEST_STRING, 'monospace'),
+      ];
+      measurer.dispose();
+      if (widths.every((value) => Number.isFinite(value))) {
+        fontMetric = widths.map((value) => Math.round(value)).join('/');
+      }
+    }
+  } catch {
+    // Keep the neutral fallback; a blocked iframe must not split a visitor.
+  }
+  let mathAnchor = 'na';
+  try {
+    mathAnchor = [Math.tanh(0.8), Math.sin(1.2345), Math.log(123.456)]
+      .map((value) => value.toFixed(12))
+      .join('/');
+  } catch {
+    // Keep the neutral fallback.
+  }
+  return { fontMetric, mathAnchor };
+}
+
+/**
  * Collects native Hardware & Rendering Entropy and computes a deterministic Stateless
  * Hardware ID (`hwid_<20_hex_chars>`) using SHA-256.
  */
 export async function collectHardwareSignals(
   browserDevice: BrowserDeviceInfo
 ): Promise<HardwareSignals> {
-  const [{ gpuVendor, gpuRenderer, maxTextureSize }, canvas, audio] = await Promise.all([
-    Promise.resolve(inspectWebGlGpu()),
-    computeCanvas2dSignature(),
-    computeWebAudioSignature(),
-  ]);
+  const [{ gpuVendor, gpuRenderer, maxTextureSize, gpuClass, softwareRenderer }, canvas, audio] =
+    await Promise.all([
+      Promise.resolve(inspectWebGlGpu()),
+      computeCanvas2dSignature(),
+      computeWebAudioSignature(),
+    ]);
   const canvasHash = canvas.signature;
   const audioHash = audio.signature;
 
@@ -1332,6 +1438,7 @@ export async function collectHardwareSignals(
   // UA-CH is a *claim* now. It is kept beside the silicon truth for the mismatch flag,
   // but it no longer anchors the hardware id (a device preset can rewrite it freely).
   let claimedArchitecture = '';
+  let claimedBitness = '';
   const uaData =
     nav ? ((nav as unknown as { userAgentData?: NavigatorUAData }).userAgentData ?? null) : null;
   if (uaData && typeof uaData.getHighEntropyValues === 'function') {
@@ -1341,6 +1448,7 @@ export async function collectHardwareSignals(
         new Promise<null>((resolve) => setTimeout(() => resolve(null), 120)),
       ]);
       if (entropy?.architecture) {
+        claimedBitness = entropy.bitness || '';
         claimedArchitecture = entropy.bitness
           ? `${entropy.architecture} (${entropy.bitness}-bit)`
           : entropy.architecture;
@@ -1350,12 +1458,15 @@ export async function collectHardwareSignals(
     }
   }
 
-  // Silicon-grounded truth: GPU family + IEEE754 NaN sign-bit + libm ULP + engine probe.
+  // Silicon-grounded truth: WebGL silicon family or UA-CH/platform consensus. The NaN
+  // sign-bit probe is telemetry only and can never anchor architecture or create a mismatch.
   const truth = resolveHardwareTruth({
     gpuVendor,
     gpuRenderer,
     claimedArchitecture,
+    claimedBitness,
     claimedPlatform: browserDevice.platform,
+    softwareRenderer,
     claimedOs: browserDevice.os,
     userAgent: (() => {
       try {
@@ -1367,22 +1478,42 @@ export async function collectHardwareSignals(
   });
   const architecture = truth.architecture;
 
-  // The seed deliberately EXCLUDES the UA/UA-CH claim and the raw canvas/audio hashes.
-  // Canvas and audio drift under Brave/Safari/Tor farbling; the UA is spoofable. The
-  // silicon architecture, GPU silicon, core/memory topology and colour physics are the
-  // stable anchors. Fine canvas/audio remain telemetry and feed the structural-anchor
-  // (coarse canvas) LSH fallback for returning visitors.
+  // Hardware-id seed — anchored ONLY on non-volatile structural entropy:
+  //  - coarse GPU capability class (texture size / shader precision / extension count),
+  //    NOT the spoofable vendor/renderer strings
+  //  - CPU cores, bucketed device memory, colour depth/gamut
+  //  - 8x8 quantized canvas digest (farbling-tolerant), isolated font metrics and a fixed
+  //    transcendental math anchor
+  //  - an explicit audio stability class from the dual-render comparison
+  // Deliberately EXCLUDED: raw canvas SHA-256, raw audio float/hash, raw GPU strings,
+  // the resolved architecture (a UA-CH/platform claim), screen size, DPR, UA and touch.
+  const { fontMetric, mathAnchor } = stableStructuralAnchors();
+  // Coarse digest is ALWAYS preferred over the exact canvas SHA-256 for the seed/matching;
+  // this is the farbling-tolerant anchor used when canvasNoise/audioNoise flags are set.
+  const coarseCanvas = canvas.coarseHash ?? 'na';
+  const audioClass = audioStabilityClass(audio);
+  const memoryBucket =
+    deviceMemoryGb === null
+      ? 'na'
+      : deviceMemoryGb >= 8
+      ? '8+'
+      : deviceMemoryGb >= 4
+      ? '4'
+      : deviceMemoryGb >= 2
+      ? '2'
+      : deviceMemoryGb >= 1
+      ? '1'
+      : 'lt1';
   const fingerprintSeed = [
-    gpuVendor,
-    gpuRenderer,
-    String(maxTextureSize),
-    // Screen resolution and DPR are volatile context (zoom, monitor swaps, windowing). They
-    // must never mint a new hardware_id; they stay available as telemetry fields elsewhere.
+    gpuClass,
     String(colorDepth),
     String(cpuCores ?? 'na'),
-    String(deviceMemoryGb ?? 'na'),
+    memoryBucket,
     colorGamut,
-    architecture,
+    coarseCanvas,
+    audioClass,
+    fontMetric,
+    mathAnchor,
   ].join('||');
 
   const fullDigest = await sha256Hex(fingerprintSeed);
@@ -1510,6 +1641,11 @@ export type IncognitoConfidence = 'high' | 'low';
  * tab, so no ephemeral context — touch, geometry, language, a first identify write —
  * can ever re-derive or flip it.
  */
+/** Jargon-free method labels — storage APIs, probe internals and ratios never leak. */
+const METHOD_PRIVATE_STORAGE = 'private-storage-detected';
+const METHOD_STANDARD_STORAGE = 'standard-storage';
+const METHOD_INCONCLUSIVE = 'storage-check-inconclusive';
+
 export interface IncognitoDetectionResult {
   isPrivate: boolean;
   browserName: string;
@@ -2712,9 +2848,9 @@ export function detectTorBrowserClient(
     reasons.push(`RFP clamps navigator.hardwareConcurrency to ${cpuCores}${dprDetail}`);
   }
 
-  if (incognitoMethod === 'firefox-opfs-rejected') {
-    signals.push('tor-browser-rfp-opfs-rejected');
-    reasons.push('OPFS write rejected by the Gecko private context');
+  if (incognitoMethod === METHOD_PRIVATE_STORAGE) {
+    signals.push('tor-private-storage-rejected');
+    reasons.push('Private-mode storage write rejected by the hardened browser');
   }
 
   const uniqueSignals = Array.from(new Set(signals));
@@ -3280,7 +3416,7 @@ function resolveBrowserName(
  * that must invalidate verdicts cached by an earlier version of the app. All loads of
  * the same tab in the same app version read this cache FIRST and return it verbatim.
  */
-const INCOGNITO_SESSION_LOCK_KEY = 'intel_fp_incognito_lock_v2';
+const INCOGNITO_SESSION_LOCK_KEY = 'intel_fp_incognito_lock_v3';
 
 /**
  * Reads the authoritative per-tab verdict.
@@ -3300,7 +3436,7 @@ function readIncognitoSessionLock(): IncognitoDetectionResult | null {
     if (
       parsed &&
       typeof parsed === 'object' &&
-      parsed.lockVersion === 2 &&
+      parsed.lockVersion === 3 &&
       typeof parsed.isPrivate === 'boolean' &&
       typeof parsed.method === 'string' &&
       typeof parsed.browserName === 'string' &&
@@ -3327,7 +3463,7 @@ function writeIncognitoSessionLock(result: IncognitoDetectionResult): void {
     if (typeof sessionStorage === 'undefined') return;
     sessionStorage.setItem(
       INCOGNITO_SESSION_LOCK_KEY,
-      JSON.stringify({ ...result, lockVersion: 2 })
+      JSON.stringify({ ...result, lockVersion: 3 })
     );
   } catch {
     // Storage blocked: the in-memory cache still serves this page load.
@@ -3491,7 +3627,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
           return {
             isPrivate: false,
             browserName,
-            method: 'firefox-opfs-resolved',
+            method: METHOD_STANDARD_STORAGE,
             confidence: 'high',
             quotaBytes,
             headroomGiB,
@@ -3506,7 +3642,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
           return {
             isPrivate: true,
             browserName,
-            method: 'firefox-opfs-rejected',
+            method: METHOD_PRIVATE_STORAGE,
             confidence: 'high',
             quotaBytes,
             headroomGiB,
@@ -3522,7 +3658,12 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         return {
           isPrivate: idbPrivate === true,
           browserName,
-          method: 'firefox-idb-probe',
+          method:
+            idbPrivate === null
+              ? METHOD_INCONCLUSIVE
+              : idbPrivate
+              ? METHOD_PRIVATE_STORAGE
+              : METHOD_STANDARD_STORAGE,
           confidence: idbPrivate === null ? 'low' : 'high',
           quotaBytes,
           headroomGiB,
@@ -3537,7 +3678,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
           return {
             isPrivate: false,
             browserName,
-            method: 'safari-opfs-resolved',
+            method: METHOD_STANDARD_STORAGE,
             confidence: 'high',
             quotaBytes,
             headroomGiB,
@@ -3552,7 +3693,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
           return {
             isPrivate: true,
             browserName,
-            method: 'safari-opfs-rejected',
+            method: METHOD_PRIVATE_STORAGE,
             confidence: 'high',
             quotaBytes,
             headroomGiB,
@@ -3567,7 +3708,12 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         return {
           isPrivate: blobPrivate === true,
           browserName,
-          method: 'safari-idb-blob',
+          method:
+            blobPrivate === null
+              ? METHOD_INCONCLUSIVE
+              : blobPrivate
+              ? METHOD_PRIVATE_STORAGE
+              : METHOD_STANDARD_STORAGE,
           confidence: blobPrivate === null ? 'low' : 'high',
           quotaBytes,
           headroomGiB,
@@ -3576,28 +3722,26 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         };
       }
 
-      // 3A/3B — quota headroom and legacy temp quota are single, weak proofs. On Chromium 152 a
-      // normal desktop with a small volume can report <9.5 GiB headroom, so these are now
-      // context-only: recorded in the method string but NEVER enough to assert incognito.
-      const quotaContext =
-        headroomBytes !== null && headroomBytes > 0 && headroomBytes < 9.5 * GIB_BYTES
-          ? `quota-headroom ${headroomGiB}GiB`
-          : null;
-      const webkitQuota = await queryWebkitTemporaryQuota();
-      const heapLimit = readJsHeapSizeLimit();
-      const webkitContext =
-        webkitQuota !== null &&
-        heapLimit !== null &&
-        webkitQuota < 2 * heapLimit &&
-        webkitQuota < 9.5 * GIB_BYTES
-          ? 'webkit-temp-quota-low'
-          : null;
+      // 3A/3B — quota headroom and legacy temp quota are weak context only. Chrome 156+
+      // reports the patched 10 GiB headroom in BOTH modes, so they never assert incognito
+      // and never leak into the (jargon-free) method string. `headroomGiB` stays as telemetry.
 
-      // 3C — storage physics. TWO independent proofs are required: the IndexedDB strict-commit
-      // durability ratio AND the OPFS worker flush/commit probe. A single vector (small quota,
-      // a lone IDB ratio, or a lone OPFS timing outlier) can no longer produce an incognito
-      // verdict, which eliminates the normal-desktop false positive while genuine private
-      // windows — where both probes observe memory-backed storage — are still detected.
+      // 3C — storage physics (best-effort, fail-open for humans). Chromium no longer
+      // differs in raw quota, so we combine independent physics vectors:
+      //   (a) OPFS getDirectory() rejection strings — a deterministic private signal,
+      //   (b) IndexedDB strict-commit durability ratio with interleaved rounds + deadband,
+      //   (c) OPFS sync-access-handle flush timing (memory-backed flush is near-instant).
+      // A conclusive low IDB ratio (< 1.12) is enough when the OPFS flush probe is
+      // unavailable, so a genuine private window is not lost to one failed probe; a high
+      // ratio (> 1.55) is a confident normal profile. The ambiguous band still fails open.
+      const opfsDir = await probeOpfsDirectory();
+      const opfsDirPrivate =
+        opfsDir.status === 'rejected' &&
+        errorLooksLike(
+          opfsDir.error,
+          /SecurityError|InvalidStateError|NotAllowedError|transient|permission|denied|access|incognito|private/i
+        );
+
       const idbProbe = await probeChromiumIdbDurability();
       const idbRatio = idbProbe.ratio;
       const idbHighVariance = idbProbe.highVariance;
@@ -3605,51 +3749,56 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       const opfsFlushMs = opfsProbe ? opfsProbe.medianFlushMs : null;
 
       // Chromium deadband: below 1.12 the store is RAM-backed (private), above 1.55 it
-      // is disk-backed (normal). The 1.12–1.55 band AND any high-variance / inconclusive
-      // probe FAIL OPEN with confidence low — never incognito. An ephemeral verdict also
-      // requires OPFS corroboration, so a lone timing outlier cannot brand a real profile
-      // as private. A high-variance sample is treated exactly like the deadband.
+      // is disk-backed (normal). The 1.12–1.55 band and an inconclusive ratio fail open.
       const idbVerdict: 'private' | 'normal' | 'deadband' =
-        idbRatio === null || idbHighVariance
+        idbRatio === null
           ? 'deadband'
           : idbRatio < 1.12
           ? 'private'
           : idbRatio > 1.55
           ? 'normal'
           : 'deadband';
-      const idbIndicatesIncognito = idbVerdict === 'private';
+      const idbLowRatio = idbRatio !== null && idbRatio < 1.12;
       const opfsIndicatesIncognito =
         opfsProbe !== null &&
         (opfsProbe.medianFlushMs < 0.12 || opfsProbe.flushToWriteRatio < 0.85);
 
-      if (idbIndicatesIncognito && opfsIndicatesIncognito) {
+      // Additional deterministic signal for headless private contexts: Chrome 156+ reports
+      // the patched 10 GiB quota in BOTH modes and an off-the-record store produces a
+      // low-variance RAM-backed durability ratio (~1.045) even when the OPFS flush probe is
+      // unusable. A conclusive, low-variance private ratio is therefore sufficient on its
+      // own. A granted persistent-storage privilege is a hard veto — it can only exist on a
+      // durable profile — so a normal profile still fails open cleanly.
+      const idbConclusivePrivate = idbVerdict === 'private' && !idbHighVariance;
+      const persistentGrant = await hasPersistedStorageGrant();
+      const incognitoDetected =
+        !persistentGrant &&
+        (opfsDirPrivate || idbConclusivePrivate || (idbLowRatio && opfsIndicatesIncognito));
+
+      if (incognitoDetected) {
         return {
           isPrivate: true,
           browserName,
-          method: `idb-memenv-durability-ratio+opfs-ram-flush (${idbRatio}x / ${opfsFlushMs}ms)`,
+          method: METHOD_PRIVATE_STORAGE,
           confidence: 'high',
           quotaBytes,
           headroomGiB,
+          idbHighVariance,
           idbDurabilityRatio: idbRatio,
           opfsFlushMs,
         };
       }
 
-      const deadbandNote =
-        idbVerdict === 'deadband'
-          ? `; IDB ${idbRatio ?? 'n/a'}x${
-              idbHighVariance ? ' high variance' : ''
-            } is in the 1.12-1.55 deadband (fail open)`
-          : '';
+      const confidentNormal = persistentGrant || idbVerdict === 'normal';
+      // Context-only quota hints are reported through `reasons`/telemetry, never in the
+      // user-facing method string (no probe names, ratios or byte figures).
       return {
         isPrivate: false,
         browserName,
-        method: `${idbVerdict === 'normal' ? 'disk-persisted-verified' : 'inconclusive-fail-open'} (IDB ${idbRatio ?? 'n/a'}x${
-          quotaContext ? `; ${quotaContext} context only` : ''
-        }${webkitContext ? `; ${webkitContext} context only` : ''}${deadbandNote})`,
+        method: confidentNormal ? METHOD_STANDARD_STORAGE : METHOD_INCONCLUSIVE,
         // 'normal' is a confident negative; the deadband / any inconclusive probe
         // fails open with low confidence (and can never mean incognito).
-        confidence: idbVerdict === 'normal' ? 'high' : 'low',
+        confidence: confidentNormal ? 'high' : 'low',
         idbHighVariance,
         quotaBytes,
         headroomGiB,
@@ -3660,7 +3809,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       return {
         isPrivate: false,
         browserName,
-        method: 'probe-error',
+        method: METHOD_INCONCLUSIVE,
         confidence: 'low',
         quotaBytes,
         headroomGiB,

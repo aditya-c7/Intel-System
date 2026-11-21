@@ -1091,6 +1091,15 @@ export default function App() {
       ? data.securitySignals.ipTimezone
       : null;
   const timezoneMismatchContextual = Boolean(canonical.network?.timezone_mismatch);
+  // The Locale & Timezone tile must surface the discrepancy on EVERY actual mismatch, even
+  // on legacy responses without a canonical envelope. The server flag and a direct browser-
+  // vs-IP label comparison are OR-ed; the copy stays purely contextual (never VPN / spoof).
+  const browserTzKnown =
+    browserTimezoneLabel && browserTimezoneLabel !== 'Unavailable' ? browserTimezoneLabel : null;
+  const directTimezoneMismatch = Boolean(
+    browserTzKnown && ipTimezoneLabel && browserTzKnown !== ipTimezoneLabel
+  );
+  const timezoneMismatchVisible = directTimezoneMismatch || timezoneMismatchContextual;
 
   const isCurrentVisit = selectedVisitIndex === 0;
 
@@ -1126,19 +1135,50 @@ export default function App() {
   const claimedOsRaw = isCurrentVisit
     ? currentOsLabel || data?.browserDevice.os || ''
     : activeVisit?.os || data?.browserDevice.os || '';
-  const claimedOsFamily = mapRuntimeOs(claimedOsRaw) ||
-    (/mac/i.test(claimedOsRaw) ? 'macOS' : /win/i.test(claimedOsRaw) ? 'Windows' : /linux/i.test(claimedOsRaw) ? 'Linux' : null);
-  const runtimeDisagrees = Boolean(
-    runtimeOsLabel && claimedOsFamily && runtimeOsLabel !== claimedOsFamily
-  );
-  const spoofedOsClaim =
+  const claimedOsFamily =
+    mapRuntimeOs(claimedOsRaw) ||
+    (/iphone|ipad|ipod|\bios\b/i.test(claimedOsRaw)
+      ? 'iOS'
+      : /android/i.test(claimedOsRaw)
+      ? 'Android'
+      : /mac/i.test(claimedOsRaw)
+      ? 'macOS'
+      : /win/i.test(claimedOsRaw)
+      ? 'Windows'
+      : /linux/i.test(claimedOsRaw)
+      ? 'Linux'
+      : null);
+  // The nan-sign-bit host-OS/architecture probe is buggy on genuine Linux, so the spoofed-OS
+  // badge is deliberately conservative: it needs the silicon arch mismatch AND a second,
+  // independent runtime witness. A WebGL backend that contradicts the claimed OS, a verified
+  // DevTools device-emulation preset, or an OS-vs-engine contradiction each qualify. An
+  // unknown/software hostOs never earns the badge, and a math-ULP mismatch alone never does.
+  const rawEngineFamily =
+    typeof hardwareTruth?.engine === 'string' ? hardwareTruth.engine.trim().toLowerCase() : '';
+  const engineFamily = /chrom|v8|blink/.test(rawEngineFamily)
+    ? 'chromium'
+    : /webkit|javascriptcore|\bjsc\b/.test(rawEngineFamily)
+    ? 'webkit'
+    : /firefox|spidermonkey|gecko/.test(rawEngineFamily)
+    ? 'firefox'
+    : '';
+  const osVsEngineContradiction =
+    (engineFamily === 'chromium' && claimedOsFamily === 'iOS') ||
+    (engineFamily === 'webkit' &&
+      (claimedOsFamily === 'Windows' || claimedOsFamily === 'Linux')) ||
+    (engineFamily === 'firefox' && claimedOsFamily === 'iOS');
+  const gpuContradictsClaim =
+    Boolean(gpuOsHint && claimedOsFamily && gpuOsHint !== claimedOsFamily);
+  const independentOsProof =
+    gpuContradictsClaim ||
+    Boolean(data?.tamperingDetails?.devtools_device_emulation) ||
+    osVsEngineContradiction;
+  const spoofedOsEligible =
     isCurrentVisit &&
-    (runtimeDisagrees ||
-      Boolean(data?.tamperingDetails?.devtools_device_emulation) ||
-      Boolean(hardwareTruth?.archUaMismatch) ||
-      osUaMismatch)
-      ? stripVerifiedSuffix(claimedOsRaw)
-      : '';
+    runtimeOsLabel !== null &&
+    Boolean(hardwareTruth?.archUaMismatch) &&
+    independentOsProof;
+  const spoofedOsClaim = spoofedOsEligible ? stripVerifiedSuffix(claimedOsRaw) : '';
   const spoofedOsBlocked = Boolean(spoofedOsClaim && spoofedOsClaim !== 'Unavailable');
 
   const serverOsLabel = stripVerifiedSuffix(
@@ -1482,7 +1522,8 @@ export default function App() {
       timezone_display: {
         browser: browserTimezoneLabel,
         ip_geo: ipTimezoneLabel,
-        mismatch_contextual_only: timezoneMismatchContextual,
+        // Purely contextual: this is a browser-vs-IP network signal, never a VPN/spoof verdict.
+        mismatch_contextual_only: timezoneMismatchVisible,
       },
       rare_device: Boolean(data.rareDevice ?? s.rareDevice),
       rare_device_percentile_bucket:
@@ -1558,6 +1599,7 @@ export default function App() {
     spoofedOsBlocked,
     spoofedOsClaim,
     runtimeOsLabel,
+    timezoneMismatchVisible,
     spoofedSpecs,
     tamperingDetected,
     swiftShader,
@@ -2272,10 +2314,10 @@ export default function App() {
                         >
                           {data.browserDevice.language} • {browserTimezoneLabel}
                         </span>
-                        {timezoneMismatchContextual && ipTimezoneLabel && (
+                        {timezoneMismatchVisible && (
                           <span className="mt-0.5 block text-[9px] leading-snug text-slate-500">
                             Timezone mismatch: browser {browserTimezoneLabel} vs IP{' '}
-                            {ipTimezoneLabel} — contextual signal only
+                            {ipTimezoneLabel ?? 'Unavailable'} — contextual signal only
                           </span>
                         )}
                       </div>
@@ -2706,15 +2748,26 @@ export default function App() {
                     const rowIsp = formatValidNetworkField(visit.isp);
                     const rowOrg = formatValidNetworkField(visit.org);
                     const rowAsn = formatValidNetworkField(visit.asn);
-                    // Use the server-classified brand for rows on the current ASN so history and
-                    // the header card can never display two different operator names.
+                    // ONE server-classified brand source: prefer `securitySignals.brandName`
+                    // over the raw geo-provider strings ("Chiron Software" vs "Cox"), so the
+                    // history table and the header card can never name the same network
+                    // differently. Compare ASNs numerically so "AS22773" and "22773" agree.
+                    const asnDigits = (value: string): string => value.replace(/\D/g, '');
+                    const brandName = data.securitySignals?.brandName;
+                    const brandIsValid = Boolean(
+                      brandName && brandName !== 'Unavailable' && brandName !== 'Unknown'
+                    );
+                    const rowAsnKey = asnDigits(rowAsn);
+                    const currentAsnKey = asnDigits(data.location.asn ?? '');
                     const canonicalBrand =
-                      rowAsn && rowAsn === data.location.asn
-                        ? data.securitySignals?.brandName
+                      brandIsValid &&
+                      (index === 0 ||
+                        (rowAsnKey !== '' && rowAsnKey === currentAsnKey))
+                        ? brandName
                         : undefined;
                     const rowIspFormatted = formatCleanIspDisplay(
                       canonicalBrand || rowIsp,
-                      canonicalBrand ? canonicalBrand : rowOrg,
+                      canonicalBrand || rowOrg,
                       rowAsn
                     );
                     const rowScore = normalizeLegacyScore(visit.suspectScore);
