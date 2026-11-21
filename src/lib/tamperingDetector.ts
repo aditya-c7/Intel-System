@@ -24,6 +24,14 @@
  * V8 engine is a UA spoof and is flagged as tampering instead of earning an exemption.
  * Likewise, an injected `window.chrome` on a non-Chromium UA/engine is flagged, while a
  * genuine Electron / Chromium runtime with its real chrome object is not.
+ *
+ * Automation evidence is split by strength. Injected driver globals (and a confirmed
+ * cross-realm getter leak with non-native getters on multiple surfaces) are genuinely
+ * strong proof and are promoted to hard bot evidence. A non-native `navigator.webdriver`
+ * descriptor and V8's `Error.prototype.name` descriptor preview are WEAK, engine-dependent
+ * artifacts that also occur on genuine mobile browsers and under privacy extensions — they
+ * are NEVER promoted on their own, and only ever accompany strong proof as context. This
+ * is what keeps a real Android/Chrome visitor out of the automation gate.
  */
 
 export type TamperingConfidence = 'low' | 'medium' | 'high';
@@ -36,8 +44,11 @@ export interface TamperingDetails {
    * Brave shields, Safari 26 ATFP). Such browsers are exempt from anti-detect/tamper. */
   privacy_hardened: boolean;
   reasons: string[];
-  /** Deterministic automation artifacts (CDP/Playwright/CDC/getter tamper). Each one is
-   * hard evidence on its own and is promoted to the bot gate by the verdict module. */
+  /** Deterministic automation artifacts corroborated by GENUINELY STRONG proof (injected
+   * CDP/Playwright/CDC driver globals or a confirmed cross-realm getter leak on multiple
+   * surfaces). Weak, engine-dependent artifacts (a non-native webdriver descriptor or an
+   * Error.prototype.name preview) never appear here on their own. The verdict module
+   * promotes this list to the single authoritative bot gate. */
   hardAutomationEvidence?: string[];
 }
 
@@ -81,13 +92,105 @@ const AUTOMATION_GLOBAL_PATTERN =
   /^cdc_|^\$cdc_|^__\$webdriver|^__webdriverAsyncExecutor|^__selenium|^__fxdriver|^__playwright|^__pwInitScripts|^_phantom|^callPhantom|^domAutomation/i;
 
 /**
+ * Weak, engine-dependent automation artifacts. A non-native `navigator.webdriver`
+ * descriptor and V8's `Error.prototype.name` descriptor preview both occur on genuine
+ * mobile browsers and under privacy extensions, so they are recorded only as *context*.
+ * They are NEVER hard evidence by themselves — `detectAutomationTamper` promotes them
+ * only when genuinely strong proof already exists.
+ */
+function weakAutomationArtifacts(): string[] {
+  const weak: string[] = [];
+  try {
+    const proto = typeof Navigator !== 'undefined' ? Navigator.prototype : undefined;
+    const descriptor =
+      (proto && Object.getOwnPropertyDescriptor(proto, 'webdriver')) ||
+      (typeof navigator !== 'undefined' ? Object.getOwnPropertyDescriptor(navigator, 'webdriver') : undefined);
+    if (descriptor && typeof descriptor.get === 'function') {
+      const source = Function.prototype.toString.call(descriptor.get);
+      if (!/\[native code\]/.test(source)) {
+        weak.push('non-native navigator.webdriver descriptor (engine-dependent artifact)');
+      }
+    }
+  } catch {
+    // Ignore hostile proxies.
+  }
+  // V8 serialises the Error.prototype.name descriptor while a CDP inspector previews a
+  // thrown Error. It is an engine artifact (observable server-side) and is intentionally
+  // NOT promoted here; listed so downstream keeps it in the weak-evidence set.
+  return weak;
+}
+
+/**
+ * Strong proof from a cross-realm identity leak: the top window exposes non-native
+ * getters on MULTIPLE automation surfaces while a fresh same-origin iframe still reports
+ * native getters, together with a controlled (`true`) webdriver value. Genuine mobile
+ * browsers and privacy extensions never produce that combination, so it is safe to treat
+ * it as hard evidence. A blocked/unreadable iframe is inconclusive and abstains.
+ */
+function confirmedCrossRealmLeak(): boolean {
+  if (typeof document === 'undefined' || typeof window === 'undefined' || !document.body) return false;
+  let frame: HTMLIFrameElement | null = null;
+  try {
+    frame = document.createElement('iframe');
+    frame.style.cssText =
+      'position:absolute;left:-9999px;top:0;width:1px;height:1px;border:0;opacity:0;';
+    frame.setAttribute('aria-hidden', 'true');
+    frame.src = 'about:blank';
+    document.body.appendChild(frame);
+    const child = frame.contentWindow as (Window & typeof globalThis) | null;
+    if (!child || !child.navigator) return false;
+    const getterSource = (target: object | undefined, property: string): string => {
+      try {
+        if (!target) return '';
+        const descriptor = Object.getOwnPropertyDescriptor(target, property);
+        return typeof descriptor?.get === 'function'
+          ? Function.prototype.toString.call(descriptor.get)
+          : '';
+      } catch {
+        return '';
+      }
+    };
+    const parentProto = typeof Navigator !== 'undefined' ? Navigator.prototype : undefined;
+    let childProto: object | undefined;
+    try {
+      childProto = child.navigator ? Object.getPrototypeOf(child.navigator) : undefined;
+    } catch {
+      return false;
+    }
+    const parentUserAgent = getterSource(parentProto, 'userAgent');
+    const parentWebdriver = getterSource(parentProto, 'webdriver');
+    const childUserAgent = getterSource(childProto, 'userAgent');
+    const childWebdriver = getterSource(childProto, 'webdriver');
+    const nonNativeParentSurfaces = [parentUserAgent, parentWebdriver].filter(
+      (source) => source && !/\[native code\]/.test(source)
+    ).length;
+    const webdriverControlled = Boolean(navigator.webdriver);
+    return (
+      webdriverControlled &&
+      nonNativeParentSurfaces >= 2 &&
+      /\[native code\]/.test(childUserAgent) &&
+      /\[native code\]/.test(childWebdriver)
+    );
+  } catch {
+    return false;
+  } finally {
+    try {
+      frame?.remove();
+    } catch {
+      // Ignore.
+    }
+  }
+}
+
+/**
  * Deterministic automation artifacts that are hard evidence rather than environment
- * quirks: injected driver globals and a `navigator.webdriver` getter that was rewritten
- * to report a controlled session. A privacy extension that merely wraps the getter but
- * still returns `false` is deliberately not flagged. Never throws.
+ * quirks. Strong proof (injected driver globals, or a confirmed cross-realm getter leak
+ * on multiple surfaces) is REQUIRED; weak engine-dependent artifacts — a non-native
+ * webdriver descriptor or an Error.prototype.name preview — are NEVER promoted on their
+ * own. This keeps a genuine Android/Chrome session out of the bot gate. Never throws.
  */
 function detectAutomationTamper(): string[] {
-  const evidence: string[] = [];
+  const strong: string[] = [];
   for (const target of [
     typeof window !== 'undefined' ? (window as unknown as Record<string, unknown>) : null,
     typeof document !== 'undefined' ? (document as unknown as Record<string, unknown>) : null,
@@ -96,28 +199,22 @@ function detectAutomationTamper(): string[] {
     try {
       for (const key of Object.keys(target)) {
         if (AUTOMATION_GLOBAL_PATTERN.test(key)) {
-          evidence.push(`automation driver binding '${key}' injected into the page`);
+          strong.push(`automation driver binding '${key}' injected into the page`);
         }
       }
     } catch {
       // A hostile global proxy is not evidence.
     }
   }
-  try {
-    const proto = typeof Navigator !== 'undefined' ? Navigator.prototype : undefined;
-    const descriptor =
-      (proto && Object.getOwnPropertyDescriptor(proto, 'webdriver')) ||
-      (typeof navigator !== 'undefined' ? Object.getOwnPropertyDescriptor(navigator, 'webdriver') : undefined);
-    if (descriptor && typeof descriptor.get === 'function') {
-      const source = Function.prototype.toString.call(descriptor.get);
-      if (!/\[native code\]/.test(source) && Boolean(navigator.webdriver)) {
-        evidence.push('patched navigator.webdriver getter reports a controlled session');
-      }
-    }
-  } catch {
-    // Ignore hostile proxies.
+  if (confirmedCrossRealmLeak()) {
+    strong.push('confirmed cross-realm automation identity leak (non-native getters on multiple surfaces)');
   }
-  return evidence;
+  if (strong.length === 0) {
+    // Weak artifacts alone are engine-dependent and occur on real mobile browsers.
+    return [];
+  }
+  // Only accompany genuinely strong proof with the weak artifacts as explanatory detail.
+  return [...strong, ...weakAutomationArtifacts()];
 }
 
 function detectEngine(): { evalLen: number; isV8: boolean; hasChrome: boolean; isWebKit: boolean } {
@@ -392,10 +489,11 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     reasons.push('JS navigator.userAgent differs from the HTTP User-Agent header');
   }
 
-  // 9. Deterministic automation artifacts (CDP / Playwright / CDC bindings and a forged
-  //    webdriver getter) are hard evidence, not environment quirks. Privacy-hardened
-  //    runtimes (Tor/RFP, Firefox FPP, Brave shields, Safari ATFP) stay exempt: their
-  //    entropy reductions must never become an automation verdict.
+  // 9. Deterministic automation artifacts are hard evidence ONLY when backed by genuinely
+  //    strong proof (CDP / Playwright / CDC bindings or a confirmed cross-realm getter leak).
+  //    A forged webdriver descriptor / Error.name preview on its own is engine-dependent and
+  //    is deliberately not promoted. Privacy-hardened runtimes (Tor/RFP, Firefox FPP, Brave
+  //    shields, Safari ATFP) stay exempt: their entropy reductions are never an automation verdict.
   if (hardAutomationEvidence.length > 0 && !privacyHardened) {
     antiDetect = true;
     anomalyPoints += 45;

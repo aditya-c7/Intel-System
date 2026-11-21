@@ -12784,6 +12784,7 @@ function verifySecurityEnvelope(args) {
   const { envelope, headers, hardwareId, nowMs } = args;
   const reasons = [];
   let tamperedRequest = false;
+  let signatureVerified = false;
   const headerSignature = readRequestHeader(headers, "x-intel-signature");
   const headerNonce = readRequestHeader(headers, "x-intel-nonce");
   const headerTimestamp = readRequestHeader(headers, "x-intel-timestamp");
@@ -12807,7 +12808,8 @@ function verifySecurityEnvelope(args) {
       envelopeScreenResolution,
       envelopeTimezone
     ].join("|");
-    if (sha256HexLower(canonical) !== envSignature.toLowerCase()) {
+    signatureVerified = sha256HexLower(canonical) === envSignature.toLowerCase();
+    if (!signatureVerified) {
       tamperedRequest = true;
       reasons.push("Payload integrity hash mismatch");
     }
@@ -12843,7 +12845,8 @@ function verifySecurityEnvelope(args) {
     tamperedRequest,
     replayDetected,
     requestIntegrityReason: Array.from(new Set(reasons)).join("; "),
-    requestNonce
+    requestNonce,
+    signatureVerified
   };
 }
 function normalizeLegacySuspectScore(rawSuspectScore) {
@@ -13868,13 +13871,28 @@ function detectAutomationTargetedTampering(reasons, botSignals) {
   const matched = Array.from(/* @__PURE__ */ new Set([...collect(reasons), ...collect(botSignals)]));
   return { detected: matched.length > 0, reasons: matched };
 }
+var STRONG_CDP_PROOF_REASON_PATTERN = /^(?:navigator\.webdriver\b|cdc[._$]|\$cdc_|playwright[._]|puppeteer[._]|selenium[._]|webdriver[._]|cdp\.ua_override\.|bot\.playwright-binding)|\b(?:automation driver binding|CDP\/WebDriver binding exposed|automation globals|confirmed cross-realm automation identity leak)\b/i;
+function hasStrongCdpProof(raw, extras = {}) {
+  if (raw?.webdriver === true) return true;
+  const reasons = [
+    ...Array.isArray(raw?.botSignals) ? raw.botSignals : [],
+    ...Array.isArray(raw?.tamperReasons) ? raw.tamperReasons : [],
+    ...Array.isArray(raw?.tamperingDetails?.reasons) ? raw.tamperingDetails.reasons : [],
+    ...Array.isArray(raw?.tamperingDetails?.hardAutomationEvidence) ? (raw?.tamperingDetails).hardAutomationEvidence : [],
+    ...Array.isArray(extras.hardAutomationEvidence) ? extras.hardAutomationEvidence : [],
+    ...Array.isArray(extras.cdpBridgeEvidence) ? extras.cdpBridgeEvidence : []
+  ];
+  return reasons.some(
+    (reason) => typeof reason === "string" && STRONG_CDP_PROOF_REASON_PATTERN.test(reason.trim())
+  );
+}
 function clampHumanCorroboration(value) {
   if (typeof value !== "number" || !Number.isFinite(value)) return 0;
   return Math.max(0, Math.min(1, value));
 }
 function assessCorroboratedCdp(args) {
   const reasons = [];
-  if (!args.cdpBridge || args.signedAgentExempt || args.dockedWithHumanInteraction) {
+  if (!args.cdpBridge || !args.strongCdpProof || args.signedAgentExempt || args.dockedWithHumanInteraction) {
     return { escalate: false, botType: null, reasons };
   }
   if (args.stealthArtifact) {
@@ -13906,8 +13924,14 @@ function assertBotVerdictParity(serialized, botVerdict) {
 }
 function hasIndependentAutomationProof(raw, requestContext) {
   const rawExtras = raw ?? {};
+  const strongCdpProof = Boolean(
+    requestContext?.strongCdpProof ?? hasStrongCdpProof(raw, rawExtras)
+  );
   return Boolean(
-    raw?.stealthPluginDetected || raw?.webdriver || raw?.cdpDetected || raw?.isBot || raw?.canvasFarblingDetected || raw?.replayDetected || raw?.tamperedRequest || rawExtras.automationTargetedTampering || detectAutomationTargetedTampering(rawExtras.tamperingReasons ?? raw?.tamperingDetails?.reasons, raw?.botSignals).detected || requestContext?.tamperedRequest || requestContext?.replayDetected
+    strongCdpProof && (raw?.stealthPluginDetected || raw?.cdpDetected || raw?.isBot || rawExtras.automationTargetedTampering || detectAutomationTargetedTampering(
+      rawExtras.tamperingReasons ?? raw?.tamperingDetails?.reasons,
+      raw?.botSignals
+    ).detected) || raw?.webdriver || strongCdpProof || raw?.canvasFarblingDetected || raw?.replayDetected || raw?.tamperedRequest || requestContext?.tamperedRequest || requestContext?.replayDetected
   );
 }
 function isConfirmedTorRfpClient(raw, requestContext) {
@@ -13934,12 +13958,18 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const clientTorBrowser = Boolean(requestContext.clientTorBrowser ?? raw?.isTorBrowserClient);
   const tamperingResponse = rfpExempt ? false : Boolean(raw?.tampering);
   const tamperingDetailsResponse = rfpExempt ? rfpExemptTamperingDetails(raw) : raw?.tamperingDetails;
+  const rawExtrasForProof = raw ?? {};
+  const strongCdpProof = Boolean(
+    requestContext.strongCdpProof ?? hasStrongCdpProof(raw, rawExtrasForProof)
+  );
   const webdriver = Boolean(raw?.webdriver);
-  const cdpDetected = Boolean(raw?.cdpDetected);
+  const cdpDetected = strongCdpProof && Boolean(raw?.cdpDetected);
+  const verifiedIsBot = strongCdpProof && Boolean(raw?.isBot);
+  const verifiedStealthPlugin = strongCdpProof && Boolean(raw?.stealthPluginDetected);
   const isHeadless = Boolean(raw?.isHeadless);
   const rawBotReason = typeof raw?.botReason === "string" && raw.botReason.trim() ? raw.botReason.trim().slice(0, 200) : "";
   const botSignals = safeStrArray(raw?.botSignals);
-  const clientAutomationDetected = Boolean(raw?.isBot || webdriver || cdpDetected);
+  const clientAutomationDetected = Boolean(verifiedIsBot || webdriver || cdpDetected);
   const automationTampering = detectAutomationTargetedTampering(
     [
       ...raw?.tamperingReasons ?? [],
@@ -13947,7 +13977,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     ],
     botSignals
   );
-  const automationTargetedTampering = Boolean(requestContext.automationTargetedTampering) || automationTampering.detected;
+  const automationTargetedTampering = strongCdpProof && (Boolean(requestContext.automationTargetedTampering) || automationTampering.detected);
   const antiDetectBrowser = rfpExempt ? false : Boolean(raw?.tamperingDetails?.anti_detect_browser);
   const tamperingMlScore = typeof raw?.tamperingMlScore === "number" && Number.isFinite(raw.tamperingMlScore) ? raw.tamperingMlScore : 0;
   const mlTampering = rfpExempt ? false : tamperingMlScore >= 0.5;
@@ -13955,10 +13985,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     raw?.developerTools || raw?.cdpRuntimeLeak || raw?.automationEnvironment === "electron" || raw?.automationEnvironment === "ide_webview"
   );
   const stealthAutomation = Boolean(
-    raw?.stealthPluginDetected || antiDetectBrowser || automationTargetedTampering || requestContext.corroboratedCdpEscalation
+    verifiedStealthPlugin || antiDetectBrowser || automationTargetedTampering || requestContext.corroboratedCdpEscalation
   );
   const activeDeception = Boolean(
-    raw?.stealthPluginDetected || antiDetectBrowser || automationTargetedTampering || requestContext.corroboratedCdpEscalation
+    verifiedStealthPlugin || antiDetectBrowser || automationTargetedTampering || requestContext.corroboratedCdpEscalation
   );
   const hardAutomationReasons = [];
   if (automationTargetedTampering) {
@@ -13966,10 +13996,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       `Automation-targeted tampering (${automationTampering.reasons.slice(0, 2).join("; ") || "webdriver / playwright / CDC / CDP getter wrappers"})`
     );
   }
-  if (raw?.cdpRuntimeLeak) {
+  if (strongCdpProof && raw?.cdpRuntimeLeak) {
     hardAutomationReasons.push("CDP Runtime.enable serialization leak");
   }
-  if (raw?.stealthPluginDetected) {
+  if (verifiedStealthPlugin) {
     hardAutomationReasons.push("Stealth plugin artifacts (non-native getters / iframe leak)");
   }
   if (antiDetectBrowser) {
@@ -13993,7 +14023,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       cdpDetected,
       botSignals,
       cdpRuntimeLeak: Boolean(raw?.cdpRuntimeLeak),
-      stealthPluginDetected: Boolean(raw?.stealthPluginDetected),
+      stealthPluginDetected: verifiedStealthPlugin,
       developerTools: developerToolsAttached,
       automationEnvironment: raw?.automationEnvironment,
       humanCorroboration: raw?.humanCorroboration,
@@ -14403,7 +14433,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       cdpDetected,
       // Protocol-level and stealth-plugin evidence reaches the payload, the grid and the JSON.
       cdpRuntimeLeak: Boolean(raw?.cdpRuntimeLeak),
-      stealthPluginDetected: Boolean(raw?.stealthPluginDetected),
+      stealthPluginDetected: verifiedStealthPlugin,
       automationTargetedTampering,
       automationTamperingReasons: automationTampering.reasons,
       // The single source of truth for `vpn_methods`: the UI derives its count from this object.
@@ -15031,36 +15061,28 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       nowMs
     });
     const rawSignalExtras = rawSecuritySignals || {};
+    const topLevelExtras = requestBody;
+    const clientExtras = { ...topLevelExtras, ...rawSignalExtras };
     const claimedHumanCorroboration = clampHumanCorroboration(
-      rawSecuritySignals?.humanCorroboration ?? rawSignalExtras.humanCorroboration
+      rawSecuritySignals?.humanCorroboration ?? rawSignalExtras.humanCorroboration ?? topLevelExtras.humanCorroboration
     );
     const envelopeSignedAndClean = Boolean(
-      requestBody.securityEnvelope && envelopeVerdict.requestNonce && !envelopeVerdict.tamperedRequest && !envelopeVerdict.replayDetected
+      requestBody.securityEnvelope && envelopeVerdict.signatureVerified && envelopeVerdict.requestNonce && !envelopeVerdict.tamperedRequest && !envelopeVerdict.replayDetected
     );
     const trustedHumanCorroboration = envelopeSignedAndClean ? claimedHumanCorroboration : Math.min(claimedHumanCorroboration, 0.2);
-    const earlyInteractionEvidence = Array.isArray(rawSignalExtras.interactionEvidence) ? rawSignalExtras.interactionEvidence.filter(
+    const earlyInteractionEvidence = Array.isArray(clientExtras.interactionEvidence) ? clientExtras.interactionEvidence.filter(
       (item) => typeof item === "string" && item.trim().length > 0
     ).length : 0;
     const hasTrustedInteractionEvidence = envelopeSignedAndClean && earlyInteractionEvidence > 0;
-    const earlyInspectorProbes = rawSignalExtras.inspectorProbes && typeof rawSignalExtras.inspectorProbes === "object" ? rawSignalExtras.inspectorProbes : null;
-    const inspectorProbeCdpEvidence = Boolean(
-      earlyInspectorProbes && (Object.keys(earlyInspectorProbes).some(
-        (key) => /cdp|devtools|debugger|automation[_ -]?protocol/i.test(key)
-      ) || Object.values(earlyInspectorProbes).some(
-        (value) => typeof value === "string" && /cdp|devtools|debugger|automation[_ -]?protocol/i.test(value)
-      ))
-    );
-    const cdpAttachedRaw = Boolean(
-      rawSecuritySignals?.cdpDetected || rawSecuritySignals?.cdpRuntimeLeak || inspectorProbeCdpEvidence
-    );
+    const strongCdpProof = hasStrongCdpProof(rawSecuritySignals, clientExtras);
     const earlyInspectorState = classifyInspectorState({
-      cdpAttached: cdpAttachedRaw,
-      devtoolsActiveVerified: Boolean(rawSignalExtras.devtoolsActiveVerified),
-      viewportContractionNormalized: Boolean(rawSignalExtras.viewportContractionNormalized)
+      cdpAttached: strongCdpProof,
+      devtoolsActiveVerified: Boolean(clientExtras.devtoolsActiveVerified),
+      viewportContractionNormalized: Boolean(clientExtras.viewportContractionNormalized)
     });
-    const cdpBridge = cdpAttachedRaw || earlyInspectorState === "automation_protocol_attached";
+    const cdpBridge = strongCdpProof;
     const dockedWithHumanInteraction = Boolean(
-      rawSecuritySignals?.developerTools || rawSignalExtras.devtoolsActiveVerified || rawSecuritySignals?.automationEnvironment === "electron" || rawSecuritySignals?.automationEnvironment === "ide_webview" || earlyInspectorState === "devtools_docked_suspected" || earlyInspectorState === "devtools_active_verified"
+      rawSecuritySignals?.developerTools || clientExtras.devtoolsActiveVerified || rawSecuritySignals?.automationEnvironment === "electron" || rawSecuritySignals?.automationEnvironment === "ide_webview" || earlyInspectorState === "devtools_docked_suspected" || earlyInspectorState === "devtools_active_verified"
     ) && (trustedHumanCorroboration >= 0.5 || hasTrustedInteractionEvidence);
     const encodedOriginalUa = readRequestHeader(rawRequestHeaders, "x-intel-original-ua");
     let headerRequestUserAgent = readRequestHeader(rawRequestHeaders, "user-agent");
@@ -15073,7 +15095,12 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const envelopeRequestUserAgent = typeof requestBody.securityEnvelope?.userAgent === "string" ? requestBody.securityEnvelope.userAgent.trim() : "";
     const headerCarriesBotSignature = Boolean(headerRequestUserAgent) && (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) || GOOD_BOT_UA_RULES2.some((rule) => rule.pattern.test(headerRequestUserAgent)) || AI_AGENT_UA_RULES2.some((rule) => rule.pattern.test(headerRequestUserAgent)));
     const fullRequestUserAgent = headerCarriesBotSignature ? headerRequestUserAgent : envelopeRequestUserAgent || headerRequestUserAgent;
-    const rfpExemptRequest = isConfirmedTorRfpClient(rawSecuritySignals);
+    const rfpExemptRequest = isConfirmedTorRfpClient(rawSecuritySignals, {
+      clientTorBrowser: Boolean(rawSecuritySignals?.isTorBrowserClient),
+      tamperedRequest: envelopeVerdict.tamperedRequest,
+      replayDetected: envelopeVerdict.replayDetected,
+      strongCdpProof
+    });
     const developerToolsSignals = Boolean(
       rawSecuritySignals?.developerTools || rawSecuritySignals?.cdpRuntimeLeak || rawSecuritySignals?.automationEnvironment === "electron" || rawSecuritySignals?.automationEnvironment === "ide_webview"
     );
@@ -15084,11 +15111,11 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       ],
       rawSecuritySignals?.botSignals
     );
-    const automationTargetedTampering = handlerAutomationTampering.detected || Boolean(
+    const automationTargetedTampering = strongCdpProof && (handlerAutomationTampering.detected || Boolean(
       rawSecuritySignals?.automationTargetedTampering
-    );
+    ));
     let hardAutomationSignals = (!rfpExemptRequest || automationTargetedTampering) && Boolean(
-      automationTargetedTampering || rawSecuritySignals?.stealthPluginDetected || rawSecuritySignals?.tamperingDetails?.anti_detect_browser
+      automationTargetedTampering || strongCdpProof && rawSecuritySignals?.stealthPluginDetected || rawSecuritySignals?.tamperingDetails?.anti_detect_browser
     );
     const decodeEdgeHeader = (name) => {
       const value = readRequestHeader(rawRequestHeaders, name);
@@ -15125,10 +15152,11 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const effectiveWba = requestWba && requestWba.verified ? requestWba : pageAttestation;
     const corroboratedCdp = assessCorroboratedCdp({
       cdpBridge,
+      strongCdpProof,
       inspectorState: earlyInspectorState,
       dockedWithHumanInteraction,
       stealthArtifact: Boolean(
-        automationTargetedTampering || rawSecuritySignals?.stealthPluginDetected || !rfpExemptRequest && rawSecuritySignals?.tamperingDetails?.anti_detect_browser
+        automationTargetedTampering || strongCdpProof && rawSecuritySignals?.stealthPluginDetected || !rfpExemptRequest && rawSecuritySignals?.tamperingDetails?.anti_detect_browser
       ),
       trustedHumanCorroboration,
       hasTrustedInteractionEvidence,
@@ -15142,14 +15170,14 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       { org: location.org, isp: location.isp, asn: location.asn },
       {
         isBot: Boolean(
-          rawSecuritySignals?.isBot || rawSecuritySignals?.webdriver || rawSecuritySignals?.cdpDetected
+          strongCdpProof && rawSecuritySignals?.isBot || rawSecuritySignals?.webdriver || strongCdpProof && rawSecuritySignals?.cdpDetected
         ),
         isHeadless: Boolean(rawSecuritySignals?.isHeadless),
         webdriver: Boolean(rawSecuritySignals?.webdriver),
-        cdpDetected: Boolean(rawSecuritySignals?.cdpDetected),
+        cdpDetected: strongCdpProof && Boolean(rawSecuritySignals?.cdpDetected),
         botSignals: Array.isArray(rawSecuritySignals?.botSignals) ? rawSecuritySignals.botSignals : [],
         cdpRuntimeLeak: Boolean(rawSecuritySignals?.cdpRuntimeLeak),
-        stealthPluginDetected: Boolean(rawSecuritySignals?.stealthPluginDetected),
+        stealthPluginDetected: strongCdpProof && Boolean(rawSecuritySignals?.stealthPluginDetected),
         developerTools: developerToolsSignals,
         automationEnvironment: rawSecuritySignals?.automationEnvironment,
         humanCorroboration: rawSecuritySignals?.humanCorroboration,
@@ -15206,10 +15234,10 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       network: { isp: location.isp, org: location.org, asn: location.asn },
       publicIp: location.publicIp,
       client: {
-        isBot: Boolean(rawSecuritySignals?.isBot),
+        isBot: strongCdpProof && Boolean(rawSecuritySignals?.isBot),
         isHeadless: Boolean(rawSecuritySignals?.isHeadless),
         webdriver: Boolean(rawSecuritySignals?.webdriver),
-        cdpDetected: Boolean(rawSecuritySignals?.cdpDetected),
+        cdpDetected: strongCdpProof && Boolean(rawSecuritySignals?.cdpDetected),
         isVirtualMachine: Boolean(rawSecuritySignals?.isVirtualMachine),
         gpuVendor: hardwareSignals.gpuVendor,
         gpuRenderer: hardwareSignals.gpuRenderer,
@@ -15307,6 +15335,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         ipBlocklistReasons: blocklist.reasons,
         botClassification: effectiveBotClassification,
         automationTargetedTampering,
+        strongCdpProof,
         corroboratedCdpEscalation: corroboratedCdp.escalate
       }
     );
@@ -15780,8 +15809,8 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       )
     };
     const eventId = safePageLoadId;
-    const collectorInspectorProbes = rawExtras.inspectorProbes && typeof rawExtras.inspectorProbes === "object" ? rawExtras.inspectorProbes : {};
-    const collectorInteractionEvidence = Array.isArray(rawExtras.interactionEvidence) ? rawExtras.interactionEvidence.filter((item) => typeof item === "string" && item.trim().length > 0).map((item) => item.trim().slice(0, 160)).slice(0, 24) : [];
+    const collectorInspectorProbes = clientExtras.inspectorProbes && typeof clientExtras.inspectorProbes === "object" ? clientExtras.inspectorProbes : {};
+    const collectorInteractionEvidence = Array.isArray(clientExtras.interactionEvidence) ? clientExtras.interactionEvidence.filter((item) => typeof item === "string" && item.trim().length > 0).map((item) => item.trim().slice(0, 160)).slice(0, 24) : [];
     rememberPassiveVisit({
       eventId,
       visitorId,
@@ -15797,10 +15826,11 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const inspectorFlags = inspectorFlagsForState(inspectorState);
     const inspectorDetail = inspectorState === "automation_protocol_attached" ? "CDP protocol attached; no docked DevTools UI" : inspectorState === "devtools_docked_suspected" ? "Docked DevTools frontend suspected" : inspectorState === "devtools_active_verified" ? "Docked DevTools frontend verified active" : "No inspector / DevTools attachment detected";
     const automationVerdict = securitySignals.isBot || botVerdict === "bad" || hardAutomationSignals ? "automated" : securitySignals.botSubtype === "human" || botVerdict === "not_detected" ? "human" : "uncertain";
+    const humanCorroborationClaim = trustedHumanCorroboration >= 0.5 || hasTrustedInteractionEvidence ? 1 : 0;
     const verdictState = decideVerdictTier({
       automation: automationVerdict,
       tamperingDetected: reconciledTampering.detected || Boolean(securitySignals.tamperedRequest),
-      humanCorroboration: trustedHumanCorroboration >= 0.5 ? 1 : 0,
+      humanCorroboration: humanCorroborationClaim,
       hasInteractionEvidence: collectorInteractionEvidence.length > 0 || trustedHumanCorroboration >= 0.5
     });
     const unverifiedAutomationClaim = Boolean(

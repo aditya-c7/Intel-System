@@ -2086,7 +2086,15 @@ export function detectVmAndIntegrity(
  * a definitive one (iframe leak, prepareStackTrace invocation) raise the flag.
  */
 export interface StealthArtifacts {
+  /** Informational serialization artifacts (may be engine-dependent). Telemetry only. */
   cdpRuntimeLeak: boolean;
+  /**
+   * STRONG protocol-level proof: a CDP Runtime.enable leak observed by TWO independent
+   * protocol probes. Only this — never `cdpRuntimeLeak`, a webdriver getter descriptor,
+   * a cross-realm getter source diff or an Error.prototype.name preview — may escalate a
+   * real browser to a CDP/stealth-automation bot.
+   */
+  cdpRuntimeProof: boolean;
   stealthPluginDetected: boolean;
   stealthReasons: string[];
 }
@@ -2107,6 +2115,13 @@ interface InteractionCounters {
   pointerMoves: number;
   pointerDowns: number;
   touchStarts: number;
+  /** Trusted touchmove/touchend counts — a real touch has phases, a script often does not. */
+  touchMoves: number;
+  touchEnds: number;
+  /** Trusted touch coordinates from touchstart/touchmove — a real drag changes position. */
+  touchPositions: Array<{ x: number; y: number }>;
+  /** Trusted intervals between successive touchstarts — human tap cadence. */
+  touchIntervalsMs: number[];
   scrolls: number;
   keyDowns: number;
   keyIntervalsMs: number[];
@@ -2121,6 +2136,10 @@ const interactionCounters: InteractionCounters = {
   pointerMoves: 0,
   pointerDowns: 0,
   touchStarts: 0,
+  touchMoves: 0,
+  touchEnds: 0,
+  touchPositions: [],
+  touchIntervalsMs: [],
   scrolls: 0,
   keyDowns: 0,
   keyIntervalsMs: [],
@@ -2131,6 +2150,7 @@ const interactionCounters: InteractionCounters = {
   lastInteractionAt: 0,
 };
 let lastKeyDownAt = 0;
+let lastTouchStartAt = 0;
 
 /** Passive inspector probes. Results are reported for `inspector_state`, never bot proof. */
 export interface InspectorProbes {
@@ -2153,6 +2173,10 @@ export function getInteractionEvidence(): string[] {
     evidence.push(`pointer-kinematics:${interactionCounters.pointerMoves}`);
   }
   if (interactionCounters.touchStarts > 0) evidence.push(`touch:${interactionCounters.touchStarts}`);
+  if (interactionCounters.touchMoves > 0) evidence.push(`touch-move:${interactionCounters.touchMoves}`);
+  if (interactionCounters.touchEnds > 0) evidence.push(`touch-end:${interactionCounters.touchEnds}`);
+  const touchCadence = interactionCounters.touchIntervalsMs.filter((ms) => ms > 0 && ms < 2000);
+  if (touchCadence.length >= 2) evidence.push(`touch-cadence:${touchCadence.length}`);
   if (interactionCounters.scrolls > 0) evidence.push(`scroll:${interactionCounters.scrolls}`);
   if (interactionCounters.keyDowns > 0) evidence.push(`keyboard:${interactionCounters.keyDowns}`);
   const cadence = interactionCounters.keyIntervalsMs.filter((ms) => ms > 0 && ms < 2000);
@@ -2178,7 +2202,23 @@ export function hasGenuineHumanInput(): boolean {
   // An injected automation library is present: any input seen this session is attributable
   // to the driver, not to a person, regardless of how natural its cadence looked.
   if (c.frameworkGlobals.length > 0 || c.playwrightMarkTargets > 0) return false;
-  if (c.touchStarts > 0) return true;
+  // Trusted touch input is genuine on a phone exactly as pointer/keyboard input is on a
+  // desktop. A completed tap (touchstart -> touchend), a drag with realistic movement, a
+  // human tap cadence, or even a single in-flight trusted touchstart all count. CDP-
+  // dispatched synthetic touch is excluded by the framework/mark-target guard above, so a
+  // real person is never asked to "prove" their touch with desktop-only pointer trails.
+  if (c.touchStarts > 0 || c.touchEnds > 0) return true;
+  if (c.touchMoves >= 2 && c.touchPositions.length >= 2) {
+    const first = c.touchPositions[0];
+    const last = c.touchPositions[c.touchPositions.length - 1];
+    if (Math.abs(first.x - last.x) + Math.abs(first.y - last.y) >= 12) return true;
+    const distinct = new Set(
+      c.touchPositions.map((p) => `${Math.round(p.x / 4)}:${Math.round(p.y / 4)}`)
+    ).size;
+    if (distinct >= 3) return true;
+  }
+  const humanTouchIntervals = c.touchIntervalsMs.filter((ms) => ms >= 40 && ms < 1500);
+  if (humanTouchIntervals.length >= 1) return true;
   if (c.scrolls > 0) return true;
   const humanIntervals = c.keyIntervalsMs.filter((ms) => ms >= 40 && ms < 1500);
   if (c.keyDowns >= 3 && humanIntervals.length >= 2) return true;
@@ -2249,30 +2289,28 @@ function detectInjectedChromeInNonChromium(ua?: string): boolean {
 }
 
 /**
- * Every CDP / runtime-bridge artifact that can corroborate the escalation. A bare CDP
- * Runtime leak stays developer-tools evidence; this is the bridge PRESENCE set that the
- * uncorroborated-after-dwell rule consults. Software GPUs are deliberately NOT included.
+ * STRONG CDP / runtime-bridge proof only. These artifacts are the bridge PRESENCE set that
+ * the uncorroborated-after-dwell rule consults, so every entry must be impossible on an
+ * ordinary real browser. Deliberately EXCLUDED (all are weak, engine-dependent artifacts
+ * that fire naturally on Android Chrome / other engines and must never escalate anywhere):
+ *   - `webdriverGetterTampered` / non-native or cross-realm getter source differences
+ *   - the `Error.prototype.name` / `console.debug` serialization preview
+ *   - informational `cdpRuntimeLeak` without a second independent protocol probe
+ *   - `window.chrome` in a non-Chromium runtime (an environment quirk, not a CDP bridge)
+ * What qualifies: real `__playwright__*` / `$cdc_*` / `__webdriver*` binding globals, a
+ * playwright mark-target listener, or a CDP Runtime.enable leak corroborated by a second
+ * independent protocol probe (`cdpRuntimeProof`). Software GPUs are never included.
  */
-function collectCdpBridgeEvidence(stealth: StealthArtifacts, ua?: string): string[] {
+function collectCdpBridgeEvidence(stealth: StealthArtifacts, _ua?: string): string[] {
   const evidence: string[] = [];
-  if (stealth.cdpRuntimeLeak) evidence.push('CDP Runtime.enable serialization leak');
-  if (inspectorProbes.errorPrototypeNamePreviewReads > 0) {
-    evidence.push('CDP inspector error-preview probe');
-  }
-  if (inspectorProbes.crossRealmGetterSourceMismatch || stealth.stealthReasons.some((r) => /cross-realm/i.test(r))) {
-    evidence.push('cross-realm automation-surface getter mismatch');
-  }
-  if (stealth.stealthReasons.some((r) => /non-native|rewritten|not native/i.test(r))) {
-    evidence.push('non-native getter on an automation surface');
+  if (stealth.cdpRuntimeProof) {
+    evidence.push('CDP Runtime.enable leak corroborated by an independent protocol probe');
   }
   if (interactionCounters.frameworkGlobals.length > 0) {
     evidence.push(`automation globals (${interactionCounters.frameworkGlobals.slice(0, 3).join(', ')})`);
   }
   if (interactionCounters.playwrightMarkTargets > 0) evidence.push('playwright mark-target listener');
   if (scanCdpGlobals()) evidence.push('CDP/WebDriver binding exposed on window or document');
-  if (detectInjectedChromeInNonChromium(ua)) {
-    evidence.push('window.chrome injected into a non-Chromium runtime');
-  }
   return evidence;
 }
 
@@ -2380,9 +2418,57 @@ export function installTrustedInputTracker(): void {
       }
       stamp();
     };
+    // A single physical touch fires capture listeners on BOTH window and document; dedupe
+    // by event identity so movement/cadence reflect real touches, not double counts.
+    const seenTouchEvents = new WeakSet<Event>();
+    const touchCoordinates = (event: Event): { x: number; y: number } | null => {
+      const touchEvent = event as TouchEvent;
+      const list =
+        touchEvent.changedTouches && touchEvent.changedTouches.length > 0
+          ? touchEvent.changedTouches
+          : touchEvent.touches;
+      if (!list || list.length === 0) return null;
+      const x = Number(list[0].clientX);
+      const y = Number(list[0].clientY);
+      return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : null;
+    };
+    const rememberTouchPoint = (point: { x: number; y: number }): void => {
+      interactionCounters.touchPositions.push(point);
+      if (interactionCounters.touchPositions.length > 24) {
+        interactionCounters.touchPositions.shift();
+      }
+    };
     const onTouchStart = (event: Event): void => {
-      if (!(event as TouchEvent).isTrusted) return;
+      if (!(event as TouchEvent).isTrusted || seenTouchEvents.has(event)) return;
+      seenTouchEvents.add(event);
       interactionCounters.touchStarts += 1;
+      const now = Date.now();
+      if (lastTouchStartAt > 0) {
+        const interval = now - lastTouchStartAt;
+        if (interval > 0 && interval < 2000) {
+          interactionCounters.touchIntervalsMs.push(interval);
+          if (interactionCounters.touchIntervalsMs.length > 32) {
+            interactionCounters.touchIntervalsMs.shift();
+          }
+        }
+      }
+      lastTouchStartAt = now;
+      const point = touchCoordinates(event);
+      if (point) rememberTouchPoint(point);
+      stamp();
+    };
+    const onTouchMove = (event: Event): void => {
+      if (!(event as TouchEvent).isTrusted || seenTouchEvents.has(event)) return;
+      seenTouchEvents.add(event);
+      interactionCounters.touchMoves += 1;
+      const point = touchCoordinates(event);
+      if (point) rememberTouchPoint(point);
+      stamp();
+    };
+    const onTouchEnd = (event: Event): void => {
+      if (!(event as TouchEvent).isTrusted || seenTouchEvents.has(event)) return;
+      seenTouchEvents.add(event);
+      interactionCounters.touchEnds += 1;
       stamp();
     };
     const onScroll = (event: Event): void => {
@@ -2416,8 +2502,12 @@ export function installTrustedInputTracker(): void {
     window.addEventListener('pointermove', onPointerMove, options);
     window.addEventListener('keydown', onKey, options);
     window.addEventListener('touchstart', onTouchStart, options);
+    window.addEventListener('touchmove', onTouchMove, options);
+    window.addEventListener('touchend', onTouchEnd, options);
     window.addEventListener('scroll', onScroll, options);
     document.addEventListener('touchstart', onTouchStart, options);
+    document.addEventListener('touchmove', onTouchMove, options);
+    document.addEventListener('touchend', onTouchEnd, options);
     document.addEventListener('scroll', onScroll, options);
     document.addEventListener('__playwright_mark_target__', onMarkTarget, options);
     window.addEventListener('__playwright_mark_target__', onMarkTarget, options);
@@ -2486,6 +2576,8 @@ export function measureHumanCorroboration(gpuRenderer?: string): HumanCorroborat
   const trustedInput =
     trustedPointerEvents + trustedKeyEvents > 0 ||
     interactionCounters.touchStarts > 0 ||
+    interactionCounters.touchMoves > 0 ||
+    interactionCounters.touchEnds > 0 ||
     interactionCounters.scrolls > 0;
   total += 4;
   if (genuineInput) {
@@ -2515,20 +2607,25 @@ export function measureHumanCorroboration(gpuRenderer?: string): HumanCorroborat
 export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
   const reasons: string[] = [];
   let cdpRuntimeLeak = false;
+  let cdpRuntimeProof = false;
   let definitive = false;
 
   if (typeof window === 'undefined' || typeof document === 'undefined') {
-    return { cdpRuntimeLeak: false, stealthPluginDetected: false, stealthReasons: [] };
+    return { cdpRuntimeLeak: false, cdpRuntimeProof: false, stealthPluginDetected: false, stealthReasons: [] };
   }
 
-  // Inspector probes. Two independent, non-blocking side-effect checks:
-  //  (1) CDP Runtime.debug eagerly serialises an Error and invokes
-  //      `Error.prepareStackTrace` — the protocol-level leak the suite pins.
-  //  (2) V8 previews `Error.prototype.name` while serialising. We install a temporary
-  //      getter on the PROTOTYPE (never an own Error instance / own Error.stack) and
-  //      count reads; the result is reported under `inspector_probes` and is
-  //      informational only. A human with DevTools open is NEVER branded a bot here
-  //      (Agent 2 owns the inspector_state state machine).
+  // Inspector probes. Three independent, non-blocking side-effect checks:
+  //  (1) STRONG — CDP Runtime.debug eagerly serialises an Error and invokes
+  //      `Error.prepareStackTrace`, a hook page JavaScript never calls itself.
+  //  (2) STRONG, INDEPENDENT — a CDP/DevTools object preview eagerly evaluates an
+  //      enumerable accessor on a plain object (the classic "getter detects DevTools"
+  //      technique). It is a structurally different protocol observable from (1).
+  //      Only (1) AND (2) together produce `cdpRuntimeProof`.
+  //  (3) WEAK, ENGINE-DEPENDENT — V8 previews `Error.prototype.name` while serialising.
+  //      On Android Chrome and other engines this naturally looks non-native, so it is
+  //      telemetry only and can NEVER establish bridge proof or tampering on its own.
+  //      A human with DevTools open is NEVER branded a bot here (Agent 2 owns the
+  //      inspector_state state machine).
   try {
     const errorCtor = Error as unknown as { prepareStackTrace?: unknown };
     const originalPrepare = errorCtor.prepareStackTrace;
@@ -2554,8 +2651,25 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
       },
     });
 
+    // Probe (2): a plain object with a uniquely named enumerable accessor. A CDP /
+    // DevTools object preview eagerly serialises the object and invokes the getter;
+    // without a protocol debugger the object stays lazy and the getter is never read.
+    // This is a structurally different observable from Error.prepareStackTrace (1) and
+    // from the engine-dependent Error.prototype.name preview (3).
+    let objectPreviewReads = 0;
+    const previewProbe: Record<string, unknown> = {};
+    Object.defineProperty(previewProbe, '__intelCdpPreview__', {
+      enumerable: true,
+      configurable: true,
+      get() {
+        objectPreviewReads += 1;
+        return 'preview';
+      },
+    });
+
     try {
       console.debug(new Error('intel-cdp-probe'));
+      console.debug(previewProbe);
     } catch {
       /* console may be restricted — inconclusive */
     } finally {
@@ -2580,13 +2694,21 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
     }
 
     inspectorProbes.errorPrototypeNamePreviewReads = namePreviewReads;
-    if (prepareInvoked || namePreviewReads > 1) {
-      cdpRuntimeLeak = true;
-      reasons.push(
-        prepareInvoked
-          ? 'CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked on console.debug)'
-          : 'CDP Runtime.debug preview read Error.prototype.name (inspector probe)'
-      );
+    // (3) is WEAK and engine-dependent (it fires naturally on Android Chrome). It is
+    // recorded in `inspectorProbes` for telemetry but is deliberately NOT pushed into
+    // `reasons`, so it can never corroborate a stealth-plugin or CDP bot verdict.
+    // STRONG proof requires BOTH independent protocol observables (1) and (2).
+    // `cdpRuntimeLeak` is informational telemetry: the protocol hook alone is enough to
+    // record it. STRONG proof (`cdpRuntimeProof`) additionally requires the independent
+    // object-preview observable, and is the ONLY thing that may escalate a bot verdict.
+    cdpRuntimeLeak = prepareInvoked || objectPreviewReads > 0;
+    cdpRuntimeProof = prepareInvoked && objectPreviewReads > 0;
+    if (cdpRuntimeProof) {
+      reasons.push('CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked on console.debug)');
+    } else if (prepareInvoked) {
+      // The protocol hook fired but the second probe could not corroborate it — keep it
+      // informational. The `CDP Runtime.enable` prefix excludes it from patch artifacts.
+      reasons.push('CDP Runtime.enable serialization hook fired (uncorroborated)');
     }
   } catch (error) {
     inspectorProbes.inspectorProbeError = String(error);
@@ -2733,7 +2855,7 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
   const patchArtifacts = reasons.filter((reason) => !/^CDP Runtime\.enable/.test(reason));
   const stealthPluginDetected = definitive || patchArtifacts.length >= 2;
 
-  return { cdpRuntimeLeak, stealthPluginDetected, stealthReasons: reasons };
+  return { cdpRuntimeLeak, cdpRuntimeProof, stealthPluginDetected, stealthReasons: reasons };
 }
 
 const CDP_GLOBAL_KEY_PATTERN =
@@ -2841,7 +2963,7 @@ export function detectBotAndAutomation(
   const dockedDevToolsLayout = hasDockedDevToolsLayout();
   const developerTools = runtimeHost.environment === 'ide_webview' || dockedDevToolsLayout;
   const headlessShapedCdp =
-    stealth.cdpRuntimeLeak &&
+    stealth.cdpRuntimeProof &&
     human.score < 0.34 &&
     !privacyHardenedRuntime &&
     (zeroGeometry || emptyLanguages || softwareGpu);
@@ -2849,8 +2971,11 @@ export function detectBotAndAutomation(
   // A stealth runtime that hides `navigator.webdriver` behind a native-looking getter and
   // keeps a normal desktop UA previously earned a "Verified Human" verdict: static geometry
   // scored high even though nobody ever touched the page, and the live CDP bridge was weight
-  // 0. Now any CDP / runtime bridge, left uncorroborated by genuine trusted input after the
-  // dwell window, escalates to a bot. Electron / IDE / docked-DevTools hosts stay weight 0.
+  // 0. Now ONLY STRONG bridge proof — real automation binding globals, or a CDP Runtime.enable
+  // leak corroborated by a second independent protocol probe — left uncorroborated by genuine
+  // trusted input after the dwell window, escalates to a bot. Engine-dependent artifacts
+  // (webdriver getter descriptors, Error.prototype.name previews, cross-realm getter diffs)
+  // are explicitly NOT bridge proof. Electron / IDE / docked-DevTools hosts stay weight 0.
   // Privacy-hardened runtimes (Tor / RFP / Firefox / Safari / Brave) keep their exemption;
   // a software GPU is NOT bridge evidence (SwiftShader on its own remains exempt).
   const bridgeEvidence = collectCdpBridgeEvidence(stealth, ua);
@@ -2878,7 +3003,7 @@ export function detectBotAndAutomation(
     !privacyHardenedRuntime &&
     !exemptHost;
   const cdpEscalationReason =
-    'Stealth automation: CDP runtime bridge with webdriver getter tampering and no trusted human input after dwell';
+    'Stealth automation: corroborated CDP runtime bridge with no trusted human input after dwell';
 
   const isBot =
     webdriver ||

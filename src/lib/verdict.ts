@@ -67,13 +67,10 @@ const HARD_REASONS: ReadonlySet<string> = new Set([
   'page.ua.cursor',
   'page.platform.cloudflare-workers',
   'launch.ipc-flooding-switch',
-  'bot.webdriver-getter-tampered-cdp',
-  // Automation getter tampering, Playwright/CDC bindings and CDP-level tamper are all
-  // deterministic artifacts of a driven runtime. A plain CDP attachment stays in the
-  // developer_tools tier (see DEVELOPER_TOOLS_REASONS / the `cdp.` prefix rule); only a
-  // *tampered* CDP surface is hard evidence here.
-  'bot.webdriver-getter-tampered',
-  'bot.automation-getter-tampered',
+  // Real Playwright/CDC bindings and protocol-level CDP tamper are deterministic artifacts
+  // of a driven runtime. A plain CDP attachment stays in the developer_tools tier (see
+  // DEVELOPER_TOOLS_REASONS / the `cdp.` prefix rule); only a *corroborated* CDP bridge is
+  // hard evidence here.
   'bot.cdp-tampered',
   'bot.playwright-binding',
   'cdc.global.binding',
@@ -134,6 +131,11 @@ const WEAK_REASONS: ReadonlySet<string> = new Set([
   'bot.zero-geometry',
   'bot.rtt-zero',
   'bot.plugins-empty',
+  // Getter-descriptor / serialization artifacts are engine-dependent (they fire naturally
+  // on Android Chrome and other engines). They are never bridge proof or tampering proof.
+  'bot.webdriver-getter-tampered-cdp',
+  'bot.webdriver-getter-tampered',
+  'bot.automation-getter-tampered',
 ]);
 
 /** Prefix rules evaluated after the exact sets (first match wins). */

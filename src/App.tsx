@@ -591,12 +591,20 @@ function buildSignalRows(
         })
       );
 
-  // The exact edge/server verdict always wins over a coarse placeholder. `smartSignalToRow`
-  // already prints server `bot.status` + `bot.detail` verbatim; only generic statuses get the
-  // exact name appended so the "Bot & Automation Detection" card and the Bot tile agree.
+  // Mirror the server's canonical bot status verbatim. When the server explicitly says there is
+  // no bot, keep `Not detected` / `Verified Human` — never let a stale name replace it with a
+  // stealth label. `smartSignalToRow` already prints server statuses exactly; only a genuinely
+  // generic placeholder may be replaced by the exact agent name.
+  const serverBotStatus = (serverSignals?.bot?.status ?? '').trim().toLowerCase();
+  const serverSaysNoBot =
+    Boolean(serverSignals) &&
+    (/^(not detected|verified human|no bot|none|false|unknown|unavailable|n\/a)$/.test(
+      serverBotStatus
+    ) ||
+      /^not detected\b/.test(serverBotStatus));
   const name = exactBotName?.trim();
   const vagueName = /soft signals|low[- ]confidence|weak signals|heuristic|not detected/i.test(name || '');
-  if (name && !vagueName) {
+  if (name && !vagueName && !serverSaysNoBot) {
     const index = rows.findIndex((row) => row.key === 'bot' || row.title === 'Bot & Automation Detection');
     if (index >= 0) {
       const row = rows[index];
@@ -1070,32 +1078,52 @@ export default function App() {
   const rawGpuTooltip = data?.hardwareSignals
     ? `${data.hardwareSignals.gpuVendor} • ${data.hardwareSignals.gpuRenderer}`
     : '';
-  // Anti-spoof integrity. When tampering, an anti-detect browser, CDP / stealth artifacts or a
-  // high tampering-ML score are present, the cores / RAM / GPU numbers come from the very
-  // getters that were patched, so the dashboard tags them as unverified instead of facts.
+  // Anti-spoof integrity. A "Spoofed / Unverified" tag or a raw-attribute quarantine is only
+  // honest when the SERVER has authoritatively declared the session tampered. Stealth / bot
+  // artifacts are never enough on their own — a clean device must keep its real attributes.
   const tamperingMlScore = data?.securitySignals?.tamperingMlScore;
   // The single canonical envelope. Every panel and the Event JSON below read this object —
   // no client code recomputes a composite score, tier, verdict or quarantine decision.
   const canonical = useMemo(() => resolveCanonical(data), [data]);
+  // The server's canonical bot tile is authoritative for "is this a bot". When it explicitly
+  // reports no bot, stale bot_type / bot_info mirrors must never resurrect a stealth label in
+  // the banner, the cursor pill or the Event JSON.
+  const serverBotTile = data?.smartSignals?.bot ?? data?.securitySignals?.smartSignals?.bot ?? null;
+  const serverBotStatus = (serverBotTile?.status ?? '').trim().toLowerCase();
+  const serverSaysNoBot =
+    Boolean(serverBotTile) &&
+    (/^(not detected|verified human|no bot|none|false|unknown|unavailable|n\/a)$/.test(
+      serverBotStatus
+    ) ||
+      /^not detected\b/.test(serverBotStatus));
   // One server-authoritative automation label. The semantic bot_type (mirrored into the
   // canonical envelope) outranks any stale aiAgent / Gemini field, so the cursor pill, the
   // attribution banner and the Event JSON can never disagree or name a stealth session as a
   // signed cloud agent.
   // The edge verdict is a fallback for the bot_type before the API response lands.
-  const displayBotType =
-    data?.bot_type ?? initialVerdict?.botType ?? canonical.automation?.bot_type ?? null;
+  const displayBotType = serverSaysNoBot
+    ? null
+    : data?.bot_type ?? initialVerdict?.botType ?? canonical.automation?.bot_type ?? null;
   // Exact agent name from the Worker's edge verdict (or the server's own bot_info). Never a
   // stale aiAgent fallback — a verdict, once present, is authoritative for the name.
-  const exactBotName = initialVerdict?.name ?? data?.bot_info?.name ?? null;
+  const exactBotName = serverSaysNoBot
+    ? null
+    : initialVerdict?.name ?? data?.bot_info?.name ?? null;
   const automationDisplayLabel = resolveAutomationLabel(displayBotType);
-  const spoofedSpecs = Boolean(
+
+  // Quarantine gate: server-authoritative tampering AND explicit spoof evidence. Stealth /
+  // bot signals are deliberately excluded — they do not prove the JS getters were patched.
+  const smartTampering = (data?.smartSignals as { tampering?: boolean } | undefined)?.tampering;
+  const serverTampering =
+    typeof smartTampering === 'boolean' ? smartTampering : data?.tampering === true;
+  const explicitSpoofEvidence = Boolean(
     data?.tamperingDetails?.anti_detect_browser ||
       data?.tamperingDetails?.devtools_device_emulation ||
-      data?.securitySignals?.stealthPluginDetected ||
       (typeof tamperingMlScore === 'number' && tamperingMlScore >= 0.8) ||
       canonical.tampering?.anti_detect_browser ||
       canonical.tampering?.hard_spec_violation
   );
+  const spoofedSpecs = Boolean(serverTampering && explicitSpoofEvidence);
   const spoofedSpecTag = spoofedSpecs ? ' (Spoofed / Unverified)' : '';
 
   // A browser-vs-IP timezone gap is a NETWORK context signal, never a JS lie. Keep the raw
@@ -1226,7 +1254,7 @@ export default function App() {
   // 4-signal core grid model (null-safe: renders only inside the data block). Only the
   // server-computed grid is displayed; a legacy response gets explicit unavailable tiles.
   const serverSmartSignals = data?.smartSignals ?? data?.securitySignals?.smartSignals ?? null;
-  const signalRows = buildSignalRows(serverSmartSignals, data?.bot_info?.name ?? exactBotName);
+  const signalRows = buildSignalRows(serverSmartSignals, exactBotName);
 
   // User-visible risk stays on the 0-10 suspect-score scale. The normalizer converts any
   // legacy 0-100 mirror back to 0-10; the tier follows that same displayed score.
@@ -1604,8 +1632,13 @@ export default function App() {
           proxy_rotation: canonical.network?.proxy ? 'Detected' : 'Not detected',
           timezone_discrepancy: canonical.network?.timezone_mismatch ? 'Detected' : 'Not detected',
         },
-        software_renderer: swiftShader ? SWIFTSHADER_LABEL : null,
-        // Same server-canonical verdict the Virtual Machine tile shows.
+        // Mirror the server-canonical environment axes (client SwiftShader detection only
+        // backfills legacy responses without them), so this never disagrees with the VM tile.
+        software_renderer:
+          canonical.environment?.software_renderer || swiftShader ? SWIFTSHADER_LABEL : null,
+        // Same detail-free, server-resolved verdict the Virtual Machine tile shows. The raw
+        // smartSignals.vm.detail is deliberately not reproduced: when the status is masked /
+        // unavailable it can still claim a verified physical GPU and contradict the status.
         virtual_machine_label: vmVerdict.status,
       },
       // Tri-layer identity evidence from the server resolver + calibrated confidence v2.0.
@@ -1940,12 +1973,15 @@ export default function App() {
                   <div className="mt-2 flex items-center gap-1.5 flex-wrap">
                     {(() => {
                       // The exported Event JSON keeps confidence_score null until calibration passes.
-                      // Never render a fabricated percentage that the JSON cannot substantiate.
-                      const numeric = canonical?.confidenceScore ?? data.identification?.confidence?.score ?? null;
+                      // Never render a fabricated percentage the JSON cannot substantiate: the
+                      // raw identification.confidence.score mirror is deliberately NOT a fallback.
+                      // With no canonical score, show the categorical tier only.
+                      const numeric = canonical?.confidenceScore ?? null;
+                      const version = data.identification?.confidence?.version;
                       const label =
                         typeof numeric === 'number' && Number.isFinite(numeric)
-                          ? `Confidence ${(numeric * 100).toFixed(1)}% · v${
-                              data.identification.confidence.version
+                          ? `Confidence ${(numeric * 100).toFixed(1)}%${
+                              version ? ` · v${version}` : ''
                             }`
                           : `Confidence ${canonical?.confidenceTier ?? 'Unverified'}`;
                       return (

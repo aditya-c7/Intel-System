@@ -248,7 +248,12 @@ export function resolveVmVerdict(
     return {
       state: 'unknown',
       status: signalState === 'unknown' ? signalStatus : 'Unknown',
-      detail: signalDetail || label || undefined,
+      // An unavailable / masked environment has no positive detail. The server's raw VM
+      // detail can still claim an "Unmasked physical GPU & consistent OS platform verified"
+      // even after its own consistency pass rewrote the status to "GPU Masked / Unavailable".
+      // Printing it here would contradict the canonical virtual_machine_label (null) and
+      // software_renderer axes, so clear it while the status stays honestly unavailable.
+      detail: undefined,
     };
   }
 
@@ -267,8 +272,9 @@ export function resolveVmVerdict(
       detail: signalDetail || label || undefined,
     };
   }
-  // Server authority was present but inconclusive: report unknown, never a Yes/physical claim.
-  return { state: 'unknown', status: 'Unknown', detail: signalDetail || label || undefined };
+  // Server authority was present but inconclusive: report unknown, never a Yes/physical claim,
+  // and never attach a detail that would imply a confirmed (unavailable) environment.
+  return { state: 'unknown', status: 'Unknown', detail: undefined };
 }
 
 export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRowData[] {

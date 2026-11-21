@@ -317,11 +317,14 @@ function isKnownArchTranslation(silicon: ArchFamily, claimed: ArchFamily, ua: st
 /**
  * Combine all probes into one hardware-truth verdict.
  *
- * `archUaMismatch` / `osUaMismatch` are intentionally conservative: they only fire when
- * BOTH the silicon/host probe and the claim resolved to a known family that disagree,
- * and no legitimate translation layer explains the difference. The NaN sign-bit probe is
- * telemetry only and can never manufacture an architecture mismatch (live x86_64 audits
- * showed it reporting `arm`).
+ * `archUaMismatch` / `osUaMismatch` are intentionally conservative: architecture fires
+ * only when WebGL silicon disagrees with a STRONG two-source (sec-ch-ua-arch +
+ * navigator.platform) claim — a lone platform string is labelling-only, never proof — and
+ * OS fires only when two independent host probes agree, with no legitimate translation
+ * layer explaining the difference. This keeps a genuine Mali-G615 Android device (silicon
+ * 'arm', GPU family 'arm'/'unknown', NaN telemetry 'arm') out of both mismatch flags. The
+ * NaN sign-bit probe is telemetry only and can never manufacture an architecture mismatch
+ * (live x86_64 audits showed it reporting `arm`).
  */
 export function resolveHardwareTruth(input: HardwareTruthInput = {}): HardwareTruth {
   const nan = probeNanSignArch(); // TELEMETRY ONLY — never an architecture anchor.
@@ -348,6 +351,12 @@ export function resolveHardwareTruth(input: HardwareTruthInput = {}): HardwareTr
       : uaArchFamily !== 'unknown'
       ? uaArchFamily
       : platformArchFamily;
+  // A mismatch may only be asserted from a STRONG claim: sec-ch-ua-arch AND navigator.platform
+  // both known and agreeing. A lone platform string (often odd on genuine Android builds) or a
+  // lone UA-CH token is fine for labelling, but can never manufacture an arch mismatch against
+  // real silicon such as a Mali-G615 GPU (which reports 'arm' even when one claim says 'x86').
+  const hasStrongArchClaim =
+    uaArchFamily !== 'unknown' && platformArchFamily !== 'unknown' && uaArchFamily === platformArchFamily;
 
   // Architecture resolution — three trustworthy sources, strictly ranked:
   //   (a) a real WebGL silicon family (manufacturer GPU exposed), else
@@ -387,10 +396,12 @@ export function resolveHardwareTruth(input: HardwareTruthInput = {}): HardwareTr
     `${input.claimedBitness || ''} ${claimedArchitecture} ${input.claimedPlatform || ''}`
   );
   const gpuSignature = `${input.gpuVendor || ''} ${input.gpuRenderer || ''}`;
-  // A mismatch can only be asserted from corroborated hardware evidence. Platform-consensus
-  // resolution (software GPU) and the ignored NaN probe can NEVER create a mismatch.
+  // A mismatch can only be asserted from corroborated hardware evidence AND a strong,
+  // two-source UA-CH/platform consensus. Platform-consensus resolution (software GPU),
+  // a lone platform string and the ignored NaN probe can NEVER create a mismatch.
   const archUaMismatch =
     hardwareAnchored &&
+    hasStrongArchClaim &&
     claimedArchFamily !== 'unknown' &&
     silicon !== claimedArchFamily &&
     !isKnownArchTranslation(silicon, claimedArchFamily, input.userAgent || '', gpuSignature);
@@ -410,8 +421,13 @@ export function resolveHardwareTruth(input: HardwareTruthInput = {}): HardwareTr
   // with the independent graphics-backend hint before asserting a host OS; a disagreement
   // means "unknown", not "pick one". Software renderers leave the OS unknown.
   let resolvedHostOs: HostOsFamily = 'unknown';
+  // Only a two-probe agreement is strong enough to assert an OS mismatch. A single graphics
+  // hint (e.g. an Android WebGL string containing a Mesa/EGL token, or a software rasteriser)
+  // is left unverified so it can never manufacture an osUaMismatch against a real device.
+  let hostOsConfirmed = false;
   if (tanh.hostOs !== 'unknown' && gpuHostOs !== 'unknown' && tanh.hostOs === gpuHostOs) {
     resolvedHostOs = tanh.hostOs;
+    hostOsConfirmed = true;
     reasons.push(`Host OS ${resolvedHostOs} confirmed by independent math and graphics-backend probes`);
   } else if (tanh.hostOs !== 'unknown' && gpuHostOs !== 'unknown') {
     reasons.push(
@@ -427,6 +443,7 @@ export function resolveHardwareTruth(input: HardwareTruthInput = {}): HardwareTr
   }
 
   const osUaMismatch =
+    hostOsConfirmed &&
     resolvedHostOs !== 'unknown' &&
     claimedOsFamily !== 'unknown' &&
     resolvedHostOs !== claimedOsFamily;

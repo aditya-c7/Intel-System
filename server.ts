@@ -4488,6 +4488,8 @@ interface EnvelopeVerdict {
   replayDetected: boolean;
   requestIntegrityReason: string;
   requestNonce: string;
+  /** True only when the payload integrity hash actually verified for a signed envelope. */
+  signatureVerified: boolean;
 }
 
 function sha256HexLower(input: string): string {
@@ -4538,6 +4540,7 @@ function verifySecurityEnvelope(args: {
   const { envelope, headers, hardwareId, nowMs } = args;
   const reasons: string[] = [];
   let tamperedRequest = false;
+  let signatureVerified = false;
 
   const headerSignature = readRequestHeader(headers, 'x-intel-signature');
   const headerNonce = readRequestHeader(headers, 'x-intel-nonce');
@@ -4579,7 +4582,8 @@ function verifySecurityEnvelope(args: {
       envelopeScreenResolution,
       envelopeTimezone,
     ].join('|');
-    if (sha256HexLower(canonical) !== envSignature.toLowerCase()) {
+    signatureVerified = sha256HexLower(canonical) === envSignature.toLowerCase();
+    if (!signatureVerified) {
       tamperedRequest = true;
       reasons.push('Payload integrity hash mismatch');
     }
@@ -4641,6 +4645,7 @@ function verifySecurityEnvelope(args: {
     replayDetected,
     requestIntegrityReason: Array.from(new Set(reasons)).join('; '),
     requestNonce,
+    signatureVerified,
   };
 }
 
@@ -6292,6 +6297,8 @@ interface RequestIntegrityContext {
   botVerdict?: string;
   /** Automation-targeted tampering escalation resolved from reasons + botSignals. */
   automationTargetedTampering?: boolean;
+  /** Strong protocol-level CDP proof; weak Error-preview / getter artifacts never set this. */
+  strongCdpProof?: boolean;
   /** Corroborated CDP bridge escalation (CDP + stealth artifact, or no human corroboration). */
   corroboratedCdpEscalation?: boolean;
   /** True when the Tor verdict came from the operator-name fallback, not a DNS answer. */
@@ -6335,6 +6342,46 @@ function detectAutomationTargetedTampering(
 }
 
 /**
+ * STRONG CDP / automation-protocol proof — the only client evidence allowed to raise a CDP
+ * bridge from the weight-0 developer-tools axis to an automation verdict.
+ *
+ * Deliberately excluded as WEAK, engine-dependent artifacts that genuine browsers (notably
+ * Android Chrome / Jio / OnePlus) emit all the time:
+ *   - an `Error.prototype.name` preview read / `Runtime.enable` serialization leak
+ *   - a patched or non-native `navigator.webdriver` getter (privacy extensions do this)
+ *   - a substring match such as "cdp" inside an inspector error preview
+ *   - the free-text "webdriver getter tampering" corroboration string
+ * A runtime reporting only those stays human. Real proof is a protocol binding injected into
+ * the page (CDC / Playwright / Selenium / WebDriver globals), a confirmed cross-realm
+ * automation leak, or a protocol-level reason id from the weighted evidence gate.
+ */
+const STRONG_CDP_PROOF_REASON_PATTERN =
+  /^(?:navigator\.webdriver\b|cdc[._$]|\$cdc_|playwright[._]|puppeteer[._]|selenium[._]|webdriver[._]|cdp\.ua_override\.|bot\.playwright-binding)|\b(?:automation driver binding|CDP\/WebDriver binding exposed|automation globals|confirmed cross-realm automation identity leak)\b/i;
+
+function hasStrongCdpProof(
+  raw: Partial<SecuritySignals> | null | undefined,
+  extras: Record<string, unknown> = {}
+): boolean {
+  // `navigator.webdriver === true` is the WebDriver handshake itself, not a getter preview.
+  if (raw?.webdriver === true) return true;
+  const reasons: unknown[] = [
+    ...(Array.isArray(raw?.botSignals) ? raw.botSignals : []),
+    ...(Array.isArray(raw?.tamperReasons) ? raw.tamperReasons : []),
+    ...(Array.isArray(raw?.tamperingDetails?.reasons) ? raw.tamperingDetails.reasons : []),
+    ...(Array.isArray((raw?.tamperingDetails as { hardAutomationEvidence?: unknown } | null)
+      ?.hardAutomationEvidence)
+      ? (raw?.tamperingDetails as { hardAutomationEvidence: unknown[] }).hardAutomationEvidence
+      : []),
+    ...(Array.isArray(extras.hardAutomationEvidence) ? extras.hardAutomationEvidence : []),
+    ...(Array.isArray(extras.cdpBridgeEvidence) ? extras.cdpBridgeEvidence : []),
+  ];
+  return reasons.some(
+    (reason) =>
+      typeof reason === 'string' && STRONG_CDP_PROOF_REASON_PATTERN.test(reason.trim())
+  );
+}
+
+/**
  * Client-reported post-interaction human corroboration is a float in [0, 1] carried in the
  * sealed request's raw signals. Accept it only when finite; NaN / Infinity / out-of-range
  * values collapse to 0 so a malformed value can never manufacture a trusted human verdict.
@@ -6361,10 +6408,14 @@ interface CorroboratedCdpAssessment {
  * OR when there is no trusted post-interaction human-input evidence after dwell.
  *
  * Verified RFC 9421 agents are exempt (handled by the caller) and a genuinely docked DevTools
- * frontend with trusted interaction never escalates.
+ * frontend with trusted interaction never escalates. STRONG protocol-level CDP proof is now
+ * mandatory: Electron / IDE / docked hosts and ordinary mobile or desktop browsers stay at
+ * weight 0 unless a real binding/protocol artifact is present. Weak Error.name previews and
+ * webdriver-getter tampering strings alone can never escalate.
  */
 function assessCorroboratedCdp(args: {
   cdpBridge: boolean;
+  strongCdpProof: boolean;
   inspectorState: InspectorState;
   dockedWithHumanInteraction: boolean;
   stealthArtifact: boolean;
@@ -6375,6 +6426,7 @@ function assessCorroboratedCdp(args: {
   const reasons: string[] = [];
   if (
     !args.cdpBridge ||
+    !args.strongCdpProof ||
     args.signedAgentExempt ||
     args.dockedWithHumanInteraction
   ) {
@@ -6431,19 +6483,31 @@ export function assertBotVerdictParity(
  */
 function hasIndependentAutomationProof(
   raw: Partial<SecuritySignals> | null | undefined,
-  requestContext?: { tamperedRequest?: boolean; replayDetected?: boolean } | null
+  requestContext?: {
+    tamperedRequest?: boolean;
+    replayDetected?: boolean;
+    strongCdpProof?: boolean;
+  } | null
 ): boolean {
   const rawExtras = (raw ?? {}) as Record<string, unknown>;
+  const strongCdpProof = Boolean(
+    requestContext?.strongCdpProof ?? hasStrongCdpProof(raw, rawExtras)
+  );
   return Boolean(
-    raw?.stealthPluginDetected ||
+    (strongCdpProof &&
+      (raw?.stealthPluginDetected ||
+        raw?.cdpDetected ||
+        raw?.isBot ||
+        rawExtras.automationTargetedTampering ||
+        detectAutomationTargetedTampering(
+          rawExtras.tamperingReasons ?? raw?.tamperingDetails?.reasons,
+          raw?.botSignals
+        ).detected)) ||
       raw?.webdriver ||
-      raw?.cdpDetected ||
-      raw?.isBot ||
+      strongCdpProof ||
       raw?.canvasFarblingDetected ||
       raw?.replayDetected ||
       raw?.tamperedRequest ||
-      rawExtras.automationTargetedTampering ||
-      detectAutomationTargetedTampering(rawExtras.tamperingReasons ?? raw?.tamperingDetails?.reasons, raw?.botSignals).detected ||
       requestContext?.tamperedRequest ||
       requestContext?.replayDetected
   );
@@ -6455,6 +6519,7 @@ function isConfirmedTorRfpClient(
     clientTorBrowser?: boolean;
     tamperedRequest?: boolean;
     replayDetected?: boolean;
+    strongCdpProof?: boolean;
   } | null
 ): boolean {
   return (
@@ -6507,18 +6572,24 @@ function sanitizeAndReinforceSecuritySignals(
   const tamperingResponse = rfpExempt ? false : Boolean(raw?.tampering);
   const tamperingDetailsResponse = rfpExempt ? rfpExemptTamperingDetails(raw) : raw?.tamperingDetails;
 
-  // Bot / automation: client flags plus the server-side identity classification. `isBot` is
-  // the union of the explicit client verdict, the WebDriver handshake, the CDP (Chrome DevTools
-  // Protocol) runtime probe and any non-human subtype the request signature proves.
+  // Bot / automation: client flags plus the server-side identity classification. Only STRONG
+  // protocol-level CDP proof promotes a client's isBot / cdpDetected / stealth claims: a real
+  // Android Chrome session reports Error.name previews and getter quirks that must stay human.
+  const rawExtrasForProof = (raw ?? {}) as Record<string, unknown>;
+  const strongCdpProof = Boolean(
+    requestContext.strongCdpProof ?? hasStrongCdpProof(raw, rawExtrasForProof)
+  );
   const webdriver = Boolean(raw?.webdriver);
-  const cdpDetected = Boolean(raw?.cdpDetected);
+  const cdpDetected = strongCdpProof && Boolean(raw?.cdpDetected);
+  const verifiedIsBot = strongCdpProof && Boolean(raw?.isBot);
+  const verifiedStealthPlugin = strongCdpProof && Boolean(raw?.stealthPluginDetected);
   const isHeadless = Boolean(raw?.isHeadless);
   const rawBotReason =
     typeof raw?.botReason === 'string' && raw.botReason.trim()
       ? raw.botReason.trim().slice(0, 200)
       : '';
   const botSignals = safeStrArray(raw?.botSignals);
-  const clientAutomationDetected = Boolean(raw?.isBot || webdriver || cdpDetected);
+  const clientAutomationDetected = Boolean(verifiedIsBot || webdriver || cdpDetected);
 
   // Automation-targeted tampering (webdriver / playwright / CDC / patched CDP getters) is hard
   // proof of a hidden automation runtime. It is read from the tampering reasons AND the bot
@@ -6531,8 +6602,11 @@ function sanitizeAndReinforceSecuritySignals(
     ],
     botSignals
   );
-  const automationTargetedTampering =
-    Boolean(requestContext.automationTargetedTampering) || automationTampering.detected;
+  // Weak getter / Error-preview artifacts are telemetry only; they escalate only when genuine
+  // CDP protocol proof exists. A clean mobile browser reporting only those stays human.
+  const automationTargetedTampering = strongCdpProof && (
+    Boolean(requestContext.automationTargetedTampering) || automationTampering.detected
+  );
 
   // Hard automation artifacts — the exact same set classifyBotTraffic gates on. One source of
   // truth for the tile score, the composite, the echoed signals and the subtype escalation.
@@ -6554,7 +6628,7 @@ function sanitizeAndReinforceSecuritySignals(
       raw?.automationEnvironment === 'ide_webview'
   );
   const stealthAutomation = Boolean(
-    raw?.stealthPluginDetected ||
+    verifiedStealthPlugin ||
       antiDetectBrowser ||
       automationTargetedTampering ||
       requestContext.corroboratedCdpEscalation
@@ -6564,7 +6638,7 @@ function sanitizeAndReinforceSecuritySignals(
   // targeted tampering, a tampering model score, or a CDP bridge corroborated by a stealth
   // artifact / an absence of trusted human input justify the critical 9/10 tier.
   const activeDeception = Boolean(
-    raw?.stealthPluginDetected ||
+    verifiedStealthPlugin ||
       antiDetectBrowser ||
       automationTargetedTampering ||
       requestContext.corroboratedCdpEscalation
@@ -6575,10 +6649,10 @@ function sanitizeAndReinforceSecuritySignals(
       `Automation-targeted tampering (${automationTampering.reasons.slice(0, 2).join('; ') || 'webdriver / playwright / CDC / CDP getter wrappers'})`
     );
   }
-  if (raw?.cdpRuntimeLeak) {
+  if (strongCdpProof && raw?.cdpRuntimeLeak) {
     hardAutomationReasons.push('CDP Runtime.enable serialization leak');
   }
-  if (raw?.stealthPluginDetected) {
+  if (verifiedStealthPlugin) {
     hardAutomationReasons.push('Stealth plugin artifacts (non-native getters / iframe leak)');
   }
   if (antiDetectBrowser) {
@@ -6605,7 +6679,7 @@ function sanitizeAndReinforceSecuritySignals(
         cdpDetected,
         botSignals,
         cdpRuntimeLeak: Boolean(raw?.cdpRuntimeLeak),
-        stealthPluginDetected: Boolean(raw?.stealthPluginDetected),
+        stealthPluginDetected: verifiedStealthPlugin,
         developerTools: developerToolsAttached,
         automationEnvironment: raw?.automationEnvironment,
         humanCorroboration: raw?.humanCorroboration,
@@ -7561,7 +7635,7 @@ function sanitizeAndReinforceSecuritySignals(
       cdpDetected,
       // Protocol-level and stealth-plugin evidence reaches the payload, the grid and the JSON.
       cdpRuntimeLeak: Boolean(raw?.cdpRuntimeLeak),
-      stealthPluginDetected: Boolean(raw?.stealthPluginDetected),
+      stealthPluginDetected: verifiedStealthPlugin,
       automationTargetedTampering,
       automationTamperingReasons: automationTampering.reasons,
       // The single source of truth for `vpn_methods`: the UI derives its count from this object.
@@ -8536,11 +8610,21 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     // a bare client flag without a valid envelope is capped low so it cannot manufacture human
     // corroboration. This same trusted value feeds the canonical envelope and the CDP gate.
     const rawSignalExtras = (rawSecuritySignals || {}) as Record<string, unknown>;
+    // New clients post interaction evidence / inspector probes at the top level; older clients
+    // nest them inside securitySignals. Merge both so genuine interaction is never invisible.
+    const topLevelExtras = requestBody as unknown as Record<string, unknown>;
+    const clientExtras: Record<string, unknown> = { ...topLevelExtras, ...rawSignalExtras };
     const claimedHumanCorroboration = clampHumanCorroboration(
-      rawSecuritySignals?.humanCorroboration ?? rawSignalExtras.humanCorroboration
+      rawSecuritySignals?.humanCorroboration ??
+        rawSignalExtras.humanCorroboration ??
+        topLevelExtras.humanCorroboration
     );
+    // Trust the client number only behind an actually verified, clean envelope. A valid signed
+    // envelope with real interaction can still earn human_corroboration 1 below; a bare client
+    // flag is capped low and automated / tampered sessions stay 0 via decideVerdictTier.
     const envelopeSignedAndClean = Boolean(
       requestBody.securityEnvelope &&
+        envelopeVerdict.signatureVerified &&
         envelopeVerdict.requestNonce &&
         !envelopeVerdict.tamperedRequest &&
         !envelopeVerdict.replayDetected
@@ -8548,45 +8632,28 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     const trustedHumanCorroboration = envelopeSignedAndClean
       ? claimedHumanCorroboration
       : Math.min(claimedHumanCorroboration, 0.2);
-    const earlyInteractionEvidence = Array.isArray(rawSignalExtras.interactionEvidence)
-      ? (rawSignalExtras.interactionEvidence as unknown[]).filter(
+    const earlyInteractionEvidence = Array.isArray(clientExtras.interactionEvidence)
+      ? (clientExtras.interactionEvidence as unknown[]).filter(
           (item): item is string => typeof item === 'string' && item.trim().length > 0
         ).length
       : 0;
     const hasTrustedInteractionEvidence =
       envelopeSignedAndClean && earlyInteractionEvidence > 0;
 
-    // Inspector / CDP bridge resolved early so the corroborated-CDP escalation can feed the
-    // single hard-automation gate below. `classifyInspectorState` is the same helper used for
-    // the envelope telemetry later in this handler, so both surfaces agree.
-    const earlyInspectorProbes =
-      rawSignalExtras.inspectorProbes && typeof rawSignalExtras.inspectorProbes === 'object'
-        ? (rawSignalExtras.inspectorProbes as Record<string, unknown>)
-        : null;
-    const inspectorProbeCdpEvidence = Boolean(
-      earlyInspectorProbes &&
-        (Object.keys(earlyInspectorProbes).some((key) =>
-          /cdp|devtools|debugger|automation[_ -]?protocol/i.test(key)
-        ) ||
-          Object.values(earlyInspectorProbes).some(
-            (value) =>
-              typeof value === 'string' && /cdp|devtools|debugger|automation[_ -]?protocol/i.test(value)
-          ))
-    );
-    const cdpAttachedRaw = Boolean(
-      rawSecuritySignals?.cdpDetected ||
-        rawSecuritySignals?.cdpRuntimeLeak ||
-        inspectorProbeCdpEvidence
-    );
+    // STRONG protocol-level CDP proof is the only path to `cdp_attached` / CDP escalation.
+    // Error.name preview reads, a `cdpRuntimeLeak`, a patched webdriver getter or a substring
+    // match inside an inspector probe preview are weak, engine-dependent mobile artifacts: they
+    // are developer-tools telemetry and MUST NOT attach CDP or brand a real phone as automation.
+    const strongCdpProof = hasStrongCdpProof(rawSecuritySignals, clientExtras);
     const earlyInspectorState = classifyInspectorState({
-      cdpAttached: cdpAttachedRaw,
-      devtoolsActiveVerified: Boolean(rawSignalExtras.devtoolsActiveVerified),
-      viewportContractionNormalized: Boolean(rawSignalExtras.viewportContractionNormalized),
+      cdpAttached: strongCdpProof,
+      devtoolsActiveVerified: Boolean(clientExtras.devtoolsActiveVerified),
+      viewportContractionNormalized: Boolean(clientExtras.viewportContractionNormalized),
     });
-    const cdpBridge = cdpAttachedRaw || earlyInspectorState === 'automation_protocol_attached';
+    const cdpBridge = strongCdpProof;
     const dockedWithHumanInteraction = Boolean(
       rawSecuritySignals?.developerTools ||
-        rawSignalExtras.devtoolsActiveVerified ||
+        clientExtras.devtoolsActiveVerified ||
         rawSecuritySignals?.automationEnvironment === 'electron' ||
         rawSecuritySignals?.automationEnvironment === 'ide_webview' ||
         earlyInspectorState === 'devtools_docked_suspected' ||
@@ -8625,7 +8692,12 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     // bot_info / bot_type / history verdict) and the sanitizer's per-tile escalation. Omitting
     // them here used to leave the final classification as "Verified Human" even when the bot
     // tile was escalated — the two paths now read the exact same client fields.
-    const rfpExemptRequest = isConfirmedTorRfpClient(rawSecuritySignals);
+    const rfpExemptRequest = isConfirmedTorRfpClient(rawSecuritySignals, {
+      clientTorBrowser: Boolean(rawSecuritySignals?.isTorBrowserClient),
+      tamperedRequest: envelopeVerdict.tamperedRequest,
+      replayDetected: envelopeVerdict.replayDetected,
+      strongCdpProof,
+    });
     // Developer-tools evidence is a separate axis from automation (Fingerprint Pro parity).
     const developerToolsSignals = Boolean(
       rawSecuritySignals?.developerTools ||
@@ -8643,17 +8715,21 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       ],
       rawSecuritySignals?.botSignals
     );
-    const automationTargetedTampering =
+    // Weak webdriver-getter / Error-preview strings are NOT hard automation proof on their own;
+    // they only accompany a genuine protocol-level CDP binding. A clean phone reporting just
+    // those artifacts must stay human.
+    const automationTargetedTampering = strongCdpProof && (
       handlerAutomationTampering.detected ||
       Boolean(
         (rawSecuritySignals as (Partial<SecuritySignals> & { automationTargetedTampering?: boolean }) | null)
           ?.automationTargetedTampering
-      );
+      )
+    );
     let hardAutomationSignals =
       (!rfpExemptRequest || automationTargetedTampering) &&
       Boolean(
         automationTargetedTampering ||
-          rawSecuritySignals?.stealthPluginDetected ||
+          (strongCdpProof && rawSecuritySignals?.stealthPluginDetected) ||
           rawSecuritySignals?.tamperingDetails?.anti_detect_browser
       );
     // Verify Web Bot Auth once, against the ORIGINAL public authority. Workers rewrites the
@@ -8706,16 +8782,17 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
 
     // Corroborated CDP escalation. A CDP bridge alone (Runtime leak / inspector probe) is
     // developer-tools evidence with ZERO automation weight, so docked Electron / IDE sessions
-    // with genuine interaction stay human. It becomes automation only alongside a stealth
-    // artifact or an absence of trusted post-interaction human corroboration. Verified RFC 9421
-    // agents are exempt and keep their real attribution.
+    // with genuine interaction stay human. Real mobile / desktop browsers stay human unless
+    // STRONG CDP protocol proof exists; only then do stealth artifacts or an absence of trusted
+    // post-interaction corroboration promote the bridge. Verified RFC 9421 agents are exempt.
     const corroboratedCdp = assessCorroboratedCdp({
       cdpBridge,
+      strongCdpProof,
       inspectorState: earlyInspectorState,
       dockedWithHumanInteraction,
       stealthArtifact: Boolean(
         automationTargetedTampering ||
-          rawSecuritySignals?.stealthPluginDetected ||
+          (strongCdpProof && rawSecuritySignals?.stealthPluginDetected) ||
           (!rfpExemptRequest && rawSecuritySignals?.tamperingDetails?.anti_detect_browser)
       ),
       trustedHumanCorroboration,
@@ -8731,18 +8808,18 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       { org: location.org, isp: location.isp, asn: location.asn },
       {
         isBot: Boolean(
-          rawSecuritySignals?.isBot ||
+          (strongCdpProof && rawSecuritySignals?.isBot) ||
             rawSecuritySignals?.webdriver ||
-            rawSecuritySignals?.cdpDetected
+            (strongCdpProof && rawSecuritySignals?.cdpDetected)
         ),
         isHeadless: Boolean(rawSecuritySignals?.isHeadless),
         webdriver: Boolean(rawSecuritySignals?.webdriver),
-        cdpDetected: Boolean(rawSecuritySignals?.cdpDetected),
+        cdpDetected: strongCdpProof && Boolean(rawSecuritySignals?.cdpDetected),
         botSignals: Array.isArray(rawSecuritySignals?.botSignals)
           ? rawSecuritySignals.botSignals
           : [],
         cdpRuntimeLeak: Boolean(rawSecuritySignals?.cdpRuntimeLeak),
-        stealthPluginDetected: Boolean(rawSecuritySignals?.stealthPluginDetected),
+        stealthPluginDetected: strongCdpProof && Boolean(rawSecuritySignals?.stealthPluginDetected),
         developerTools: developerToolsSignals,
         automationEnvironment: rawSecuritySignals?.automationEnvironment,
         humanCorroboration: rawSecuritySignals?.humanCorroboration,
@@ -8832,10 +8909,10 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       network: { isp: location.isp, org: location.org, asn: location.asn },
       publicIp: location.publicIp,
       client: {
-        isBot: Boolean(rawSecuritySignals?.isBot),
+        isBot: strongCdpProof && Boolean(rawSecuritySignals?.isBot),
         isHeadless: Boolean(rawSecuritySignals?.isHeadless),
         webdriver: Boolean(rawSecuritySignals?.webdriver),
-        cdpDetected: Boolean(rawSecuritySignals?.cdpDetected),
+        cdpDetected: strongCdpProof && Boolean(rawSecuritySignals?.cdpDetected),
         isVirtualMachine: Boolean(rawSecuritySignals?.isVirtualMachine),
         gpuVendor: hardwareSignals.gpuVendor,
         gpuRenderer: hardwareSignals.gpuRenderer,
@@ -8980,6 +9057,7 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         ipBlocklistReasons: blocklist.reasons,
         botClassification: effectiveBotClassification,
         automationTargetedTampering,
+        strongCdpProof,
         corroboratedCdpEscalation: corroboratedCdp.escalate,
       }
     );
@@ -9735,11 +9813,11 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     /* ------------------------------------------------------------------ */
     const eventId = safePageLoadId;
     const collectorInspectorProbes =
-      rawExtras.inspectorProbes && typeof rawExtras.inspectorProbes === 'object'
-        ? (rawExtras.inspectorProbes as Record<string, unknown>)
+      clientExtras.inspectorProbes && typeof clientExtras.inspectorProbes === 'object'
+        ? (clientExtras.inspectorProbes as Record<string, unknown>)
         : {};
-    const collectorInteractionEvidence = Array.isArray(rawExtras.interactionEvidence)
-      ? (rawExtras.interactionEvidence as unknown[])
+    const collectorInteractionEvidence = Array.isArray(clientExtras.interactionEvidence)
+      ? (clientExtras.interactionEvidence as unknown[])
           .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
           .map((item) => item.trim().slice(0, 160))
           .slice(0, 24)
@@ -9774,13 +9852,16 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         : securitySignals.botSubtype === 'human' || botVerdict === 'not_detected'
         ? 'human'
         : 'uncertain';
-    // Human corroboration now comes from the client's post-interaction signal (clamped, finite
-    // and envelope-gated above) rather than being pinned at 0 for everyone. decideVerdictTier
-    // still forces 0 on every automated / tampered session, so a bot cannot inherit it.
+    // Human corroboration comes only from an envelope-backed client signal OR real recorded
+    // interaction on that signed session — a clean person is never pinned at 0 merely because
+    // the numeric score landed under 0.5. decideVerdictTier still forces 0 on every automated /
+    // tampered session, so a bot inherits nothing.
+    const humanCorroborationClaim: 0 | 1 =
+      trustedHumanCorroboration >= 0.5 || hasTrustedInteractionEvidence ? 1 : 0;
     const verdictState = decideVerdictTier({
       automation: automationVerdict as 'human' | 'uncertain' | 'automated',
       tamperingDetected: reconciledTampering.detected || Boolean(securitySignals.tamperedRequest),
-      humanCorroboration: (trustedHumanCorroboration >= 0.5 ? 1 : 0) as 0 | 1,
+      humanCorroboration: humanCorroborationClaim,
       hasInteractionEvidence:
         collectorInteractionEvidence.length > 0 || trustedHumanCorroboration >= 0.5,
     });

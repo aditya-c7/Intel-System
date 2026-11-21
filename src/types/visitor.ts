@@ -45,7 +45,7 @@ export interface HardwareSignals {
   colorGamut: 'P3' | 'sRGB' | 'Rec2020';
   architecture: string;
   /* --- Silicon-grounded truth (additive, optional — older payloads stay valid) ------- */
-  /** How `architecture` was determined: 'webgl-silicon' | 'nan-sign-bit' | 'unavailable'. */
+  /** How `architecture` was determined: 'webgl-silicon' | 'platform-consensus' | 'ua-ch-consensus'. */
   architectureSource?: string;
   /** The UA/UA-CH architecture claim kept beside the silicon truth. */
   claimedArchitecture?: string;
@@ -362,6 +362,11 @@ export interface SecuritySignals {
     anti_detect_browser: boolean;
     devtools_device_emulation: boolean;
     reasons: string[];
+    /** True when the runtime is a confirmed privacy-hardened browser (RFP/FPP/ATFP). */
+    privacy_hardened?: boolean;
+    /** Strongly-corroborated CDP/Playwright/CDC artifacts promoted to the bot gate. Weak,
+     * engine-dependent artifacts never appear here on their own. */
+    hardAutomationEvidence?: string[];
   };
   developerTools?: boolean;
 
@@ -540,6 +545,11 @@ export interface IntelVisitorResponse {
     anti_detect_browser: boolean;
     devtools_device_emulation: boolean;
     reasons: string[];
+    /** True when the runtime is a confirmed privacy-hardened browser (RFP/FPP/ATFP). */
+    privacy_hardened?: boolean;
+    /** Strongly-corroborated CDP/Playwright/CDC artifacts promoted to the bot gate. Weak,
+     * engine-dependent artifacts never appear here on their own. */
+    hardAutomationEvidence?: string[];
   };
   activeCall?: boolean;
   activeCallSupported?: boolean;
