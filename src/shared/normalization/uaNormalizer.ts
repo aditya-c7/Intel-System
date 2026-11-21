@@ -303,12 +303,22 @@ interface BrowserSpec {
 }
 
 /**
- * Brand priority (highest first). Firefox/Safari sit last because they do not
- * send UA-CH and are only detectable from the UA string. 'Cursor' and
- * 'Manus-User' are AI-agent Chromium forks detected from their UA tokens —
+ * Brand priority (highest first). Electron is handled first: it is a distinct runtime and
+ * its `Electron/<version>` UA token outranks the embedded Chromium engine brand. Firefox/
+ * Safari sit last because they do not send UA-CH and are only detectable from the UA string.
+ * 'Cursor' and 'Manus-User' are AI-agent Chromium forks detected from their UA tokens —
  * they are listed first in the UA regex fallback chain (per spec ordering).
  */
 const BROWSER_SPECS: BrowserSpec[] = [
+  {
+    // Electron is a distinct binary/runtime (it embeds Chromium), not the engine version.
+    // Its UA carries `Electron/<version>` alongside `Chrome/<version>`; the Electron token
+    // must win over the generic Chromium/Chrome tokens so an Electron 44.9.1 session is
+    // labelled `Electron 44.9.1` instead of the embedded `Chromium 152`.
+    name: 'Electron',
+    brands: ['electron'],
+    uaTokens: [/Electron\/([\d.]+)/i],
+  },
   {
     name: 'Cursor',
     brands: ['cursor'],
@@ -381,6 +391,7 @@ function firstMatch(token: RegExp, ua: string): string | null {
  * browsers. This ordering is independent of the UA-regex chain below.
  */
 const BRAND_PRECEDENCE: readonly string[] = [
+  'Electron',
   'Headless Chrome',
   'Microsoft Edge',
   'Brave',
@@ -463,6 +474,17 @@ function resolveBrowser(
   secCh: SecChHints,
 ): BrowserResolution {
   const empty: BrowserResolution = { name: 'Unknown', full: '', major: '' };
+
+  /* A genuine Electron runtime always carries the `Electron/<version>` UA token. Electron
+   * is the binary/runtime, not the Chromium engine version it happens to embed, so an
+   * Electron 44.9.1 session must be labelled `Electron 44.9.1` — never `Chromium 152`.
+   * This token is checked FIRST because UA-CH brand lists only describe the embedded
+   * engine (and would otherwise be selected ahead of the UA token below). Non-Electron
+   * clients keep the existing UA-CH Chromium version resolution unchanged. */
+  const electronVersion = firstMatch(/Electron\/([\d.]+)/i, ua);
+  if (electronVersion) {
+    return { name: 'Electron', full: electronVersion, major: majorOf(electronVersion) };
+  }
 
   const uadBrands = filterBrands((uad?.fullVersionList ?? []).filter((b) => !!b));
   const candidates: Array<{ brands: BrandEntry[]; source: 'uad' | 'secch' }> = [];
@@ -863,9 +885,10 @@ const BLANK_IDENTITY: NormalizedIdentity = {
 /**
  * Normalizes UA / client hints into the shared identity shape. Never throws.
  * Source priority: uaData.fullVersionList + platformVersion → secCh headers →
- * UA regexes; brand priority: Edge → Opera → Brave → Samsung Internet →
+ * UA regexes; brand priority: Electron → Edge → Opera → Brave → Samsung Internet →
  * Headless Chrome → Google Chrome → Chromium → Firefox → Safari (plus the
- * Cursor / Manus agent tokens in the UA fallback chain).
+ * Cursor / Manus agent tokens in the UA fallback chain). A genuine `Electron/<version>`
+ * UA token is always resolved to `Electron` before any UA-CH brand is considered.
  */
 export function normalizeIdentity(input: NormalizeIdentityInput): NormalizedIdentity {
   try {

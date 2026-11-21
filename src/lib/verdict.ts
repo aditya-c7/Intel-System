@@ -21,7 +21,8 @@
  * only produces an "automated" verdict when the evidence is corroborated:
  *
  *   hard   — sufficient on its own (CDP runtime/network bindings,
- *            navigator.webdriver, automation user agents, launch switches)
+ *            navigator.webdriver, automation user agents, launch switches, and a
+ *            CDP bridge left uncorroborated by human input after the dwell window)
  *   medium — meaningful only in pairs, or paired with any weak reason
  *   weak   — never sufficient alone; kept for telemetry/attribution only
  */
@@ -30,6 +31,19 @@ import type { VerdictTier } from './telemetryContract';
 
 export type ReasonWeight = 'hard' | 'medium' | 'weak' | 'developer_tools';
 
+/**
+ * reason id emitted ONLY when a CDP / runtime bridge is present AND no genuine, trusted
+ * human input was recorded after the corroboration dwell window. A bare CDP attachment
+ * stays in the weight-0 `developer_tools` tier (Electron / IDE / docked DevTools with a
+ * real person driving); this id is the single hard-escalation path for the adversarial
+ * case where stealth tooling hides `navigator.webdriver` behind a native-looking getter
+ * and uses a normal desktop UA. The server escalates the matching bot signal to
+ * `bad` / `stealth_automation`.
+ */
+export const CORROBORATED_CDP_REASON_ID = 'bot.stealth-automation-uncorroborated';
+/** Chromium-flavoured alias retained for parity with the server's `chromium_automation`. */
+export const CORROBORATED_CHROMIUM_CDP_REASON_ID = 'bot.chromium-automation-uncorroborated';
+
 export type AutomationVerdict = 'human' | 'uncertain' | 'automated';
 
 export interface GatedAutomationEvidence {
@@ -37,7 +51,10 @@ export interface GatedAutomationEvidence {
   hardReasons: string[];
   mediumReasons: string[];
   weakReasons: string[];
-  /** CDP / DevTools bridge evidence — reported separately, never flips the verdict. */
+  /**
+   * CDP / DevTools bridge evidence — reported separately and weight 0. It never flips the
+   * verdict on its own; only the explicit, corroborated escalation reason ids above do.
+   */
   developerToolsReasons: string[];
 }
 
@@ -60,6 +77,10 @@ const HARD_REASONS: ReadonlySet<string> = new Set([
   'bot.cdp-tampered',
   'bot.playwright-binding',
   'cdc.global.binding',
+  // Corroborated CDP escalation: a runtime bridge with NO trusted human input after the
+  // dwell window. Exact ids win over the generic weak `bot.` prefix rule below.
+  CORROBORATED_CDP_REASON_ID,
+  CORROBORATED_CHROMIUM_CDP_REASON_ID,
 ]);
 
 /**

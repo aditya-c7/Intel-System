@@ -22,6 +22,8 @@
  * Privacy hardening (Tor RFP, Firefox FPP, Brave shields, Safari 26 ATFP) is never granted
  * from a UA token alone: a Gecko-only or JavaScriptCore-only claim executing on Chromium's
  * V8 engine is a UA spoof and is flagged as tampering instead of earning an exemption.
+ * Likewise, an injected `window.chrome` on a non-Chromium UA/engine is flagged, while a
+ * genuine Electron / Chromium runtime with its real chrome object is not.
  */
 
 export type TamperingConfidence = 'low' | 'medium' | 'high';
@@ -118,7 +120,7 @@ function detectAutomationTamper(): string[] {
   return evidence;
 }
 
-function detectEngine(): { evalLen: number; isV8: boolean } {
+function detectEngine(): { evalLen: number; isV8: boolean; hasChrome: boolean; isWebKit: boolean } {
   let evalLen = 0;
   try {
     // eslint-disable-next-line no-eval
@@ -127,20 +129,28 @@ function detectEngine(): { evalLen: number; isV8: boolean } {
     evalLen = 0;
   }
   let isV8 = evalLen === 33;
+  let hasChrome = false;
+  let isWebKit = false;
   try {
     const scope = window as unknown as Record<string, unknown>;
+    hasChrome = 'chrome' in scope;
     // A WebKit-only binding is decisive JavaScriptCore evidence and vetoes V8: Safari also
     // exposes the ambiguous `webkitPersistentStorage` prefix, so that token must never be
     // used to assert Chromium (it would misclassify genuine Safari ATFP as a UA spoof).
     if (typeof scope.webkitConvertPointFromNodeToPage === 'function') {
+      isWebKit = true;
       isV8 = false;
-    } else if ('chrome' in scope) {
+    } else if (hasChrome) {
+      // Legacy V8-positive assertion. `window.chrome` alone is NOT proof of a genuine
+      // Chromium engine (it can be injected): the separate chrome-injection rule below
+      // uses the eval signature (`evalLen`) so a forged chrome object on a non-V8 engine
+      // is still flagged as tampering.
       isV8 = true;
     }
   } catch {
     // Engine probes unavailable (SSR / sandboxed frame): keep the eval-length verdict.
   }
-  return { evalLen, isV8 };
+  return { evalLen, isV8, hasChrome, isWebKit };
 }
 
 /** True when a `Navigator` getter on the prototype OR the instance was replaced by a spoof. */
@@ -254,6 +264,22 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     reasons.push('Safari UA on Chromium V8 engine — not a genuine JavaScriptCore/ATFP profile');
     antiDetect = true;
     anomalyPoints += 55;
+  }
+
+  // An injected `window.chrome` surface on a browser that neither claims a Chromium-family
+  // UA nor runs V8 natively is a forged browser artifact. Genuine Electron (which carries
+  // `Electron/<version>` alongside `Chrome/<version>`) and real Chromium browsers expose
+  // `window.chrome` naturally, so a genuine Electron session is never flagged here.
+  const claimsChromiumFamily =
+    /Chrome\/|Chromium\/|CriOS\/|HeadlessChrome|Edg[AE]?\/|OPR\/|Electron\//i.test(ua);
+  const nativeV8 = engine.evalLen === 33 && !engine.isWebKit;
+  // Both halves must be non-Chromium: a genuine Electron/Chromium runtime has a Chromium UA
+  // (so the first term is false) and its real chrome object is therefore never flagged.
+  if (engine.hasChrome && !claimsChromiumFamily && !nativeV8) {
+    privacyHardened = false;
+    antiDetect = true;
+    anomalyPoints += 55;
+    reasons.push('window.chrome injected on a non-Chromium user-agent / engine');
   }
 
   // Confirmed privacy hardening (Tor/RFP, Firefox FPP, Brave shields, Safari 26 ATFP) is

@@ -617,10 +617,12 @@ const REGISTRY_LITERAL = [
   },
   {
     // Unsigned UA claim only: no ASN / network corroboration is assumed for xAI traffic.
-    // The GrokBot token is version-anchored: the reported xAI crawler string is
-    // `Mozilla/5.0 (compatible; GrokBot/1.0; +x.ai/)`. A bare `GrokBot` substring is
-    // deliberately NOT accepted — it false-positives on third-party UAs such as
-    // `news-tracker/1.0 (...mail.grokbot.com)` and `GrokBot-ArticleSaver/1.0`.
+    // The GrokBot token is VERSION-ANCHORED: the reported xAI crawler string is
+    // `Mozilla/5.0 (compatible; GrokBot/1.0; +x.ai/)`. The regex requires `GrokBot/` followed
+    // by a numeric version, so a bare `GrokBot` substring is deliberately NOT accepted.
+    // Verified: `/\bGrokBot\/\d+(?:\.\d+)*\b/i` does NOT match `mail.grokbot.com` (there is
+    // no `GrokBot/<digit>` token there — `grokbot.` is followed by a domain, not a slash),
+    // nor `GrokBot-ArticleSaver/1.0` (hyphen, not slash). Only an explicit crawler token wins.
     id: 'grok_bot',
     provider: 'xAI',
     displayName: 'Grok Bot',
@@ -628,7 +630,9 @@ const REGISTRY_LITERAL = [
     bucket: 'grok',
     rank: 815,
     which: ['robodex'],
-    ua: { patterns: [/\bGrokBot\/\d/i, /\bxAI-GrokBot\b/i, /\bxAI-Bot\b/i, /GrokAgent/i] },
+    ua: {
+      patterns: [/\bGrokBot\/\d+(?:\.\d+)*\b/i, /\bxAI-GrokBot\b/i, /\bxAI-Bot\b/i, /GrokAgent/i],
+    },
     minProofForVerified: 'ua_claim',
     executionMode: 'Cloud Browser Agent',
   },
@@ -883,6 +887,24 @@ function identityFor(agent: AgentDef): 'verified' | 'signed' | 'unknown' {
   }
 }
 
+/**
+ * Brands that are routinely impersonated by a bare User-Agent token. A static catalog can
+ * never grant these `verified` from a UA claim alone: real proof (official CIDR, FCrDNS or
+ * Web Bot Auth) is resolved per request by the caller. Holding them at `identity:'unknown'`
+ * in the derived directory guarantees a UA-only `GPTBot/…`, `Googlebot/…`,
+ * `BedrockAgentCore/…`, … cannot surface as a verified identity — even when the request
+ * happens to originate from the operator's ASN (which names the network, not the product).
+ */
+const UA_IMPERSONABLE_AGENT_IDS = new Set([
+  'gptbot',
+  'claude_bot',
+  'bedrock_agentcore',
+  'googlebot',
+  'chatgpt_user',
+  'perplexity_bot',
+  'ccbot',
+]);
+
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -899,7 +921,8 @@ export const BOT_DIRECTORY: BotDirectoryViewEntry[] = AGENT_REGISTRY.filter((age
     name: agent.displayName,
     provider: agent.provider,
     category: agent.category,
-    identity: identityFor(agent),
+    // UA-impersonable brands never carry a pre-granted "verified" catalog identity.
+    identity: UA_IMPERSONABLE_AGENT_IDS.has(agent.id) ? 'unknown' : identityFor(agent),
     uaPatterns: agent.ua ? [...agent.ua.patterns] : undefined,
     asnNumbers: agent.asns ? [...agent.asns] : undefined,
     asnPatterns: agent.asnPatterns ? [...agent.asnPatterns] : undefined,

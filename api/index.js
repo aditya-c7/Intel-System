@@ -1120,10 +1120,12 @@ var REGISTRY_LITERAL = [
   },
   {
     // Unsigned UA claim only: no ASN / network corroboration is assumed for xAI traffic.
-    // The GrokBot token is version-anchored: the reported xAI crawler string is
-    // `Mozilla/5.0 (compatible; GrokBot/1.0; +x.ai/)`. A bare `GrokBot` substring is
-    // deliberately NOT accepted — it false-positives on third-party UAs such as
-    // `news-tracker/1.0 (...mail.grokbot.com)` and `GrokBot-ArticleSaver/1.0`.
+    // The GrokBot token is VERSION-ANCHORED: the reported xAI crawler string is
+    // `Mozilla/5.0 (compatible; GrokBot/1.0; +x.ai/)`. The regex requires `GrokBot/` followed
+    // by a numeric version, so a bare `GrokBot` substring is deliberately NOT accepted.
+    // Verified: `/\bGrokBot\/\d+(?:\.\d+)*\b/i` does NOT match `mail.grokbot.com` (there is
+    // no `GrokBot/<digit>` token there — `grokbot.` is followed by a domain, not a slash),
+    // nor `GrokBot-ArticleSaver/1.0` (hyphen, not slash). Only an explicit crawler token wins.
     id: "grok_bot",
     provider: "xAI",
     displayName: "Grok Bot",
@@ -1131,7 +1133,9 @@ var REGISTRY_LITERAL = [
     bucket: "grok",
     rank: 815,
     which: ["robodex"],
-    ua: { patterns: [/\bGrokBot\/\d/i, /\bxAI-GrokBot\b/i, /\bxAI-Bot\b/i, /GrokAgent/i] },
+    ua: {
+      patterns: [/\bGrokBot\/\d+(?:\.\d+)*\b/i, /\bxAI-GrokBot\b/i, /\bxAI-Bot\b/i, /GrokAgent/i]
+    },
     minProofForVerified: "ua_claim",
     executionMode: "Cloud Browser Agent"
   },
@@ -1332,6 +1336,15 @@ function identityFor(agent) {
       return "unknown";
   }
 }
+var UA_IMPERSONABLE_AGENT_IDS = /* @__PURE__ */ new Set([
+  "gptbot",
+  "claude_bot",
+  "bedrock_agentcore",
+  "googlebot",
+  "chatgpt_user",
+  "perplexity_bot",
+  "ccbot"
+]);
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -1344,7 +1357,8 @@ var BOT_DIRECTORY = AGENT_REGISTRY.filter(
     name: agent.displayName,
     provider: agent.provider,
     category: agent.category,
-    identity: identityFor(agent),
+    // UA-impersonable brands never carry a pre-granted "verified" catalog identity.
+    identity: UA_IMPERSONABLE_AGENT_IDS.has(agent.id) ? "unknown" : identityFor(agent),
     uaPatterns: agent.ua ? [...agent.ua.patterns] : void 0,
     asnNumbers: agent.asns ? [...agent.asns] : void 0,
     asnPatterns: agent.asnPatterns ? [...agent.asnPatterns] : void 0,
@@ -1913,6 +1927,15 @@ function parseSecCh(secCh) {
 }
 var BROWSER_SPECS = [
   {
+    // Electron is a distinct binary/runtime (it embeds Chromium), not the engine version.
+    // Its UA carries `Electron/<version>` alongside `Chrome/<version>`; the Electron token
+    // must win over the generic Chromium/Chrome tokens so an Electron 44.9.1 session is
+    // labelled `Electron 44.9.1` instead of the embedded `Chromium 152`.
+    name: "Electron",
+    brands: ["electron"],
+    uaTokens: [/Electron\/([\d.]+)/i]
+  },
+  {
     name: "Cursor",
     brands: ["cursor"],
     uaTokens: [/Cursor\/([\d.]+)/]
@@ -1974,6 +1997,7 @@ function firstMatch(token, ua) {
   return (m[1] ?? "").trim() || null;
 }
 var BRAND_PRECEDENCE = [
+  "Electron",
   "Headless Chrome",
   "Microsoft Edge",
   "Brave",
@@ -2021,6 +2045,10 @@ function pickFullerVersion(preferred, candidate) {
 }
 function resolveBrowser(ua, uad, secCh) {
   const empty = { name: "Unknown", full: "", major: "" };
+  const electronVersion = firstMatch(/Electron\/([\d.]+)/i, ua);
+  if (electronVersion) {
+    return { name: "Electron", full: electronVersion, major: majorOf(electronVersion) };
+  }
   const uadBrands = filterBrands((uad?.fullVersionList ?? []).filter((b) => !!b));
   const candidates = [];
   if (uadBrands.length > 0) candidates.push({ brands: uadBrands, source: "uad" });
@@ -13840,6 +13868,25 @@ function detectAutomationTargetedTampering(reasons, botSignals) {
   const matched = Array.from(/* @__PURE__ */ new Set([...collect(reasons), ...collect(botSignals)]));
   return { detected: matched.length > 0, reasons: matched };
 }
+function clampHumanCorroboration(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+function assessCorroboratedCdp(args) {
+  const reasons = [];
+  if (!args.cdpBridge || args.signedAgentExempt || args.dockedWithHumanInteraction) {
+    return { escalate: false, botType: null, reasons };
+  }
+  if (args.stealthArtifact) {
+    reasons.push("CDP automation bridge corroborated by stealth / tampering artifacts");
+    return { escalate: true, botType: "stealth_automation", reasons };
+  }
+  if (args.trustedHumanCorroboration < 0.5 && !args.hasTrustedInteractionEvidence) {
+    reasons.push("CDP automation bridge without trusted post-interaction human corroboration");
+    return { escalate: true, botType: "chromium_automation", reasons };
+  }
+  return { escalate: false, botType: null, reasons };
+}
 function isTimezoneMismatchReason(reason) {
   return /\btime[\s_-]?zone\b/i.test(reason);
 }
@@ -13908,10 +13955,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     raw?.developerTools || raw?.cdpRuntimeLeak || raw?.automationEnvironment === "electron" || raw?.automationEnvironment === "ide_webview"
   );
   const stealthAutomation = Boolean(
-    raw?.stealthPluginDetected || antiDetectBrowser || automationTargetedTampering
+    raw?.stealthPluginDetected || antiDetectBrowser || automationTargetedTampering || requestContext.corroboratedCdpEscalation
   );
   const activeDeception = Boolean(
-    raw?.stealthPluginDetected || antiDetectBrowser || automationTargetedTampering
+    raw?.stealthPluginDetected || antiDetectBrowser || automationTargetedTampering || requestContext.corroboratedCdpEscalation
   );
   const hardAutomationReasons = [];
   if (automationTargetedTampering) {
@@ -13930,6 +13977,11 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   }
   if (mlTampering) {
     hardAutomationReasons.push(`Browser tampering ML score ${tamperingMlScore.toFixed(3)}`);
+  }
+  if (requestContext.corroboratedCdpEscalation) {
+    hardAutomationReasons.push(
+      "Corroborated CDP automation bridge (no trusted post-interaction human corroboration)"
+    );
   }
   const rawBotClassification = requestContext.botClassification ?? classifyBotTraffic(
     requestContext.headers,
@@ -14131,7 +14183,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     (line) => /CIDR|FCrDNS|signature|SAIL|Web Bot Auth/i.test(line)
   ) || aiAgent.evidence[0] || "agent identity attributed from request headers"}` : "";
   const botDetail = scrubOsClaim(
-    stealthAutomation ? `${hardAutomationReasons.join("; ") || "Stealth / anti-detect automation runtime detected"} \u2014 hard automation artifact, never a verified human` : botSubtype === "human" && !aiAgent?.detected ? developerToolsAttached ? `Verified human interactive session \xB7 developer tools attached${raw?.automationEnvironment && raw.automationEnvironment !== "none" ? ` (${raw.automationEnvironment})` : ""}` : "Verified human interactive session" : registryBotDetail ? registryBotDetail : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected"),
+    stealthAutomation ? `${hardAutomationReasons.join("; ") || "Stealth / anti-detect automation runtime detected"} \u2014 hard automation artifact, never a verified human` : botSubtype === "human" && !aiAgent?.detected ? developerToolsAttached ? `Verified human interactive session \xB7 ${raw?.cdpDetected || raw?.cdpRuntimeLeak ? "CDP protocol attached; no docked DevTools UI" : "developer tools attached"}${raw?.automationEnvironment && raw.automationEnvironment !== "none" ? ` (${raw.automationEnvironment})` : ""}` : "Verified human interactive session" : registryBotDetail ? registryBotDetail : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected"),
     tileRuntimeOs
   );
   const botSignal = {
@@ -14179,9 +14231,12 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const vmReasonVerdict = isVm ? vmReason && !cloudContainerVmReason ? vmReason : hypervisorGpuProof ? "Hypervisor-specific GPU signature detected in the WebGL vendor / renderer" : "Host-level virtualization evidence detected" : "";
   const isTampered = isOsTampered;
   const vmLike = isVm;
-  const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : softwareRenderedGpu ? 3 : vmLike || isTampered ? 6 : hasRealUnmaskedGpu ? 0 : 3;
-  const vmStatus = tamperedRequest || replayDetected ? "Tampered / Replayed" : emulatorDetected ? "Mobile Emulator" : softwareRenderedGpu ? "Software-Rendered Graphics (SwiftShader)" : vmLike ? "Virtual Machine / VM" : isTampered ? "Spoofed Environment" : hasRealUnmaskedGpu ? "Physical Hardware" : "GPU Masked / Unavailable";
-  const vmDetail = tamperedRequest || replayDetected ? requestIntegrityReason || "Sealed request envelope failed verification" : emulatorDetected ? emulatorReason || vmReason || "Mobile emulator / simulator runtime detected" : softwareRenderedGpu ? "Software-rendered graphics \u2014 virtualization likely, not proven" : vmLike ? vmReasonVerdict : isTampered ? vmReason || tamperReasons[0] || "Operating-system / User-Agent tampering detected" : hasRealUnmaskedGpu ? "Unmasked physical GPU & consistent OS platform verified" : "GPU vendor / renderer unavailable \u2014 physical hardware cannot be verified";
+  const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : vmLike ? 6 : isTampered ? 6 : softwareRenderedGpu ? 3 : hasRealUnmaskedGpu ? 0 : 3;
+  let vmStatus = tamperedRequest || replayDetected ? "Tampered / Replayed" : emulatorDetected ? "Mobile Emulator" : vmLike ? "Virtual Machine / VM" : isTampered ? "Spoofed Environment" : softwareRenderedGpu ? "Software-Rendered Graphics (SwiftShader)" : hasRealUnmaskedGpu ? "Physical Hardware" : "GPU Masked / Unavailable";
+  const vmDetail = tamperedRequest || replayDetected ? requestIntegrityReason || "Sealed request envelope failed verification" : emulatorDetected ? emulatorReason || vmReason || "Mobile emulator / simulator runtime detected" : vmLike ? vmReasonVerdict : isTampered ? vmReason || tamperReasons[0] || "Operating-system / User-Agent tampering detected" : softwareRenderedGpu ? "Software-rendered graphics \u2014 virtualization likely, not proven; virtual machine not confirmed" : hasRealUnmaskedGpu ? "Unmasked physical GPU & consistent OS platform verified" : "GPU vendor / renderer unavailable \u2014 physical hardware cannot be verified";
+  if (!isVm && (vmStatus === "Virtual Machine / VM" || vmStatus === "Physical Hardware")) {
+    vmStatus = softwareRenderedGpu ? "Software-Rendered Graphics (SwiftShader)" : "GPU Masked / Unavailable";
+  }
   const vmSignal = {
     id: "vm",
     title: "Virtual Machine & OS Integrity",
@@ -14299,7 +14354,11 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   return {
     ...securitySignalsCore,
     ...{
-      cloudOrMaskedGpu,
+      // The UI's separate "Virtual Machine" row ORs this flag with isVirtualMachine. Keep it
+      // consistent with the honest host-level VM verdict so it can never print "Yes" while
+      // isVirtualMachine (and envelope.environment.virtual_machine_label) says false. Software
+      // rendering is reported by the renderer itself, not by this VM-consistency flag.
+      cloudOrMaskedGpu: isVm ? cloudOrMaskedGpu : false,
       // Task 1 — ISP brand & network classification from the server-resolved location
       brandName: classification.brandName,
       networkType: classification.networkType,
@@ -14971,6 +15030,38 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       hardwareId,
       nowMs
     });
+    const rawSignalExtras = rawSecuritySignals || {};
+    const claimedHumanCorroboration = clampHumanCorroboration(
+      rawSecuritySignals?.humanCorroboration ?? rawSignalExtras.humanCorroboration
+    );
+    const envelopeSignedAndClean = Boolean(
+      requestBody.securityEnvelope && envelopeVerdict.requestNonce && !envelopeVerdict.tamperedRequest && !envelopeVerdict.replayDetected
+    );
+    const trustedHumanCorroboration = envelopeSignedAndClean ? claimedHumanCorroboration : Math.min(claimedHumanCorroboration, 0.2);
+    const earlyInteractionEvidence = Array.isArray(rawSignalExtras.interactionEvidence) ? rawSignalExtras.interactionEvidence.filter(
+      (item) => typeof item === "string" && item.trim().length > 0
+    ).length : 0;
+    const hasTrustedInteractionEvidence = envelopeSignedAndClean && earlyInteractionEvidence > 0;
+    const earlyInspectorProbes = rawSignalExtras.inspectorProbes && typeof rawSignalExtras.inspectorProbes === "object" ? rawSignalExtras.inspectorProbes : null;
+    const inspectorProbeCdpEvidence = Boolean(
+      earlyInspectorProbes && (Object.keys(earlyInspectorProbes).some(
+        (key) => /cdp|devtools|debugger|automation[_ -]?protocol/i.test(key)
+      ) || Object.values(earlyInspectorProbes).some(
+        (value) => typeof value === "string" && /cdp|devtools|debugger|automation[_ -]?protocol/i.test(value)
+      ))
+    );
+    const cdpAttachedRaw = Boolean(
+      rawSecuritySignals?.cdpDetected || rawSecuritySignals?.cdpRuntimeLeak || inspectorProbeCdpEvidence
+    );
+    const earlyInspectorState = classifyInspectorState({
+      cdpAttached: cdpAttachedRaw,
+      devtoolsActiveVerified: Boolean(rawSignalExtras.devtoolsActiveVerified),
+      viewportContractionNormalized: Boolean(rawSignalExtras.viewportContractionNormalized)
+    });
+    const cdpBridge = cdpAttachedRaw || earlyInspectorState === "automation_protocol_attached";
+    const dockedWithHumanInteraction = Boolean(
+      rawSecuritySignals?.developerTools || rawSignalExtras.devtoolsActiveVerified || rawSecuritySignals?.automationEnvironment === "electron" || rawSecuritySignals?.automationEnvironment === "ide_webview" || earlyInspectorState === "devtools_docked_suspected" || earlyInspectorState === "devtools_active_verified"
+    ) && (trustedHumanCorroboration >= 0.5 || hasTrustedInteractionEvidence);
     const encodedOriginalUa = readRequestHeader(rawRequestHeaders, "x-intel-original-ua");
     let headerRequestUserAgent = readRequestHeader(rawRequestHeaders, "user-agent");
     if (encodedOriginalUa) {
@@ -14996,7 +15087,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const automationTargetedTampering = handlerAutomationTampering.detected || Boolean(
       rawSecuritySignals?.automationTargetedTampering
     );
-    const hardAutomationSignals = (!rfpExemptRequest || automationTargetedTampering) && Boolean(
+    let hardAutomationSignals = (!rfpExemptRequest || automationTargetedTampering) && Boolean(
       automationTargetedTampering || rawSecuritySignals?.stealthPluginDetected || rawSecuritySignals?.tamperingDetails?.anti_detect_browser
     );
     const decodeEdgeHeader = (name) => {
@@ -15032,6 +15123,20 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       location.publicIp
     );
     const effectiveWba = requestWba && requestWba.verified ? requestWba : pageAttestation;
+    const corroboratedCdp = assessCorroboratedCdp({
+      cdpBridge,
+      inspectorState: earlyInspectorState,
+      dockedWithHumanInteraction,
+      stealthArtifact: Boolean(
+        automationTargetedTampering || rawSecuritySignals?.stealthPluginDetected || !rfpExemptRequest && rawSecuritySignals?.tamperingDetails?.anti_detect_browser
+      ),
+      trustedHumanCorroboration,
+      hasTrustedInteractionEvidence,
+      signedAgentExempt: Boolean(effectiveWba?.verified || pageAttestation?.verified)
+    });
+    if (corroboratedCdp.escalate) {
+      hardAutomationSignals = true;
+    }
     const botClassification = classifyBotTraffic(
       { ...rawRequestHeaders, "user-agent": fullRequestUserAgent },
       { org: location.org, isp: location.isp, asn: location.asn },
@@ -15142,7 +15247,14 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       confidence: aiAgent.verified ? 0.99 : 0.85,
       reasons: aiAgent.evidence.slice(0, 3)
     } : null;
-    const effectiveBotClassification = hardAutomationSignals && attributedBotClassification?.subtype !== "bad_bot" ? botClassification : attributedBotClassification ?? botClassification;
+    const effectiveBotClassification = corroboratedCdp.escalate ? {
+      subtype: "bad_bot",
+      label: corroboratedCdp.botType === "stealth_automation" ? "Stealth Automation" : "Headless / CDP Automation",
+      provider: "Stealth Automation",
+      category: "Automation",
+      confidence: 0.93,
+      reasons: corroboratedCdp.reasons
+    } : hardAutomationSignals && attributedBotClassification?.subtype !== "bad_bot" ? botClassification : attributedBotClassification ?? botClassification;
     const signedPayloadTampered = /Payload integrity hash mismatch/i.test(
       envelopeVerdict.requestIntegrityReason
     );
@@ -15194,7 +15306,8 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         ipBlocklisted: blocklist.blocklisted,
         ipBlocklistReasons: blocklist.reasons,
         botClassification: effectiveBotClassification,
-        automationTargetedTampering
+        automationTargetedTampering,
+        corroboratedCdpEscalation: corroboratedCdp.escalate
       }
     );
     location = { ...location, isVpnOrHosting: Boolean(securitySignals.datacenterAsn) };
@@ -15491,7 +15604,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         name: effectiveBotClassification.label || "Automated Tool",
         identity: "unknown"
       };
-      botType = automationTargetedTampering ? "stealth_automation" : "browser_automation";
+      botType = corroboratedCdp.escalate ? corroboratedCdp.botType ?? "chromium_automation" : automationTargetedTampering ? "stealth_automation" : "browser_automation";
       botVerdict = "bad";
     } else if (aiAgent.detected && registryAgent && aiAgent.agentId !== "impostor-spoof") {
       botInfo = {
@@ -15680,19 +15793,20 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       corroborated: false
     });
     const edgeTransport = readEdgeTransport(req);
-    const inspectorState = classifyInspectorState({
-      cdpAttached: Boolean(rawSecuritySignals?.cdpDetected || rawSecuritySignals?.cdpRuntimeLeak),
-      devtoolsActiveVerified: Boolean(rawExtras.devtoolsActiveVerified),
-      viewportContractionNormalized: Boolean(rawExtras.viewportContractionNormalized)
-    });
+    const inspectorState = earlyInspectorState;
     const inspectorFlags = inspectorFlagsForState(inspectorState);
+    const inspectorDetail = inspectorState === "automation_protocol_attached" ? "CDP protocol attached; no docked DevTools UI" : inspectorState === "devtools_docked_suspected" ? "Docked DevTools frontend suspected" : inspectorState === "devtools_active_verified" ? "Docked DevTools frontend verified active" : "No inspector / DevTools attachment detected";
     const automationVerdict = securitySignals.isBot || botVerdict === "bad" || hardAutomationSignals ? "automated" : securitySignals.botSubtype === "human" || botVerdict === "not_detected" ? "human" : "uncertain";
     const verdictState = decideVerdictTier({
       automation: automationVerdict,
       tamperingDetected: reconciledTampering.detected || Boolean(securitySignals.tamperedRequest),
-      humanCorroboration: 0,
-      hasInteractionEvidence: false
+      humanCorroboration: trustedHumanCorroboration >= 0.5 ? 1 : 0,
+      hasInteractionEvidence: collectorInteractionEvidence.length > 0 || trustedHumanCorroboration >= 0.5
     });
+    const unverifiedAutomationClaim = Boolean(
+      verdictState.verdict_tier === "Verified Automation" && botVerdict === "bad" && !hardAutomationSignals && !rfc9421SignedAgent && botInfo?.identity !== "signed" && botInfo?.identity !== "verified"
+    );
+    const effectiveVerdictTier = unverifiedAutomationClaim ? "Unverified Automation Claim" : verdictState.verdict_tier;
     const identityStage = resolveIdentityStage({
       storageVisitorId: verifiedVid || storedVisitorId,
       storageValid: Boolean(existingVisitor || verifiedVid),
@@ -15710,8 +15824,16 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       serverOsFamily && clientOsFamily && serverOsFamily === clientOsFamily
     );
     const corroboratingVisitorId = identityStage.stage === "lsh_fuzzy" && identityStage.visitorId ? String(identityStage.visitorId) : existingVisitor?.visitor_id ?? null;
+    const structuralAnchorsCorroborated = !hardwareOnlyMatch ? true : Boolean(
+      corroboratingVisitorId && structuralAnchorsMatch(
+        db,
+        identityProfile,
+        corroboratingVisitorId,
+        identityHardwareFingerprint
+      ).matched
+    );
     const recognitionCorroborated = Boolean(
-      browserFamilyCorroborated && osFamilyCorroborated && corroboratingVisitorId && hardwareOnlyMatchCorroborated(
+      browserFamilyCorroborated && osFamilyCorroborated && corroboratingVisitorId && structuralAnchorsCorroborated && hardwareOnlyMatchCorroborated(
         db,
         corroboratingVisitorId,
         serverBrowserFamily || clientBrowserFamily,
@@ -15775,6 +15897,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       calibratedScore: identityConfidence.score
     });
     if (downgradeRecognition) {
+      isReturning = false;
       identityConfidenceHonest = {
         ...identityConfidenceHonest,
         confidence_tier: "Shared Hardware Class - Ambiguous",
@@ -15835,13 +15958,18 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         named_operator: rfc9421SignedAgent ? aiAgent?.operator || null : null,
         operator_verification_method: agentProofMethod,
         automation_environment: String(rawSecuritySignals?.automationEnvironment || "none"),
-        human_corroboration: 0,
-        // Collector's passive, isTrusted interaction evidence — mirrored verbatim, never
-        // promoted to a proof by itself (corroboration stays 0 until the dedicated update).
+        // Client post-interaction corroboration, clamped / finite-checked and envelope-gated;
+        // decideVerdictTier already pins it to 0 on automated / tampered sessions.
+        human_corroboration: verdictState.human_corroboration,
+        // Collector's passive, isTrusted interaction evidence — mirrored verbatim; it never
+        // promotes a probe to proof on its own.
         interaction_evidence: collectorInteractionEvidence,
         inspector_probes: collectorInspectorProbes,
         inspector_state: inspectorState,
         cdp_attached: inspectorFlags.cdp_attached,
+        // Explicit explanation for a bare CDP bridge so `cdp_attached: true` can never be
+        // misread as "DevTools open" (which stays false for automation_protocol_attached).
+        inspector_detail: inspectorDetail,
         // automation_protocol_attached explicitly reports developer_tools:false (CDP binding,
         // not a docked DevTools frontend); only the docked/verified states set it true.
         developer_tools: inspectorState === "automation_protocol_attached" ? false : inspectorFlags.developer_tools || developerToolsSignals
@@ -15884,7 +16012,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       },
       velocity: velocityReport.velocity,
       risk: riskLedger,
-      verdict_tier: verdictState.verdict_tier
+      verdict_tier: effectiveVerdictTier
     };
     const payload = {
       visitorId,
@@ -15996,8 +16124,10 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       // Phase 3–6 canonical mirrors. The single envelope above is the source of truth; these
       // top-level mirrors keep existing clients working without any parallel scoring math.
       envelope: invariantEnvelope,
-      verdict_tier: verdictState.verdict_tier,
+      verdict_tier: effectiveVerdictTier,
       human_corroboration: verdictState.human_corroboration,
+      /** Human-readable inspector explanation (mirrors envelope.automation.inspector_detail). */
+      inspector_detail: inspectorDetail,
       raw_score: riskLedger.raw_score,
       score_0_100: riskLedger.score_0_100,
       evidence_ledger: riskLedger.evidence_ledger

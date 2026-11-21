@@ -1,5 +1,5 @@
 import type { IntelVisitorResponse } from '../types/visitor';
-import { isSwiftShader, SWIFTSHADER_LABEL } from './canonical';
+import { resolveCanonical, isSwiftShader, SWIFTSHADER_LABEL } from './canonical';
 
 /**
  * Smart Signals grid.
@@ -167,7 +167,113 @@ function serverTampering(data: IntelVisitorResponse): boolean {
   return Boolean(data.securitySignals?.tampering);
 }
 
+/* -------------------------------------------------------------------------- */
+/* Virtual Machine — server-canonical verdict                                  */
+/* -------------------------------------------------------------------------- */
+
+export type VmVerdictState = 'vm' | 'software' | 'unknown' | 'physical';
+
+export interface VmVerdict {
+  state: VmVerdictState;
+  status: string;
+  detail?: string;
+}
+
+/** Interprets a canonical/server VM status string into one stable state. */
+function interpretVmText(text: string): VmVerdictState | null {
+  const t = (text || '').trim().toLowerCase();
+  if (!t) return null;
+  // Negative / physical verdicts are tested before "detected" so "Not detected" can
+  // never be mistaken for a positive VM claim.
+  if (/not detected|no virtual|physical|bare metal|native silicon|dedicated hardware|^no$/.test(t))
+    return 'physical';
+  if (/software|swiftshader|llvmpipe|softpipe|not proven/.test(t)) return 'software';
+  if (/unknown|unavailable|indeterminate|inconclusive|n\/a|^none$/.test(t)) return 'unknown';
+  if (/virtual machine|virtualbox|vmware|\bkvm\b|\bqemu\b|hyper-?v|\bxen\b|container|cloud|\bvm\b|detected|^yes$/.test(t))
+    return 'vm';
+  return null;
+}
+
+/**
+ * Resolves the Virtual Machine verdict from the SERVER canonical axes only:
+ * `smartSignals.vm.status` and `environment.virtual_machine_label` / `software_renderer`.
+ * A client-side `cloudOrMaskedGpu` / `isVirtualMachine` hint is never allowed to contradict
+ * them. When the server reports software rendering or an unknown environment, the verdict
+ * degrades to that honest label instead of asserting "Yes" or a physical machine. The
+ * client hints are consulted only for legacy responses with no server VM authority.
+ */
+export function resolveVmVerdict(
+  data: IntelVisitorResponse,
+  canonicalView: ReturnType<typeof resolveCanonical> = resolveCanonical(data)
+): VmVerdict {
+  const env = canonicalView.environment;
+  const label = (env?.virtual_machine_label ?? '').trim();
+  const webglSoftware = isSwiftShader(data.hardwareSignals?.gpuRenderer);
+  const softwareRenderer = Boolean(env?.software_renderer);
+  const signal = data.smartSignals?.vm;
+  const signalStatus = (signal?.status ?? '').trim();
+  const signalDetail = (signal?.detail ?? '').trim();
+
+  const hasServerAuthority = Boolean(label || signalStatus || softwareRenderer || webglSoftware);
+  if (!hasServerAuthority) {
+    const clientVm = Boolean(
+      data.securitySignals?.isVirtualMachine ||
+        data.securitySignals?.cloudOrMaskedGpu ||
+        data.securitySignals?.emulatorDetected
+    );
+    return {
+      state: clientVm ? 'vm' : 'physical',
+      status: clientVm ? 'Yes' : 'Not detected',
+      detail: data.securitySignals?.emulatorReason || data.securitySignals?.vmReason,
+    };
+  }
+
+  const labelState = interpretVmText(label);
+  const signalState = interpretVmText(signalStatus);
+  const software =
+    webglSoftware || softwareRenderer || labelState === 'software' || signalState === 'software';
+  const unknown = !software && (labelState === 'unknown' || signalState === 'unknown');
+
+  if (software) {
+    return {
+      state: 'software',
+      status: signalState === 'software' ? signalStatus : 'Software-rendered (not proven VM)',
+      detail:
+        signalDetail ||
+        (labelState === 'software' ? label : undefined) ||
+        SWIFTSHADER_LABEL,
+    };
+  }
+  if (unknown) {
+    return {
+      state: 'unknown',
+      status: signalState === 'unknown' ? signalStatus : 'Unknown',
+      detail: signalDetail || label || undefined,
+    };
+  }
+
+  const positive = signalState === 'vm' ? signalState : labelState === 'vm' ? labelState : null;
+  const physical = signalState === 'physical' || labelState === 'physical';
+  if (positive || physical) {
+    return {
+      state: positive ?? 'physical',
+      status: positive
+        ? signalState === 'vm'
+          ? signalStatus
+          : 'Yes'
+        : signalState === 'physical'
+        ? signalStatus
+        : 'Not detected',
+      detail: signalDetail || label || undefined,
+    };
+  }
+  // Server authority was present but inconclusive: report unknown, never a Yes/physical claim.
+  return { state: 'unknown', status: 'Unknown', detail: signalDetail || label || undefined };
+}
+
 export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRowData[] {
+  const canonicalView = resolveCanonical(data);
+
   const signals = data.securitySignals;
   const rows: SmartSignalRowData[] = [];
 
@@ -259,11 +365,7 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
 
   // DevTools is reported only when the canonical inspector state verifies an actively docked
   // debugger. A bare CDP bridge (automation_protocol_attached) is informational, not proof.
-  const envelopeAutomation = (
-    data as unknown as {
-      envelope?: { automation?: { inspector_state?: string; cdp_attached?: boolean } };
-    }
-  ).envelope?.automation;
+  const envelopeAutomation = canonicalView.automation;
   // Developer tools stays tied strictly to a docked/verified inspector — unchanged.
   const developerTools = envelopeAutomation?.inspector_state === 'devtools_active_verified';
   rows.push({
@@ -284,26 +386,24 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     status: cdpAttached ? 'Attached' : 'Not detected',
     triggered: false,
     tone: cdpAttached ? 'neutral' : 'clean',
-    detail: cdpAttached ? envelopeAutomation?.inspector_state : undefined,
+    detail: cdpAttached
+      ? envelopeAutomation?.inspector_state === 'automation_protocol_attached'
+        ? 'Automation protocol attached (no docked DevTools UI)'
+        : envelopeAutomation?.inspector_state ?? undefined
+      : undefined,
   });
 
-  // A software rasterizer is not proof of a VM: SwiftShader is reported honestly as
-  // software-rendered graphics instead of being stretched into a "Yes" VM verdict.
-  const swiftShader = isSwiftShader(data.hardwareSignals?.gpuRenderer);
-  const virtualMachine = Boolean(
-    signals.isVirtualMachine || signals.cloudOrMaskedGpu || signals.emulatorDetected
-  );
+  // The VM row mirrors the server canonical verdict. A client GPU / emulator hint can never
+  // promote a software-rendered or unknown environment into a "Yes" / physical-machine claim
+  // that contradicts `smartSignals.vm.status` or the canonical environment label.
+  const vmVerdict = resolveVmVerdict(data, canonicalView);
   rows.push({
     key: 'virtualMachine',
     label: 'Virtual Machine',
-    status: swiftShader
-      ? 'Software-rendered (not proven VM)'
-      : virtualMachine
-      ? 'Yes'
-      : 'Not detected',
-    triggered: !swiftShader && virtualMachine,
-    tone: swiftShader ? 'neutral' : undefined,
-    detail: swiftShader ? SWIFTSHADER_LABEL : signals.emulatorReason || signals.vmReason,
+    status: vmVerdict.status,
+    triggered: vmVerdict.state === 'vm',
+    tone: vmVerdict.state === 'software' || vmVerdict.state === 'unknown' ? 'neutral' : undefined,
+    detail: vmVerdict.detail,
   });
 
   const privacySettings = Boolean(

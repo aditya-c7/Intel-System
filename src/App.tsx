@@ -19,6 +19,7 @@ import {
   SmartSignalsGrid,
   safeIncognitoStatus,
   safeIncognitoDetail,
+  resolveVmVerdict,
 } from './components/SmartSignalsGrid';
 import {
   CursorAttributionOverlay,
@@ -101,6 +102,22 @@ function osHintFromGpuRenderer(value: unknown): string | null {
 /** Never let a server-side "verified" claim survive on the displayed OS string. */
 function stripVerifiedSuffix(value: string | null | undefined): string {
   return (value || '').replace(/\s*\(verified\)\s*$/i, '').trim();
+}
+
+/**
+ * A "Verified Automation" tier is only honest when the named agent identity itself carries
+ * verification (verified/signed). A UA-only claim — e.g. `Unverified · GPTBot` whose identity
+ * is `unknown` — must never sit beside a verified tier, so downgrade it to an explicit
+ * unverified-claim label. All other tiers (tampered, human, passive) are left untouched.
+ */
+function sanitizeVerdictTier(
+  tier: string | null | undefined,
+  agentIdentity: string | null | undefined
+): string | null {
+  const identity = (agentIdentity || '').trim().toLowerCase();
+  const verified = identity === 'verified' || identity === 'signed';
+  if (tier === 'Verified Automation' && !verified) return 'Unverified Automation Claim';
+  return tier ?? null;
 }
 
 /** Module-level reader for the Worker's server-rendered JSON verdict (runs once at import). */
@@ -1258,6 +1275,32 @@ export default function App() {
       initialVerdict?.identity === 'spoofed'
         ? initialVerdict.identity
         : 'unknown';
+    // One bot_info object feeds both the JSON and the verdict-tier sanitizer, so a named but
+    // unverified agent can never be printed next to a "Verified Automation" tier.
+    const eventBotInfo = automationDisplayLabel
+      ? {
+          category: 'browser_automation',
+          provider: data.bot_info?.provider ?? initialVerdict?.provider ?? 'Unknown',
+          name: automationDisplayLabel,
+          identity: 'unknown',
+        }
+      : exactBotName
+      ? {
+          category: data.bot_info?.category ?? eventBotType ?? 'crawler',
+          provider: data.bot_info?.provider ?? initialVerdict?.provider ?? 'Unknown',
+          name: exactBotName,
+          identity: data.bot_info?.identity ?? eventBotIdentity,
+        }
+      : s.aiAgent?.detected
+      ? {
+          category: 'ai_agent',
+          provider: s.aiAgent.operator || 'Unknown',
+          name: s.aiAgent.agentName,
+          identity: s.aiAgent.verified ? 'verified' : 'unknown',
+        }
+      : null;
+    const eventVerdictTier = sanitizeVerdictTier(canonical.verdictTier, eventBotInfo?.identity);
+    const vmVerdict = resolveVmVerdict(data);
     // Optional silicon-truth fields are additive: older responses simply omit them.
     const hw = (data.hardwareSignals ?? {}) as unknown as Record<string, unknown>;
     // Canonical network identity is derived only from server-side IP geolocation and the
@@ -1400,28 +1443,7 @@ export default function App() {
       // Mirror the authoritative bot_type verbatim. The edge verdict fills in when the API
       // response has not supplied one; no stale aiAgent field is consulted after that.
       bot_type: eventBotType,
-      bot_info: automationDisplayLabel
-        ? {
-            category: 'browser_automation',
-            provider: data.bot_info?.provider ?? initialVerdict?.provider ?? 'Unknown',
-            name: automationDisplayLabel,
-            identity: 'unknown',
-          }
-        : exactBotName
-        ? {
-            category: data.bot_info?.category ?? eventBotType ?? 'crawler',
-            provider: data.bot_info?.provider ?? initialVerdict?.provider ?? 'Unknown',
-            name: exactBotName,
-            identity: data.bot_info?.identity ?? eventBotIdentity,
-          }
-        : s.aiAgent?.detected
-        ? {
-            category: 'ai_agent',
-            provider: s.aiAgent.operator || 'Unknown',
-            name: s.aiAgent.agentName,
-            identity: s.aiAgent.verified ? 'verified' : 'unknown',
-          }
-        : null,
+      bot_info: eventBotInfo,
       // Developer tools = a real docked DevTools UI / IDE webview, proved ONLY by the
       // canonical envelope's inspector_state. A bare CDP binding / cdpRuntimeLeak /
       // automation_protocol_attached is reported separately and never sets this true.
@@ -1483,6 +1505,8 @@ export default function App() {
       ),
       simulator: Boolean(s.emulatorDetected),
       suspect_score: displayedSuspectScore,
+      // Mirrors the same server-canonical verdict the Virtual Machine tile renders.
+      virtual_machine: vmVerdict.state === 'vm',
       tampering: Boolean(data.tampering ?? s.tampering),
       tampering_confidence: data.tamperingConfidence ?? 'high',
       tampering_ml_score: s.tamperingMlScore ?? 0.0024,
@@ -1493,7 +1517,6 @@ export default function App() {
         reasons: [],
       },
       velocity: data.velocity ?? null,
-      virtual_machine: Boolean(s.isVirtualMachine || s.emulatorDetected),
       vpn: Boolean(s.vpnSuspected),
       vpn_confidence: s.vpnSuspected ? 'high' : 'low',
       // Server-authoritative method object: the grid tile count is derived from this exact
@@ -1551,7 +1574,7 @@ export default function App() {
       // Everything below is the single canonical envelope, identical to the DOM panels.
       canonical: {
         source: canonical.source,
-        verdict_tier: canonical.verdictTier,
+        verdict_tier: eventVerdictTier,
         browser_tampering: tamperingDetected ? 'Detected' : 'Not detected',
         human_corroboration: canonical.humanCorroboration,
         identity: {
@@ -1582,6 +1605,8 @@ export default function App() {
           timezone_discrepancy: canonical.network?.timezone_mismatch ? 'Detected' : 'Not detected',
         },
         software_renderer: swiftShader ? SWIFTSHADER_LABEL : null,
+        // Same server-canonical verdict the Virtual Machine tile shows.
+        virtual_machine_label: vmVerdict.status,
       },
       // Tri-layer identity evidence from the server resolver + calibrated confidence v2.0.
       identity_layers: data.identity_layers ?? null,
@@ -1953,7 +1978,12 @@ export default function App() {
                         {data.bot === 'bad'
                           ? `Agent signals: ${data.consistency.agent_verdict}`
                           : data.bot === 'good'
-                          ? `Verified agent: ${data.consistency.agent_verdict}`
+                          ? `${
+                              data.bot_info?.identity === 'unknown' ||
+                              data.bot_info?.identity === 'spoofed'
+                                ? 'Unverified agent claim'
+                                : 'Verified agent'
+                            }: ${data.consistency.agent_verdict}`
                           : 'Consistent human signals'}
                       </span>
                     ) : null}

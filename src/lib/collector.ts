@@ -11,7 +11,11 @@ import type {
   SignedHistoryBackup,
 } from '../types/visitor';
 import { detectBrowserTampering } from './tamperingDetector';
-import { deriveBotVerdict } from './verdict';
+import {
+  CORROBORATED_CDP_REASON_ID,
+  CORROBORATED_CHROMIUM_CDP_REASON_ID,
+  deriveBotVerdict,
+} from './verdict';
 import { probeEngineLength, resolveHardwareTruth } from './hardwareTruth';
 import { detectBotD19Signals } from './aiBotDirectory';
 import {
@@ -49,6 +53,16 @@ const CURRENT_PAGE_LOAD_ID: string =
   typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
     : 'pl_' + Math.random().toString(36).slice(2) + '_' + Date.now().toString(36);
+
+/**
+ * Corroborated-CDP dwell. A bare CDP bridge is weight-0 developer-tools evidence: a real
+ * person with DevTools open, an Electron shell or an IDE webview all expose one. We give a
+ * genuine user a short, bounded window to produce trusted input before a bridge with NO
+ * such input is escalated to a stealth-automation bot verdict. The wait is bounded and
+ * only runs in the async identify path — it never blocks rendering or adds UI.
+ */
+const CDP_CORROBORATION_DWELL_MS = 2500;
+const PAGE_SESSION_STARTED_AT: number = Date.now();
 
 interface NavigatorUABrand {
   brand: string;
@@ -1615,10 +1629,18 @@ export interface BotAutomationSignals {
   developerTools?: boolean;
   /** Host runtime: `none`, `electron`, `ide_webview`, `headless_shell` or `vm`. */
   automationEnvironment?: AutomationEnvironment;
-  /** 0–1 confidence that a real person is driving this runtime (geometry, inputs, GPU). */
+  /**
+   * 0–1 confidence that a real person is driving this runtime. Recomputed on EVERY call
+   * after the dwell window — static geometry alone can never reach the human tier; only
+   * genuine, trusted pointer/keyboard/scroll/touch evidence can.
+   */
   humanCorroboration?: number;
   /** Passive isTrusted physical-interaction evidence (pointer/touch/scroll/keyboard). */
   interactionEvidence?: string[];
+  /** True when a CDP bridge was escalated to a bot because no trusted human input arrived. */
+  corroboratedCdpEscalation?: boolean;
+  /** The bridge artifacts that fed the corroborated escalation (telemetry/attribution). */
+  cdpBridgeEvidence?: string[];
   /** Passive inspector probe results — informational input for `inspector_state`. */
   inspectorProbes?: InspectorProbes;
 }
@@ -2088,6 +2110,8 @@ interface InteractionCounters {
   scrolls: number;
   keyDowns: number;
   keyIntervalsMs: number[];
+  /** Trusted pointer-move coordinates — a real trail has varying positions, a script does not. */
+  pointerPositions: Array<{ x: number; y: number }>;
   playwrightMarkTargets: number;
   frameworkGlobals: string[];
   firstInteractionAt: number;
@@ -2100,6 +2124,7 @@ const interactionCounters: InteractionCounters = {
   scrolls: 0,
   keyDowns: 0,
   keyIntervalsMs: [],
+  pointerPositions: [],
   playwrightMarkTargets: 0,
   frameworkGlobals: [],
   firstInteractionAt: 0,
@@ -2139,6 +2164,134 @@ export function getInteractionEvidence(): string[] {
     evidence.push(`framework-globals:${interactionCounters.frameworkGlobals.join(',')}`);
   }
   return evidence;
+}
+
+/**
+ * True only for GENUINE human input. All counters below are fed exclusively by
+ * `isTrusted` events, and CDP-dispatched synthetic Playwright input additionally trips the
+ * mark-target / framework-global guards, so a driven runtime can never earn human credit.
+ * Geometry, languages, a visible document and a hardware GPU are deliberately absent —
+ * a headless browser with a normal desktop UA manufactures all of them.
+ */
+export function hasGenuineHumanInput(): boolean {
+  const c = interactionCounters;
+  // An injected automation library is present: any input seen this session is attributable
+  // to the driver, not to a person, regardless of how natural its cadence looked.
+  if (c.frameworkGlobals.length > 0 || c.playwrightMarkTargets > 0) return false;
+  if (c.touchStarts > 0) return true;
+  if (c.scrolls > 0) return true;
+  const humanIntervals = c.keyIntervalsMs.filter((ms) => ms >= 40 && ms < 1500);
+  if (c.keyDowns >= 3 && humanIntervals.length >= 2) return true;
+  if (c.pointerMoves >= 3 && c.pointerPositions.length >= 3) {
+    const first = c.pointerPositions[0];
+    const last = c.pointerPositions[c.pointerPositions.length - 1];
+    if (Math.abs(first.x - last.x) + Math.abs(first.y - last.y) >= 12) return true;
+    const distinct = new Set(
+      c.pointerPositions.map((p) => `${Math.round(p.x / 4)}:${Math.round(p.y / 4)}`)
+    ).size;
+    if (distinct >= 3) return true;
+  }
+  return false;
+}
+
+/** Shape of the fresh human-corroboration measurement returned by `measureHumanCorroboration`. */
+export interface HumanCorroborationResult {
+  score: number;
+  checks: string[];
+  /** Any isTrusted input at all (including raw synthetic CDP input). */
+  trustedInput: boolean;
+  /** Genuine, human-attributable input after the dwell window. */
+  genuineInput: boolean;
+}
+
+/** Passive scan for CDP / WebDriver / framework bindings on the two global objects. */
+function scanCdpGlobals(): boolean {
+  for (const target of [typeof window !== 'undefined' ? window : undefined, typeof document !== 'undefined' ? document : undefined]) {
+    if (!target) continue;
+    try {
+      for (const key of Object.keys(target as unknown as Record<string, unknown>)) {
+        if (CDP_GLOBAL_KEY_PATTERN.test(key)) return true;
+      }
+    } catch {
+      // Hostile proxies over the global object are inconclusive, not evidence.
+    }
+  }
+  return false;
+}
+
+/** A genuine docked DevTools layout (a large outer/inner viewport delta). */
+function hasDockedDevToolsLayout(): boolean {
+  try {
+    return (
+      typeof window !== 'undefined' &&
+      window.outerHeight > 0 &&
+      window.innerHeight > 0 &&
+      window.outerHeight - window.innerHeight > 200
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** `window.chrome` present on a browser that can never legitimately expose it. */
+function detectInjectedChromeInNonChromium(ua?: string): boolean {
+  try {
+    const userAgent = ua ?? (typeof navigator !== 'undefined' ? navigator.userAgent || '' : '');
+    if (!userAgent) return false;
+    const chromium = /Chrome\/|Chromium\/|Edg\/|OPR\/|CriOS\//i.test(userAgent);
+    const nonChromium = /Firefox\/|FxiOS\/|Version\/[^\s]+\s+Safari|iPhone|iPad|iPod/i.test(userAgent);
+    if (chromium || !nonChromium) return false;
+    const chromeObject = (window as unknown as { chrome?: unknown }).chrome;
+    return Boolean(chromeObject && typeof chromeObject === 'object');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Every CDP / runtime-bridge artifact that can corroborate the escalation. A bare CDP
+ * Runtime leak stays developer-tools evidence; this is the bridge PRESENCE set that the
+ * uncorroborated-after-dwell rule consults. Software GPUs are deliberately NOT included.
+ */
+function collectCdpBridgeEvidence(stealth: StealthArtifacts, ua?: string): string[] {
+  const evidence: string[] = [];
+  if (stealth.cdpRuntimeLeak) evidence.push('CDP Runtime.enable serialization leak');
+  if (inspectorProbes.errorPrototypeNamePreviewReads > 0) {
+    evidence.push('CDP inspector error-preview probe');
+  }
+  if (inspectorProbes.crossRealmGetterSourceMismatch || stealth.stealthReasons.some((r) => /cross-realm/i.test(r))) {
+    evidence.push('cross-realm automation-surface getter mismatch');
+  }
+  if (stealth.stealthReasons.some((r) => /non-native|rewritten|not native/i.test(r))) {
+    evidence.push('non-native getter on an automation surface');
+  }
+  if (interactionCounters.frameworkGlobals.length > 0) {
+    evidence.push(`automation globals (${interactionCounters.frameworkGlobals.slice(0, 3).join(', ')})`);
+  }
+  if (interactionCounters.playwrightMarkTargets > 0) evidence.push('playwright mark-target listener');
+  if (scanCdpGlobals()) evidence.push('CDP/WebDriver binding exposed on window or document');
+  if (detectInjectedChromeInNonChromium(ua)) {
+    evidence.push('window.chrome injected into a non-Chromium runtime');
+  }
+  return evidence;
+}
+
+/**
+ * Bounded, non-blocking dwell: wait (at most `CDP_CORROBORATION_DWELL_MS`) for genuine
+ * trusted input before finalizing an uncorroborated-CDP escalation. Returns immediately
+ * as soon as a real person interacts, so legitimate Electron / IDE / DevTools sessions
+ * keep their weight-0 developer-tools classification.
+ */
+async function awaitCdpCorroborationWindow(bridgePresent: boolean): Promise<boolean> {
+  if (!bridgePresent || typeof window === 'undefined') return false;
+  const elapsed = Date.now() - PAGE_SESSION_STARTED_AT;
+  if (elapsed >= CDP_CORROBORATION_DWELL_MS) return true;
+  const deadline = Date.now() + (CDP_CORROBORATION_DWELL_MS - elapsed);
+  while (Date.now() < deadline) {
+    if (hasGenuineHumanInput()) return false;
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+  }
+  return true;
 }
 
 /** Framework globals scanned passively (presence only — no tampering with their values). */
@@ -2218,6 +2371,13 @@ export function installTrustedInputTracker(): void {
     const onPointerMove = (event: Event): void => {
       if (!(event as PointerEvent).isTrusted) return;
       interactionCounters.pointerMoves += 1;
+      const pointer = event as PointerEvent;
+      if (Number.isFinite(pointer.clientX) && Number.isFinite(pointer.clientY)) {
+        interactionCounters.pointerPositions.push({ x: pointer.clientX, y: pointer.clientY });
+        if (interactionCounters.pointerPositions.length > 24) {
+          interactionCounters.pointerPositions.shift();
+        }
+      }
       stamp();
     };
     const onTouchStart = (event: Event): void => {
@@ -2281,11 +2441,7 @@ export function installTrustedInputTracker(): void {
  * rendering) and, once they interact, trusted input events. A headless shell or a scripted
  * runtime accumulates none of these.
  */
-export function measureHumanCorroboration(gpuRenderer?: string): {
-  score: number;
-  checks: string[];
-  trustedInput: boolean;
-} {
+export function measureHumanCorroboration(gpuRenderer?: string): HumanCorroborationResult {
   installTrustedInputTracker();
   const checks: string[] = [];
   let earned = 0;
@@ -2314,23 +2470,45 @@ export function measureHumanCorroboration(gpuRenderer?: string): {
     // Keep every false.
   }
 
-  add(outerOk, 2, 'non-zero outer viewport');
-  add(innerOk, 2, 'desktop-sized inner viewport');
-  add(visible, 1, 'document visible');
-  add(languagesOk, 1, 'navigator.languages populated');
-  add(!/swiftshader|llvmpipe|mesa offscreen/i.test((gpuRenderer || '').toLowerCase()), 2, 'hardware GPU');
-  add(nativeChrome, 1, 'window.chrome runtime present');
-  const trustedInput = trustedPointerEvents + trustedKeyEvents > 0;
-  if (trustedInput) {
-    total += 2;
-    earned += 2;
-    checks.push('trusted pointer/keyboard input observed');
+  // Static runtime facts describe a real desktop runtime (18/22 = 0.82 when all pass).
+  // They are corroborating context, NOT proof of a person: CDP escalation keys off the
+  // separate `genuineInput` flag below, not off this score.
+  add(outerOk, 3, 'non-zero outer viewport');
+  add(innerOk, 3, 'desktop-sized inner viewport');
+  add(visible, 3, 'document visible');
+  add(languagesOk, 3, 'navigator.languages populated');
+  add(!/swiftshader|llvmpipe|mesa offscreen/i.test((gpuRenderer || '').toLowerCase()), 3, 'hardware GPU');
+  add(nativeChrome, 3, 'window.chrome runtime present');
+
+  // Genuine trusted interaction adds the final 4/22. Without it a perfect static runtime
+  // still scores 0.82, but it can never satisfy the CDP-escalation exemption on its own.
+  const genuineInput = hasGenuineHumanInput();
+  const trustedInput =
+    trustedPointerEvents + trustedKeyEvents > 0 ||
+    interactionCounters.touchStarts > 0 ||
+    interactionCounters.scrolls > 0;
+  total += 4;
+  if (genuineInput) {
+    earned += 4;
+    checks.push('genuine trusted pointer/keyboard/scroll/touch input observed after dwell');
+  } else if (trustedInput) {
+    // Raw isTrusted input alone earns no human credit: CDP-dispatched Playwright input is
+    // isTrusted too, and without human-like cadence/trail it cannot corroborate a person.
+    checks.push('raw trusted input observed (human cadence unconfirmed)');
+  } else {
+    checks.push('no trusted human input observed');
+  }
+  // An injected automation library makes observed input unattributable to a person.
+  if (interactionCounters.frameworkGlobals.length > 0 || interactionCounters.playwrightMarkTargets > 0) {
+    earned = Math.max(0, earned - 4);
+    checks.push('automation library globals present (input not human-attributable)');
   }
 
   return {
     score: total > 0 ? Math.round((earned / total) * 100) / 100 : 0,
     checks,
     trustedInput,
+    genuineInput,
   };
 }
 
@@ -2567,7 +2745,16 @@ const CDP_GLOBAL_KEY_PATTERN =
  * `window` and `document`, a patched `Navigator.prototype.webdriver` getter,
  * headless User-Agents, software GPUs, zero outer geometry and empty languages.
  */
-export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignals {
+export function detectBotAndAutomation(
+  gpuRenderer: string,
+  options?: {
+    /** Snapshot from the async dwell decision, so both paths read the same probe result. */
+    stealth?: StealthArtifacts;
+    human?: HumanCorroborationResult;
+    /** True when the identify path waited out the corroboration window with no input. */
+    dwellAwaited?: boolean;
+  }
+): BotAutomationSignals {
   const nav = typeof navigator !== 'undefined' ? navigator : undefined;
   let ua = '';
   let webdriver = false;
@@ -2580,22 +2767,7 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
     // Ignore hostile navigator proxies.
   }
 
-  let cdpDetected = false;
-  const scanTarget = (target: object | undefined): void => {
-    if (!target || cdpDetected) return;
-    try {
-      for (const key of Object.keys(target as Record<string, unknown>)) {
-        if (CDP_GLOBAL_KEY_PATTERN.test(key)) {
-          cdpDetected = true;
-          return;
-        }
-      }
-    } catch {
-      // Ignore hostile proxies over the global object.
-    }
-  };
-  scanTarget(typeof window !== 'undefined' ? window : undefined);
-  scanTarget(typeof document !== 'undefined' ? document : undefined);
+  const cdpDetected = scanCdpGlobals();
 
   const navProto = typeof Navigator !== 'undefined' ? Navigator.prototype : undefined;
   const webdriverGetterTampered = !isNativeAccessor(navProto, 'webdriver');
@@ -2618,7 +2790,7 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
 
   // Stealth plugins hide every classic flag, so their own patching side effects become the
   // evidence: CDP Runtime serialization, forged native getters, iframe identity leaks.
-  const stealth = detectStealthArtifacts(gpuRenderer);
+  const stealth = options?.stealth ?? detectStealthArtifacts(gpuRenderer);
 
   // Weighted evidence gate. A real person must never be branded as a bot from ambiguous
   // environment quirks: SwiftShader appears whenever hardware acceleration is off (battery
@@ -2660,25 +2832,53 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
   // stays a bot signal when the runtime is simultaneously headless-shaped (no viewport,
   // no languages, software GPU), which a real window never is.
   const runtimeHost = detectAutomationEnvironment(ua, gpuRenderer);
-  const human = measureHumanCorroboration(gpuRenderer);
+  const privacyHardenedRuntime = isPrivacyHardenedRuntime(ua, false);
+  const human = options?.human ?? measureHumanCorroboration(gpuRenderer);
   // A bare CDP Runtime binding is protocol attachment, NOT a visible DevTools frontend — the
   // envelope reports that as automation_protocol_attached (cdp_attached:true,
   // developer_tools:false) via classifyInspectorState. Only a known IDE webview host or a genuine
   // docked layout (large outer/inner viewport delta) counts as real DevTools evidence here.
-  const dockedDevToolsLayout =
-    typeof window !== 'undefined' &&
-    window.outerHeight > 0 &&
-    window.innerHeight > 0 &&
-    window.outerHeight - window.innerHeight > 200;
+  const dockedDevToolsLayout = hasDockedDevToolsLayout();
   const developerTools = runtimeHost.environment === 'ide_webview' || dockedDevToolsLayout;
   const headlessShapedCdp =
-    stealth.cdpRuntimeLeak && human.score < 0.34 && (zeroGeometry || emptyLanguages || softwareGpu);
+    stealth.cdpRuntimeLeak &&
+    human.score < 0.34 &&
+    !privacyHardenedRuntime &&
+    (zeroGeometry || emptyLanguages || softwareGpu);
+  // ---- Corroborated CDP escalation ----------------------------------------------------
+  // A stealth runtime that hides `navigator.webdriver` behind a native-looking getter and
+  // keeps a normal desktop UA previously earned a "Verified Human" verdict: static geometry
+  // scored high even though nobody ever touched the page, and the live CDP bridge was weight
+  // 0. Now any CDP / runtime bridge, left uncorroborated by genuine trusted input after the
+  // dwell window, escalates to a bot. Electron / IDE / docked-DevTools hosts stay weight 0.
+  // Privacy-hardened runtimes (Tor / RFP / Firefox / Safari / Brave) keep their exemption;
+  // a software GPU is NOT bridge evidence (SwiftShader on its own remains exempt).
+  const bridgeEvidence = collectCdpBridgeEvidence(stealth, ua);
+  // A real docked DevTools layout or a known embedded host is always weight 0, even before
+  // the person has interacted — a fresh IDE / Electron / DevTools load must never be branded
+  // a bot. A headless stealth runtime has no docked layout, so it cannot hide behind this.
+  const exemptHost = dockedDevToolsLayout || runtimeHost.electron || runtimeHost.ideWebview;
+  const dwellSatisfied =
+    options?.dwellAwaited === true || Date.now() - PAGE_SESSION_STARTED_AT >= CDP_CORROBORATION_DWELL_MS;
+  const corroboratedCdpBot =
+    bridgeEvidence.length > 0 &&
+    dwellSatisfied &&
+    !human.genuineInput &&
+    !privacyHardenedRuntime &&
+    !exemptHost;
+
   // Research-backed corroboration rule (incolumitas / Fingerprint Pro): patch artifacts from
   // privacy extensions are "suspicious", never a verdict. A stealth plugin only reaches the
-  // bot gate when the runtime does NOT look like a person's desktop (viewport, languages,
-  // hardware GPU, native window.chrome). Deterministic signals below are unaffected.
-  const humanCorroborated = human.score >= 0.6;
-  const stealthBot = stealth.stealthPluginDetected && !humanCorroborated;
+  // bot gate once a dwell has elapsed with no genuine human input, and never on a
+  // privacy-hardened runtime. First-sample privacy users keep their human classification.
+  const humanCorroborated = human.genuineInput || privacyHardenedRuntime || !dwellSatisfied;
+  const stealthBot =
+    stealth.stealthPluginDetected &&
+    !humanCorroborated &&
+    !privacyHardenedRuntime &&
+    !exemptHost;
+  const cdpEscalationReason =
+    'Stealth automation: CDP runtime bridge with webdriver getter tampering and no trusted human input after dwell';
 
   const isBot =
     webdriver ||
@@ -2686,7 +2886,8 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
     headlessUa ||
     d19Hard ||
     stealthBot ||
-    headlessShapedCdp;
+    headlessShapedCdp ||
+    corroboratedCdpBot;
   const botSuspicion =
     !isBot &&
     (softEvidenceCount >= 2 || (stealth.stealthPluginDetected && humanCorroborated));
@@ -2701,6 +2902,8 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
     botReason = 'Headless browser User-Agent signature detected';
   } else if (d19Hard) {
     botReason = botD19.reasons[0] || 'BotD hard automation signal detected';
+  } else if (corroboratedCdpBot) {
+    botReason = cdpEscalationReason;
   } else if (stealthBot) {
     botReason =
       stealth.stealthReasons[0] || 'Stealth automation plugin artifacts detected';
@@ -2724,6 +2927,16 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
       if (!allBotReasons.includes(reason)) allBotReasons.push(reason);
     }
   }
+  if (corroboratedCdpBot) {
+    // The CDP inspector probe is normally weight-0 developer-tools evidence. Once the
+    // dwell has elapsed with no trusted human input, the same artifacts become automation
+    // evidence. Keep them verbose so the server's automation-targeted-tampering check can
+    // escalate the bot_type to `stealth_automation`.
+    for (const evidence of bridgeEvidence) {
+      if (!allBotReasons.includes(evidence)) allBotReasons.push(evidence);
+    }
+    if (!allBotReasons.includes(cdpEscalationReason)) allBotReasons.push(cdpEscalationReason);
+  }
   if (isBot && botD19.detected) {
     allBotReasons.push(...botD19.reasons.filter((reason) => reason !== botReason));
   }
@@ -2744,15 +2957,17 @@ export function detectBotAndAutomation(gpuRenderer: string): BotAutomationSignal
       isHeadless || botD19.signals.window_size || botD19.signals.user_agent,
     botReason,
     webdriver,
-    cdpDetected: cdpDetected || botD19.signals.distinctive_properties,
+    cdpDetected: cdpDetected || botD19.signals.distinctive_properties || corroboratedCdpBot,
     botSignals: allBotReasons,
     botSuspicion,
     cdpRuntimeLeak: stealth.cdpRuntimeLeak,
-    stealthPluginDetected: stealthBot,
+    stealthPluginDetected: stealthBot || corroboratedCdpBot,
     developerTools,
     automationEnvironment: runtimeHost.environment,
     humanCorroboration: human.score,
     interactionEvidence: getInteractionEvidence(),
+    corroboratedCdpEscalation: corroboratedCdpBot,
+    cdpBridgeEvidence: bridgeEvidence,
     inspectorProbes: { ...inspectorProbes },
   };
 }
@@ -3416,7 +3631,8 @@ function resolveBrowserName(
  * that must invalidate verdicts cached by an earlier version of the app. All loads of
  * the same tab in the same app version read this cache FIRST and return it verbatim.
  */
-const INCOGNITO_SESSION_LOCK_KEY = 'intel_fp_incognito_lock_v3';
+const INCOGNITO_SESSION_LOCK_KEY = 'intel_fp_incognito_lock_v4';
+const INCOGNITO_LOCK_VERSION = 4;
 
 /**
  * Reads the authoritative per-tab verdict.
@@ -3436,7 +3652,7 @@ function readIncognitoSessionLock(): IncognitoDetectionResult | null {
     if (
       parsed &&
       typeof parsed === 'object' &&
-      parsed.lockVersion === 3 &&
+      parsed.lockVersion === INCOGNITO_LOCK_VERSION &&
       typeof parsed.isPrivate === 'boolean' &&
       typeof parsed.method === 'string' &&
       typeof parsed.browserName === 'string' &&
@@ -3463,7 +3679,7 @@ function writeIncognitoSessionLock(result: IncognitoDetectionResult): void {
     if (typeof sessionStorage === 'undefined') return;
     sessionStorage.setItem(
       INCOGNITO_SESSION_LOCK_KEY,
-      JSON.stringify({ ...result, lockVersion: 3 })
+      JSON.stringify({ ...result, lockVersion: INCOGNITO_LOCK_VERSION })
     );
   } catch {
     // Storage blocked: the in-memory cache still serves this page load.
@@ -3731,9 +3947,9 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       //   (a) OPFS getDirectory() rejection strings — a deterministic private signal,
       //   (b) IndexedDB strict-commit durability ratio with interleaved rounds + deadband,
       //   (c) OPFS sync-access-handle flush timing (memory-backed flush is near-instant).
-      // A conclusive low IDB ratio (< 1.12) is enough when the OPFS flush probe is
-      // unavailable, so a genuine private window is not lost to one failed probe; a high
-      // ratio (> 1.55) is a confident normal profile. The ambiguous band still fails open.
+      // A private verdict requires OPFS (a or c) AND IDB (b) agreement — a single vector
+      // can be produced by an isolated/partitioned storage context, so it never suffices.
+      // The ambiguous band and any single-vector-only result fail open.
       const opfsDir = await probeOpfsDirectory();
       const opfsDirPrivate =
         opfsDir.status === 'rejected' &&
@@ -3763,17 +3979,19 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
         opfsProbe !== null &&
         (opfsProbe.medianFlushMs < 0.12 || opfsProbe.flushToWriteRatio < 0.85);
 
-      // Additional deterministic signal for headless private contexts: Chrome 156+ reports
-      // the patched 10 GiB quota in BOTH modes and an off-the-record store produces a
-      // low-variance RAM-backed durability ratio (~1.045) even when the OPFS flush probe is
-      // unusable. A conclusive, low-variance private ratio is therefore sufficient on its
-      // own. A granted persistent-storage privilege is a hard veto — it can only exist on a
-      // durable profile — so a normal profile still fails open cleanly.
+      // Tightened private-mode gate. An isolated / partitioned storage context can show
+      // OPFS rejection or RAM-backed IndexedDB timing WITHOUT being real private browsing,
+      // so a private verdict now requires BOTH an OPFS-family signal and an IDB-family
+      // signal. A granted persistent-storage privilege and an opaque/cross-origin context
+      // are hard vetoes; any inconclusive combination fails open with low confidence below.
+      // Real OTR windows still satisfy both families, so genuine incognito is preserved.
       const idbConclusivePrivate = idbVerdict === 'private' && !idbHighVariance;
       const persistentGrant = await hasPersistedStorageGrant();
+      const opfsPrivateEvidence = opfsDirPrivate || opfsIndicatesIncognito;
+      const idbPrivateEvidence = idbConclusivePrivate || (idbLowRatio && !idbHighVariance);
+      const isolatedContext = isIsolatedStorageContext();
       const incognitoDetected =
-        !persistentGrant &&
-        (opfsDirPrivate || idbConclusivePrivate || (idbLowRatio && opfsIndicatesIncognito));
+        !persistentGrant && !isolatedContext && opfsPrivateEvidence && idbPrivateEvidence;
 
       if (incognitoDetected) {
         return {
@@ -3844,6 +4062,30 @@ async function hasPersistedStorageGrant(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * An isolated / partitioned storage context (an opaque `null` origin, a sandboxed or
+ * cross-origin frame) can reject OPFS and show RAM-backed IndexedDB timing WITHOUT being
+ * a real private-browsing window. Such contexts must fail open — never `incognito: true`.
+ */
+function isIsolatedStorageContext(): boolean {
+  try {
+    if (typeof window === 'undefined') return false;
+    if (typeof location !== 'undefined' && location.origin === 'null') return true;
+    // Touching a cross-origin frame's location throws; that is the partition signal.
+    const top = window.top;
+    if (top && top !== window) {
+      try {
+        void top.location.href;
+      } catch {
+        return true;
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
 }
 
 /**
@@ -3973,8 +4215,34 @@ export async function evaluateSecuritySignals(
   clientGeoHint: ClientGeoHint | null,
   hasStoredIdentity: boolean
 ): Promise<SecuritySignals> {
-  // 1. Automation & Headless Bot Detection (CDP bindings, native prototype checks)
-  const botAssessment = detectBotAndAutomation(hardwareSignals.gpuRenderer);
+  // 1. Automation & Headless Bot Detection (CDP bindings, native prototype checks).
+  // Snapshot the CDP bridge once, up front, so the dwell decision and the authoritative
+  // detector read the same probe result. A real person with DevTools open, an Electron shell
+  // or an IDE webview gets the benefit of the bounded dwell / docked-host exemption; a
+  // stealth runtime with no trusted input after the window is escalated below.
+  const stealthSnapshot = detectStealthArtifacts(hardwareSignals.gpuRenderer);
+  let uaSnapshot = '';
+  try {
+    uaSnapshot = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+  } catch {
+    // Hostile navigator proxy: leave the UA unknown.
+  }
+  const runtimeHostSnapshot = detectAutomationEnvironment(uaSnapshot, hardwareSignals.gpuRenderer);
+  const bridgeSnapshot = collectCdpBridgeEvidence(stealthSnapshot, uaSnapshot);
+  const exemptDockedHost =
+    hasDockedDevToolsLayout() ||
+    runtimeHostSnapshot.electron ||
+    runtimeHostSnapshot.ideWebview;
+  const dwellAwaited = await awaitCdpCorroborationWindow(
+    bridgeSnapshot.length > 0 && !exemptDockedHost
+  );
+  // Fresh, post-interaction corroboration — never a value cached at page load.
+  const humanSnapshot = measureHumanCorroboration(hardwareSignals.gpuRenderer);
+  const botAssessment = detectBotAndAutomation(hardwareSignals.gpuRenderer, {
+    stealth: stealthSnapshot,
+    human: humanSnapshot,
+    dwellAwaited,
+  });
   const botSignals: string[] = botAssessment.isBot
     ? (botAssessment.botSignals && botAssessment.botSignals.length > 0
         ? botAssessment.botSignals
@@ -4225,10 +4493,20 @@ export async function evaluateSecuritySignals(
   // downstream reads `isBot` from that single derivation — no second opinion can flip it.
   const hardAutomationEvidence = tampering.tampering_details.hardAutomationEvidence ?? [];
   const authoritativeIsBot = botAssessment.isBot || hardAutomationEvidence.length > 0;
+  // The corroborated-CDP id is the single hard reason for this escalation path. It is
+  // already present in `botSignals`; include it explicitly so the gate and the authoritative
+  // detector cannot drift even if a downstream consumer filters the human-readable list.
+  const cdpEscalationReasonIds = botAssessment.corroboratedCdpEscalation
+    ? [CORROBORATED_CDP_REASON_ID, CORROBORATED_CHROMIUM_CDP_REASON_ID]
+    : [];
   const botVerdict = deriveBotVerdict({
     isBot: authoritativeIsBot,
     reasonIds: authoritativeIsBot
-      ? [...botSignals, ...hardAutomationEvidence.map((reason) => `cdc.${reason}`)]
+      ? [
+          ...botSignals,
+          ...hardAutomationEvidence.map((reason) => `cdc.${reason}`),
+          ...cdpEscalationReasonIds,
+        ]
       : [],
   });
   const isBot = botVerdict.isBot;
@@ -4384,7 +4662,9 @@ export async function evaluateSecuritySignals(
     /* Three-axis split (Fingerprint Pro parity): developer tools ≠ bot */
     developerTools: Boolean(tampering.developerTools || botAssessment.developerTools),
     automationEnvironment: botAssessment.automationEnvironment ?? 'none',
-    humanCorroboration: botAssessment.humanCorroboration ?? 0,
+    // Recomputed at payload construction — never a value frozen at page load. Automated /
+    // escalated sessions are pinned at 0 so no surface can render them as "Verified Human".
+    humanCorroboration: isBot ? 0 : measureHumanCorroboration(hardwareSignals.gpuRenderer).score,
     /* Phase 2 — client-side Tor Browser fingerprint (Gecko RFP + letterboxing) */
     isTorBrowserClient: torBrowserClient.detected,
     /* Phase 5 — browser tampering (DevTools device emulation / anti-detect browsers) */
@@ -5491,6 +5771,12 @@ export async function identifyCurrentVisitor(options?: {
         )
       : null;
 
+    // Fresh, post-interaction corroboration on EVERY identify payload — never a value
+    // cached at page load. Mirrored at top level for the server verdict state machine and
+    // inspector telemetry as well as inside `securitySignals`.
+    const freshHuman = measureHumanCorroboration(hardwareSignals.gpuRenderer);
+    const freshInteractionEvidence = getInteractionEvidence();
+
     const response = await fetch('/api/visitor/identify', {
       method: 'POST',
       headers: {
@@ -5518,6 +5804,11 @@ export async function identifyCurrentVisitor(options?: {
         // High-entropy UA-CH values; the server's own `Sec-CH-UA*` headers outrank them.
         clientHints,
         securityEnvelope,
+        // Fresh interaction evidence / human corroboration (recomputed above on every call).
+        humanCorroboration: securitySignals.isBot ? 0 : freshHuman.score,
+        humanCorroborationChecks: freshHuman.checks,
+        interactionEvidence: freshInteractionEvidence,
+        inspectorProbes: { ...inspectorProbes },
         // Top-level mirrors so no server-side spelling path can miss the verdict.
         // All aliases derive from the same authoritative session lock; `incognito` is
         // forced false whenever the stable confidence is 'low'.
