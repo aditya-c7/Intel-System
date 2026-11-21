@@ -1972,57 +1972,34 @@ export default function App() {
                 {data.identification ? (
                   <div className="mt-2 flex items-center gap-1.5 flex-wrap">
                     {(() => {
-                      // The exported Event JSON keeps confidence_score null until calibration passes.
-                      // Never render a fabricated percentage the JSON cannot substantiate: the
-                      // raw identification.confidence.score mirror is deliberately NOT a fallback.
-                      // With no canonical score, show the categorical tier only.
-                      const numeric = canonical?.confidenceScore ?? null;
-                      const version = data.identification?.confidence?.version;
-                      const label =
+                      // The only honest percentage is the server-calibrated 0..1 score in
+                      // canonical.confidenceScore. Convert it to an integer 0..100, clamped to
+                      // that range; an unavailable score is shown as a truthful 0% with an
+                      // explicit title — never a fabricated tier or a raw-JSON mirror fallback.
+                      const numeric = canonical?.confidenceScore;
+                      const hasScore =
+                        typeof numeric === 'number' && Number.isFinite(numeric);
+                      const percent =
                         typeof numeric === 'number' && Number.isFinite(numeric)
-                          ? `Confidence ${(numeric * 100).toFixed(1)}%${
-                              version ? ` · v${version}` : ''
-                            }`
-                          : `Confidence ${canonical?.confidenceTier ?? 'Unverified'}`;
+                          ? Math.max(0, Math.min(100, Math.round(numeric * 100)))
+                          : 0;
+                      const stage = canonical?.identity?.match_stage;
+                      const label = canonical?.identity?.match_label;
+                      const stageText = stage ? stage.replace(/_/g, ' ') : null;
+                      const basis = label
+                        ? `Based on ${label}${stageText ? ` · ${stageText}` : ''}`
+                        : stageText
+                        ? `Based on ${stageText}`
+                        : 'Match basis unavailable';
                       return (
                         <span
                           className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-700"
-                          title="Identification confidence"
+                          title={hasScore ? basis : 'No calibrated match evidence yet'}
                         >
-                          {label}
+                          Confidence {percent}%
                         </span>
                       );
                     })()}
-                    {data.identity_layers ? (
-                      <span
-                        className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-600"
-                        title={`Match score ${data.identity_layers.match_score}`}
-                      >
-                        {data.identity_layers.match_mode === 'exact'
-                          ? 'Matching browser profile'
-                          : data.identity_layers.match_mode === 'cross_browser'
-                          ? 'Cross-browser match'
-                          : data.identity_layers.match_mode === 'hardware'
-                          ? 'Hardware match'
-                          : data.identity_layers.match_mode === 'lenient'
-                          ? 'Lenient match'
-                          : 'New identity'}
-                      </span>
-                    ) : null}
-                    {data.consistency ? (
-                      <span className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-medium text-slate-600">
-                        {data.bot === 'bad'
-                          ? `Agent signals: ${data.consistency.agent_verdict}`
-                          : data.bot === 'good'
-                          ? `${
-                              data.bot_info?.identity === 'unknown' ||
-                              data.bot_info?.identity === 'spoofed'
-                                ? 'Unverified agent claim'
-                                : 'Verified agent'
-                            }: ${data.consistency.agent_verdict}`
-                          : 'Consistent human signals'}
-                      </span>
-                    ) : null}
                   </div>
                 ) : null}
                 {data.browserDevice.genuineMobile ? (

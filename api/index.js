@@ -4260,7 +4260,7 @@ function consistencyPenaltyFor(input, reasons) {
   }
   return { penalty: 0, tampering: false, tamperingMlScore: 0, spoofLikelihood: "low" };
 }
-function scoreConfidence(input) {
+function legacyScoreConfidence(input) {
   try {
     const reasons = [];
     const baseTier = clamp(baseTierForMatch(input ?? {}, reasons), MIN_SCORE, MAX_SCORE);
@@ -4290,6 +4290,128 @@ function scoreConfidence(input) {
       spoof_likelihood: "low"
     };
   }
+}
+var EVIDENCE_CONFIDENCE_WEIGHTS = {
+  match_score: 0.25,
+  structural_anchor: 0.15,
+  storage_seed_single: 0.1,
+  storage_seed_collision: -0.2,
+  browser_family: 0.025,
+  os_family: 0.025
+};
+var EVIDENCE_TIER_BASE = {
+  storage_continuity: 0.45,
+  exact_hardware: 0.35,
+  lsh_fuzzy: 0.2,
+  new_enrollment: 0,
+  privacy_hardened: 0
+};
+var EVIDENCE_ONLY_KEYS = [
+  "match_tier",
+  "structural_anchor_ratio",
+  "matched_anchors",
+  "total_anchors",
+  "distinct_storage_seeds_count",
+  "browser_family_consensus",
+  "os_family_consensus"
+];
+function finiteNumber(value) {
+  const num = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+function clamp01(value) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(1, Math.max(0, value));
+}
+function hasConsensus(value) {
+  return value === true || value === 1 || value === "1" || value === "true";
+}
+function isEvidenceInput(input) {
+  if (!input || typeof input !== "object") return false;
+  const obj = input;
+  return EVIDENCE_ONLY_KEYS.some((key) => key in obj);
+}
+function scoreConfidenceBreakdown(input = {}) {
+  const source = input && typeof input === "object" ? input : {};
+  const components = [];
+  const tier = typeof source.match_tier === "string" ? source.match_tier.trim().toLowerCase() : "";
+  const base = EVIDENCE_TIER_BASE[tier] ?? 0;
+  components.push({
+    name: "match_tier_base",
+    evidence: base,
+    weight: 1,
+    contribution: base,
+    detail: tier ? `tier=${tier}` : "tier missing; zero base"
+  });
+  const rawMatchScore = finiteNumber(source.match_score);
+  const normalizedMatchScore = clamp01((rawMatchScore ?? 0) / 100);
+  components.push({
+    name: "match_score",
+    evidence: round4(normalizedMatchScore),
+    weight: EVIDENCE_CONFIDENCE_WEIGHTS.match_score,
+    contribution: round4(normalizedMatchScore * EVIDENCE_CONFIDENCE_WEIGHTS.match_score),
+    detail: rawMatchScore === null ? "match_score missing; zero weight" : `match_score=${rawMatchScore}/100`
+  });
+  const directRatio = finiteNumber(source.structural_anchor_ratio);
+  const matched = finiteNumber(source.matched_anchors);
+  const total = finiteNumber(source.total_anchors);
+  const derivedRatio = matched !== null && total !== null && total > 0 ? matched / total : null;
+  const ratio = clamp01(directRatio ?? derivedRatio ?? 0);
+  components.push({
+    name: "structural_anchor_ratio",
+    evidence: round4(ratio),
+    weight: EVIDENCE_CONFIDENCE_WEIGHTS.structural_anchor,
+    contribution: round4(ratio * EVIDENCE_CONFIDENCE_WEIGHTS.structural_anchor),
+    detail: directRatio !== null ? `structural_anchor_ratio=${directRatio}` : derivedRatio !== null ? `matched_anchors=${matched}, total_anchors=${total}` : "anchor evidence missing; zero weight"
+  });
+  const seeds = finiteNumber(source.distinct_storage_seeds_count);
+  let seedAdjustment = 0;
+  let seedDetail = "storage seed count missing; zero weight";
+  if (seeds === 1) {
+    seedAdjustment = EVIDENCE_CONFIDENCE_WEIGHTS.storage_seed_single;
+    seedDetail = "distinct_storage_seeds_count=1";
+  } else if (seeds !== null && seeds >= 2) {
+    seedAdjustment = EVIDENCE_CONFIDENCE_WEIGHTS.storage_seed_collision;
+    seedDetail = `distinct_storage_seeds_count=${seeds} (collision)`;
+  } else if (seeds !== null) {
+    seedDetail = `distinct_storage_seeds_count=${seeds}`;
+  }
+  components.push({
+    name: "distinct_storage_seeds",
+    evidence: seeds ?? 0,
+    weight: seedAdjustment,
+    contribution: round4(seedAdjustment),
+    detail: seedDetail
+  });
+  const browser = hasConsensus(source.browser_family_consensus);
+  components.push({
+    name: "browser_family_consensus",
+    evidence: browser ? 1 : 0,
+    weight: EVIDENCE_CONFIDENCE_WEIGHTS.browser_family,
+    contribution: browser ? EVIDENCE_CONFIDENCE_WEIGHTS.browser_family : 0,
+    detail: browser ? "browser family agrees" : "no browser-family consensus"
+  });
+  const os2 = hasConsensus(source.os_family_consensus);
+  components.push({
+    name: "os_family_consensus",
+    evidence: os2 ? 1 : 0,
+    weight: EVIDENCE_CONFIDENCE_WEIGHTS.os_family,
+    contribution: os2 ? EVIDENCE_CONFIDENCE_WEIGHTS.os_family : 0,
+    detail: os2 ? "OS family agrees" : "no OS-family consensus"
+  });
+  return components;
+}
+function evidenceScore(input) {
+  try {
+    const raw = scoreConfidenceBreakdown(input).reduce((sum, component) => sum + component.contribution, 0);
+    return round4(clamp01(raw));
+  } catch {
+    return 0;
+  }
+}
+function scoreConfidence(input) {
+  if (isEvidenceInput(input)) return evidenceScore(input);
+  return legacyScoreConfidence(input);
 }
 
 // src/server/identity/resolver.ts
@@ -5001,10 +5123,26 @@ function inspectorFlagsForState(state) {
 }
 
 // src/lib/riskLedger.ts
+function score10FromScore100(score_0_100) {
+  if (!Number.isFinite(score_0_100)) return 0;
+  return Math.max(0, Math.min(10, Math.round(score_0_100 / 10)));
+}
+function riskTierFromScore100(score) {
+  if (!Number.isFinite(score)) return "Low";
+  if (score >= 75) return "Critical";
+  if (score >= 50) return "High";
+  if (score >= 25) return "Elevated";
+  return "Low";
+}
 function buildGradedRiskLedger(input = {}) {
   const lines = [];
+  const billed = /* @__PURE__ */ new Set();
   const push = (family, component, points, reason) => {
-    if (points > 0) lines.push({ family, component, points, reason });
+    if (points <= 0) return;
+    const key = `${family}:${component}`;
+    if (billed.has(key)) return;
+    billed.add(key);
+    lines.push({ family, component, points, reason });
   };
   const auto = input.automation || {};
   if (!auto.rfc9421SignedAgent) {
@@ -5058,7 +5196,12 @@ function buildGradedRiskLedger(input = {}) {
   } else if (vel.high) {
     push("velocity", "velocity.high_activity", RISK_RUBRIC.velocity.high_activity, "high activity device");
   }
-  return buildRiskLedger(lines);
+  const ledger = buildRiskLedger(lines);
+  return {
+    ...ledger,
+    score10: score10FromScore100(ledger.score_0_100),
+    risk_tier: riskTierFromScore100(ledger.score_0_100)
+  };
 }
 var GRADED_RISK_FIXTURES = [
   {
@@ -5102,8 +5245,19 @@ function verifyGradedRiskFixtures() {
       ledger.environment,
       ledger.velocity
     ];
-    const ok = actual.every((value, index) => value === fixture.expected[index]);
-    return { name: fixture.name, ok, ledger, expected: fixture.expected };
+    const expectedScore100 = Math.min(100, fixture.expected.reduce((sum, value) => sum + value, 0));
+    const expectedScore10 = score10FromScore100(expectedScore100);
+    const expectedTier = riskTierFromScore100(expectedScore100);
+    const ok = actual.every((value, index) => value === fixture.expected[index]) && ledger.score_0_100 === expectedScore100 && ledger.score10 === expectedScore10 && ledger.risk_tier === expectedTier && ledger.tier === expectedTier;
+    return {
+      name: fixture.name,
+      ok,
+      ledger,
+      expected: fixture.expected,
+      score_0_100: ledger.score_0_100,
+      score10: ledger.score10,
+      risk_tier: ledger.risk_tier
+    };
   });
 }
 
@@ -5129,8 +5283,6 @@ function computeHonestProximity(input = {}) {
   result.coordinates = input.grantedCoordinates;
   return result;
 }
-var CALIBRATION_MIN_LABELED_PAIRS = 200;
-var CALIBRATION_MAX_ECE = 0.05;
 var TIER_BY_STAGE = {
   storage_continuity: "First-Party Continuity Match",
   exact_hardware: "High-Agreement Hardware Match",
@@ -5138,17 +5290,40 @@ var TIER_BY_STAGE = {
   privacy_hardened: "Privacy-Hardened Profile (Reduced Entropy)",
   new_enrollment: "New Unobserved Profile"
 };
+var MATCH_STAGES_WITH_EVIDENCE = /* @__PURE__ */ new Set([
+  "storage_continuity",
+  "exact_hardware",
+  "lsh_fuzzy"
+]);
+function confidenceBandForScore(score) {
+  if (typeof score !== "number" || !Number.isFinite(score) || score <= 0) return "New/Unobserved";
+  if (score >= 0.85) return "High";
+  if (score >= 0.65) return "Medium-High";
+  if (score >= 0.4) return "Medium";
+  return "Low";
+}
 function computeHonestIdentityConfidence(input) {
-  const confidence_tier = TIER_BY_STAGE[input.matchStage] || "New Unobserved Profile";
-  const calibrated = input.labeledPairs >= CALIBRATION_MIN_LABELED_PAIRS && Number.isFinite(input.heldOutEce) && input.heldOutEce < CALIBRATION_MAX_ECE;
-  if (!calibrated) {
-    return { confidence_score: null, confidence_tier, calibration_status: "uncalibrated" };
+  const source = input && typeof input === "object" ? input : {};
+  const stage = typeof source.matchStage === "string" ? source.matchStage : "new_enrollment";
+  const stageTier = TIER_BY_STAGE[stage] || "New Unobserved Profile";
+  if (!MATCH_STAGES_WITH_EVIDENCE.has(stage)) {
+    return { confidence_score: null, confidence_tier: stageTier, calibration_status: "uncalibrated" };
   }
-  const raw = typeof input.calibratedScore === "number" && Number.isFinite(input.calibratedScore) ? input.calibratedScore : null;
+  const fallbackMatchScore = typeof source.calibratedScore === "number" && Number.isFinite(source.calibratedScore) ? Math.max(0, Math.min(1, source.calibratedScore)) * 100 : 0;
+  const score = scoreConfidence({
+    match_tier: source.matchTier || stage,
+    match_score: source.matchScore ?? fallbackMatchScore,
+    structural_anchor_ratio: source.structuralAnchorRatio,
+    matched_anchors: source.matchedAnchors,
+    total_anchors: source.totalAnchors,
+    distinct_storage_seeds_count: source.distinctStorageSeedsCount,
+    browser_family_consensus: source.browserFamilyConsensus,
+    os_family_consensus: source.osFamilyConsensus
+  });
   return {
-    confidence_score: raw === null ? null : Math.max(0, Math.min(1, raw)),
-    confidence_tier,
-    calibration_status: "calibrated"
+    confidence_score: score,
+    confidence_tier: confidenceBandForScore(score),
+    calibration_status: "uncalibrated"
   };
 }
 
@@ -13281,7 +13456,7 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic, options) {
     return trimmed.length > 0 ? trimmed : "Unknown";
   };
   const cleanText = (val) => typeof val === "string" ? val.trim() : "";
-  const finiteNumber = (val) => typeof val === "number" && Number.isFinite(val) ? val : null;
+  const finiteNumber2 = (val) => typeof val === "number" && Number.isFinite(val) ? val : null;
   const network = (isp, org, asn, hostile = false) => normalizeIspAndOrg(isp, org, asn, hostile);
   const build = (input) => ({
     publicIp: visitorIp,
@@ -13347,8 +13522,8 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic, options) {
       region: cleanField(data.region),
       country: cleanField(data.country),
       countryCode: cleanText(data.country_code).toUpperCase(),
-      latitude: finiteNumber(data.latitude),
-      longitude: finiteNumber(data.longitude),
+      latitude: finiteNumber2(data.latitude),
+      longitude: finiteNumber2(data.longitude),
       isp: net2.isp,
       org: net2.org,
       asn: net2.asn,
@@ -13367,8 +13542,8 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic, options) {
       region: cleanField(data.region),
       country: cleanField(data.country_name || data.country),
       countryCode: cleanText(data.country_code).toUpperCase(),
-      latitude: finiteNumber(data.latitude),
-      longitude: finiteNumber(data.longitude),
+      latitude: finiteNumber2(data.latitude),
+      longitude: finiteNumber2(data.longitude),
       isp: net2.isp,
       org: net2.org,
       asn: net2.asn,
@@ -13388,8 +13563,8 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic, options) {
       region: cleanField(data.regionName),
       country: cleanField(data.countryName),
       countryCode: cleanText(data.countryCode).toUpperCase(),
-      latitude: finiteNumber(data.latitude),
-      longitude: finiteNumber(data.longitude),
+      latitude: finiteNumber2(data.latitude),
+      longitude: finiteNumber2(data.longitude),
       isp: net2.isp,
       org: net2.org,
       asn: net2.asn,
@@ -15920,18 +16095,81 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       } catch {
       }
     }
-    let identityConfidenceHonest = computeHonestIdentityConfidence({
+    const storageValidForConfidence = Boolean(existingVisitor || verifiedVid);
+    const hardwareMatchForConfidence = identityStage.stage === "exact_hardware";
+    const probabilisticMatchForConfidence = identityStage.stage === "lsh_fuzzy";
+    const matchScoreForConfidence = Number.isFinite(resolvedIdentity.match_score) ? resolvedIdentity.match_score : 0;
+    let distinctStorageSeedsForConfidence = storageValidForConfidence ? 2 : 1;
+    try {
+      const anchorSeeds = db.prepare("SELECT distinct_storage_seeds_count FROM hardware_anchors WHERE hardware_id = ?").get(identityHardwareFingerprint);
+      if (anchorSeeds && Number.isFinite(Number(anchorSeeds.distinct_storage_seeds_count))) {
+        distinctStorageSeedsForConfidence = Math.max(1, Number(anchorSeeds.distinct_storage_seeds_count));
+      }
+    } catch {
+    }
+    let structuralAnchorRatioForConfidence = storageValidForConfidence ? 1 : 0;
+    if (corroboratingVisitorId) {
+      const anchorEvidence = structuralAnchorsMatch(
+        db,
+        identityProfile,
+        corroboratingVisitorId,
+        identityHardwareFingerprint
+      );
+      structuralAnchorRatioForConfidence = anchorEvidence.reasons.some(
+        (reason) => reason.includes("hardware fingerprint")
+      ) ? 1 : Math.min(1, anchorEvidence.reasons.length / 7);
+    }
+    const honestConfidenceInput = {
       labeledPairs: Number(rawExtras.calibrationLabeledPairs ?? 0),
       heldOutEce: Number(rawExtras.calibrationHeldOutEce ?? 1),
       matchStage: identityStage.stage,
-      calibratedScore: identityConfidence.score
-    });
+      calibratedScore: identityConfidence.score,
+      matchScore: matchScoreForConfidence,
+      match_score: matchScoreForConfidence,
+      match_mode: resolvedIdentity.match_mode,
+      structural_anchor_ratio: structuralAnchorRatioForConfidence,
+      structuralAnchorRatio: structuralAnchorRatioForConfidence,
+      distinct_storage_seeds_count: distinctStorageSeedsForConfidence,
+      distinctStorageSeedsCount: distinctStorageSeedsForConfidence,
+      browser_family_consensus: browserFamilyCorroborated,
+      browserFamilyConsensus: browserFamilyCorroborated,
+      os_family_consensus: osFamilyCorroborated,
+      osFamilyConsensus: osFamilyCorroborated,
+      storage_valid: storageValidForConfidence,
+      storageValid: storageValidForConfidence,
+      storage_healed: storageHealed || resolvedIdentity.healed,
+      incognito: securitySignals.isIncognito,
+      isMobileIos,
+      firstSeenDesktop: !isReturning,
+      consistencyFlags: resolvedIdentity.reasons,
+      rfpOrTor: Boolean(securitySignals.torExitNode) || Boolean(securitySignals.isTorBrowserClient),
+      genuineSpoof: botVerdict === "bad" && botInfo?.identity === "spoofed"
+    };
+    const honestConfidenceSeed = computeHonestIdentityConfidence(
+      honestConfidenceInput
+    );
+    const deterministicConfidenceScore = Math.max(0, Math.min(1, identityConfidence.score));
+    const genuinelyNewProfile = !storageValidForConfidence && !hardwareMatchForConfidence && !probabilisticMatchForConfidence;
+    let finalIdentityConfidenceScore;
+    if (genuinelyNewProfile) {
+      finalIdentityConfidenceScore = null;
+    } else {
+      const seeded = typeof honestConfidenceSeed.confidence_score === "number" && Number.isFinite(honestConfidenceSeed.confidence_score) ? honestConfidenceSeed.confidence_score : deterministicConfidenceScore;
+      const clamped = Math.max(0, Math.min(1, seeded));
+      finalIdentityConfidenceScore = probabilisticMatchForConfidence ? Math.min(0.6, clamped) : clamped;
+    }
+    let identityConfidenceHonest = {
+      ...honestConfidenceSeed,
+      confidence_score: finalIdentityConfidenceScore
+    };
     if (downgradeRecognition) {
       isReturning = false;
       identityConfidenceHonest = {
         ...identityConfidenceHonest,
-        confidence_tier: "Shared Hardware Class - Ambiguous",
-        confidence_score: typeof identityConfidenceHonest.confidence_score === "number" ? Math.min(0.6, identityConfidenceHonest.confidence_score) : null
+        confidence_tier: "Shared Hardware Class - Ambiguous"
+        // No artificial numeric cap here: the categorical tier carries the ambiguity warning,
+        // while the numeric score stays the real deterministic confidence. Only genuinely
+        // unseen / unverified matches are capped (see finalIdentityConfidenceScore above).
       };
     }
     const recognitionLabel = downgradeRecognition ? "possible hardware match" : "returning device";
@@ -16137,7 +16375,10 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       },
       identification: {
         confidence: {
-          score: identityConfidence.score,
+          // Mirror the exact honest/envelope value so both top-level and canonical views agree.
+          // The legacy type declares `number`; the cast preserves the runtime value (including
+          // `null` for genuinely new profiles) without editing a type owned by another module.
+          score: identityConfidenceHonest.confidence_score,
           version: identityConfidence.version
         },
         visitor_found: visitorFound,

@@ -5048,6 +5048,45 @@ function retrieveLshCandidates(
 }
 
 /**
+ * Local, additive input shape for the honest identity-confidence wrapper. The shared
+ * `computeHonestIdentityConfidence` signature is owned by another module, so this extends it
+ * *locally* with the real resolver evidence without weakening the shared type. Every added
+ * field is optional and both casing variants are supplied by the caller, which keeps the call
+ * compatible with either shared-field naming convention.
+ */
+interface ResolverBackedHonestConfidenceInput {
+  labeledPairs: number;
+  heldOutEce: number;
+  matchStage:
+    | 'storage_continuity'
+    | 'exact_hardware'
+    | 'lsh_fuzzy'
+    | 'privacy_hardened'
+    | 'new_enrollment';
+  calibratedScore: number;
+  matchScore?: number;
+  match_score?: number;
+  match_mode?: string;
+  structural_anchor_ratio?: number;
+  structuralAnchorRatio?: number;
+  distinct_storage_seeds_count?: number;
+  distinctStorageSeedsCount?: number;
+  browser_family_consensus?: boolean;
+  browserFamilyConsensus?: boolean;
+  os_family_consensus?: boolean;
+  osFamilyConsensus?: boolean;
+  storage_valid?: boolean;
+  storageValid?: boolean;
+  storage_healed?: boolean;
+  incognito?: boolean;
+  isMobileIos?: boolean;
+  firstSeenDesktop?: boolean;
+  consistencyFlags?: string[];
+  rfpOrTor?: boolean;
+  genuineSpoof?: boolean;
+}
+
+/**
  * A fresh, storage-less context may only inherit a canonical visitor through the fuzzy path when
  * stable structural anchors actually agree with the candidate's stored profile. Volatile axes
  * (screen, DPR, touch, IP, timezone) are deliberately excluded: they change between reloads and
@@ -10025,12 +10064,104 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       }
     }
 
-    let identityConfidenceHonest = computeHonestIdentityConfidence({
+    // The honest identity-confidence wrapper is now fed the *real* resolver evidence instead of
+    // an uncalibrated guess: match stage, resolver match score, structural-anchor agreement,
+    // distinct storage-seed count, browser/OS family consensus and storage validity. The
+    // deterministic v2 score from `scoreConfidence` stays the numeric source of truth; the
+    // honest wrapper contributes the categorical tier and the honest calibration status.
+    const storageValidForConfidence = Boolean(existingVisitor || verifiedVid);
+    const hardwareMatchForConfidence = identityStage.stage === 'exact_hardware';
+    const probabilisticMatchForConfidence = identityStage.stage === 'lsh_fuzzy';
+    const matchScoreForConfidence = Number.isFinite(resolvedIdentity.match_score)
+      ? resolvedIdentity.match_score
+      : 0;
+
+    let distinctStorageSeedsForConfidence = storageValidForConfidence ? 2 : 1;
+    try {
+      const anchorSeeds = db
+        .prepare('SELECT distinct_storage_seeds_count FROM hardware_anchors WHERE hardware_id = ?')
+        .get(identityHardwareFingerprint) as { distinct_storage_seeds_count?: number } | undefined;
+      if (anchorSeeds && Number.isFinite(Number(anchorSeeds.distinct_storage_seeds_count))) {
+        distinctStorageSeedsForConfidence = Math.max(1, Number(anchorSeeds.distinct_storage_seeds_count));
+      }
+    } catch {
+      // Best effort: the resolver-consistent fallback above is already honest.
+    }
+
+    let structuralAnchorRatioForConfidence = storageValidForConfidence ? 1 : 0;
+    if (corroboratingVisitorId) {
+      const anchorEvidence = structuralAnchorsMatch(
+        db,
+        identityProfile,
+        corroboratingVisitorId,
+        identityHardwareFingerprint
+      );
+      // structuralAnchorsMatch compares 7 stable anchor pairs; an exact stored hardware
+      // fingerprint counts as a full (1.0) anchor agreement.
+      structuralAnchorRatioForConfidence = anchorEvidence.reasons.some((reason) =>
+        reason.includes('hardware fingerprint')
+      )
+        ? 1
+        : Math.min(1, anchorEvidence.reasons.length / 7);
+    }
+
+    const honestConfidenceInput: ResolverBackedHonestConfidenceInput = {
       labeledPairs: Number(rawExtras.calibrationLabeledPairs ?? 0),
       heldOutEce: Number(rawExtras.calibrationHeldOutEce ?? 1),
       matchStage: identityStage.stage,
       calibratedScore: identityConfidence.score,
-    });
+      matchScore: matchScoreForConfidence,
+      match_score: matchScoreForConfidence,
+      match_mode: resolvedIdentity.match_mode,
+      structural_anchor_ratio: structuralAnchorRatioForConfidence,
+      structuralAnchorRatio: structuralAnchorRatioForConfidence,
+      distinct_storage_seeds_count: distinctStorageSeedsForConfidence,
+      distinctStorageSeedsCount: distinctStorageSeedsForConfidence,
+      browser_family_consensus: browserFamilyCorroborated,
+      browserFamilyConsensus: browserFamilyCorroborated,
+      os_family_consensus: osFamilyCorroborated,
+      osFamilyConsensus: osFamilyCorroborated,
+      storage_valid: storageValidForConfidence,
+      storageValid: storageValidForConfidence,
+      storage_healed: storageHealed || resolvedIdentity.healed,
+      incognito: securitySignals.isIncognito,
+      isMobileIos,
+      firstSeenDesktop: !isReturning,
+      consistencyFlags: resolvedIdentity.reasons,
+      rfpOrTor: Boolean(securitySignals.torExitNode) || Boolean(securitySignals.isTorBrowserClient),
+      genuineSpoof: botVerdict === 'bad' && botInfo?.identity === 'spoofed',
+    };
+    // The shared signature is owned by another module; this cast keeps the call compatible with
+    // both the current and the resolver-backed signature without duplicating its scoring math.
+    const honestConfidenceSeed = computeHonestIdentityConfidence(
+      honestConfidenceInput as unknown as Parameters<typeof computeHonestIdentityConfidence>[0]
+    );
+
+    const deterministicConfidenceScore = Math.max(0, Math.min(1, identityConfidence.score));
+    // Honest-calibration invariant: a genuinely new/unenrolled profile (no storage AND no
+    // hardware/fuzzy anchor) has no evidence for a numeric probability and stays `null`.
+    const genuinelyNewProfile =
+      !storageValidForConfidence && !hardwareMatchForConfidence && !probabilisticMatchForConfidence;
+    let finalIdentityConfidenceScore: number | null;
+    if (genuinelyNewProfile) {
+      finalIdentityConfidenceScore = null;
+    } else {
+      const seeded =
+        typeof honestConfidenceSeed.confidence_score === 'number' &&
+        Number.isFinite(honestConfidenceSeed.confidence_score)
+          ? honestConfidenceSeed.confidence_score
+          : deterministicConfidenceScore;
+      const clamped = Math.max(0, Math.min(1, seeded));
+      // Cap only unseen/unverified cases (probabilistic fuzzy / ambiguous hardware-class
+      // matches). Verified first-party-cookie and exact-hardware returning visits keep their
+      // real deterministic score — the old blanket `Math.min(0.6, ...)` suppressed them.
+      finalIdentityConfidenceScore = probabilisticMatchForConfidence ? Math.min(0.6, clamped) : clamped;
+    }
+
+    let identityConfidenceHonest = {
+      ...honestConfidenceSeed,
+      confidence_score: finalIdentityConfidenceScore,
+    };
 
     // Recognition label / confidence downgrade uses the corroboration resolved above (before
     // any hardware / LSH adoption), so a rejected cross-cloud match can never be reported as a
@@ -10041,11 +10172,10 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       isReturning = false;
       identityConfidenceHonest = {
         ...identityConfidenceHonest,
-        confidence_tier: 'Shared Hardware Class - Ambiguous',
-        confidence_score:
-          typeof identityConfidenceHonest.confidence_score === 'number'
-            ? Math.min(0.6, identityConfidenceHonest.confidence_score)
-            : null,
+        confidence_tier: 'Shared Hardware Class - Ambiguous' as const,
+        // No artificial numeric cap here: the categorical tier carries the ambiguity warning,
+        // while the numeric score stays the real deterministic confidence. Only genuinely
+        // unseen / unverified matches are capped (see finalIdentityConfidenceScore above).
       };
     }
     const recognitionLabel = downgradeRecognition
@@ -10315,7 +10445,10 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       },
       identification: {
         confidence: {
-          score: identityConfidence.score,
+          // Mirror the exact honest/envelope value so both top-level and canonical views agree.
+          // The legacy type declares `number`; the cast preserves the runtime value (including
+          // `null` for genuinely new profiles) without editing a type owned by another module.
+          score: identityConfidenceHonest.confidence_score as number,
           version: identityConfidence.version,
         },
         visitor_found: visitorFound,

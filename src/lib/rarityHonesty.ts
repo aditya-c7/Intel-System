@@ -5,8 +5,10 @@
  * decideRarity gates). This module only applies the presentation / scoring policy:
  *  - suppressed rarity contributes ZERO score;
  *  - proximity is never derived from IP coordinates without granted geolocation permission;
- *  - confidence_score stays null (with a categorical tier + 'uncalibrated' status) until the
- *    held-out calibration gate (>=200 labeled pairs AND ECE < 0.05) has passed.
+ *  - a genuine identity match publishes a deterministic, auditable numeric confidence
+ *    (weighted observable evidence, clamped to [0,1]) while `calibration_status` honestly
+ *    stays 'uncalibrated' until a real held-out calibration gate has passed;
+ *  - a genuinely unseen / non-identifying profile keeps null (never a fabricated number).
  */
 
 import {
@@ -14,6 +16,10 @@ import {
   type RarityDecision,
 } from './telemetryContract';
 import type { IdentityAxes } from './telemetryContract';
+import {
+  scoreConfidence,
+  type EvidenceMatchTier,
+} from '../server/identity/confidenceScorer';
 
 export interface HonestRarity extends RarityDecision {
   /** Zero when status !== 'published'; rarity never silently adds points. */
@@ -81,11 +87,26 @@ export interface CalibrationInput {
   /** The resolved match stage; maps to a categorical confidence tier. */
   matchStage: IdentityAxes['match_stage'];
   calibratedScore?: number;
+
+  /* Observable evidence for the weighted numeric score. Every field is optional and
+   * contributes zero weight when absent, so legacy callers remain source-compatible. */
+  matchTier?: EvidenceMatchTier | string;
+  matchScore?: number;
+  structuralAnchorRatio?: number;
+  matchedAnchors?: number;
+  totalAnchors?: number;
+  distinctStorageSeedsCount?: number;
+  browserFamilyConsensus?: boolean;
+  osFamilyConsensus?: boolean;
 }
+
+/** Display band derived from the numeric confidence score. */
+export type NumericConfidenceTier = 'High' | 'Medium-High' | 'Medium' | 'Low' | 'New/Unobserved';
 
 export interface HonestIdentityConfidence {
   confidence_score: number | null;
-  confidence_tier: IdentityAxes['confidence_tier'];
+  /** Numeric band for scored profiles; the legacy stage tier for unseen profiles. */
+  confidence_tier: IdentityAxes['confidence_tier'] | NumericConfidenceTier;
   calibration_status: 'uncalibrated' | 'calibrated';
 }
 
@@ -97,26 +118,62 @@ const TIER_BY_STAGE: Record<IdentityAxes['match_stage'], IdentityAxes['confidenc
   new_enrollment: 'New Unobserved Profile',
 };
 
+/** Only these stages represent an actual identity match with observable evidence. */
+const MATCH_STAGES_WITH_EVIDENCE: ReadonlySet<string> = new Set([
+  'storage_continuity',
+  'exact_hardware',
+  'lsh_fuzzy',
+]);
+
+/** Locked numeric-score → display-band mapping. */
+export function confidenceBandForScore(score: number): NumericConfidenceTier {
+  if (typeof score !== 'number' || !Number.isFinite(score) || score <= 0) return 'New/Unobserved';
+  if (score >= 0.85) return 'High';
+  if (score >= 0.65) return 'Medium-High';
+  if (score >= 0.40) return 'Medium';
+  return 'Low';
+}
+
 /**
- * Confidence is never a fabricated probability. Unseen / uncalibrated profiles receive a
- * categorical tier, a null confidence_score and 'uncalibrated' status until BOTH the
- * >=200 labeled-pair sample gate and the held-out ECE < 0.05 gate have passed.
+ * Publishes a real, deterministic confidence number for profiles that actually matched,
+ * and keeps `confidence_score: null` only for a genuinely unseen / non-identifying profile
+ * (no storage continuity, no hardware match, no fuzzy match).
+ *
+ * `calibration_status` stays 'uncalibrated' on purpose: the numeric value comes from
+ * weighted observable evidence (`scoreConfidence`), NOT from a claimed calibration gate.
+ * The legacy calibration inputs are still accepted (and `calibratedScore` is used as a
+ * fallback match-score signal) so existing callers keep working unchanged.
  */
 export function computeHonestIdentityConfidence(input: CalibrationInput): HonestIdentityConfidence {
-  const confidence_tier = TIER_BY_STAGE[input.matchStage] || 'New Unobserved Profile';
-  const calibrated =
-    input.labeledPairs >= CALIBRATION_MIN_LABELED_PAIRS &&
-    Number.isFinite(input.heldOutEce) &&
-    input.heldOutEce < CALIBRATION_MAX_ECE;
-  if (!calibrated) {
-    return { confidence_score: null, confidence_tier, calibration_status: 'uncalibrated' };
+  const source: CalibrationInput = input && typeof input === 'object' ? input : ({} as CalibrationInput);
+  const stage = typeof source.matchStage === 'string' ? source.matchStage : 'new_enrollment';
+  const stageTier = TIER_BY_STAGE[stage as IdentityAxes['match_stage']] || 'New Unobserved Profile';
+
+  // Genuinely unseen / non-identifying: preserve the historical null score and stage tier.
+  if (!MATCH_STAGES_WITH_EVIDENCE.has(stage)) {
+    return { confidence_score: null, confidence_tier: stageTier, calibration_status: 'uncalibrated' };
   }
-  const raw = typeof input.calibratedScore === 'number' && Number.isFinite(input.calibratedScore)
-    ? input.calibratedScore
-    : null;
+
+  // Backward compatibility: the legacy calibrated score is a [0,1] probability-like value;
+  // map it onto the engine's 0..100 match-score scale only when no explicit evidence exists.
+  const fallbackMatchScore =
+    typeof source.calibratedScore === 'number' && Number.isFinite(source.calibratedScore)
+      ? Math.max(0, Math.min(1, source.calibratedScore)) * 100
+      : 0;
+  const score = scoreConfidence({
+    match_tier: (source.matchTier || stage) as EvidenceMatchTier,
+    match_score: source.matchScore ?? fallbackMatchScore,
+    structural_anchor_ratio: source.structuralAnchorRatio,
+    matched_anchors: source.matchedAnchors,
+    total_anchors: source.totalAnchors,
+    distinct_storage_seeds_count: source.distinctStorageSeedsCount,
+    browser_family_consensus: source.browserFamilyConsensus,
+    os_family_consensus: source.osFamilyConsensus,
+  });
+
   return {
-    confidence_score: raw === null ? null : Math.max(0, Math.min(1, raw)),
-    confidence_tier,
-    calibration_status: 'calibrated',
+    confidence_score: score,
+    confidence_tier: confidenceBandForScore(score),
+    calibration_status: 'uncalibrated',
   };
 }

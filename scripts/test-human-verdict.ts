@@ -15,6 +15,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { buildGradedRiskLedger, riskTierFromScore100, score10FromScore100 } from '../src/lib/riskLedger';
 
 /* -------------------------------------------------------------------------- */
 /* Browser globals                                                            */
@@ -331,6 +332,12 @@ const gcpHuman = detectAiBotFromServerSignals({
 check('Google Cloud ASN + normal Chrome UA is not an AI agent', gcpHuman.detected === false);
 
 /* -------------------------------------------------------------------------- */
+
+section('G. Canonical risk headline math (shared with the graded ledger)');
+
+const humanGraded = buildGradedRiskLedger({});
+check('clean human graded ledger -> score10 0 / Low', humanGraded.score10 === 0 && humanGraded.risk_tier === 'Low');
+check('score10/tier derive from 67 composite', score10FromScore100(67) === 7 && riskTierFromScore100(67) === 'High');
 
 console.log(`\nHuman-verdict suite: ${passed} passed, ${failed} failed`);
 if (failed > 0) process.exitCode = 1;

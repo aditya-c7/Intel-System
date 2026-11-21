@@ -11,6 +11,7 @@ import {
   buildRiskLedger,
   type OrthogonalRiskLedger,
   type RiskEvidenceLine,
+  type RiskTier,
 } from './telemetryContract';
 
 export interface AutomationRiskSignals {
@@ -63,13 +64,53 @@ export interface GradedRiskInput {
 }
 
 /**
+ * `clamp(round(score_0_100 / 10), 0, 10)` — the one deterministic mapping from the frozen
+ * 0–100 composite to the 0–10 headline. Non-finite input scores as 0.
+ */
+export function score10FromScore100(score_0_100: number): number {
+  if (!Number.isFinite(score_0_100)) return 0;
+  return Math.max(0, Math.min(10, Math.round(score_0_100 / 10)));
+}
+
+/**
+ * Low<25, Elevated<50, High<75, Critical>=75 — thresholds identical to the frozen contract's
+ * `riskTier`, but exported here so the tier is derived from the same composite as `score10`
+ * instead of a separate ad-hoc sum.
+ */
+export function riskTierFromScore100(score: number): RiskTier {
+  if (!Number.isFinite(score)) return 'Low';
+  if (score >= 75) return 'Critical';
+  if (score >= 50) return 'High';
+  if (score >= 25) return 'Elevated';
+  return 'Low';
+}
+
+/**
+ * The canonical graded ledger plus the 0–10 headline and tier name, both derived from the
+ * SAME `score_0_100` composite. Additive on top of `OrthogonalRiskLedger`, so every existing
+ * consumer of the contract type keeps compiling.
+ */
+export interface GradedRiskLedger extends OrthogonalRiskLedger {
+  /** clamp(round(score_0_100 / 10), 0, 10) — single source for the 0–10 headline. */
+  score10: number;
+  /** Tier derived from `score_0_100` — always consistent with `score10`. */
+  risk_tier: RiskTier;
+}
+
+/**
  * Build the exact graded ledger. Components stack inside a family but each family is capped
  * by `buildRiskLedger`; the global score is min(100, raw) with Low/Elevated/High/Critical tiers.
  */
-export function buildGradedRiskLedger(input: GradedRiskInput = {}): OrthogonalRiskLedger {
+export function buildGradedRiskLedger(input: GradedRiskInput = {}): GradedRiskLedger {
   const lines: RiskEvidenceLine[] = [];
+  /** Family+component keys already billed — a component can never bill the same family twice. */
+  const billed = new Set<string>();
   const push = (family: RiskEvidenceLine['family'], component: string, points: number, reason: string): void => {
-    if (points > 0) lines.push({ family, component, points, reason });
+    if (points <= 0) return;
+    const key = `${family}:${component}`;
+    if (billed.has(key)) return;
+    billed.add(key);
+    lines.push({ family, component, points, reason });
   };
 
   /* Automation — cap 45, RFC 9421 signed agent is exempt. */
@@ -138,7 +179,12 @@ export function buildGradedRiskLedger(input: GradedRiskInput = {}): OrthogonalRi
     push('velocity', 'velocity.high_activity', RISK_RUBRIC.velocity.high_activity, 'high activity device');
   }
 
-  return buildRiskLedger(lines);
+  const ledger = buildRiskLedger(lines);
+  return {
+    ...ledger,
+    score10: score10FromScore100(ledger.score_0_100),
+    risk_tier: riskTierFromScore100(ledger.score_0_100),
+  };
 }
 
 /**
@@ -185,8 +231,11 @@ export const GRADED_RISK_FIXTURES: ReadonlyArray<{
 export function verifyGradedRiskFixtures(): {
   name: string;
   ok: boolean;
-  ledger: OrthogonalRiskLedger;
+  ledger: GradedRiskLedger;
   expected: readonly [number, number, number, number, number];
+  score_0_100: number;
+  score10: number;
+  risk_tier: RiskTier;
 }[] {
   return GRADED_RISK_FIXTURES.map((fixture) => {
     const ledger = buildGradedRiskLedger(fixture.input);
@@ -197,7 +246,25 @@ export function verifyGradedRiskFixtures(): {
       ledger.environment,
       ledger.velocity,
     ];
-    const ok = actual.every((value, index) => value === fixture.expected[index]);
-    return { name: fixture.name, ok, ledger, expected: fixture.expected };
+    /* Independently derive the expected composite from the frozen per-family tuple so the
+     * derived 0–10 headline and tier are checked against the baseline, not against themselves. */
+    const expectedScore100 = Math.min(100, fixture.expected.reduce((sum, value) => sum + value, 0));
+    const expectedScore10 = score10FromScore100(expectedScore100);
+    const expectedTier = riskTierFromScore100(expectedScore100);
+    const ok =
+      actual.every((value, index) => value === fixture.expected[index]) &&
+      ledger.score_0_100 === expectedScore100 &&
+      ledger.score10 === expectedScore10 &&
+      ledger.risk_tier === expectedTier &&
+      ledger.tier === expectedTier;
+    return {
+      name: fixture.name,
+      ok,
+      ledger,
+      expected: fixture.expected,
+      score_0_100: ledger.score_0_100,
+      score10: ledger.score10,
+      risk_tier: ledger.risk_tier,
+    };
   });
 }

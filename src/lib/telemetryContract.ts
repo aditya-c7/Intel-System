@@ -69,6 +69,10 @@ export interface OrthogonalRiskLedger {
   /** min(100, raw_score). */
   score_0_100: number;
   tier: RiskTier;
+  /** Optional 0-10 headline score supplied by the canonical (server) ledger. */
+  score10?: number;
+  /** Optional canonical risk-tier mirror; same vocabulary as `tier`. */
+  risk_tier?: RiskTier;
   evidence_ledger: RiskEvidenceLine[];
 }
 

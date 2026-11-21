@@ -59,6 +59,10 @@ export interface CanonicalView {
   source: 'canonical' | 'legacy' | 'empty';
   eventId: string | null;
   risk: OrthogonalRiskLedger;
+  /** 0-10 headline mirrored verbatim from the canonical risk ledger (never re-derived). */
+  riskScore10: number;
+  /** Risk tier mirrored verbatim from the canonical risk ledger. */
+  riskTier: RiskTier;
   verdictTier: VerdictTier | null;
   humanCorroboration: 0 | 1 | null;
   identity: IdentityAxes | null;
@@ -132,6 +136,23 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     ? finiteNumber(riskRoot.score_0_100)
     : legacyScore;
   const score = clampScore(canonicalScore);
+
+  // The canonical ledger itself is the one source for the 0-10 headline and its tier mirror.
+  // Read its optional fields with the same `as unknown as` pass-through used for the other
+  // axes; the client only mirrors server values and never recomputes a score from the cards.
+  const canonicalRisk = (riskRaw ?? riskRoot) as unknown as OrthogonalRiskLedger | null;
+  const ledgerScore10 = canonicalRisk?.score10;
+  const ledgerTier = canonicalRisk?.risk_tier ?? canonicalRisk?.tier;
+  const canonicalScore10 =
+    typeof ledgerScore10 === 'number' && Number.isFinite(ledgerScore10)
+      ? ledgerScore10
+      : typeof data?.suspectScore === 'number' && Number.isFinite(data.suspectScore)
+      ? data.suspectScore
+      : 0;
+  const canonicalRiskTier: RiskTier = RISK_TIERS.includes(String(ledgerTier))
+    ? (ledgerTier as unknown as RiskTier)
+    : riskTier(score);
+
   const risk: OrthogonalRiskLedger = {
     automation: finiteNumber(riskRaw?.automation),
     tampering: finiteNumber(riskRaw?.tampering),
@@ -146,6 +167,10 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     evidence_ledger: Array.isArray(riskRaw?.evidence_ledger ?? riskRoot?.evidence_ledger)
       ? ((riskRaw?.evidence_ledger ?? riskRoot?.evidence_ledger) as OrthogonalRiskLedger['evidence_ledger'])
       : [],
+    // Optional server-supplied mirrors. The canonical ledger is the single source for the
+    // 0-10 headline and its tier; neither value is recomputed from the family cards here.
+    score10: canonicalScore10,
+    risk_tier: canonicalRiskTier,
   };
 
   const verdict = typeof env?.verdict_tier === 'string' && VERDICT_TIERS.includes(env.verdict_tier)
@@ -172,19 +197,14 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     ? stringArray(tamperingRaw.reasons)
     : stringArray(data?.tamperingDetails?.reasons);
 
-  const isUnseen = identity
-    ? identity.match_stage === 'new_enrollment' ||
-      identity.confidence_tier === 'New Unobserved Profile'
-    : false;
-  const confidenceTier =
-    identity?.confidence_tier ??
-    (data?.identification ? 'New Unobserved Profile' : 'New Unobserved Profile');
-  const canonicalScoreValue = identityRaw?.confidence_score;
-  const confidenceScore = isUnseen
-    ? null
-    : typeof canonicalScoreValue === 'number'
-    ? canonicalScoreValue
-    : null;
+  // Identity confidence is the server's calibrated value from the canonical envelope's
+  // `identity` axis. Mirror it verbatim (0..1 or null): the server already applies the
+  // held-out calibration gate before serializing, so nothing is gated or recomputed here.
+  const confidenceTier = identity?.confidence_tier ?? 'New Unobserved Profile';
+  const confidenceScore =
+    typeof identityRaw?.confidence_score === 'number' && Number.isFinite(identityRaw.confidence_score)
+      ? identityRaw.confidence_score
+      : null;
   const calibrationStatus: 'uncalibrated' | 'calibrated' =
     identityRaw?.calibration_status === 'calibrated' ? 'calibrated' : 'uncalibrated';
 
@@ -193,6 +213,8 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     source,
     eventId: typeof env?.event_id === 'string' ? env.event_id : null,
     risk,
+    riskScore10: canonicalScore10,
+    riskTier: canonicalRiskTier,
     verdictTier: verdict,
     humanCorroboration,
     identity,

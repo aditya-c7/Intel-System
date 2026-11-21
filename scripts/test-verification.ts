@@ -22,6 +22,7 @@ import {
   type MatchMode,
 } from '../src/shared/matching/compareFingerprints';
 import { scoreConfidence } from '../src/server/identity/confidenceScorer';
+import { buildGradedRiskLedger } from '../src/lib/riskLedger';
 import { normalizeGpuRenderer } from '../src/client/signals/webgl';
 import {
   RISK_FAMILY_CAPS,
@@ -388,6 +389,25 @@ const driftLedger = ledgerFrom([35, 35, 18, 4, 12]);
 check('drift+proxy ledger raw 104 clamped 100 / Critical', driftLedger.raw_score === 104 && driftLedger.score_0_100 === 100 && driftLedger.tier === 'Critical', JSON.stringify(driftLedger));
 const cleanLedger = ledgerFrom([0, 0, 0, 0, 0]);
 check('clean human ledger 0 / Low', cleanLedger.raw_score === 0 && cleanLedger.tier === 'Low');
+
+/* New derived headline fields: same frozen tuples, checked through the graded builder. */
+const gradedFixtures = [
+  { input: { automation: { tierA: true }, network: { vpnOrRelay: true }, environment: { swiftshader: true, ephemeralOrPrivateStorage: true } }, score100: 67, score10: 7, tier: 'High' },
+  { input: { tampering: { tierA: true } }, score100: 35, score10: 4, tier: 'Elevated' },
+  { input: { automation: { tierB: true }, tampering: { tierA: true }, network: { rotatingProxy: true }, environment: { ephemeralOrPrivateStorage: true }, velocity: { high: true } }, score100: 100, score10: 10, tier: 'Critical' },
+  { input: {}, score100: 0, score10: 0, tier: 'Low' },
+] as const;
+for (const fixture of gradedFixtures) {
+  const graded = buildGradedRiskLedger(fixture.input);
+  check(
+    `graded ledger ${fixture.score100}: score10=${fixture.score10} / ${fixture.tier}`,
+    graded.score_0_100 === fixture.score100 &&
+      graded.score10 === fixture.score10 &&
+      graded.risk_tier === fixture.tier &&
+      graded.tier === fixture.tier,
+    JSON.stringify(graded),
+  );
+}
 
 check('512-bit SimHash config locked', LSH_CONFIG.bits === 512 && LSH_CONFIG.bands === 32 && LSH_CONFIG.rows === 16);
 check('singleton Clopper-Pearson upper ~4.74/n', Math.abs(clopperPearsonUpperBound(1, 1000, 0.05) - 0.00474) < 0.0005, String(clopperPearsonUpperBound(1, 1000, 0.05)));
