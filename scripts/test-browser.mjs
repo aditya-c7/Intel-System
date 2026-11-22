@@ -120,18 +120,32 @@ try {
   watchPings(mirrorPage, 'b');
   await mirrorPage.goto(base, { waitUntil: 'networkidle2', timeout: 60000 });
   await waitForPanel(mirrorPage);
-  await delay(8000);
+  // Opening the mirror tab backgrounds tab A in headless Chrome, which pauses its lease
+  // renewal. Bring A back to the foreground so it remains the leader during phase 1; the
+  // counter reset below still keeps the check correct if visibility is not restored.
+  await page.bringToFront();
+
+  // The counters are cumulative from page creation, but a legitimate hidden -> visible
+  // handover can happen inside the observation window: opening tab B makes tab A report
+  // visibilityState='hidden' in headless Chrome, so A stops renewing its lease and B takes
+  // over when the 12s TTL lapses. Reset the counters so we measure ONLY the observation
+  // window, and make that window longer than the lease TTL so the takeover is always seen.
+  pingCounts.set('a', 0);
+  pingCounts.set('b', 0);
+  await delay(14000);
   const aPings = pingCounts.get('a') || 0;
   const bPings = pingCounts.get('b') || 0;
   assert.ok(aPings + bPings > 0, 'at least one tab must probe RTT');
-  assert.ok(aPings === 0 || bPings === 0, 'only the leader tab may probe RTT');
+  assert.ok(aPings === 0 || bPings === 0, 'only the current leader tab may probe RTT');
+  // Whoever probed in the window is the CURRENT leader, which is not necessarily tab A.
   const leaderIsA = aPings > 0;
   const follower = leaderIsA ? mirrorPage : page;
   const leader = leaderIsA ? page : mirrorPage;
   const followerId = leaderIsA ? 'b' : 'a';
   await leader.close();
   const followerBefore = pingCounts.get(followerId) || 0;
-  await delay(15000);
+  // 12s lease expiry + 5s probe cadence margin, plus headless timing slack.
+  await delay(18000);
   const followerAfter = pingCounts.get(followerId) || 0;
   assert.ok(
     followerAfter > followerBefore,
