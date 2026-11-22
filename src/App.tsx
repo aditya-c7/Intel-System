@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { identifyCurrentVisitor, detectIncognitoMode } from './lib/collector';
 import type {
   IntelVisitorResponse,
@@ -61,6 +61,24 @@ import {
   EyeOff,
   ChevronRight,
 } from 'lucide-react';
+
+/**
+ * The dashboard has exactly one theme: the light UI. The legacy bootstrap can add `dark`
+ * from a stored/OS preference before React mounts, which used to flash a dark frame. Strip it
+ * as early as this module evaluates and again in a pre-paint layout effect so the very first
+ * painted frame already matches the light dashboard (no bootstrap dark class can survive).
+ */
+function enforceLightTheme(): void {
+  if (typeof document === 'undefined') return;
+  document.documentElement.classList.remove('dark');
+  document.body?.classList.remove('dark');
+  try {
+    window.localStorage.removeItem('intel_theme');
+  } catch {
+    // localStorage unavailable
+  }
+}
+enforceLightTheme();
 
 /** Edge-computed verdict injected into index.html by the Worker before any JS runs. */
 interface InitialVerdict {
@@ -877,16 +895,8 @@ export default function App() {
   // Monotonic token: a newer load (or unmount) cancels any in-flight geo retry loop.
   const geoPollToken = useRef(0);
 
-  // Swiss light mode is the only theme: strip any legacy class left by a previous session.
-  useEffect(() => {
-    document.documentElement.classList.remove('dark');
-    document.body?.classList.remove('dark');
-    try {
-      window.localStorage.removeItem('intel_theme');
-    } catch {
-      // localStorage unavailable
-    }
-  }, []);
+  // Swiss light mode is the only theme: strip any legacy class before the first paint.
+  useLayoutEffect(enforceLightTheme, []);
 
   /**
    * Retries ISP + location until the server has an exact answer.
@@ -1072,13 +1082,23 @@ export default function App() {
       : data?.location.longitude ?? null;
 
   const swiftShader = isSwiftShader(data?.hardwareSignals?.gpuRenderer);
+  const rawGpuRenderer = data?.hardwareSignals?.gpuRenderer;
+  // A real, unmasked WebGL renderer is the GPU line's single source of truth. Masked /
+  // unavailable placeholders are never printed as if they were a measured renderer, and the
+  // VM tile's software/masked verdict never overwrites an actual reported renderer.
+  const hasUnmaskedGpuRenderer =
+    typeof rawGpuRenderer === 'string' &&
+    rawGpuRenderer.trim() !== '' &&
+    !/masked|unavailable|unknown|not available|n\/a/i.test(rawGpuRenderer.trim());
   const cleanGpuName = !data?.hardwareSignals
     ? 'Standard GPU'
+    : hasUnmaskedGpuRenderer
+    ? (rawGpuRenderer as string).trim()
     : swiftShader
     ? SWIFTSHADER_LABEL
-    : formatCleanGpuName(data.hardwareSignals.gpuRenderer, data.hardwareSignals.gpuVendor);
-  const rawGpuTooltip = data?.hardwareSignals
-    ? `${data.hardwareSignals.gpuVendor} • ${data.hardwareSignals.gpuRenderer}`
+    : formatCleanGpuName(rawGpuRenderer, data.hardwareSignals.gpuVendor);
+  const rawGpuTooltip = data?.hardwareSignals && hasUnmaskedGpuRenderer
+    ? `${data.hardwareSignals.gpuVendor} • ${(rawGpuRenderer as string).trim()}`
     : '';
   // Anti-spoof integrity. A "Spoofed / Unverified" tag or a raw-attribute quarantine is only
   // honest when the SERVER has authoritatively declared the session tampered. Stealth / bot
@@ -1137,16 +1157,14 @@ export default function App() {
     data.securitySignals.ipTimezone !== 'Unavailable'
       ? data.securitySignals.ipTimezone
       : null;
-  const timezoneMismatchContextual = Boolean(canonical.network?.timezone_mismatch);
-  // The Locale & Timezone tile must surface the discrepancy on EVERY actual mismatch, even
-  // on legacy responses without a canonical envelope. The server flag and a direct browser-
-  // vs-IP label comparison are OR-ed; the copy stays purely contextual (never VPN / spoof).
-  const browserTzKnown =
-    browserTimezoneLabel && browserTimezoneLabel !== 'Unavailable' ? browserTimezoneLabel : null;
-  const directTimezoneMismatch = Boolean(
-    browserTzKnown && ipTimezoneLabel && browserTzKnown !== ipTimezoneLabel
-  );
-  const timezoneMismatchVisible = directTimezoneMismatch || timezoneMismatchContextual;
+  // The ONLY honest mismatch flag is the server's canonical `timezone_mismatch`. A raw
+  // browser-vs-IP string compare is deliberately gone: benign IANA aliases such as
+  // Asia/Calcutta vs Asia/Kolkata (or an unknown IP zone) must never light up this note.
+  const timezoneMismatchContextual =
+    typeof canonical.timezoneMismatchCanonical === 'boolean'
+      ? canonical.timezoneMismatchCanonical
+      : Boolean(canonical.network?.timezone_mismatch);
+  const timezoneMismatchVisible = timezoneMismatchContextual;
 
   const isCurrentVisit = selectedVisitIndex === 0;
 
@@ -1261,16 +1279,25 @@ export default function App() {
   const incognitoVerdict = useMemo(() => resolveIncognitoVerdict(data), [data]);
   const signalRows = buildSignalRows(serverSmartSignals, exactBotName, incognitoVerdict);
 
-  // User-visible risk stays on the 0-10 suspect-score scale. The normalizer converts any
-  // legacy 0-100 mirror back to 0-10; the tier follows that same displayed score.
-  const displayedSuspectScore = normalizeLegacyScore(
-    data?.suspectScore ?? data?.securitySignals?.suspectScore
-  );
-  const riskTier = resolveRiskTier(displayedSuspectScore);
-  const riskIsHigh = riskTier === 'High';
-  const riskIsElevated = riskTier === 'Medium';
+  // The headline risk is the server-canonical 0..10 ledger value and its tier — never a
+  // client-normalized legacy suspectScore. Tier vocabulary is Low / Elevated / High / Critical.
+  type DisplayRiskTier = 'Low' | 'Elevated' | 'High' | 'Critical';
+  const canonicalScore10Raw = canonical.riskScore10 as unknown as number | undefined;
+  const displayedRiskScore10 =
+    typeof canonicalScore10Raw === 'number' && Number.isFinite(canonicalScore10Raw)
+      ? canonicalScore10Raw
+      : 0;
+  const canonicalTierRaw = canonical.riskTier as unknown as DisplayRiskTier | undefined;
+  const riskTier: DisplayRiskTier =
+    canonicalTierRaw === 'Elevated' ||
+    canonicalTierRaw === 'High' ||
+    canonicalTierRaw === 'Critical'
+      ? canonicalTierRaw
+      : 'Low';
+  const riskIsHigh = riskTier === 'High' || riskTier === 'Critical';
+  const riskIsElevated = riskTier === 'Elevated';
   const riskTone = riskIsHigh ? 'text-rose-700' : riskIsElevated ? 'text-amber-700' : 'text-emerald-700';
-  const riskBadgeText = `${riskTier} Risk • ${displayedSuspectScore}/10`;
+  const riskBadgeText = `${riskTier} Risk • ${displayedRiskScore10}/10`;
 
   // Whenever the canonical tampering axis reports reasons, the header must say so.
   const tamperingDetected = canonical.tamperingReasons.length > 0;
@@ -1289,6 +1316,16 @@ export default function App() {
     userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : null,
   });
 
+  // ONE canonical inspector state feeds every CDP / DevTools surface. A bare CDP binding is
+  // never "Developer Tools", and nothing ever claims a CDP attachment when the canonical
+  // envelope says cdp_attached:false. No prose about an attachment is rendered in the UI.
+  const canonicalInspectorState = canonical.inspectorState ?? null;
+  const canonicalCdpAttached =
+    typeof canonical.cdpAttached === 'boolean'
+      ? canonical.cdpAttached
+      : canonicalInspectorState === 'automation_protocol_attached';
+  const canonicalDeveloperTools = canonicalInspectorState === 'devtools_active_verified';
+
   // API v4 event payload rendered by the bottom inspector. Built exclusively from live
   // first-party values: no invented signals, no third-party fraud labels.
   // Browser/OS fields come from the shared UA-CH normalizer so `os` is always the
@@ -1299,6 +1336,13 @@ export default function App() {
   const eventJson = useMemo(() => {
     if (!data) return null;
     const s = data.securitySignals;
+    // Only a server-supplied ML score is ever published — never a hard-coded baseline.
+    const serverTamperingMl =
+      typeof canonical.tampering?.tampering_ml_score === 'number'
+        ? canonical.tampering.tampering_ml_score
+        : typeof s.tamperingMlScore === 'number'
+        ? s.tamperingMlScore
+        : null;
     // Edge verdict fallback: a named agent is authoritative, so no stale aiAgent value may
     // ever supply bot / bot_type / bot_info once one of these verdict fields exists.
     const eventBotType = data.bot_type ?? initialVerdict?.botType ?? null;
@@ -1480,21 +1524,16 @@ export default function App() {
       // Developer tools = a real docked DevTools UI / IDE webview, proved ONLY by the
       // canonical envelope's inspector_state. A bare CDP binding / cdpRuntimeLeak /
       // automation_protocol_attached is reported separately and never sets this true.
-      developer_tools: canonical.automation?.inspector_state === 'devtools_active_verified',
-      cdp_attached:
-        canonical.automation?.cdp_attached ?? Boolean(s.cdpDetected || s.cdpRuntimeLeak),
-      inspector_state:
-        canonical.automation?.inspector_state ??
-        (s as { inspectorState?: string }).inspectorState ??
-        (s.cdpDetected || s.cdpRuntimeLeak
-          ? 'automation_protocol_attached'
-          : s.developerTools
-          ? 'devtools_active_verified'
-          : 'none'),
+      developer_tools: canonicalDeveloperTools,
+      cdp_attached: canonicalCdpAttached,
+      inspector_state: canonicalInspectorState,
       automation_environment: s.automationEnvironment ?? 'none',
       human_corroboration: canonical.humanCorroboration,
       ip_blocklist: {
-        email_spam: false,
+        // Omit email_spam entirely unless the server actually classified it.
+        ...(typeof (s as { emailSpam?: boolean }).emailSpam === 'boolean'
+          ? { email_spam: (s as { emailSpam?: boolean }).emailSpam as boolean }
+          : {}),
         attack_source: Boolean(s.ipBlocklisted),
         tor_node: Boolean(s.torExitNode),
       },
@@ -1532,25 +1571,31 @@ export default function App() {
         (s as { privacySettings?: boolean }).privacySettings || s.isTorBrowserClient
       ),
       simulator: Boolean(s.emulatorDetected),
-      suspect_score: displayedSuspectScore,
+      suspect_score: displayedRiskScore10,
+      // The complete canonical risk ledger: 0..100 composite, the 0..10 headline and its tier
+      // mirrored verbatim from the server, plus every evidence line. Nothing is recomputed.
+      risk_ledger: {
+        score_0_100: canonical.risk.score_0_100,
+        score10: displayedRiskScore10,
+        risk_tier: riskTier,
+        evidence_ledger: canonical.risk.evidence_ledger,
+      },
       // Mirrors the same server-canonical verdict the Virtual Machine tile renders.
       virtual_machine: vmVerdict.state === 'vm',
       tampering: Boolean(data.tampering ?? s.tampering),
       tampering_confidence: data.tamperingConfidence ?? 'high',
-      tampering_ml_score: s.tamperingMlScore ?? 0.0024,
-      tampering_details: data.tamperingDetails ?? {
-        anomaly_score: 0,
-        anti_detect_browser: false,
-        devtools_device_emulation: false,
-        reasons: [],
-      },
+      // Published only when the server measured it — no fabricated 0.0024 fallback.
+      ...(serverTamperingMl !== null ? { tampering_ml_score: serverTamperingMl } : {}),
+      // No fabricated zero/false detail object for a response that never supplied one.
+      ...(data.tamperingDetails ? { tampering_details: data.tamperingDetails } : {}),
       velocity: data.velocity ?? null,
       vpn: Boolean(s.vpnSuspected),
       vpn_confidence: s.vpnSuspected ? 'high' : 'low',
       // Server-authoritative method object: the grid tile count is derived from this exact
       // object, so the subtitle can never disagree with #raw-json.
       vpn_methods: {
-        timezone_mismatch: Boolean(s.vpnMethods?.timezone_mismatch ?? s.timezoneMismatch),
+        // Canonical server timezone_mismatch only; the legacy raw browser/IP compare is gone.
+        timezone_mismatch: Boolean(canonical.network?.timezone_mismatch ?? s.vpnMethods?.timezone_mismatch),
         public_vpn: Boolean(s.vpnMethods?.public_vpn),
         auxiliary_mobile: Boolean(s.vpnMethods?.auxiliary_mobile),
         os_mismatch: Boolean(s.vpnMethods?.os_mismatch ?? s.isOsTampered),
@@ -1577,8 +1622,13 @@ export default function App() {
         mismatch_contextual_only: timezoneMismatchVisible,
       },
       rare_device: Boolean(data.rareDevice ?? s.rareDevice),
-      rare_device_percentile_bucket:
-        data.rareDevicePercentileBucket ?? s.rareDevicePercentileBucket ?? '<p95',
+      // No fabricated "<p95" bucket: publish only a server-supplied value.
+      ...((data.rareDevicePercentileBucket ?? s.rareDevicePercentileBucket)
+        ? {
+            rare_device_percentile_bucket:
+              data.rareDevicePercentileBucket ?? s.rareDevicePercentileBucket,
+          }
+        : {}),
       // Spoof quarantine: client-reported browser / font / canvas / WebGL claims are blocked
       // when the session is tampered. Timezone is NEVER quarantined here: a browser-vs-IP
       // timezone difference is a network-context axis (timezone_mismatch), not a JS lie.
@@ -1587,7 +1637,8 @@ export default function App() {
             status: 'Quarantined - Tampered Session',
             client_claimed_browser: quarantineClaim(claimedBrowser, true),
             client_claimed_timezone: claimedTimezone,
-            timezone_discrepancy: canonical.network?.timezone_mismatch ? 'Detected' : 'Not detected',
+            timezone_discrepancy:
+              canonical.timezoneMismatchCanonical === true ? 'Detected' : 'Not detected',
             timezone_discrepancy_scope: 'network_axis_only',
             font: quarantineClaim(claimedFont, true),
             canvas: quarantineClaim(claimedCanvas, true),
@@ -1602,9 +1653,23 @@ export default function App() {
       // Everything below is the single canonical envelope, identical to the DOM panels.
       canonical: {
         source: canonical.source,
+        event_id: canonical.eventId,
         verdict_tier: eventVerdictTier,
         browser_tampering: tamperingDetected ? 'Detected' : 'Not detected',
         human_corroboration: canonical.humanCorroboration,
+        // All provenance fields, mirrored verbatim from the one canonical envelope.
+        server_verified: canonical.serverVerified,
+        client_claimed: canonical.clientClaimed,
+        reconciled_display: canonical.reconciledDisplay,
+        os_truth: canonical.osTruth,
+        verified_agent_id: canonical.verifiedAgentId ?? null,
+        signature_status: canonical.signatureStatus ?? null,
+        inspector_state: canonicalInspectorState,
+        cdp_attached: canonicalCdpAttached,
+        developer_tools: canonicalDeveloperTools,
+        gpu_observation: canonical.gpuObservation ?? null,
+        timezone_mismatch_canonical: canonical.timezoneMismatchCanonical ?? null,
+        calibration_status: canonical.calibrationStatus,
         identity: {
           match_stage: canonical.identity?.match_stage ?? null,
           match_label: canonical.identity?.match_label ?? null,
@@ -1630,7 +1695,8 @@ export default function App() {
             ? 'No VPN detected (high confidence)'
             : 'No VPN detected (low confidence)',
           proxy_rotation: canonical.network?.proxy ? 'Detected' : 'Not detected',
-          timezone_discrepancy: canonical.network?.timezone_mismatch ? 'Detected' : 'Not detected',
+          timezone_discrepancy:
+            canonical.timezoneMismatchCanonical === true ? 'Detected' : 'Not detected',
         },
         // Mirror the server-canonical environment axes (client SwiftShader detection only
         // backfills legacy responses without them), so this never disagrees with the VM tile.
@@ -1648,8 +1714,12 @@ export default function App() {
   }, [
     data,
     incognitoVerdict,
-    displayedSuspectScore,
+    displayedRiskScore10,
+    riskTier,
     canonical,
+    canonicalInspectorState,
+    canonicalCdpAttached,
+    canonicalDeveloperTools,
     displayBotType,
     automationDisplayLabel,
     exactBotName,
@@ -1718,17 +1788,8 @@ export default function App() {
             </a>
           </nav>
 
-          <div className="flex items-center gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={() => loadVisitorData(true)}
-              disabled={loading || refreshing}
-              className="inline-flex items-center gap-1.5 px-3 sm:px-3.5 py-1.5 text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 border border-slate-300 rounded-md disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-              <span>{refreshing ? 'Refreshing...' : 'Record Visit'}</span>
-            </button>
-          </div>
+          {/* One primary CTA lives in the risk header ("Analyze my browser again"); no
+              duplicate visit-recording button is rendered here. */}
         </div>
       </header>
 
@@ -1762,7 +1823,7 @@ export default function App() {
                   ? 'bg-[#F9AB00]'
                   : 'bg-[#81C995]'
               }`}
-              style={{ width: `${Math.max(2, displayedSuspectScore * 10)}%` }}
+              style={{ width: `${Math.max(2, displayedRiskScore10 * 10)}%` }}
             />
           </div>
           <div className="mt-3 flex items-center justify-center gap-3">
@@ -1773,7 +1834,7 @@ export default function App() {
               className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-md disabled:opacity-50 cursor-pointer"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin' : ''}`} />
-              <span>{refreshing ? 'Analyzing...' : 'Analyze my browser'}</span>
+              <span>{refreshing ? 'Analyzing...' : 'Analyze my browser again'}</span>
             </button>
             <a
               href="#raw-json"
@@ -1982,32 +2043,32 @@ export default function App() {
                 {data.identification ? (
                   <div className="mt-2 flex items-center gap-1.5 flex-wrap">
                     {(() => {
-                      // The only honest percentage is the server-calibrated 0..1 score in
-                      // canonical.confidenceScore. Convert it to an integer 0..100, clamped to
-                      // that range; an unavailable score is shown as a truthful 0% with an
-                      // explicit title — never a fabricated tier or a raw-JSON mirror fallback.
+                      // This is observable match evidence, NOT a calibrated probability.
+                      // Mirror the server's 0..1 score as an integer 0..100; an absent score
+                      // stays an honest 0% and the chip is explicitly labelled uncalibrated.
                       const numeric = canonical?.confidenceScore;
-                      const hasScore =
-                        typeof numeric === 'number' && Number.isFinite(numeric);
                       const percent =
                         typeof numeric === 'number' && Number.isFinite(numeric)
                           ? Math.max(0, Math.min(100, Math.round(numeric * 100)))
                           : 0;
-                      const stage = canonical?.identity?.match_stage;
-                      const label = canonical?.identity?.match_label;
-                      const stageText = stage ? stage.replace(/_/g, ' ') : null;
-                      const basis = label
-                        ? `Based on ${label}${stageText ? ` · ${stageText}` : ''}`
-                        : stageText
-                        ? `Based on ${stageText}`
-                        : 'Match basis unavailable';
+                      const isUncalibrated = canonical?.calibrationStatus !== 'calibrated';
                       return (
-                        <span
-                          className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-700"
-                          title={hasScore ? basis : 'No calibrated match evidence yet'}
-                        >
-                          Confidence {percent}%
-                        </span>
+                        <>
+                          <span
+                            className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-700"
+                            title="Evidence-based match score — not a calibrated probability"
+                          >
+                            Match evidence {percent}%
+                          </span>
+                          {isUncalibrated && (
+                            <span
+                              className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700"
+                              title="No held-out calibration gate has passed for this score"
+                            >
+                              uncalibrated
+                            </span>
+                          )}
+                        </>
                       );
                     })()}
                   </div>
@@ -2419,21 +2480,23 @@ export default function App() {
                 </div>
               </div>
 
-            {/* 4. 4 KPI Summary Counters: Total Visits, Active Sessions, Observed IPs, Locations */}
+            {/* 4. 4 KPI Summary Counters: Local History, Active Sessions, Observed IPs, Locations */}
             <div className="order-5 lg:col-span-2 lg:row-start-4 grid grid-cols-2 lg:grid-cols-4 border-t border-[#E5E7EB]">
-              {/* KPI 1: Visits */}
+              {/* KPI 1: honest local-history count (the records actually persisted) */}
               <div className="px-3 sm:px-6 py-3.5 flex items-center gap-3 sm:gap-3.5 min-w-0 border-r border-b lg:border-b-0 border-[#E5E7EB]">
                 <div className="w-9 h-9 rounded-lg bg-orange-50/40 border border-orange-100 flex items-center justify-center shrink-0">
                   <Activity className="w-4 h-4 text-[#F05A28]" />
                 </div>
                 <div className="min-w-0">
                   <span className="block text-[11px] font-medium text-slate-500">
-                    Total Visits
+                    Local History
                   </span>
                   <span className="block text-sm sm:text-base font-bold font-mono tabular-nums text-[#111827] leading-tight break-words">
-                    {data.statistics.totalVisits}{' '}
+                    {data.visitHistory.length}{' '}
                     <span className="font-sans font-medium text-xs text-slate-500">
-                      {data.statistics.totalVisits === 1 ? 'visit' : 'visits'}
+                      {data.visitHistory.length === 1
+                        ? 'visit in local history'
+                        : 'visits in local history'}
                     </span>
                   </span>
                 </div>
@@ -2565,11 +2628,6 @@ export default function App() {
                       </div>
                       <span className="block text-xs sm:text-sm font-semibold text-[#111827] truncate mt-0.5">
                         {cleanGpuName}
-                        {spoofedSpecs && !swiftShader && (
-                          <span className="ml-1.5 text-[9px] font-sans font-medium text-amber-600">
-                            (Spoofed / Unverified)
-                          </span>
-                        )}
                       </span>
                     </div>
                   </div>
@@ -2638,7 +2696,7 @@ export default function App() {
                   <span className="text-xs text-slate-500 truncate">
                     Vendor:{' '}
                     <strong className="font-semibold text-slate-800">
-                      {data.hardwareSignals.gpuVendor}
+                      {hasUnmaskedGpuRenderer ? data.hardwareSignals.gpuVendor : 'Unavailable'}
                     </strong>
                   </span>
                   <span className="text-[11px] font-mono text-slate-400 shrink-0">
@@ -2647,7 +2705,7 @@ export default function App() {
                 </div>
 
                 <div className="mt-2 p-2.5 rounded-lg bg-slate-50 border border-[#E5E7EB] text-[11px] font-mono text-slate-600 break-all">
-                  {data.hardwareSignals.gpuRenderer}
+                  {hasUnmaskedGpuRenderer ? (rawGpuRenderer as string).trim() : 'Unavailable'}
                 </div>
               </div>
             </div>

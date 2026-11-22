@@ -122,6 +122,30 @@ export type InspectorState =
   | 'devtools_active_verified'
   | 'closed';
 
+/**
+ * Additive coarse GPU observation bucket for the labeling / calibration record. This is the
+ * normalized truth category, not a raw client-supplied WebGL vendor / renderer string, so it
+ * can be compared across model and weight-config versions.
+ */
+export type GpuObservation =
+  | 'hardware_visible'
+  | 'masked_by_privacy'
+  | 'observation_unavailable'
+  | 'software_or_virtual';
+
+/** Lowercase alias matching the canonical envelope field name. */
+export type gpuObservation = GpuObservation;
+
+/**
+ * Additive tri-state inspector signal: positively attached, positively detached, or unknown.
+ * Kept separate from the four-valued `InspectorState` so a consumer that only needs certainty
+ * never has to interpret the "docked suspected" state.
+ */
+export type InspectorStateTristate = 'attached' | 'detached' | 'unknown';
+
+/** Lowercase alias matching the canonical envelope field name. */
+export type inspectorState = InspectorStateTristate;
+
 export interface AutomationAxes {
   bot: 'not_detected' | 'suspected' | 'bad' | 'good' | 'ai_agent';
   bot_type: string | null;
@@ -252,6 +276,152 @@ export interface CanonicalTelemetryEnvelope {
   velocity: Record<string, unknown>;
   risk: OrthogonalRiskLedger;
   verdict_tier: VerdictTier;
+
+  /* ------------------------------------------------------------------------ */
+  /* Additive provenance / schema metadata (all OPTIONAL — legacy payloads stay valid).
+  /* `risk.score10` and `risk.risk_tier` already ship on OrthogonalRiskLedger; the fields
+  /* below only attach versioning, an optional flat evidence mirror and the labeling /
+  /* calibration record used by the offline training pipeline. None are re-derived here.
+  /* ------------------------------------------------------------------------ */
+  /** Version of the canonical envelope schema itself. */
+  schemaVersion?: number | string;
+  /** Version of the parser that produced this envelope. */
+  parserVersion?: string;
+  /** Source-control revision of the build that emitted this envelope. */
+  buildSha?: string;
+  /** Flat scored-line mirror of `risk.evidence_ledger`, carried for transport/debugging. */
+  evidenceLedger?: RiskEvidenceLine[];
+
+  /** Ground-truth label assigned to this observation by the labeling pipeline. */
+  label?: string;
+  /** When the telemetry observation was captured (ISO-8601 timestamp). */
+  observation_timestamp?: string;
+  /** When the ground-truth label was assigned (ISO-8601 timestamp). */
+  label_timestamp?: string;
+  /** Who or what produced the label (analyst, model id, rule set, ...). */
+  label_source?: string;
+  /** Scoring model version used at observation time. */
+  model_version?: string;
+  /** Calibration artifact version applied to the score. */
+  calibration_version?: string;
+  /** Hash of the weight configuration used for scoring. */
+  weight_config_hash?: string;
+
+  /** Normalized GPU truth bucket, when the observation pipeline supplied one. */
+  gpuObservation?: GpuObservation;
+  /** Certainty-only inspector attachment signal; legacy four-state values are accepted verbatim. */
+  inspectorState?: InspectorStateTristate | InspectorState;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Canonical consistency (pure, non-throwing)                                 */
+/* -------------------------------------------------------------------------- */
+
+/** Structural subset needed by `assertCanonicalConsistency`; both the envelope and the
+ * graded ledger satisfy it without any cast. */
+export interface CanonicalConsistencyView {
+  event_id?: string;
+  risk: {
+    score_0_100: number;
+    tier: RiskTier;
+    score10?: number;
+    risk_tier?: RiskTier;
+  };
+  identity?: Pick<IdentityAxes, 'match_stage' | 'confidence_tier' | 'confidence_score' | 'calibration_status'> | null;
+  label?: string;
+  verdict_tier?: VerdictTier;
+}
+
+const CANONICAL_RISK_TIERS: ReadonlySet<string> = new Set<RiskTier>(['Low', 'Elevated', 'High', 'Critical']);
+
+/** Mirror of the frozen `score10FromScore100` mapping, kept local so this file stays
+ * dependency-free (it is imported by Node, the browser bundle and the Worker adapter). */
+function canonicalScore10(score_0_100: number): number {
+  if (!Number.isFinite(score_0_100)) return 0;
+  return Math.max(0, Math.min(10, Math.round(score_0_100 / 10)));
+}
+
+/**
+ * Pure invariant check over the canonical view. Returns a list of human-readable issues and
+ * NEVER throws, so a malformed legacy payload degrades to diagnostics instead of crashing a
+ * client or an adapter. Checks three parity families:
+ *
+ *   1. score10 parity      — `risk.score10` (when present) vs the frozen 0-100 -> 0-10 mapping.
+ *   2. tier parity         — `risk.tier` vs the frozen composite tier boundaries.
+ *   3. identity parity     — the `risk.risk_tier` / `label` mirrors and the identity axes agree
+ *                            with that same canonical tier (no client re-derivation).
+ *
+ * An empty array means the view is internally consistent.
+ */
+export function assertCanonicalConsistency(view: CanonicalConsistencyView): string[] {
+  const issues: string[] = [];
+  if (!view || typeof view !== 'object') {
+    return ['view must be an object'];
+  }
+
+  const risk = view.risk;
+  if (!risk || typeof risk !== 'object' || !Number.isFinite(risk.score_0_100)) {
+    issues.push('risk.score_0_100 must be a finite number');
+    return issues;
+  }
+
+  const composite = risk.score_0_100;
+  const expectedScore10 = canonicalScore10(composite);
+  const expectedTier = riskTier(composite);
+
+  /* 1. score10 parity. */
+  if (risk.score10 !== undefined) {
+    if (typeof risk.score10 !== 'number' || !Number.isFinite(risk.score10)) {
+      issues.push('risk.score10 must be a finite number when present');
+    } else if (risk.score10 !== expectedScore10) {
+      issues.push(`risk.score10=${risk.score10} disagrees with score_0_100=${composite} (expected ${expectedScore10})`);
+    }
+  }
+
+  /* 2. tier parity. */
+  if (!CANONICAL_RISK_TIERS.has(risk.tier)) {
+    issues.push(`risk.tier=${String(risk.tier)} is not a canonical risk tier`);
+  } else if (risk.tier !== expectedTier) {
+    issues.push(`risk.tier=${risk.tier} disagrees with score_0_100=${composite} (expected ${expectedTier})`);
+  }
+
+  /* 3a. identity parity — the optional risk_tier mirror and the canonical tier. */
+  if (risk.risk_tier !== undefined) {
+    if (!CANONICAL_RISK_TIERS.has(risk.risk_tier)) {
+      issues.push(`risk.risk_tier=${String(risk.risk_tier)} is not a canonical risk tier`);
+    } else if (risk.risk_tier !== expectedTier || risk.risk_tier !== risk.tier) {
+      issues.push(`risk.risk_tier=${risk.risk_tier} disagrees with risk.tier=${risk.tier} (expected ${expectedTier})`);
+    }
+  }
+
+  /* 3b. identity parity — a tier-shaped label must name the same canonical tier. */
+  if (typeof view.label === 'string' && CANONICAL_RISK_TIERS.has(view.label) && view.label !== expectedTier) {
+    issues.push(`label=${view.label} disagrees with canonical tier ${expectedTier}`);
+  }
+
+  /* 3c. identity parity — documented calibration / match-stage invariants. */
+  const identity = view.identity;
+  if (identity) {
+    const calibrated = identity.calibration_status === 'calibrated';
+    const hasFiniteScore = typeof identity.confidence_score === 'number' && Number.isFinite(identity.confidence_score);
+    if (calibrated && !hasFiniteScore) {
+      issues.push('identity.calibration_status=calibrated requires a finite confidence_score');
+    }
+    if (!calibrated && identity.confidence_score !== null && identity.confidence_score !== undefined) {
+      issues.push('identity.calibration_status=uncalibrated requires confidence_score=null');
+    }
+    if (identity.match_stage === 'new_enrollment' && identity.confidence_tier !== 'New Unobserved Profile') {
+      issues.push('new_enrollment match_stage requires New Unobserved Profile confidence_tier');
+    }
+    if (
+      identity.match_stage === 'privacy_hardened' &&
+      identity.confidence_tier !== 'Privacy-Hardened Profile (Reduced Entropy)'
+    ) {
+      issues.push('privacy_hardened match_stage requires Privacy-Hardened Profile (Reduced Entropy) confidence_tier');
+    }
+  }
+
+  return issues;
 }
 
 /* -------------------------------------------------------------------------- */

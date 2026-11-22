@@ -475,6 +475,39 @@ function normalizeCountryCode(raw) {
   if (upper === "XX" || upper === "T1") return "";
   return upper;
 }
+var CONTINENT_NAMES = {
+  AF: "Africa",
+  AN: "Antarctica",
+  AS: "Asia",
+  EU: "Europe",
+  NA: "North America",
+  OC: "Oceania",
+  SA: "South America"
+};
+var CONTINENT_CODES_BY_NAME = Object.fromEntries(
+  Object.entries(CONTINENT_NAMES).map(([code, name]) => [name.toLowerCase(), code])
+);
+function parseContinentValue(raw) {
+  const value = typeof raw === "string" ? raw.trim() : "";
+  if (!value) return { code: "", name: "" };
+  const upper = value.toUpperCase();
+  if (/^[A-Z]{2}$/.test(upper)) {
+    const name = CONTINENT_NAMES[upper] || "";
+    return { code: name ? upper : "", name };
+  }
+  const code = CONTINENT_CODES_BY_NAME[value.toLowerCase()] || "";
+  return { code, name: code ? CONTINENT_NAMES[code] : value };
+}
+function parseAccuracyRadius(raw) {
+  const value = typeof raw === "number" ? raw : typeof raw === "string" && raw.trim() ? Number(raw) : Number.NaN;
+  return Number.isFinite(value) && value >= 0 && value < 1e6 ? value : null;
+}
+function parseAsnNetwork(raw) {
+  if (typeof raw !== "string") return "";
+  const value = raw.trim();
+  if (!value) return "";
+  return /^(?:\d{1,3}\.){3}\d{1,3}\/\d{1,2}$|^[0-9a-fA-F:.]+\/\d{1,3}$/.test(value) ? value : "";
+}
 function parseEdgeGeoPayload(raw) {
   if (!raw) return null;
   try {
@@ -489,6 +522,16 @@ function payloadText(payload, key) {
   const value = payload[key];
   return typeof value === "string" ? value.trim() : "";
 }
+function payloadAnyText(payload, keys) {
+  for (const key of keys) {
+    const text = payloadText(payload, key);
+    if (text) return text;
+  }
+  return "";
+}
+function payloadAccuracyRadius(payload) {
+  return parseAccuracyRadius(payload.accuracyRadius) ?? parseAccuracyRadius(payload.accuracy_radius);
+}
 function readEdgeGeoHeaders(headers) {
   const signedPayload = parseEdgeGeoPayload(headerValue(headers, ["x-intel-edge-geo"]));
   if (signedPayload) {
@@ -497,17 +540,33 @@ function readEdgeGeoHeaders(headers) {
     const countryCode2 = normalizeCountryCode(rawCountry);
     const city2 = decodeCity(payloadText(signedPayload, "city"));
     const region2 = payloadText(signedPayload, "region");
+    const regionCode2 = payloadAnyText(signedPayload, ["regionCode", "region_code"]);
+    const continent2 = payloadAnyText(signedPayload, [
+      "continent",
+      "continentCode",
+      "continent_code"
+    ]);
+    const timezone2 = payloadText(signedPayload, "timezone");
+    const postalCode2 = payloadAnyText(signedPayload, ["postalCode", "postal_code"]);
+    const accuracyRadius2 = payloadAccuracyRadius(signedPayload);
+    const asnNetwork2 = parseAsnNetwork(
+      payloadAnyText(signedPayload, ["asnNetwork", "asn_network"])
+    );
     return {
       city: isMissingGeoValue(city2) ? "" : city2,
       region: isMissingGeoValue(region2) ? "" : region2,
       country: countryNameFromCode(countryCode2),
       countryCode: countryCode2,
-      timezone: isMissingGeoValue(payloadText(signedPayload, "timezone")) ? "" : payloadText(signedPayload, "timezone"),
+      timezone: isMissingGeoValue(timezone2) ? "" : timezone2,
       latitude: parseLat(payloadText(signedPayload, "latitude")),
       longitude: parseLng(payloadText(signedPayload, "longitude")),
       asn: normalizeAsnLabel(payloadText(signedPayload, "asn")),
       organization: payloadText(signedPayload, "organization"),
-      postalCode: payloadText(signedPayload, "postalCode"),
+      postalCode: isMissingGeoValue(postalCode2) ? "" : postalCode2,
+      regionCode: isMissingGeoValue(regionCode2) ? "" : regionCode2,
+      continent: isMissingGeoValue(continent2) ? "" : continent2,
+      accuracyRadius: accuracyRadius2,
+      asnNetwork: asnNetwork2,
       isTorNetwork: isTorNetwork2,
       trusted: true,
       source: "cloudflare"
@@ -537,6 +596,33 @@ function readEdgeGeoHeaders(headers) {
   );
   const organization = headerValue(headers, ["x-vercel-ip-as-organization"]);
   const postalCode = headerValue(headers, ["x-vercel-ip-postal-code", "cf-postal-code"]);
+  const regionCode = headerValue(headers, [
+    "x-vercel-ip-country-region",
+    "cf-region-code",
+    "cf-regioncode",
+    "x-intel-ip-region-code"
+  ]);
+  const continent = headerValue(headers, [
+    "x-vercel-ip-continent",
+    "cf-ipcontinent",
+    "cf-continent",
+    "x-intel-ip-continent"
+  ]);
+  const accuracyRadius = parseAccuracyRadius(
+    headerValue(headers, [
+      "x-vercel-ip-accuracy-radius",
+      "cf-ipaccuracy-radius",
+      "x-intel-ip-accuracy-radius"
+    ])
+  );
+  const asnNetwork = parseAsnNetwork(
+    headerValue(headers, [
+      "x-vercel-ip-as-network",
+      "cf-as-network",
+      "cf-asn-network",
+      "x-intel-ip-as-network"
+    ])
+  );
   const source = headerValue(headers, ["x-vercel-id", "x-vercel-ip-country"]) ? "vercel" : headerValue(headers, ["cf-ipcountry", "cf-ray"]) ? "cloudflare" : "none";
   return {
     city: isMissingGeoValue(city) ? "" : city,
@@ -549,6 +635,10 @@ function readEdgeGeoHeaders(headers) {
     asn,
     organization: isMissingGeoValue(organization) ? "" : organization,
     postalCode: isMissingGeoValue(postalCode) ? "" : postalCode,
+    regionCode: isMissingGeoValue(regionCode) ? "" : regionCode,
+    continent: isMissingGeoValue(continent) ? "" : continent,
+    accuracyRadius,
+    asnNetwork,
     isTorNetwork,
     trusted: false,
     source
@@ -586,7 +676,14 @@ function cloudProviderOrgForAsn(rawAsn) {
 function meaningful(value) {
   return typeof value === "string" && !isMissingGeoValue(value);
 }
+function firstMeaningful(...values) {
+  for (const value of values) {
+    if (meaningful(value)) return value.trim();
+  }
+  return "";
+}
 function mergeLocationWithEdge(location, edge) {
+  const extras = location;
   const edgeCountryCode = normalizeCountryCode(edge.countryCode);
   const providerCountryCode = normalizeCountryCode(location.countryCode);
   const countryCode = edgeCountryCode || providerCountryCode;
@@ -613,6 +710,29 @@ function mergeLocationWithEdge(location, edge) {
   const city = providerLocationTrusted && meaningful(location.city) ? location.city : edge.city || "Unknown";
   const region = providerLocationTrusted && meaningful(location.region) ? location.region : edge.region || "Unknown";
   const timezone = meaningful(location.timezone) ? location.timezone : edge.timezone || void 0;
+  const edgeContinent = parseContinentValue(edge.continent);
+  const providerContinent = providerCountryAgrees ? parseContinentValue(
+    firstMeaningful(
+      extras.continentCode,
+      extras.continent_code,
+      extras.continentName,
+      extras.continent_name,
+      extras.continent
+    )
+  ) : { code: "", name: "" };
+  const continentCode = edgeContinent.code || providerContinent.code;
+  const continentName = edgeContinent.name || providerContinent.name;
+  const providerSubdivision = providerCountryAgrees ? firstMeaningful(
+    extras.subdivisionIso,
+    extras.subdivision_iso,
+    extras.regionCode,
+    extras.region_code
+  ) : "";
+  const subdivisionIso = firstMeaningful(edge.regionCode, providerSubdivision) || null;
+  const providerPostal = providerCountryAgrees ? firstMeaningful(extras.postalCode, extras.postal_code, extras.postal) : "";
+  const postalCode = firstMeaningful(edge.postalCode, providerPostal) || null;
+  const accuracyRadius = (providerCountryAgrees ? parseAccuracyRadius(extras.accuracyRadius ?? extras.accuracy_radius) : null) ?? edge.accuracyRadius ?? null;
+  const asnNetwork = parseAsnNetwork(firstMeaningful(extras.asnNetwork, extras.asn_network)) || parseAsnNetwork(edge.asnNetwork) || null;
   const locationPrecision = meaningful(city) && !isMissingGeoValue(city) ? "city" : meaningful(region) && !isMissingGeoValue(region) ? "region" : countryCode ? "country" : "unknown";
   const hasCountry = Boolean(countryCode) || meaningful(country) && country !== "Unknown";
   return {
@@ -631,8 +751,181 @@ function mergeLocationWithEdge(location, edge) {
     isTorExit: Boolean(location.isTorExit) || edge.isTorNetwork,
     locationSource: edgeCountryCode ? "edge" : location.locationSource ?? "provider",
     locationPrecision,
-    isLocationVerified: hasCountry
+    isLocationVerified: hasCountry,
+    continent_code: continentCode || void 0,
+    continent_name: continentName || void 0,
+    postal_code: postalCode || void 0,
+    subdivision_iso: subdivisionIso || void 0,
+    accuracy_radius: accuracyRadius,
+    asn_network: asnNetwork || void 0
   };
+}
+
+// src/lib/timezone.ts
+var IANA_TIMEZONE_ALIASES = Object.freeze({
+  // Asia
+  "asia/calcutta": "Asia/Kolkata",
+  "asia/katmandu": "Asia/Kathmandu",
+  "asia/rangoon": "Asia/Yangon",
+  "asia/saigon": "Asia/Ho_Chi_Minh",
+  "asia/chongqing": "Asia/Shanghai",
+  "asia/harbin": "Asia/Shanghai",
+  "asia/beijing": "Asia/Shanghai",
+  "asia/kashgar": "Asia/Urumqi",
+  "asia/ulan_baba": "Asia/Ulaanbaatar",
+  "asia/phnom_penh": "Asia/Bangkok",
+  "asia/vientiane": "Asia/Bangkok",
+  "asia/tel_aviv": "Asia/Jerusalem",
+  // Europe
+  "europe/kiev": "Europe/Kyiv",
+  "europe/uzhgorod": "Europe/Kyiv",
+  "europe/zaporozhye": "Europe/Kyiv",
+  "europe/belfast": "Europe/London",
+  "europe/ljubljana": "Europe/Belgrade",
+  "europe/podgorica": "Europe/Belgrade",
+  "europe/sarajevo": "Europe/Belgrade",
+  "europe/skopje": "Europe/Belgrade",
+  "europe/zagreb": "Europe/Belgrade",
+  "europe/bratislava": "Europe/Prague",
+  "europe/tiraspol": "Europe/Chisinau",
+  // Americas
+  "america/buenos_aires": "America/Argentina/Buenos_Aires",
+  "america/catamarca": "America/Argentina/Catamarca",
+  "america/cordoba": "America/Argentina/Cordoba",
+  "america/jujuy": "America/Argentina/Jujuy",
+  "america/mendoza": "America/Argentina/Mendoza",
+  "america/rosario": "America/Argentina/Cordoba",
+  "america/indianapolis": "America/Indiana/Indianapolis",
+  "america/fort_wayne": "America/Indiana/Indianapolis",
+  "america/louisville": "America/Kentucky/Louisville",
+  "america/monticello": "America/Kentucky/Monticello",
+  "america/godthab": "America/Nuuk",
+  "us/eastern": "America/New_York",
+  "us/central": "America/Chicago",
+  "us/mountain": "America/Denver",
+  "us/pacific": "America/Los_Angeles",
+  "us/alaska": "America/Anchorage",
+  "us/aleutian": "America/Adak",
+  "us/arizona": "America/Phoenix",
+  "us/hawaii": "Pacific/Honolulu",
+  "us/michigan": "America/Detroit",
+  "us/samoa": "Pacific/Pago_Pago",
+  "us/east-indiana": "America/Indiana/Indianapolis",
+  "us/indiana-starke": "America/Indiana/Knox",
+  // Pacific / Australia / Africa
+  "pacific/johnston": "Pacific/Honolulu",
+  "pacific/samoa": "Pacific/Pago_Pago",
+  "pacific/truk": "Pacific/Chuuk",
+  "pacific/yap": "Pacific/Chuuk",
+  "pacific/ponape": "Pacific/Pohnpei",
+  "australia/act": "Australia/Sydney",
+  "australia/nsw": "Australia/Sydney",
+  "australia/canberra": "Australia/Sydney",
+  "australia/victoria": "Australia/Melbourne",
+  "australia/queensland": "Australia/Brisbane",
+  "australia/south": "Australia/Adelaide",
+  "australia/west": "Australia/Perth",
+  "australia/tasmania": "Australia/Hobart",
+  "africa/asmera": "Africa/Asmara",
+  "atlantic/faeroe": "Atlantic/Faroe",
+  // UTC spellings (Etc/GMT±N offsets are intentionally NOT aliases for UTC)
+  "etc/utc": "UTC",
+  "etc/gmt": "UTC",
+  "etc/universal": "UTC",
+  "etc/zulu": "UTC",
+  "etc/greenwich": "UTC",
+  "etc/gmt0": "UTC",
+  "etc/uct": "UTC",
+  utc: "UTC",
+  gmt: "UTC",
+  universal: "UTC",
+  zulu: "UTC",
+  greenwich: "UTC",
+  gmt0: "UTC",
+  uct: "UTC"
+});
+var SENTINEL_KEYS = /* @__PURE__ */ new Set([
+  "unknown",
+  "unavailable",
+  "n/a",
+  "na",
+  "none",
+  "null",
+  "undefined",
+  "etc/unknown",
+  "local"
+]);
+var CANONICAL_BY_KNOWN_NAME = (() => {
+  const map = /* @__PURE__ */ new Map();
+  for (const [alias, canonical] of Object.entries(IANA_TIMEZONE_ALIASES)) {
+    if (typeof canonical !== "string" || canonical.length === 0) continue;
+    for (const knownName of [alias, canonical]) {
+      const key = knownName.toLowerCase();
+      if (!map.has(key)) map.set(key, canonical);
+    }
+  }
+  return map;
+})();
+var ETC_GMT_OFFSET = /^etc\/gmt([+-](?:0?\d|1[0-4]))$/;
+var supportedZoneIndexCache;
+function supportedZoneIndex() {
+  if (supportedZoneIndexCache !== void 0) return supportedZoneIndexCache;
+  let index = null;
+  try {
+    const intl = typeof Intl === "undefined" ? void 0 : Intl;
+    const supportedValuesOf = intl ? intl.supportedValuesOf : void 0;
+    if (typeof supportedValuesOf === "function") {
+      const values = supportedValuesOf.call(intl, "timeZone");
+      if (Array.isArray(values)) {
+        index = /* @__PURE__ */ new Map();
+        for (const value of values) {
+          if (typeof value !== "string" || value.length === 0) continue;
+          const key = value.toLowerCase();
+          if (!index.has(key)) index.set(key, value);
+        }
+      }
+    }
+  } catch {
+    index = null;
+  }
+  supportedZoneIndexCache = index;
+  return index;
+}
+function canonicalTimezone(input) {
+  try {
+    if (typeof input !== "string") return null;
+    const trimmed = input.trim();
+    if (trimmed.length === 0) return null;
+    const key = trimmed.toLowerCase();
+    if (SENTINEL_KEYS.has(key)) return null;
+    const alias = IANA_TIMEZONE_ALIASES[key];
+    const candidate = typeof alias === "string" && alias.length > 0 ? alias : trimmed;
+    const candidateKey = candidate.toLowerCase();
+    const index = supportedZoneIndex();
+    const fromIntl = index?.get(candidateKey);
+    if (fromIntl) {
+      return CANONICAL_BY_KNOWN_NAME.get(fromIntl.toLowerCase()) ?? fromIntl;
+    }
+    const known = CANONICAL_BY_KNOWN_NAME.get(candidateKey);
+    if (known) return known;
+    const gmtOffset = ETC_GMT_OFFSET.exec(candidateKey);
+    if (gmtOffset) return `Etc/GMT${gmtOffset[1]}`;
+    return index === null ? candidateKey : null;
+  } catch {
+    return null;
+  }
+}
+function timezonesEquivalent(a, b) {
+  const canonicalA = canonicalTimezone(a);
+  const canonicalB = canonicalTimezone(b);
+  if (canonicalA === null || canonicalB === null) return false;
+  return canonicalA.toLowerCase() === canonicalB.toLowerCase();
+}
+function timezoneMismatchContext(browserTz, ipTz) {
+  const canonicalBrowser = canonicalTimezone(browserTz);
+  const canonicalIp = canonicalTimezone(ipTz);
+  const mismatch = canonicalBrowser !== null && canonicalIp !== null && canonicalBrowser.toLowerCase() !== canonicalIp.toLowerCase();
+  return { mismatch, canonicalBrowser, canonicalIp };
 }
 
 // src/lib/agentRegistry.ts
@@ -1894,6 +2187,15 @@ function filterBrands(brands) {
   const nonChromium = real.filter((b) => b.brand.toLowerCase() !== CHROMIUM_PLACEHOLDER);
   return nonChromium.length > 0 ? nonChromium : real;
 }
+function isPlaceholderVersion(version) {
+  if (typeof version !== "string" || !version.trim()) return false;
+  return /^0+(?:\.0+)*$/.test(version.trim());
+}
+function hasRealBrand(brands) {
+  return brands.some(
+    (b) => !!b && !GREASE_RE.test(b.brand) && !isPlaceholderVersion(b.version)
+  );
+}
 function headerValue3(secCh, name) {
   if (!secCh) return "";
   const lower = name.toLowerCase();
@@ -1910,6 +2212,22 @@ function unquote(value) {
   if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) return v.slice(1, -1);
   return v;
 }
+function parseStructuredBoolean(value) {
+  if (value === true) return true;
+  if (typeof value === "number") return value === 1;
+  if (typeof value !== "string") return false;
+  const token = value.trim().replace(/^[?"']+|[?"']+$/g, "").toLowerCase();
+  return token === "1" || token === "true";
+}
+var parseMobileFlag = parseStructuredBoolean;
+var parseWow64 = parseStructuredBoolean;
+function parseFormFactors(value) {
+  if (Array.isArray(value)) {
+    return value.filter((v) => typeof v === "string" && v.trim().length > 0).map((v) => v.trim());
+  }
+  if (typeof value !== "string" || !value.trim()) return [];
+  return parseBrandList(value).map((entry) => entry.brand.trim()).filter((brand) => brand.length > 0);
+}
 function parseSecCh(secCh) {
   const fullListRaw = headerValue3(secCh, "sec-ch-ua-full-version-list");
   const majorListRaw = headerValue3(secCh, "sec-ch-ua");
@@ -1922,7 +2240,8 @@ function parseSecCh(secCh) {
     model: unquote(headerValue3(secCh, "sec-ch-ua-model")),
     architecture: unquote(headerValue3(secCh, "sec-ch-ua-arch")),
     bitness: unquote(headerValue3(secCh, "sec-ch-ua-bitness")),
-    formFactors: unquote(headerValue3(secCh, "sec-ch-ua-form-factors")).split(",").map((f) => unquote(f)).filter((f) => f.length > 0)
+    formFactors: parseFormFactors(headerValue3(secCh, "sec-ch-ua-form-factors")),
+    wow64: parseWow64(headerValue3(secCh, "sec-ch-ua-wow64"))
   };
 }
 var BROWSER_SPECS = [
@@ -2049,22 +2368,29 @@ function resolveBrowser(ua, uad, secCh) {
   if (electronVersion) {
     return { name: "Electron", full: electronVersion, major: majorOf(electronVersion) };
   }
-  const uadBrands = filterBrands((uad?.fullVersionList ?? []).filter((b) => !!b));
+  const rawUadBrands = (uad?.fullVersionList ?? []).filter((b) => !!b);
+  const uadBrands = filterBrands(rawUadBrands);
   const candidates = [];
-  if (uadBrands.length > 0) candidates.push({ brands: uadBrands, source: "uad" });
-  if (secCh.brands.length > 0) candidates.push({ brands: secCh.brands, source: "secch" });
+  if (uadBrands.length > 0 && hasRealBrand(rawUadBrands)) {
+    candidates.push({ brands: uadBrands, source: "uad" });
+  }
+  if (secCh.brands.length > 0 && hasRealBrand(secCh.brands)) {
+    candidates.push({ brands: secCh.brands, source: "secch" });
+  }
   for (const candidate of candidates) {
     const spec = brandToSpec(candidate.brands);
     if (!spec) continue;
     const entry = candidate.brands.find(
-      (b) => spec.brands.indexOf(b.brand.toLowerCase()) !== -1
+      (b) => spec.brands.indexOf(b.brand.toLowerCase()) !== -1 && !isPlaceholderVersion(b.version)
     );
     const headlessBrand = Boolean(entry?.is_headless_brand) || spec.name === "Headless Chrome";
     let version = entry ? entry.version : "";
+    if (isPlaceholderVersion(version)) version = "";
     if (version && version.indexOf(".") === -1) {
       version = pickFullerVersion(version, findUaVersion(spec, ua));
     }
     if (!version) version = findUaVersion(spec, ua) ?? "";
+    if (isPlaceholderVersion(version)) version = "";
     return { name: spec.name, full: version, major: majorOf(version), is_headless_brand: headlessBrand };
   }
   const uaSpec = ua ? uaToSpec(ua) : null;
@@ -2078,7 +2404,9 @@ function resolveBrowser(ua, uad, secCh) {
     };
   }
   const uaFull = (uad?.uaFullVersion ?? "").trim();
-  if (uaFull) return { name: "Unknown", full: uaFull, major: majorOf(uaFull) };
+  if (uaFull && !isPlaceholderVersion(uaFull)) {
+    return { name: "Unknown", full: uaFull, major: majorOf(uaFull) };
+  }
   return empty;
 }
 function findUaVersion(spec, ua) {
@@ -2094,9 +2422,10 @@ function majorOf(version) {
   return /^\d+$/.test(major) ? major : "";
 }
 function versionSourceExists(ua, uad, secCh) {
-  if ((uad?.fullVersionList ?? []).length > 0) return true;
-  if ((uad?.uaFullVersion ?? "").trim()) return true;
-  if (secCh.brands.length > 0) return true;
+  if (hasRealBrand((uad?.fullVersionList ?? []).filter((b) => !!b))) return true;
+  const uaFull = (uad?.uaFullVersion ?? "").trim();
+  if (uaFull && !isPlaceholderVersion(uaFull)) return true;
+  if (hasRealBrand(secCh.brands)) return true;
   return ua ? uaToSpec(ua) !== null : false;
 }
 function fallbackMajorFromUa(browserName, ua) {
@@ -2119,11 +2448,13 @@ function parseIntSafe(value) {
   const n = parseInt(m[1], 10);
   return isFinite(n) ? n : null;
 }
+var WINDOWS_11_PLATFORM_MAJOR = 13;
+var IPAD_TOUCH_THRESHOLD = 5;
 function windowsVersionFromPlatformVersion(pv) {
   const parts = (pv ?? "").trim().split(".");
   const major = parseIntSafe(parts[0] ?? "");
   if (major === null) return null;
-  if (major >= 13) return "11";
+  if (major >= WINDOWS_11_PLATFORM_MAJOR) return "11";
   if (major >= 1) return "10";
   const sub = parseIntSafe(parts[1] ?? "");
   if (sub === 1) return "7";
@@ -2169,8 +2500,8 @@ function resolveOs(ua, platformStr, touch, uad, secCh) {
   const formFactors = [...uad?.formFactors ?? [], ...secCh.formFactors];
   const uaIosPhone = /(?:iPhone|iPod)/.test(ua);
   const uaIpad = /iPad/.test(ua);
-  const macTouch = touch > 1 && (/macintel/i.test(platformStr) || /macintosh/i.test(ua));
-  const macTabletFormFactor = uadPlatform.toLowerCase() === "macos" && formFactors.map((f) => f.toLowerCase()).indexOf("tablet") !== -1;
+  const macTouch = touch >= IPAD_TOUCH_THRESHOLD && (/macintel/i.test(platformStr) || /macintosh/i.test(ua));
+  const macTabletFormFactor = touch >= IPAD_TOUCH_THRESHOLD && uadPlatform.toLowerCase() === "macos" && formFactors.map((f) => f.toLowerCase()).indexOf("tablet") !== -1;
   if (uaIosPhone || uaIpad || macTouch || macTabletFormFactor) {
     let osVersion = "";
     const m = /(?:iPhone|iPad|iPod)[\s\S]*?OS (\d+(?:[_\d]*)?)\s+like/.exec(ua);
@@ -2279,7 +2610,7 @@ function resolveOs(ua, platformStr, touch, uad, secCh) {
 function resolveArchitecture(ua, platformStr, uad, secCh) {
   const arch = (uad?.architecture ?? secCh.architecture ?? "").trim().toLowerCase();
   const bit = (uad?.bitness ?? secCh.bitness ?? "").trim();
-  const wow64 = uad?.wow64 === true;
+  const wow64 = uad?.wow64 === true || secCh.wow64 === true;
   if (arch.indexOf("arm") !== -1) {
     return { architecture: bit === "32" ? "ARM" : "ARM64", bitness: bit === "32" ? "32" : "64" };
   }
@@ -2311,6 +2642,122 @@ function sanitizeOs(os2, osVersion) {
   if (v && o && v === o) v = "";
   return { os: o, osVersion: v };
 }
+var HOST_APP_SPECS = [
+  { re: /vscode-webview[\s/][\d.]+/i, name: "Visual Studio Code", ide: true },
+  { re: /VSCodium[\s/][\d.]+/i, name: "VSCodium", ide: true },
+  { re: /Windsurf[\s/][\d.]+/i, name: "Windsurf", ide: true },
+  { re: /OpenCode[\s/][\d.]+/i, name: "OpenCode", ide: true },
+  { re: /Cursor[\s/][\d.]+/i, name: "Cursor", ide: true },
+  { re: /(?:^|[\s(])Code[\s/][\d.]+/i, name: "Visual Studio Code", ide: true },
+  { re: /Slack[\s/][\d.]+/i, name: "Slack", ide: false },
+  { re: /Instagram[\s/][\d.]+/i, name: "Instagram", ide: false },
+  { re: /WhatsApp[\s/][\d.]+/i, name: "WhatsApp", ide: false },
+  { re: /(?:FBAV|FBAN)[\s/][\d.]+/i, name: "Facebook", ide: false },
+  { re: /Twitter(?:Android)?[\s/][\d.]+/i, name: "Twitter", ide: false },
+  { re: /Discord[\s/][\d.]+/i, name: "Discord", ide: false },
+  { re: /Teams[\s/][\d.]+/i, name: "Microsoft Teams", ide: false },
+  { re: /Zoom[\s/][\d.]+/i, name: "Zoom", ide: false },
+  { re: /Line[\s/][\d.]+/i, name: "LINE", ide: false },
+  { re: /Snapchat[\s/][\d.]+/i, name: "Snapchat", ide: false },
+  { re: /Notion[\s/][\d.]+/i, name: "Notion", ide: false },
+  { re: /Figma[\s/][\d.]+/i, name: "Figma", ide: false },
+  { re: /LinkedIn[\s/][\d.]+/i, name: "LinkedIn", ide: false }
+];
+var WEBVIEW_UA_RE = /;\s*wv(?:\s|\)|$)/i;
+var SHELL_NAME_ALIASES = {
+  vscode: "Visual Studio Code",
+  "vs-code": "Visual Studio Code",
+  code: "Visual Studio Code",
+  cursor: "Cursor",
+  windsurf: "Windsurf",
+  vscodium: "VSCodium",
+  opencode: "OpenCode"
+};
+function normalizeShellName(name) {
+  const trimmed = (name ?? "").trim();
+  return SHELL_NAME_ALIASES[trimmed.toLowerCase()] ?? trimmed;
+}
+function hostAppFromUa(ua, ideOnly) {
+  for (const spec of HOST_APP_SPECS) {
+    if (ideOnly && !spec.ide) continue;
+    if (spec.re.test(ua)) return spec;
+  }
+  return null;
+}
+function explicitHost(name, ideOnly) {
+  const normalized = normalizeShellName(name);
+  if (!normalized) return null;
+  const lower = normalized.toLowerCase();
+  for (const spec of HOST_APP_SPECS) {
+    if (ideOnly && !spec.ide) continue;
+    if (lower === spec.name.toLowerCase()) return spec;
+  }
+  return ideOnly ? null : { re: /^$/, name: normalized, ide: false };
+}
+function resolveRuntime(ua, signals) {
+  const electronVersion = signals.electronVersion || String(signals.processVersions?.electron ?? "") || firstMatch(/Electron\/([\d.]+)/i, ua) || "";
+  const nodeVersion = signals.nodeVersion || String(signals.processVersions?.node ?? "");
+  const hostSpec = explicitHost(signals.hostApp ?? "", false) || hostAppFromUa(ua, false);
+  const ideSpec = explicitHost(signals.ideShell ?? "", true) || hostAppFromUa(ua, true);
+  const webview = signals.webView === true || WEBVIEW_UA_RE.test(ua);
+  if (electronVersion) {
+    return {
+      runtime: "electron",
+      host_app: hostSpec?.name || signals.hostApp || "",
+      client_type: "desktop_app",
+      preferredBrowserName: "Electron"
+    };
+  }
+  if (nodeVersion) {
+    return {
+      runtime: "node",
+      host_app: hostSpec?.name || signals.hostApp || "",
+      client_type: "node",
+      preferredBrowserName: "Node.js"
+    };
+  }
+  if (ideSpec) {
+    return {
+      runtime: "ide_webview",
+      host_app: ideSpec.name,
+      client_type: "ide_shell",
+      preferredBrowserName: ideSpec.name
+    };
+  }
+  if (webview) {
+    return {
+      runtime: "webview",
+      host_app: hostSpec?.name || signals.hostApp || "",
+      client_type: "webview",
+      preferredBrowserName: hostSpec?.name || "WebView"
+    };
+  }
+  if (hostSpec) {
+    return {
+      runtime: "host_app",
+      host_app: hostSpec.name,
+      client_type: hostSpec.ide ? "ide_shell" : "host_app",
+      preferredBrowserName: hostSpec.name
+    };
+  }
+  return { runtime: "browser", host_app: "", client_type: "browser", preferredBrowserName: "" };
+}
+function isGenericBrowserName(name) {
+  const n = name.trim().toLowerCase();
+  return n === "" || n === "unknown" || n === "chromium" || n === "chrome" || n === "google chrome";
+}
+function runtimeSignalsFromInput(input) {
+  const runtime = input.runtime ?? null;
+  const processVersions = input.processVersions ?? runtime?.processVersions ?? null;
+  return {
+    electronVersion: input.electronVersion ?? runtime?.electronVersion ?? processVersions?.electron ?? "",
+    nodeVersion: input.nodeVersion ?? runtime?.nodeVersion ?? processVersions?.node ?? "",
+    processVersions,
+    hostApp: input.hostApp ?? runtime?.hostApp ?? "",
+    ideShell: input.ideShell ?? runtime?.ideShell ?? "",
+    webView: input.webView ?? runtime?.webView ?? false
+  };
+}
 var BLANK_IDENTITY = {
   os: "Unknown",
   os_version: "",
@@ -2321,7 +2768,12 @@ var BLANK_IDENTITY = {
   device_model: "",
   architecture: "",
   bitness: "",
-  platformFamily: "unknown"
+  platformFamily: "unknown",
+  runtime: "unknown",
+  host_app: "",
+  client_type: "unknown",
+  form_factors: [],
+  wow64: false
 };
 function normalizeIdentity(input) {
   try {
@@ -2331,20 +2783,42 @@ function normalizeIdentity(input) {
     const touch = typeof rawTouch === "number" && isFinite(rawTouch) ? rawTouch : 0;
     const uad = input?.uaData ?? null;
     const secCh = parseSecCh(input?.secCh);
+    const signals = runtimeSignalsFromInput(input ?? {});
+    const runtime = resolveRuntime(ua, signals);
     const osRes = resolveOs(ua, platformStr, touch, uad, secCh);
     const browser = resolveBrowser(ua, uad, secCh);
     const archRes = resolveArchitecture(ua, platformStr, uad, secCh);
+    if (runtime.runtime === "electron" && !firstMatch(/Electron\/([\d.]+)/i, ua)) {
+      const v = signals.electronVersion || String(signals.processVersions?.electron ?? "");
+      if (v.trim()) {
+        browser.full = v.trim();
+        browser.major = majorOf(v.trim());
+      }
+    } else if (runtime.runtime === "node") {
+      const v = signals.nodeVersion || String(signals.processVersions?.node ?? "");
+      if (v.trim()) {
+        browser.full = v.trim();
+        browser.major = majorOf(v.trim());
+      }
+    }
+    const browserName = runtime.preferredBrowserName && isGenericBrowserName(browser.name) ? runtime.preferredBrowserName : browser.name;
+    const formFactors = [...uad?.formFactors ?? [], ...secCh.formFactors];
     const identity = {
       os: osRes.os,
       os_version: osRes.os_version,
-      browser_name: browser.name,
+      browser_name: browserName,
       browser_major_version: browser.major,
       browser_full_version: browser.full,
       device: osRes.device,
       device_model: osRes.device_model,
       architecture: archRes.architecture,
       bitness: archRes.bitness,
-      platformFamily: osRes.platformFamily
+      platformFamily: osRes.platformFamily,
+      runtime: runtime.runtime,
+      host_app: runtime.host_app,
+      client_type: runtime.client_type,
+      form_factors: formFactors,
+      wow64: uad?.wow64 === true || secCh.wow64 === true
     };
     if (browser.is_headless_brand) identity.is_headless_brand = true;
     if (versionSourceExists(ua, uad, secCh) && !identity.browser_major_version) {
@@ -2371,7 +2845,12 @@ var BLANK_USER_AGENT = {
   browserFullVersion: "",
   architecture: "",
   bitness: "",
-  model: ""
+  model: "",
+  runtime: "unknown",
+  host_app: "",
+  client_type: "unknown",
+  formFactors: [],
+  wow64: false
 };
 function serializeBrandList(brands) {
   return brands.filter((entry) => entry && typeof entry.brand === "string").map((entry) => `"${entry.brand}";v="${entry.version ?? ""}"`).join(", ");
@@ -2416,8 +2895,11 @@ function coerceClientHints(hints) {
   const architecture = hints.architecture || hintFromBag(hints, "arch");
   const bitness = hints.bitness ?? hintFromBag(hints, "bitness");
   const model = hints.model ?? hintFromBag(hints, "model");
-  const mobileRaw = hints.mobile;
-  const mobile = typeof mobileRaw === "boolean" ? mobileRaw : String(mobileRaw ?? hintFromBag(hints, "mobile")) === "?1";
+  const mobileRaw = hints.mobile ?? readBagKey(hints, "sec-ch-ua-mobile");
+  const mobile = parseMobileFlag(mobileRaw);
+  const wow64Raw = hints.wow64 ?? readBagKey(hints, "sec-ch-ua-wow64");
+  const wow64 = parseWow64(wow64Raw);
+  const formFactors = hints.formFactors?.length ? hints.formFactors : parseFormFactors(readBagKey(hints, "sec-ch-ua-form-factors"));
   const secCh = {};
   if (brands.length > 0) secCh["sec-ch-ua"] = serializeBrandList(brands);
   if (fullVersionList.length > 0) {
@@ -2428,8 +2910,12 @@ function coerceClientHints(hints) {
   if (architecture) secCh["sec-ch-ua-arch"] = `"${architecture}"`;
   if (bitness) secCh["sec-ch-ua-bitness"] = `"${bitness}"`;
   if (model) secCh["sec-ch-ua-model"] = `"${model}"`;
-  if (hints.formFactors && hints.formFactors.length > 0) {
-    secCh["sec-ch-ua-form-factors"] = hints.formFactors.map((f) => `"${f}"`).join(", ");
+  if (mobileRaw !== "" && mobileRaw !== void 0 && mobileRaw !== null) {
+    secCh["sec-ch-ua-mobile"] = mobile ? "?1" : "?0";
+  }
+  if (wow64) secCh["sec-ch-ua-wow64"] = "?1";
+  if (formFactors.length > 0) {
+    secCh["sec-ch-ua-form-factors"] = formFactors.map((f) => `"${f}"`).join(", ");
   }
   const uaData = {
     fullVersionList,
@@ -2438,9 +2924,9 @@ function coerceClientHints(hints) {
     architecture,
     bitness,
     model,
-    formFactors: hints.formFactors,
+    formFactors,
     uaFullVersion: hints.uaFullVersion,
-    wow64: hints.wow64
+    wow64
   };
   return { uaData, secCh: Object.keys(secCh).length > 0 ? secCh : void 0 };
 }
@@ -2452,10 +2938,17 @@ function normalizeUserAgent(input) {
       platform: input?.platform ?? "",
       maxTouchPoints: input?.maxTouchPoints,
       uaData,
-      secCh
+      secCh,
+      runtime: input?.runtime,
+      electronVersion: input?.electronVersion,
+      nodeVersion: input?.nodeVersion,
+      processVersions: input?.processVersions,
+      hostApp: input?.hostApp,
+      ideShell: input?.ideShell,
+      webView: input?.webView
     });
     const mobile = input?.clientHints?.mobile;
-    const mobileFlag = mobile === true || mobile === "true" || mobile === "?1";
+    const mobileFlag = parseMobileFlag(mobile);
     const device = identity.device === "Unknown" && mobileFlag ? "Mobile" : identity.device;
     return {
       os: identity.os,
@@ -2467,7 +2960,12 @@ function normalizeUserAgent(input) {
       architecture: identity.architecture,
       bitness: identity.bitness,
       model: identity.device_model,
-      is_headless_brand: identity.is_headless_brand
+      is_headless_brand: identity.is_headless_brand,
+      runtime: identity.runtime,
+      host_app: identity.host_app,
+      client_type: identity.client_type,
+      formFactors: identity.form_factors,
+      wow64: identity.wow64
     };
   } catch {
     return { ...BLANK_USER_AGENT };
@@ -4306,6 +4804,13 @@ var EVIDENCE_TIER_BASE = {
   new_enrollment: 0,
   privacy_hardened: 0
 };
+var MATCH_TIERS_WITH_EVIDENCE = /* @__PURE__ */ new Set([
+  "storage_continuity",
+  "exact_hardware",
+  "lsh_fuzzy"
+]);
+var CONTINUITY_CORROBORATION_STEP = 0.03;
+var MAX_CONTINUITY_CORROBORATION = 0.09;
 var EVIDENCE_ONLY_KEYS = [
   "match_tier",
   "structural_anchor_ratio",
@@ -4313,7 +4818,10 @@ var EVIDENCE_ONLY_KEYS = [
   "total_anchors",
   "distinct_storage_seeds_count",
   "browser_family_consensus",
-  "os_family_consensus"
+  "os_family_consensus",
+  "storageHealed",
+  "visitContinuity",
+  "profileAgeDays"
 ];
 function finiteNumber(value) {
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
@@ -4335,6 +4843,33 @@ function clamp01(value) {
 }
 function hasConsensus(value) {
   return value === true || value === 1 || value === "1" || value === "true";
+}
+function hasPositiveCount(value) {
+  const parsed = finiteNumber(value);
+  return parsed !== null && parsed > 0;
+}
+function continuityCorroborationFor(source, tier) {
+  if (!MATCH_TIERS_WITH_EVIDENCE.has(tier)) return { bonus: 0, detail: "" };
+  const observed = [];
+  let raw = 0;
+  if (hasConsensus(source.storageHealed)) {
+    raw += CONTINUITY_CORROBORATION_STEP;
+    observed.push("storageHealed");
+  }
+  if (hasPositiveCount(source.visitContinuity)) {
+    raw += CONTINUITY_CORROBORATION_STEP;
+    observed.push(`visitContinuity=${String(source.visitContinuity)}`);
+  }
+  if (hasPositiveCount(source.profileAgeDays)) {
+    raw += CONTINUITY_CORROBORATION_STEP;
+    observed.push(`profileAgeDays=${String(source.profileAgeDays)}`);
+  }
+  const bonus = round4(Math.min(MAX_CONTINUITY_CORROBORATION, raw));
+  if (bonus === 0) return { bonus: 0, detail: "" };
+  return {
+    bonus,
+    detail: `; continuity corroboration +${bonus} (${observed.join(", ")}; capped at ${MAX_CONTINUITY_CORROBORATION})`
+  };
 }
 function isEvidenceInput(input) {
   if (!input || typeof input !== "object") return false;
@@ -4390,11 +4925,13 @@ function scoreConfidenceBreakdown(input = {}) {
   if (rawSeeds !== void 0 && rawSeeds !== null && seeds !== finiteNumber(rawSeeds)) {
     seedDetail += "; invalid count defaulted to 1";
   }
+  const corroboration = continuityCorroborationFor(source, tier);
+  seedDetail += corroboration.detail;
   const seedComponent = {
     name: "distinct_storage_seeds",
     evidence: seeds ?? 0,
     weight: seedAdjustment,
-    contribution: round4(seedAdjustment),
+    contribution: round4(seedAdjustment + corroboration.bonus),
     detail: seedDetail
   };
   components.push(seedComponent);
@@ -4931,6 +5468,32 @@ function isSwiftShaderRenderer(renderer) {
     String(renderer || "")
   );
 }
+var SOFTWARE_OR_VIRTUAL_GPU_IDENTIFIER = /swiftshader|subzero|llvmpipe|softpipe|mesa offscreen|software rasterizer|software renderer|0x0000c0de|vmware|virtualbox|\bvbox\b|qemu|hyper-?v|microsoft basic render|basic render driver|apple software renderer|virgl/i;
+var GOOGLE_SOFTWARE_VENDOR = /^google inc\.?\s*\(\s*google\s*\)$/i;
+var GPU_NAME_PLACEHOLDER = /^(?:unavailable|unknown|n\/?a|none|null|undefined|standard webgl (?:vendor|renderer)|webkit webgl(?: (?:renderer|vendor))?|webgl(?: (?:vendor|renderer))?|generic (?:renderer|vendor)|mozilla)/i;
+function normalizedGpuValue(value) {
+  return typeof value === "string" ? value.trim() : "";
+}
+function isGpuNamePlaceholder(value) {
+  return !value || GPU_NAME_PLACEHOLDER.test(value);
+}
+function hasGpuCapabilityClass(value) {
+  const text = normalizedGpuValue(value).toLowerCase();
+  return Boolean(text) && !["na", "none", "null", "undefined", "unknown"].includes(text);
+}
+function resolveGpuObservation(vendor, renderer, capabilityClass) {
+  const v = normalizedGpuValue(vendor);
+  const r = normalizedGpuValue(renderer);
+  const combined = `${v} ${r}`;
+  if (SOFTWARE_OR_VIRTUAL_GPU_IDENTIFIER.test(combined) || GOOGLE_SOFTWARE_VENDOR.test(v)) {
+    return "software_or_virtual";
+  }
+  const noVendor = isGpuNamePlaceholder(v);
+  const noRenderer = isGpuNamePlaceholder(r);
+  const capabilitiesPresent = hasGpuCapabilityClass(capabilityClass);
+  if (!noVendor || !noRenderer) return "hardware_visible";
+  return capabilitiesPresent ? "masked_by_privacy" : "observation_unavailable";
+}
 var DEVICE_MEMORY_DOMAIN = [0.25, 0.5, 1, 2, 4, 8, 16, 32];
 function checkDeviceMemory(value, context = {}) {
   if (value === null || value === void 0) return [];
@@ -5096,6 +5659,11 @@ function checkHardwareDrift(current, previous, context = {}) {
 function evaluateSpecInvariants(input = {}) {
   const privacyHardened = resolvePrivacyHardened(input);
   const softwareRenderer = isSwiftShaderRenderer(input.webglRenderer || "");
+  const gpuObservation = resolveGpuObservation(
+    input.webglVendor,
+    input.webglRenderer,
+    input.gpuCapabilityClass
+  );
   const violations = [
     ...checkDeviceMemory(input.deviceMemoryGb, { privacyHardened }),
     ...checkNetworkRtt(input.networkRtt, { privacyHardened }),
@@ -5115,7 +5683,8 @@ function evaluateSpecInvariants(input = {}) {
     softViolations: soft.map((v) => v.id),
     hard_spec_violation: hard.length > 0,
     privacy_hardened: privacyHardened,
-    software_renderer: softwareRenderer
+    software_renderer: softwareRenderer,
+    gpu_observation: gpuObservation
   };
 }
 function enforceTamperingInvariant(input) {
@@ -5136,12 +5705,6 @@ function classifyInspectorState(signals = {}) {
   if (signals.devtoolsActiveVerified) return "devtools_active_verified";
   if (signals.viewportContractionNormalized) return "devtools_docked_suspected";
   return "closed";
-}
-function inspectorFlagsForState(state) {
-  return {
-    cdp_attached: state === "automation_protocol_attached",
-    developer_tools: state === "devtools_docked_suspected" || state === "devtools_active_verified"
-  };
 }
 
 // src/lib/riskLedger.ts
@@ -5305,6 +5868,18 @@ function computeHonestProximity(input = {}) {
   result.coordinates = input.grantedCoordinates;
   return result;
 }
+var CALIBRATION_MIN_LABELED_PAIRS = 200;
+var CALIBRATION_MAX_ECE = 0.05;
+function isCalibrationEligible(input) {
+  const source = input && typeof input === "object" ? input : {};
+  const pairs = source.labeledPairs;
+  const ece = source.heldOutEce;
+  return typeof pairs === "number" && Number.isFinite(pairs) && pairs >= CALIBRATION_MIN_LABELED_PAIRS && typeof ece === "number" && Number.isFinite(ece) && ece >= 0 && ece <= CALIBRATION_MAX_ECE;
+}
+function calibrationStatusFor(inputOrPairs, maybeEce) {
+  const input = typeof inputOrPairs === "number" ? { labeledPairs: inputOrPairs, heldOutEce: maybeEce } : inputOrPairs;
+  return isCalibrationEligible(input) ? "calibrated" : "uncalibrated";
+}
 var TIER_BY_STAGE = {
   storage_continuity: "First-Party Continuity Match",
   exact_hardware: "High-Agreement Hardware Match",
@@ -5323,6 +5898,11 @@ function confidenceBandForScore(score) {
   if (score >= 0.65) return "Medium-High";
   if (score >= 0.4) return "Medium";
   return "Low";
+}
+function confidenceLabel(score, calibrated) {
+  const finite = typeof score === "number" && Number.isFinite(score) ? score : 0;
+  const percent = Math.round(Math.max(0, Math.min(1, finite)) * 100);
+  return calibrated ? `Confidence ${percent}%` : `Match evidence ${percent}%`;
 }
 function computeHonestIdentityConfidence(input) {
   const source = input && typeof input === "object" ? input : {};
@@ -5350,7 +5930,7 @@ function computeHonestIdentityConfidence(input) {
   return {
     confidence_score: score,
     confidence_tier: confidenceBandForScore(score),
-    calibration_status: "uncalibrated"
+    calibration_status: calibrationStatusFor(source)
   };
 }
 
@@ -10120,6 +10700,9 @@ function prefixesFromNormalizedFeed(normalized, sourceId) {
 }
 dotenv.config();
 var PORT = Number(process.env.PORT) || 3e3;
+var BUILD_SHA = process.env.GIT_SHA || "unknown";
+var PARSER_VERSION = process.env.PARSER_VERSION || "tranche-0-1";
+var WORKER_VERSION = process.env.WORKER_VERSION || "tranche-0-1";
 var SESSION_TIMEOUT_MINUTES = 30;
 var SESSION_EXPIRATION_MS = SESSION_TIMEOUT_MINUTES * 60 * 1e3;
 var IS_SERVERLESS_RUNTIME = Boolean(
@@ -13242,6 +13825,23 @@ function computeDeviceRarity(db2, browserDevice) {
 function computeCanonicalRiskLedger(input) {
   return buildGradedRiskLedger(input);
 }
+function riskLevelFromTier(tier) {
+  return tier === "Critical" || tier === "High" ? "High" : tier === "Elevated" ? "Medium" : "Low";
+}
+function riskLevelFromScore10(score10) {
+  return score10 >= 7 ? "High" : score10 >= 3 ? "Medium" : "Low";
+}
+function assertRiskHeadlineConsistency(args) {
+  const expectedLevel = riskLevelFromTier(args.risk_tier);
+  const ok = args.suspectScore === args.score10 && args.riskLevel === expectedLevel && riskLevelFromScore10(args.score10) === expectedLevel;
+  if (!ok) {
+    console.error("[invariant] risk headline diverges from canonical ledger", {
+      ledger: { score10: args.score10, risk_tier: args.risk_tier },
+      published: { suspectScore: args.suspectScore, riskLevel: args.riskLevel }
+    });
+  }
+  return ok;
+}
 function writeHardwareAnchorAndBands(db2, hardwareId, visitorId, simhashHex, nowUtc, distinctStorageSeedsCount) {
   if (!hardwareId) return false;
   try {
@@ -13916,6 +14516,9 @@ app.get("/api/health", async (req, res) => {
       visitsCount,
       regionCode,
       regionLabel,
+      parser_version: PARSER_VERSION,
+      build_sha: BUILD_SHA,
+      worker_version: WORKER_VERSION,
       torCheck: {
         ip: torCheckIp,
         exitNode: verdict === "exit",
@@ -13934,7 +14537,16 @@ app.get("/api/health", async (req, res) => {
     });
     return;
   }
-  res.json({ status: "ok", visitorsCount, visitsCount, regionCode, regionLabel });
+  res.json({
+    status: "ok",
+    visitorsCount,
+    visitsCount,
+    regionCode,
+    regionLabel,
+    parser_version: PARSER_VERSION,
+    build_sha: BUILD_SHA,
+    worker_version: WORKER_VERSION
+  });
 });
 function extractEdgeGeo(req) {
   return readEdgeGeoHeaders(req.headers);
@@ -13961,43 +14573,25 @@ function readEdgeTransport(req) {
   }
   return { ...unavailable, ja3: "Unavailable", ja4t: "Unavailable", os_mismatch: "Unavailable" };
 }
-var SERVER_TIMEZONE_ALIAS_MAP = {
-  "asia/calcutta": "asia/kolkata",
-  "asia/katmandu": "asia/kathmandu",
-  "asia/rangoon": "asia/yangon",
-  "asia/saigon": "asia/ho_chi_minh",
-  "europe/kiev": "europe/kyiv",
-  "us/eastern": "america/new_york",
-  "us/central": "america/chicago",
-  "us/mountain": "america/denver",
-  "us/pacific": "america/los_angeles",
-  "etc/utc": "utc",
-  "etc/gmt": "utc"
-};
-var TIMEZONE_ALIAS_MAP = {
-  "Asia/Calcutta": "Asia/Kolkata",
-  "Asia/Katmandu": "Asia/Kathmandu",
-  "Asia/Saigon": "Asia/Ho_Chi_Minh",
-  "Asia/Rangoon": "Asia/Yangon",
-  "Europe/Kiev": "Europe/Kyiv",
-  "Europe/Uzhgorod": "Europe/Kyiv",
-  "Europe/Zaporozhye": "Europe/Kyiv",
-  "US/Eastern": "America/New_York",
-  "US/Central": "America/Chicago",
-  "US/Mountain": "America/Denver",
-  "US/Pacific": "America/Los_Angeles"
-};
-function normalizeTimezone(tz) {
-  if (!tz || typeof tz !== "string") return "";
-  const trimmed = tz.trim();
-  if (!trimmed) return "";
-  return TIMEZONE_ALIAS_MAP[trimmed] || trimmed;
+if (!timezonesEquivalent("Asia/Calcutta", "Asia/Kolkata")) {
+  console.error(
+    "[invariant] canonical timezone regression: Asia/Calcutta must be equivalent to Asia/Kolkata"
+  );
 }
-function normalizeServerTimezoneId(tz) {
-  if (!tz || typeof tz !== "string") return "";
-  const canonical = normalizeTimezone(tz).toLowerCase();
-  if (!canonical || canonical === "unknown" || canonical === "unavailable") return "";
-  return SERVER_TIMEZONE_ALIAS_MAP[canonical] || canonical;
+function normalizeTimezone(tz) {
+  return canonicalTimezone(tz) ?? "";
+}
+var SOFTWARE_RENDERER_TRUTH_PATTERN = /swiftshader|llvmpipe|softpipe|software|masked|unavailable|basic render driver|microsoft basic render|mesa offscreen|software rasterizer|apple software renderer|virgl/i;
+var HYPERVISOR_GPU_TRUTH_PATTERN = /virtualbox|\bvbox\b|vmware|svga3d|\bqemu\b|virtio|virgl|\bbochs\b|hyper-?v|microsoft remote display|parallels|citrix|\bxen\b/i;
+function resolveGpuTruth(vendor, renderer) {
+  const text = `${typeof vendor === "string" ? vendor : ""} ${typeof renderer === "string" ? renderer : ""}`.toLowerCase();
+  if (SOFTWARE_RENDERER_TRUTH_PATTERN.test(text)) return "software_renderer";
+  if (HYPERVISOR_GPU_TRUTH_PATTERN.test(text)) return "virtual_gpu";
+  const cleanRenderer = typeof renderer === "string" ? renderer.trim() : "";
+  if (cleanRenderer.length > 3 && !/^(standard|unknown|unavailable|masked|google inc\.?)\b/i.test(cleanRenderer)) {
+    return "physical_hardware";
+  }
+  return "unknown";
 }
 function sanitizeHardwareSignals(raw, browserDevice) {
   const safeStr = (val, fallback, maxLen = 140) => typeof val === "string" && val.trim().length > 0 ? val.trim().slice(0, maxLen) : fallback;
@@ -14024,10 +14618,27 @@ function sanitizeHardwareSignals(raw, browserDevice) {
     },
     browserDevice.os
   );
-  const gpuTruthText = `${safeStr(raw?.gpuVendor, "", 120)} ${safeStr(raw?.gpuRenderer, "", 160)}`.toLowerCase();
-  const softwareRendererTruth = /swiftshader|llvmpipe|softpipe|software|masked|unavailable/.test(
-    gpuTruthText
-  );
+  const webglBasics = rawHardwareExtras.webglBasics;
+  const gpuPlaceholderPattern = /^(standard|unknown|unavailable|masked|n\/a)\b/i;
+  const usableGpuText = (value) => {
+    const text = typeof value === "string" ? value.trim() : "";
+    return text.length > 3 && !gpuPlaceholderPattern.test(text) ? text : "";
+  };
+  const gpuRenderer = [
+    rawHardwareExtras.gpuRendererUnmasked,
+    rawHardwareExtras.unmaskedRenderer,
+    rawHardwareExtras.rawGpuRenderer,
+    webglBasics?.renderer_unmasked,
+    raw?.gpuRenderer
+  ].map(usableGpuText).find(Boolean) || safeStr(raw?.gpuRenderer, "Standard Hardware Renderer", 160);
+  const gpuVendor = [
+    rawHardwareExtras.gpuVendorUnmasked,
+    rawHardwareExtras.unmaskedVendor,
+    webglBasics?.vendor_unmasked,
+    raw?.gpuVendor
+  ].map(usableGpuText).find(Boolean) || safeStr(raw?.gpuVendor, "Standard WebGL Vendor", 120);
+  const gpuTruthState = resolveGpuTruth(gpuVendor, gpuRenderer);
+  const softwareRendererTruth = gpuTruthState === "software_renderer";
   const rawGpuArchFamily = safeStr(rawHardwareExtras.gpuArchFamily, "", 40);
   const gpuArchFamily = softwareRendererTruth ? /^(software|unknown)$/i.test(rawGpuArchFamily) ? rawGpuArchFamily.toLowerCase() : "software" : rawGpuArchFamily;
   const archTruthSource = safeStr(rawHardwareExtras.architectureSource, "", 80).toLowerCase();
@@ -14035,8 +14646,9 @@ function sanitizeHardwareSignals(raw, browserDevice) {
   const untrustedArchTruth = archTruthSource === "nan-sign-bit" || /^(unknown|software|nan)$/.test(archTruthValue) || /^(unknown|software|nan)$/.test(gpuArchFamily.toLowerCase());
   return {
     hardwareId: validHwId,
-    gpuVendor: safeStr(raw?.gpuVendor, "Standard WebGL Vendor", 120),
-    gpuRenderer: safeStr(raw?.gpuRenderer, "Standard Hardware Renderer", 160),
+    gpuVendor,
+    gpuRenderer,
+    gpuTruthState,
     maxTextureSize,
     canvasHash: safeStr(raw?.canvasHash, "unavailable", 40),
     audioHash: safeStr(raw?.audioHash, "unavailable", 40),
@@ -14109,6 +14721,19 @@ function assessCorroboratedCdp(args) {
 }
 function isTimezoneMismatchReason(reason) {
   return /\btime[\s_-]?zone\b/i.test(reason);
+}
+function resolveInspectorState(signals) {
+  const inspector_state = classifyInspectorState({
+    cdpAttached: Boolean(signals.strongCdpProof),
+    devtoolsActiveVerified: Boolean(signals.devtoolsActiveVerified),
+    viewportContractionNormalized: Boolean(signals.viewportContractionNormalized)
+  });
+  const cdp_attached = inspector_state === "automation_protocol_attached";
+  const developer_tools = !cdp_attached && Boolean(
+    signals.developerTools || signals.cdpRuntimeLeak || signals.automationEnvironment === "electron" || signals.automationEnvironment === "ide_webview" || signals.devtoolsActiveVerified || signals.viewportContractionNormalized
+  );
+  const detail = cdp_attached ? "CDP protocol attached; no docked DevTools UI" : inspector_state === "devtools_active_verified" ? "Docked DevTools frontend verified active" : inspector_state === "devtools_docked_suspected" ? "Docked DevTools frontend suspected" : developer_tools ? "Developer tools / inspector probe observed (no CDP protocol proof)" : "No inspector / DevTools attachment detected";
+  return { inspector_state, cdp_attached, developer_tools, detail };
 }
 function isBotFromVerdict(botVerdict) {
   return Boolean(botVerdict) && botVerdict !== "not_detected";
@@ -14249,15 +14874,16 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const isBot = requestContext.botVerdict ? isBotFromVerdict(requestContext.botVerdict) : botSubtype === "bad_bot" || botSubtype === "ai_agent";
   const browserTimezone = typeof raw?.browserTimezone === "string" && raw.browserTimezone.trim() ? raw.browserTimezone.trim().slice(0, 80) : browserDevice.timezone || "UTC";
   const ipTimezone = ipTimezoneHint || (typeof raw?.ipTimezone === "string" && raw.ipTimezone.trim() && raw.ipTimezone !== "Unavailable" ? raw.ipTimezone.trim().slice(0, 80) : "Unavailable");
-  const normBrowserTz = normalizeServerTimezoneId(browserTimezone);
-  const normIpTz = normalizeServerTimezoneId(ipTimezone);
-  const serverTzMismatch = Boolean(normBrowserTz && normIpTz && normBrowserTz !== normIpTz);
-  const timezoneMismatch = Boolean(raw?.timezoneMismatch) || serverTzMismatch;
-  const isGpuMaskedOrUnavailable = !hardwareSignals.gpuVendor || hardwareSignals.gpuVendor === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuVendor) || !hardwareSignals.gpuRenderer || hardwareSignals.gpuRenderer === "Unavailable" || /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuRenderer);
-  const SOFTWARE_GPU_PATTERN = /swiftshader|llvmpipe|softpipe|software|masked|unavailable/i;
-  const vmGpuSignatureText = `${hardwareSignals.gpuVendor || ""} ${hardwareSignals.gpuRenderer || ""}`;
-  const softwareRenderedGpu = SOFTWARE_GPU_PATTERN.test(vmGpuSignatureText);
-  const hasRealUnmaskedGpu = !isGpuMaskedOrUnavailable && !softwareRenderedGpu;
+  const timezoneVerdict = timezoneMismatchContext(browserTimezone, ipTimezone);
+  const clientTzCanonical = timezoneVerdict.canonicalBrowser ?? normalizeTimezone(browserTimezone);
+  const ipTzCanonical = timezoneVerdict.canonicalIp ?? "";
+  const hasTzMismatch = timezoneVerdict.mismatch;
+  const timezoneMismatch = hasTzMismatch;
+  const gpuTruthState = resolveGpuTruth(hardwareSignals.gpuVendor, hardwareSignals.gpuRenderer);
+  const isGpuMaskedOrUnavailable = gpuTruthState === "unknown";
+  const softwareRenderedGpu = gpuTruthState === "software_renderer";
+  const virtualGpuSignature = gpuTruthState === "virtual_gpu";
+  const hasRealUnmaskedGpu = gpuTruthState === "physical_hardware";
   const concreteVpnNetworkEvidence = Boolean(requestContext.torExitNode || requestContext.torRelay) || !baseClassification.isConsumerBroadband && Boolean(baseClassification.isDatacenterOrHosting || location.isVpnOrHosting);
   const classification = applyNetworkOverrides(baseClassification, {
     torExit: Boolean(requestContext.torExitNode || requestContext.torRelay),
@@ -14282,11 +14908,6 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   }
   const torExitNode = Boolean(requestContext.torExitNode);
   const torOperatorHint = Boolean(requestContext.torOperatorHint);
-  const clientTzCanonical = normalizeTimezone(browserTimezone);
-  const ipTzCanonical = normalizeTimezone(ipTimezone === "Unavailable" ? "" : ipTimezone);
-  const hasTzMismatch = Boolean(
-    clientTzCanonical && ipTzCanonical && clientTzCanonical.toLowerCase() !== ipTzCanonical.toLowerCase()
-  );
   const networkHaystackForVpn = `${location.isp} ${location.org}`;
   const commercialVpnProvider = !baseClassification.isConsumerBroadband && baseClassification.networkType === "VPN / Proxy Relay" && VPN_PROXY_PATTERN.test(networkHaystackForVpn) && !HOSTING_EGRESS_PATTERN.test(networkHaystackForVpn);
   const verifiedProxyRelay = detectProxyHeaders(requestContext.headers, location.publicIp).detected;
@@ -14302,6 +14923,16 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     // never timezone alone — both are orthogonal axes, not tunnels.
     ml_prediction: Boolean(raw?.vpnSuspected) && concreteVpnEvidence
   };
+  if (vpnMethods.timezone_mismatch !== timezoneMismatch) {
+    console.error("[invariant] timezone mismatch parity violation", {
+      vpnMethodsTimezoneMismatch: vpnMethods.timezone_mismatch,
+      timezoneMismatch,
+      browserTimezone,
+      ipTimezone,
+      clientTzCanonical,
+      ipTzCanonical
+    });
+  }
   const vpnSuspected = vpnMethods.public_vpn || vpnMethods.relay || vpnMethods.ml_prediction || vpnMethods.os_mismatch;
   const rawTamperReasons = safeStrArray(raw?.tamperReasons);
   const timezoneOnlyTamper = rawTamperReasons.length > 0 && rawTamperReasons.every((reason) => isTimezoneMismatchReason(reason));
@@ -14420,7 +15051,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     (line) => /CIDR|FCrDNS|signature|SAIL|Web Bot Auth/i.test(line)
   ) || aiAgent.evidence[0] || "agent identity attributed from request headers"}` : "";
   const botDetail = scrubOsClaim(
-    stealthAutomation ? `${hardAutomationReasons.join("; ") || "Stealth / anti-detect automation runtime detected"} \u2014 hard automation artifact, never a verified human` : botSubtype === "human" && !aiAgent?.detected ? developerToolsAttached ? `Verified human interactive session \xB7 ${raw?.cdpDetected || raw?.cdpRuntimeLeak ? "CDP protocol attached; no docked DevTools UI" : "developer tools attached"}${raw?.automationEnvironment && raw.automationEnvironment !== "none" ? ` (${raw.automationEnvironment})` : ""}` : "Verified human interactive session" : registryBotDetail ? registryBotDetail : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected"),
+    stealthAutomation ? `${hardAutomationReasons.join("; ") || "Stealth / anti-detect automation runtime detected"} \u2014 hard automation artifact, never a verified human` : botSubtype === "human" && !aiAgent?.detected ? developerToolsAttached ? `Verified human interactive session \xB7 ${// Only STRONG protocol proof may say "CDP attached". A weak runtime leak / Error
+    // preview is developer-tools telemetry and must never claim a CDP attachment.
+    requestContext.strongCdpProof ? "CDP protocol attached; no docked DevTools UI" : "developer tools / inspector probe attached (no CDP protocol proof)"}${raw?.automationEnvironment && raw.automationEnvironment !== "none" ? ` (${raw.automationEnvironment})` : ""}` : "Verified human interactive session" : registryBotDetail ? registryBotDetail : aiAgentDetail ? aiAgentDetail : botSubtype === "ai_agent" ? `${botClassification.provider} ${botClassification.label} \u2014 ${botClassification.reasons[0] || KNOWN_AI_CRAWLER_REASON}` : botSubtype === "good_bot" ? `${botClassification.provider} ${botClassification.label} verified against its official network \u2014 ${botClassification.reasons[1] || "ASN / organisation match"}` : botReason || botClassification.reasons[0] || (spoofedCrawler ? "Crawler user-agent claimed from a network that does not belong to the operator" : "WebDriver / CDP automation runtime detected"),
     tileRuntimeOs
   );
   const botSignal = {
@@ -14457,9 +15090,7 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     level: levelFor(vpnScore),
     detail: vpnDetail
   };
-  const HYPERVISOR_GPU_PATTERN = /virtualbox|\bvbox\b|vmware|svga3d|\bqemu\b|virtio|virgl|\bbochs\b|hyper-?v|microsoft remote display|parallels|citrix|\bxen\b/i;
-  const gpuSignatureText = `${hardwareSignals.gpuVendor || ""} ${hardwareSignals.gpuRenderer || ""}`;
-  const hypervisorGpuProof = HYPERVISOR_GPU_PATTERN.test(gpuSignatureText);
+  const hypervisorGpuProof = virtualGpuSignature;
   const cloudContainerVmReason = /cloud container|datacenter asn|masked webgl|software renderer/i.test(
     vmReason
   );
@@ -14468,10 +15099,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const vmReasonVerdict = isVm ? vmReason && !cloudContainerVmReason ? vmReason : hypervisorGpuProof ? "Hypervisor-specific GPU signature detected in the WebGL vendor / renderer" : "Host-level virtualization evidence detected" : "";
   const isTampered = isOsTampered;
   const vmLike = isVm;
-  const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : vmLike ? 6 : isTampered ? 6 : softwareRenderedGpu ? 3 : hasRealUnmaskedGpu ? 0 : 3;
+  const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : vmLike ? 6 : isTampered ? 6 : softwareRenderedGpu ? 3 : hasRealUnmaskedGpu ? 0 : 0;
   let vmStatus = tamperedRequest || replayDetected ? "Tampered / Replayed" : emulatorDetected ? "Mobile Emulator" : vmLike ? "Virtual Machine / VM" : isTampered ? "Spoofed Environment" : softwareRenderedGpu ? "Software-Rendered Graphics (SwiftShader)" : hasRealUnmaskedGpu ? "Physical Hardware" : "GPU Masked / Unavailable";
   const vmDetail = tamperedRequest || replayDetected ? requestIntegrityReason || "Sealed request envelope failed verification" : emulatorDetected ? emulatorReason || vmReason || "Mobile emulator / simulator runtime detected" : vmLike ? vmReasonVerdict : isTampered ? vmReason || tamperReasons[0] || "Operating-system / User-Agent tampering detected" : softwareRenderedGpu ? "Software-rendered graphics \u2014 virtualization likely, not proven; virtual machine not confirmed" : hasRealUnmaskedGpu ? "Unmasked physical GPU & consistent OS platform verified" : "GPU vendor / renderer unavailable \u2014 physical hardware cannot be verified";
-  if (!isVm && (vmStatus === "Virtual Machine / VM" || vmStatus === "Physical Hardware")) {
+  if (!isVm && vmStatus === "Virtual Machine / VM" || vmStatus === "Physical Hardware" && gpuTruthState !== "physical_hardware") {
     vmStatus = softwareRenderedGpu ? "Software-Rendered Graphics (SwiftShader)" : "GPU Masked / Unavailable";
   }
   const vmSignal = {
@@ -14824,6 +15455,17 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         isVpnOrHosting: location.isVpnOrHosting || byAsn.datacenter_result
       };
     }
+    const continent = parseContinentValue(edgeGeo.continent);
+    const edgeGeoParity = {
+      ...location,
+      continent: continent.name || void 0,
+      continentCode: continent.code || void 0,
+      postalCode: edgeGeo.postalCode || void 0,
+      subdivisionIso: edgeGeo.regionCode || void 0,
+      accuracyRadiusKm: typeof edgeGeo.accuracyRadius === "number" && Number.isFinite(edgeGeo.accuracyRadius) ? edgeGeo.accuracyRadius : null,
+      asnNetwork: edgeGeo.asnNetwork || enrichedNetwork.asn_network || void 0
+    };
+    location = edgeGeoParity;
     const classification = classifyIspNetwork(location.isp, location.org, location.asn);
     const cookieVid = req.cookies?.intel_http_vid;
     const cookieToken = req.cookies?.intel_http_token;
@@ -15283,11 +15925,15 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     ).length : 0;
     const hasTrustedInteractionEvidence = envelopeSignedAndClean && earlyInteractionEvidence > 0;
     const strongCdpProof = hasStrongCdpProof(rawSecuritySignals, clientExtras);
-    const earlyInspectorState = classifyInspectorState({
-      cdpAttached: strongCdpProof,
+    const earlyInspector = resolveInspectorState({
+      strongCdpProof,
+      developerTools: Boolean(rawSecuritySignals?.developerTools),
+      cdpRuntimeLeak: Boolean(rawSecuritySignals?.cdpRuntimeLeak),
+      automationEnvironment: typeof rawSecuritySignals?.automationEnvironment === "string" ? rawSecuritySignals.automationEnvironment : void 0,
       devtoolsActiveVerified: Boolean(clientExtras.devtoolsActiveVerified),
       viewportContractionNormalized: Boolean(clientExtras.viewportContractionNormalized)
     });
+    const earlyInspectorState = earlyInspector.inspector_state;
     const cdpBridge = strongCdpProof;
     const dockedWithHumanInteraction = Boolean(
       rawSecuritySignals?.developerTools || clientExtras.devtoolsActiveVerified || rawSecuritySignals?.automationEnvironment === "electron" || rawSecuritySignals?.automationEnvironment === "ide_webview" || earlyInspectorState === "devtools_docked_suspected" || earlyInspectorState === "devtools_active_verified"
@@ -15754,6 +16400,17 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       velocity: { high: highActivity, extreme: extremeRotation }
     });
     const suspectScore100 = riskLedger.score_0_100;
+    const canonicalScore10 = riskLedger.score10;
+    const canonicalRiskLevel = riskLevelFromTier(riskLedger.risk_tier);
+    assertRiskHeadlineConsistency({
+      score10: canonicalScore10,
+      risk_tier: riskLedger.risk_tier,
+      suspectScore: securitySignals.suspectScore,
+      riskLevel: securitySignals.riskLevel
+    });
+    securitySignals.suspectScore = canonicalScore10;
+    securitySignals.riskLevel = canonicalRiskLevel;
+    securitySignals.riskBadgeText = `${canonicalRiskLevel} Risk \u2022 ${canonicalScore10}/10`;
     const currentBotName = hardAutomationSignals ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim() : (aiAgent?.detected ? aiAgent.agentName : "") || (effectiveBotClassification.subtype !== "human" ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim() : "");
     const visitHistory = rawVisits.map((r) => {
       const storedScore10 = typeof r.score10 === "number" && Number.isFinite(r.score10) ? Math.max(0, Math.min(10, Math.round(r.score10))) : null;
@@ -16030,10 +16687,15 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       ),
       corroborated: false
     });
-    const edgeTransport = readEdgeTransport(req);
-    const inspectorState = earlyInspectorState;
-    const inspectorFlags = inspectorFlagsForState(inspectorState);
-    const inspectorDetail = inspectorState === "automation_protocol_attached" ? "CDP protocol attached; no docked DevTools UI" : inspectorState === "devtools_docked_suspected" ? "Docked DevTools frontend suspected" : inspectorState === "devtools_active_verified" ? "Docked DevTools frontend verified active" : "No inspector / DevTools attachment detected";
+    const inspectorState = earlyInspector.inspector_state;
+    const inspectorFlags = {
+      cdp_attached: earlyInspector.cdp_attached,
+      developer_tools: earlyInspector.developer_tools
+    };
+    const inspectorDetail = earlyInspector.detail;
+    if (inspectorFlags.cdp_attached !== (inspectorState === "automation_protocol_attached")) {
+      console.error("[invariant] inspector CDP parity violation", { inspectorState, inspectorFlags });
+    }
     const automationVerdict = securitySignals.isBot || botVerdict === "bad" || hardAutomationSignals ? "automated" : securitySignals.botSubtype === "human" || botVerdict === "not_detected" ? "human" : "uncertain";
     const humanCorroborationClaim = trustedHumanCorroboration >= 0.5 || hasTrustedInteractionEvidence ? 1 : 0;
     const verdictState = decideVerdictTier({
@@ -16141,7 +16803,8 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       }
     } catch {
     }
-    let structuralAnchorRatioForConfidence = storageValidForConfidence ? 1 : 0;
+    const TOTAL_IDENTITY_ANCHORS = 7;
+    let matchedAnchorsForConfidence = storageValidForConfidence ? TOTAL_IDENTITY_ANCHORS : 0;
     if (corroboratingVisitorId) {
       const anchorEvidence = structuralAnchorsMatch(
         db,
@@ -16149,20 +16812,34 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         corroboratingVisitorId,
         identityHardwareFingerprint
       );
-      structuralAnchorRatioForConfidence = anchorEvidence.reasons.some(
+      matchedAnchorsForConfidence = anchorEvidence.reasons.some(
         (reason) => reason.includes("hardware fingerprint")
-      ) ? 1 : Math.min(1, anchorEvidence.reasons.length / 7);
+      ) ? TOTAL_IDENTITY_ANCHORS : Math.min(TOTAL_IDENTITY_ANCHORS, anchorEvidence.reasons.length);
     }
+    const structuralAnchorRatioForConfidence = matchedAnchorsForConfidence / TOTAL_IDENTITY_ANCHORS;
+    const profileAgeDaysForConfidence = (() => {
+      const firstMs = Date.parse(statistics.firstVisitUtc);
+      if (!Number.isFinite(firstMs)) return 0;
+      return Math.max(0, Math.floor((Date.now() - firstMs) / 864e5));
+    })();
     const honestConfidenceInput = {
       labeledPairs: Number(rawExtras.calibrationLabeledPairs ?? 0),
       heldOutEce: Number(rawExtras.calibrationHeldOutEce ?? 1),
       matchStage: identityStage.stage,
+      // All six weighted evidence components (tier base, match score, anchor ratio, storage
+      // seeds, browser consensus, OS consensus) are supplied explicitly and auditable.
+      match_tier: identityStage.stage,
       calibratedScore: identityConfidence.score,
       matchScore: matchScoreForConfidence,
       match_score: matchScoreForConfidence,
       match_mode: resolvedIdentity.match_mode,
       structural_anchor_ratio: structuralAnchorRatioForConfidence,
       structuralAnchorRatio: structuralAnchorRatioForConfidence,
+      matched_anchors: matchedAnchorsForConfidence,
+      total_anchors: TOTAL_IDENTITY_ANCHORS,
+      storageHealed: Boolean(storageHealed || resolvedIdentity.healed),
+      visitContinuity: statistics.totalVisits,
+      profileAgeDays: profileAgeDaysForConfidence,
       distinct_storage_seeds_count: distinctStorageSeedsForConfidence,
       distinctStorageSeedsCount: distinctStorageSeedsForConfidence,
       browser_family_consensus: browserFamilyCorroborated,
@@ -16194,7 +16871,11 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const identityConfidenceHonest = {
       ...honestConfidenceSeed,
       confidence_score: finalIdentityConfidenceScore,
+      // No held-out calibration gate has passed: the numeric value is observable evidence
+      // strength, never a probability. The human-facing label says "Match evidence", not
+      // "Confidence"/probability.
       calibration_status: "uncalibrated",
+      confidence_label: confidenceLabel(finalIdentityConfidenceScore, false),
       ...downgradeRecognition ? { confidence_tier: "Shared Hardware Class - Ambiguous" } : {}
     };
     if (downgradeRecognition) {
@@ -16222,6 +16903,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       rarityReport.sampleSize,
       0.05
     );
+    const edgeTransport = readEdgeTransport(req);
     const invariantEnvelope = {
       event_id: eventId,
       identity: {
@@ -16230,7 +16912,9 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         collision_risk: identityStage.collisionRisk,
         confidence_tier: identityConfidenceHonest.confidence_tier,
         confidence_score: identityConfidenceHonest.confidence_score,
-        calibration_status: identityConfidenceHonest.calibration_status
+        calibration_status: identityConfidenceHonest.calibration_status,
+        // Evidence label only — no probability language until a calibration gate passes.
+        confidence_label: identityConfidenceHonest.confidence_label
       },
       server_verified: {
         browser: serverVerifiedBrowser,
@@ -16266,9 +16950,9 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         // Explicit explanation for a bare CDP bridge so `cdp_attached: true` can never be
         // misread as "DevTools open" (which stays false for automation_protocol_attached).
         inspector_detail: inspectorDetail,
-        // automation_protocol_attached explicitly reports developer_tools:false (CDP binding,
-        // not a docked DevTools frontend); only the docked/verified states set it true.
-        developer_tools: inspectorState === "automation_protocol_attached" ? false : inspectorFlags.developer_tools || developerToolsSignals
+        // Single resolved value: any DevTools / IDE / docked attach (including a weak runtime
+        // leak) sets this true, while a bare CDP protocol binding stays on the cdp_attached axis.
+        developer_tools: inspectorFlags.developer_tools
       },
       tampering: {
         detected: reconciledTampering.detected || effectiveTamperingDetected,
@@ -16407,7 +17091,9 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
           // The legacy type declares `number`; the cast preserves the runtime value (including
           // `null` for genuinely new profiles) without editing a type owned by another module.
           score: identityConfidenceHonest.confidence_score,
-          version: identityConfidence.version
+          version: identityConfidence.version,
+          calibration_status: identityConfidenceHonest.calibration_status,
+          confidence_label: identityConfidenceHonest.confidence_label
         },
         visitor_found: visitorFound,
         tampering: identityConfidence.tampering,

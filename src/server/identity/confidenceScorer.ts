@@ -268,6 +268,20 @@ export interface EvidenceConfidenceInput {
   /** Browser-family / OS-family agreement between stored and incoming profiles. */
   browser_family_consensus?: boolean | number | null;
   os_family_consensus?: boolean | number | null;
+
+  /* Continuity corroboration. These are camelCase so they cannot collide with the legacy
+   * `storage_healed` telemetry field. Every field is optional and absent evidence is ZERO —
+   * corroboration is never inferred for an unseen profile. Each present, valid signal adds a
+   * small fixed bonus (see `CONTINUITY_CORROBORATION_STEP`), capped in aggregate, and only
+   * applies to a tier that actually represents a match (never `new_enrollment` /
+   * `privacy_hardened`). */
+
+  /** First-party storage was genuinely recovered/healed for this returning profile. */
+  storageHealed?: boolean | number | string | null;
+  /** Count of observed return visits for the same profile (e.g. 119). */
+  visitContinuity?: number | string | null;
+  /** Age of the matched profile in days. */
+  profileAgeDays?: number | string | null;
 }
 
 /** One auditable component of the evidence-based score. */
@@ -302,6 +316,20 @@ const EVIDENCE_TIER_BASE: Record<string, number> = {
   privacy_hardened: 0,
 };
 
+/**
+ * Tiers that represent a real identity match. Continuity corroboration is only meaningful
+ * for these — an unseen / privacy-hardened profile must never receive a fabricated bonus.
+ */
+const MATCH_TIERS_WITH_EVIDENCE: ReadonlySet<string> = new Set([
+  'storage_continuity',
+  'exact_hardware',
+  'lsh_fuzzy',
+]);
+
+/** Each valid continuity signal adds this much; their aggregate is capped below. */
+const CONTINUITY_CORROBORATION_STEP = 0.03;
+const MAX_CONTINUITY_CORROBORATION = 0.09;
+
 /** Keys that only the evidence-based scorer accepts — used to dispatch the overload. */
 const EVIDENCE_ONLY_KEYS = [
   'match_tier',
@@ -311,6 +339,9 @@ const EVIDENCE_ONLY_KEYS = [
   'distinct_storage_seeds_count',
   'browser_family_consensus',
   'os_family_consensus',
+  'storageHealed',
+  'visitContinuity',
+  'profileAgeDays',
 ] as const;
 
 function finiteNumber(value: unknown): number | null {
@@ -343,6 +374,50 @@ function clamp01(value: number): number {
 
 function hasConsensus(value: unknown): boolean {
   return value === true || value === 1 || value === '1' || value === 'true';
+}
+
+/** A continuity count is valid only when it is a finite, strictly positive number. */
+function hasPositiveCount(value: unknown): boolean {
+  const parsed = finiteNumber(value);
+  return parsed !== null && parsed > 0;
+}
+
+/**
+ * Small, capped corroboration from genuinely observed continuity signals.
+ *
+ * Absent or malformed signals always contribute zero, and the whole bonus is suppressed for
+ * unmatched tiers so this scorer never fabricates confidence for an unseen profile. The
+ * returned detail is appended to the storage-seed component, which is the single signed
+ * adjustment bucket already used for clamp reconciliation — keeping the breakdown at exactly
+ * six components whose contributions sum to the published score.
+ */
+function continuityCorroborationFor(
+  source: EvidenceConfidenceInput,
+  tier: string
+): { bonus: number; detail: string } {
+  if (!MATCH_TIERS_WITH_EVIDENCE.has(tier)) return { bonus: 0, detail: '' };
+
+  const observed: string[] = [];
+  let raw = 0;
+  if (hasConsensus(source.storageHealed)) {
+    raw += CONTINUITY_CORROBORATION_STEP;
+    observed.push('storageHealed');
+  }
+  if (hasPositiveCount(source.visitContinuity)) {
+    raw += CONTINUITY_CORROBORATION_STEP;
+    observed.push(`visitContinuity=${String(source.visitContinuity)}`);
+  }
+  if (hasPositiveCount(source.profileAgeDays)) {
+    raw += CONTINUITY_CORROBORATION_STEP;
+    observed.push(`profileAgeDays=${String(source.profileAgeDays)}`);
+  }
+
+  const bonus = round4(Math.min(MAX_CONTINUITY_CORROBORATION, raw));
+  if (bonus === 0) return { bonus: 0, detail: '' };
+  return {
+    bonus,
+    detail: `; continuity corroboration +${bonus} (${observed.join(', ')}; capped at ${MAX_CONTINUITY_CORROBORATION})`,
+  };
 }
 
 function isEvidenceInput(input: unknown): input is EvidenceConfidenceInput {
@@ -418,11 +493,16 @@ export function scoreConfidenceBreakdown(input: EvidenceConfidenceInput = {}): C
   if (rawSeeds !== undefined && rawSeeds !== null && seeds !== finiteNumber(rawSeeds)) {
     seedDetail += '; invalid count defaulted to 1';
   }
+  // Continuity corroboration shares the single signed adjustment bucket. `weight` stays the
+  // documented seed adjustment (so the rubric never drifts); the corroboration is disclosed in
+  // `detail` and added to `contribution` alongside the later clamp reconciliation.
+  const corroboration = continuityCorroborationFor(source, tier);
+  seedDetail += corroboration.detail;
   const seedComponent: ConfidenceComponent = {
     name: 'distinct_storage_seeds',
     evidence: seeds ?? 0,
     weight: seedAdjustment,
-    contribution: round4(seedAdjustment),
+    contribution: round4(seedAdjustment + corroboration.bonus),
     detail: seedDetail,
   };
   components.push(seedComponent);
@@ -469,6 +549,22 @@ function evidenceScore(input: EvidenceConfidenceInput): number {
     // Scoring must never break a response — zero is the honest fallback.
     return 0;
   }
+}
+
+/** Display-only band for a numeric evidence score. Calibration remains the caller's call. */
+export type EvidenceScoreTier = 'High' | 'Medium-High' | 'Medium' | 'Low' | 'New/Unobserved';
+
+/**
+ * Maps an evidence score in [0,1] to its display band. This is deliberately NOT a calibration
+ * claim: callers still own `calibration_status` and should keep it `uncalibrated` until a real
+ * held-out gate passes. Non-finite and zero scores describe an unseen/unnumbered profile.
+ */
+export function evidenceScoreToTier(score: number): EvidenceScoreTier {
+  if (typeof score !== 'number' || !Number.isFinite(score) || score <= 0) return 'New/Unobserved';
+  if (score >= 0.85) return 'High';
+  if (score >= 0.65) return 'Medium-High';
+  if (score >= 0.40) return 'Medium';
+  return 'Low';
 }
 
 /**

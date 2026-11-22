@@ -32,6 +32,24 @@ export interface EdgeGeoHeaders {
   /** ASN owner reported by the edge (`request.cf.asOrganization`). */
   organization: string;
   postalCode: string;
+  /**
+   * ISO-3166-2 subdivision code from the edge (`request.cf.regionCode`, e.g. `CA`), not the
+   * human-readable `region` name. Empty when the edge did not report one.
+   */
+  regionCode: string;
+  /**
+   * Raw continent value from the edge: a two-letter code (`NA`) on Vercel or a full name
+   * (`North America`) on Cloudflare. Empty when unavailable — never inferred.
+   */
+  continent: string;
+  /**
+   * Accuracy radius in kilometres reported alongside the coordinates. Only a real value
+   * from the edge/provider is returned; an unavailable value is never replaced with a
+   * fabricated constant.
+   */
+  accuracyRadius: number | null;
+  /** Routed BGP prefix (Team Cymru / registry), when supplied by the edge or enrichment. */
+  asnNetwork: string;
   /** Cloudflare reports `T1` for requests that arrive over the Tor network. */
   isTorNetwork: boolean;
   /** True when the values came from the Worker-signed header, not a raw client header. */
@@ -220,10 +238,66 @@ function normalizeCountryCode(raw: string | null | undefined): string {
   return upper;
 }
 
+/** ISO continent codes with the English names we can surface without guessing. */
+const CONTINENT_NAMES: Record<string, string> = {
+  AF: 'Africa',
+  AN: 'Antarctica',
+  AS: 'Asia',
+  EU: 'Europe',
+  NA: 'North America',
+  OC: 'Oceania',
+  SA: 'South America',
+};
+
+const CONTINENT_CODES_BY_NAME: Record<string, string> = Object.fromEntries(
+  Object.entries(CONTINENT_NAMES).map(([code, name]) => [name.toLowerCase(), code])
+);
+
+/**
+ * Splits a free-form continent value into an ISO code and a full name. Vercel sends a code
+ * (`NA`) while Cloudflare sends a full name (`North America`), so both are accepted. An
+ * unrecognised value keeps its reported name but never gains an invented code.
+ */
+export function parseContinentValue(raw: string | null | undefined): { code: string; name: string } {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!value) return { code: '', name: '' };
+  const upper = value.toUpperCase();
+  if (/^[A-Z]{2}$/.test(upper)) {
+    const name = CONTINENT_NAMES[upper] || '';
+    return { code: name ? upper : '', name };
+  }
+  const code = CONTINENT_CODES_BY_NAME[value.toLowerCase()] || '';
+  return { code, name: code ? CONTINENT_NAMES[code] : value };
+}
+
+/**
+ * Parses a real accuracy radius in kilometres. Only finite, non-negative numbers (or their
+ * numeric-string equivalents) are accepted; a missing/invalid value stays null instead of
+ * becoming a fabricated constant such as `100`.
+ */
+export function parseAccuracyRadius(raw: unknown): number | null {
+  const value =
+    typeof raw === 'number'
+      ? raw
+      : typeof raw === 'string' && raw.trim()
+      ? Number(raw)
+      : Number.NaN;
+  return Number.isFinite(value) && value >= 0 && value < 1_000_000 ? value : null;
+}
+
+/** Keeps only a syntactically valid IPv4/IPv6 CIDR label, so no prefix is ever invented. */
+export function parseAsnNetwork(raw: unknown): string {
+  if (typeof raw !== 'string') return '';
+  const value = raw.trim();
+  if (!value) return '';
+  return /^(?:\d{1,3}\.){3}\d{1,3}\/\d{1,2}$|^[0-9a-fA-F:.]+\/\d{1,3}$/.test(value) ? value : '';
+}
+
 interface EdgeGeoPayload {
   country?: string;
   region?: string;
   regionCode?: string;
+  region_code?: string;
   city?: string;
   latitude?: string;
   longitude?: string;
@@ -231,7 +305,16 @@ interface EdgeGeoPayload {
   asn?: string;
   organization?: string;
   postalCode?: string;
+  postal_code?: string;
   continent?: string;
+  continentCode?: string;
+  continent_code?: string;
+  /** Real accuracy radius in km, when the edge/enricher actually supplies one. */
+  accuracyRadius?: string | number;
+  accuracy_radius?: string | number;
+  /** Routed BGP prefix (Team Cymru / registry), when supplied. */
+  asnNetwork?: string;
+  asn_network?: string;
   colo?: string;
 }
 
@@ -255,6 +338,21 @@ function payloadText(payload: EdgeGeoPayload, key: keyof EdgeGeoPayload): string
   return typeof value === 'string' ? value.trim() : '';
 }
 
+/** First non-empty text among several accepted key spellings (camelCase / snake_case). */
+function payloadAnyText(payload: EdgeGeoPayload, keys: (keyof EdgeGeoPayload)[]): string {
+  for (const key of keys) {
+    const text = payloadText(payload, key);
+    if (text) return text;
+  }
+  return '';
+}
+
+function payloadAccuracyRadius(payload: EdgeGeoPayload): number | null {
+  return (
+    parseAccuracyRadius(payload.accuracyRadius) ?? parseAccuracyRadius(payload.accuracy_radius)
+  );
+}
+
 /**
  * Reads edge geolocation. The Worker-signed `x-intel-edge-geo` header wins because it is
  * built from `request.cf`, which a client cannot forge. Raw Vercel / Cloudflare headers are
@@ -268,19 +366,33 @@ export function readEdgeGeoHeaders(headers: EdgeHeaderBag): EdgeGeoHeaders {
     const countryCode = normalizeCountryCode(rawCountry);
     const city = decodeCity(payloadText(signedPayload, 'city'));
     const region = payloadText(signedPayload, 'region');
+    const regionCode = payloadAnyText(signedPayload, ['regionCode', 'region_code']);
+    const continent = payloadAnyText(signedPayload, [
+      'continent',
+      'continentCode',
+      'continent_code',
+    ]);
+    const timezone = payloadText(signedPayload, 'timezone');
+    const postalCode = payloadAnyText(signedPayload, ['postalCode', 'postal_code']);
+    const accuracyRadius = payloadAccuracyRadius(signedPayload);
+    const asnNetwork = parseAsnNetwork(
+      payloadAnyText(signedPayload, ['asnNetwork', 'asn_network'])
+    );
     return {
       city: isMissingGeoValue(city) ? '' : city,
       region: isMissingGeoValue(region) ? '' : region,
       country: countryNameFromCode(countryCode),
       countryCode,
-      timezone: isMissingGeoValue(payloadText(signedPayload, 'timezone'))
-        ? ''
-        : payloadText(signedPayload, 'timezone'),
+      timezone: isMissingGeoValue(timezone) ? '' : timezone,
       latitude: parseLat(payloadText(signedPayload, 'latitude')),
       longitude: parseLng(payloadText(signedPayload, 'longitude')),
       asn: normalizeAsnLabel(payloadText(signedPayload, 'asn')),
       organization: payloadText(signedPayload, 'organization'),
-      postalCode: payloadText(signedPayload, 'postalCode'),
+      postalCode: isMissingGeoValue(postalCode) ? '' : postalCode,
+      regionCode: isMissingGeoValue(regionCode) ? '' : regionCode,
+      continent: isMissingGeoValue(continent) ? '' : continent,
+      accuracyRadius,
+      asnNetwork,
       isTorNetwork,
       trusted: true,
       source: 'cloudflare',
@@ -313,6 +425,33 @@ export function readEdgeGeoHeaders(headers: EdgeHeaderBag): EdgeGeoHeaders {
   );
   const organization = headerValue(headers, ['x-vercel-ip-as-organization']);
   const postalCode = headerValue(headers, ['x-vercel-ip-postal-code', 'cf-postal-code']);
+  const regionCode = headerValue(headers, [
+    'x-vercel-ip-country-region',
+    'cf-region-code',
+    'cf-regioncode',
+    'x-intel-ip-region-code',
+  ]);
+  const continent = headerValue(headers, [
+    'x-vercel-ip-continent',
+    'cf-ipcontinent',
+    'cf-continent',
+    'x-intel-ip-continent',
+  ]);
+  const accuracyRadius = parseAccuracyRadius(
+    headerValue(headers, [
+      'x-vercel-ip-accuracy-radius',
+      'cf-ipaccuracy-radius',
+      'x-intel-ip-accuracy-radius',
+    ])
+  );
+  const asnNetwork = parseAsnNetwork(
+    headerValue(headers, [
+      'x-vercel-ip-as-network',
+      'cf-as-network',
+      'cf-asn-network',
+      'x-intel-ip-as-network',
+    ])
+  );
 
   const source: EdgeGeoSource = headerValue(headers, ['x-vercel-id', 'x-vercel-ip-country'])
     ? 'vercel'
@@ -331,6 +470,10 @@ export function readEdgeGeoHeaders(headers: EdgeHeaderBag): EdgeGeoHeaders {
     asn,
     organization: isMissingGeoValue(organization) ? '' : organization,
     postalCode: isMissingGeoValue(postalCode) ? '' : postalCode,
+    regionCode: isMissingGeoValue(regionCode) ? '' : regionCode,
+    continent: isMissingGeoValue(continent) ? '' : continent,
+    accuracyRadius,
+    asnNetwork,
     isTorNetwork,
     trusted: false,
     source,
@@ -378,6 +521,47 @@ function meaningful(value: string | null | undefined): value is string {
   return typeof value === 'string' && !isMissingGeoValue(value);
 }
 
+/** First non-missing string among the candidates, in trust order. */
+function firstMeaningful(...values: (string | null | undefined)[]): string {
+  for (const value of values) {
+    if (meaningful(value)) return value.trim();
+  }
+  return '';
+}
+
+/**
+ * Free geo fields that a provider response or the ASN enrichment layer may carry on a
+ * `LocationInfo` even though they are not part of its core contract yet. All optional: a
+ * provider that does not report a value simply leaves it null in the merged result.
+ */
+export interface ProviderGeoExtras {
+  continent?: string | null;
+  continentCode?: string | null;
+  continent_code?: string | null;
+  continentName?: string | null;
+  continent_name?: string | null;
+  postalCode?: string | null;
+  postal_code?: string | null;
+  postal?: string | null;
+  regionCode?: string | null;
+  region_code?: string | null;
+  subdivisionIso?: string | null;
+  subdivision_iso?: string | null;
+  accuracyRadius?: number | string | null;
+  accuracy_radius?: number | string | null;
+  asnNetwork?: string | null;
+  asn_network?: string | null;
+}
+
+/**
+ * `LocationInfo` with the surfaced free edge/provider geo fields. `continent_name` is added
+ * here because the canonical `LocationInfo` contract does not declare it yet; the other five
+ * follow that contract, where an unavailable string is simply absent.
+ */
+export type MergedLocationInfo = LocationInfo & {
+  continent_name?: string | null;
+};
+
 /**
  * Field-level merge of an edge-header geo result onto a provider-resolved location.
  *
@@ -389,7 +573,8 @@ function meaningful(value: string | null | undefined): value is string {
 export function mergeLocationWithEdge(
   location: LocationInfo,
   edge: EdgeGeoHeaders
-): LocationInfo {
+): MergedLocationInfo {
+  const extras = location as LocationInfo & ProviderGeoExtras;
   const edgeCountryCode = normalizeCountryCode(edge.countryCode);
   const providerCountryCode = normalizeCountryCode(location.countryCode);
   const countryCode = edgeCountryCode || providerCountryCode;
@@ -467,6 +652,58 @@ export function mergeLocationWithEdge(
     ? location.timezone
     : edge.timezone || undefined;
 
+  /*
+   * Additional free fields are merged individually, with the same evidence rule as above:
+   * the edge answer (from `request.cf`) is authoritative because a client cannot forge it,
+   * while any provider value is only accepted when its country agrees with that edge country.
+   * Unavailable values stay null — no code, continent, prefix or radius is ever invented.
+   */
+  const edgeContinent = parseContinentValue(edge.continent);
+  const providerContinent = providerCountryAgrees
+    ? parseContinentValue(
+        firstMeaningful(
+          extras.continentCode,
+          extras.continent_code,
+          extras.continentName,
+          extras.continent_name,
+          extras.continent
+        )
+      )
+    : { code: '', name: '' };
+  const continentCode = edgeContinent.code || providerContinent.code;
+  const continentName = edgeContinent.name || providerContinent.name;
+
+  // The edge subdivision is a real ISO-3166-2 code; a provider code is only a fallback.
+  const providerSubdivision = providerCountryAgrees
+    ? firstMeaningful(
+        extras.subdivisionIso,
+        extras.subdivision_iso,
+        extras.regionCode,
+        extras.region_code
+      )
+    : '';
+  const subdivisionIso = firstMeaningful(edge.regionCode, providerSubdivision) || null;
+
+  const providerPostal = providerCountryAgrees
+    ? firstMeaningful(extras.postalCode, extras.postal_code, extras.postal)
+    : '';
+  const postalCode = firstMeaningful(edge.postalCode, providerPostal) || null;
+
+  // A radius is only surfaced when an actual value was reported (never a constant fallback).
+  // A provider value is trusted only alongside an agreeing country; edge values are already
+  // validated by readEdgeGeoHeaders()/parseAccuracyRadius().
+  const accuracyRadius =
+    (providerCountryAgrees
+      ? parseAccuracyRadius(extras.accuracyRadius ?? extras.accuracy_radius)
+      : null) ?? edge.accuracyRadius ?? null;
+
+  // The routed prefix is a BGP fact (registry / Team Cymru), independent of the country
+  // claim. Prefer a validated enrichment prefix, then one on the signed edge payload.
+  const asnNetwork =
+    parseAsnNetwork(firstMeaningful(extras.asnNetwork, extras.asn_network)) ||
+    parseAsnNetwork(edge.asnNetwork) ||
+    null;
+
   const locationPrecision =
     meaningful(city) && !isMissingGeoValue(city)
       ? 'city'
@@ -495,5 +732,11 @@ export function mergeLocationWithEdge(
     locationSource: edgeCountryCode ? 'edge' : location.locationSource ?? 'provider',
     locationPrecision,
     isLocationVerified: hasCountry,
+    continent_code: continentCode || undefined,
+    continent_name: continentName || undefined,
+    postal_code: postalCode || undefined,
+    subdivision_iso: subdivisionIso || undefined,
+    accuracy_radius: accuracyRadius,
+    asn_network: asnNetwork || undefined,
   };
 }

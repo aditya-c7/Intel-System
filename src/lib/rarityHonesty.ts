@@ -5,9 +5,11 @@
  * decideRarity gates). This module only applies the presentation / scoring policy:
  *  - suppressed rarity contributes ZERO score;
  *  - proximity is never derived from IP coordinates without granted geolocation permission;
- *  - a genuine identity match publishes a deterministic, auditable numeric confidence
- *    (weighted observable evidence, clamped to [0,1]) while `calibration_status` honestly
- *    stays 'uncalibrated' until a real held-out calibration gate has passed;
+ *  - a genuine identity match publishes a deterministic, auditable numeric evidence score
+ *    (weighted observable evidence, clamped to [0,1]); `calibration_status` is 'calibrated'
+ *    ONLY when a real held-out gate has passed (>= 200 labeled pairs, held-out ECE <= 0.05),
+ *    and is 'uncalibrated' by default — an uncalibrated number is presented as "Match evidence",
+ *    never as a calibrated probability;
  *  - a genuinely unseen / non-identifying profile keeps null (never a fabricated number).
  */
 
@@ -81,6 +83,50 @@ export function computeHonestProximity(input: ProximityInput = {}): HonestProxim
 export const CALIBRATION_MIN_LABELED_PAIRS = 200;
 export const CALIBRATION_MAX_ECE = 0.05;
 
+/** The gate-relevant slice of `CalibrationInput`. Absent / malformed values fail closed. */
+export interface CalibrationGateInput {
+  /** Number of human-labeled comparison pairs held out for calibration. */
+  labeledPairs?: number | null;
+  /** Expected Calibration Error measured on that held-out set (lower is better). */
+  heldOutEce?: number | null;
+}
+
+export type CalibrationStatus = 'uncalibrated' | 'calibrated';
+
+/**
+ * The gate is dormant by default: an insufficient / non-finite labeled-pair count, or a
+ * held-out ECE that is missing, invalid or above the ceiling, is NOT eligible. No score is
+ * ever called calibrated without a real passed gate.
+ */
+export function isCalibrationEligible(input: CalibrationGateInput): boolean {
+  const source: CalibrationGateInput = input && typeof input === 'object' ? input : {};
+  const pairs = source.labeledPairs;
+  const ece = source.heldOutEce;
+  return (
+    typeof pairs === 'number' &&
+    Number.isFinite(pairs) &&
+    pairs >= CALIBRATION_MIN_LABELED_PAIRS &&
+    typeof ece === 'number' &&
+    Number.isFinite(ece) &&
+    ece >= 0 &&
+    ece <= CALIBRATION_MAX_ECE
+  );
+}
+
+/** Honest publication status derived solely from the gate — never a default 'calibrated'. */
+export function calibrationStatusFor(input: CalibrationGateInput): CalibrationStatus;
+export function calibrationStatusFor(labeledPairs: number, heldOutEce: number): CalibrationStatus;
+export function calibrationStatusFor(
+  inputOrPairs: CalibrationGateInput | number,
+  maybeEce?: number
+): CalibrationStatus {
+  const input: CalibrationGateInput =
+    typeof inputOrPairs === 'number'
+      ? { labeledPairs: inputOrPairs, heldOutEce: maybeEce }
+      : inputOrPairs;
+  return isCalibrationEligible(input) ? 'calibrated' : 'uncalibrated';
+}
+
 export interface CalibrationInput {
   labeledPairs: number;
   heldOutEce: number;
@@ -135,14 +181,26 @@ export function confidenceBandForScore(score: number): NumericConfidenceTier {
 }
 
 /**
+ * Human-facing label for a published numeric score. An uncalibrated number is explicitly
+ * presented as observable evidence strength — never as a calibrated probability.
+ */
+export function confidenceLabel(score: number | null | undefined, calibrated: boolean): string {
+  const finite = typeof score === 'number' && Number.isFinite(score) ? score : 0;
+  const percent = Math.round(Math.max(0, Math.min(1, finite)) * 100);
+  return calibrated ? `Confidence ${percent}%` : `Match evidence ${percent}%`;
+}
+
+/**
  * Publishes a real, deterministic confidence number for profiles that actually matched,
  * and keeps `confidence_score: null` only for a genuinely unseen / non-identifying profile
  * (no storage continuity, no hardware match, no fuzzy match).
  *
- * `calibration_status` stays 'uncalibrated' on purpose: the numeric value comes from
- * weighted observable evidence (`scoreConfidence`), NOT from a claimed calibration gate.
- * The legacy calibration inputs are still accepted (and `calibratedScore` is used as a
- * fallback match-score signal) so existing callers keep working unchanged.
+ * The published `calibration_status` comes solely from the held-out gate
+ * (`calibrationStatusFor`): a real match is 'calibrated' only when that gate passed, never by
+ * default. A genuinely unseen / non-identifying profile keeps a null score and stays
+ * 'uncalibrated' because there is no score to calibrate. The legacy calibration inputs are
+ * still accepted (and `calibratedScore` is used as a fallback match-score signal) so existing
+ * callers keep working unchanged.
  */
 export function computeHonestIdentityConfidence(input: CalibrationInput): HonestIdentityConfidence {
   const source: CalibrationInput = input && typeof input === 'object' ? input : ({} as CalibrationInput);
@@ -197,6 +255,6 @@ export function computeHonestIdentityConfidence(input: CalibrationInput): Honest
   return {
     confidence_score: score,
     confidence_tier: confidenceBandForScore(score),
-    calibration_status: 'uncalibrated',
+    calibration_status: calibrationStatusFor(source),
   };
 }

@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "description": "Golden corpus of the five contradictions observed in the live payload. Each case records the raw observed fields, the canonical outcome expected after the fix, and the pure helper(s) whose invariants pin that outcome. Consumed by scripts/test-truth.ts; never edit the expectations to make a failing suite green — fix the implementation instead.",
+  "source": "reported live payload (Event JSON inspector / dashboard panels), captured during the truth-reconciliation audit",
+  "generated_on": "2026-11-22",
+  "cases": [
+    {
+      "id": "tz-alias-calcutta-kolkata",
+      "title": "Asia/Calcutta vs Asia/Kolkata IANA alias reported as a timezone mismatch",
+      "live_payload_path": "Event JSON -> network.timezone_mismatch + ip_info/reconciled_display timezone labels",
+      "contradiction": "Browser reports the legacy alias Asia/Calcutta while IP geolocation reports the canonical Asia/Kolkata. Raw string comparison emits a standalone timezone-mismatch risk line and a relay implication even though both names denote the same zone.",
+      "observed": {
+        "browserTimezone": "Asia/Calcutta",
+        "ipGeoTz": "Asia/Kolkata",
+        "timezoneMismatch": true,
+        "riskNote": "timezone mismatch (standalone)",
+        "riskLine": { "family": "network", "component": "network.timezone_mismatch_standalone", "points": 5 }
+      },
+      "expected": {
+        "canonicalBrowser": "Asia/Kolkata",
+        "canonicalIp": "Asia/Kolkata",
+        "timezonesEquivalent": true,
+        "mismatch": false,
+        "riskLine": null,
+        "networkRiskPoints": 0,
+        "display": "one canonical Asia/Kolkata label; timezone alone never implies VPN / proxy / relay"
+      },
+      "helpers": ["src/lib/timezone: canonicalTimezone, timezonesEquivalent, timezoneMismatchContext", "src/lib/riskLedger: buildGradedRiskLedger"],
+      "helper_module": "src/lib/timezone",
+      "helper_functions": ["canonicalTimezone", "timezonesEquivalent", "timezoneMismatchContext"]
+    },
+    {
+      "id": "gpu-masked-label-real-iris-xe",
+      "title": "Masked / unavailable GPU label hides a real Intel Iris Xe renderer",
+      "live_payload_path": "Event JSON -> hardwareSignals.gpu + environment.software_renderer_label + virtual_machine_label",
+      "contradiction": "The GPU label and VM panel say 'Masked' / 'Software-Rendered Graphics (SwiftShader)' / 'virtualization likely', while the WebGL renderer string is an explicit, non-placeholder 'Intel Iris Xe Graphics Direct3D11' identity. The masked label is being treated as software/VM proof instead of an observation-quality label.",
+      "observed": {
+        "gpuLabel": "Masked",
+        "gpuVendor": "Google Inc. (Intel)",
+        "gpuRenderer": "ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "gpuCapabilityClass": "t16|h|e3",
+        "softwareRenderer": true,
+        "softwareRendererLabel": "Software-Rendered Graphics (SwiftShader)",
+        "vmLabel": "Software-rendered graphics — virtualization likely, not proven"
+      },
+      "expected": {
+        "gpuObservation": "hardware_visible",
+        "hardwareAnchor": true,
+        "gpuArchFamily": "x86",
+        "webglBackend": "direct3d",
+        "swiftShader": false,
+        "softwareRenderer": false,
+        "gpuLabel": "Intel Iris Xe Graphics",
+        "softwareRendererLabel": null,
+        "vmLabel": null,
+        "environmentRiskPoints": 0
+      },
+      "helpers": ["src/lib/specInvariants: resolveGpuObservation, gpuObservationIsHardwareAnchor, checkGpuObservationInvariants, isSwiftShaderRenderer, classifyWebglBackend", "src/lib/hardwareTruth: classifyGpuArchFamily"],
+      "helper_module": "src/lib/specInvariants"
+    },
+    {
+      "id": "cdp-note-but-cdp-attached-false",
+      "title": "CDP note present while cdp_attached is false and inspector_state is closed",
+      "live_payload_path": "Event JSON -> automation.inspector_state / automation.cdp_attached / developer_tools + developer-tools note",
+      "contradiction": "A note states 'CDP protocol attached; no docked DevTools UI', but the canonical automation axes report cdp_attached=false, developer_tools=false and a closed/no inspector state. An observed CDP probe was collapsed to 'no inspector', which also wrongly permits a Verified Human verdict.",
+      "observed": {
+        "note": "CDP protocol attached; no docked DevTools UI",
+        "cdpAttached": false,
+        "developerTools": false,
+        "inspectorState": "closed"
+      },
+      "expected": {
+        "rawSignals": { "cdpAttached": true, "devtoolsActiveVerified": false, "viewportContractionNormalized": false },
+        "inspectorState": "yes-unattributed",
+        "cdpAttached": false,
+        "developerTools": true,
+        "permitsHumanVerdict": false,
+        "rule": "a bare CDP probe is honest DevTools telemetry: state yes-unattributed, cdp_attached=false, developer_tools=true; cdp_attached=true requires a corroborated CDP+DevTools pair (yes-corroborated). The note and the flags must never disagree."
+      },
+      "helpers": ["src/lib/specInvariants: resolveInspectorState, toInspectorState, inspectorFlagsForState, checkInspectorInvariants, permitsHumanVerdict"],
+      "helper_module": "src/lib/specInvariants"
+    },
+    {
+      "id": "risk-scales-3-of-10-vs-0-100",
+      "title": "Two risk scales compete: 3/10 headline against the 0-100 canonical ledger",
+      "live_payload_path": "Dashboard risk meter + four core cards; Event JSON -> risk.score_0_100 / score10 / tier",
+      "contradiction": "The headline is shown as 3/10 while the canonical 0-100 ledger reads 0 (tier Low), with four card-level 0/10-10/10 scales beside it. Two unlabelled scales are presented as competing risk truths, and the headline is not derived from the ledger.",
+      "observed": {
+        "headline": "3/10",
+        "score10": 3,
+        "score_0_100": 0,
+        "tier": "Low",
+        "cardScales": "0/10 .. 10/10"
+      },
+      "expected": {
+        "invariant": "risk.score10 = clamp(round(score_0_100 / 10), 0, 10); risk.tier = riskTier(score_0_100); no value is re-derived on the client",
+        "for_ledger_0": { "score10": 0, "tier": "Low" },
+        "for_ledger_30": { "score10": 3, "tier": "Elevated" },
+        "headline_3_only_valid_with_ledger": 30,
+        "labels": "0-100 canonical ledger with Low/Elevated/High/Critical; 0-10 headline explicitly derived; core cards explicitly labelled 0/10-10/10"
+      },
+      "helpers": ["src/lib/riskLedger: score10FromScore100, riskTierFromScore100", "src/lib/telemetryContract: riskTier, buildRiskLedger, assertCanonicalConsistency"],
+      "helper_module": "src/lib/riskLedger"
+    },
+    {
+      "id": "uncalibrated-confidence-percentage",
+      "title": "Uncalibrated identity confidence published as 'Confidence 87%'",
+      "live_payload_path": "Dashboard identity header; Event JSON -> identity.confidence_score / calibration_status",
+      "contradiction": "A percentage is rendered as a calibrated probability ('Confidence 87%') although calibration_status is 'uncalibrated' (0 labeled pairs, held-out ECE 1) and the match stage is new_enrollment with no match evidence. An uncalibrated status with a non-null score is itself a canonical-consistency violation.",
+      "observed": {
+        "display": "Confidence 87%",
+        "confidence_score": 0.87,
+        "calibration_status": "uncalibrated",
+        "labeledPairs": 0,
+        "heldOutEce": 1,
+        "match_stage": "new_enrollment"
+      },
+      "expected": {
+        "calibration_status": "uncalibrated",
+        "confidence_score": null,
+        "confidence_tier": "New Unobserved Profile",
+        "honest_label_for_evidenced_number": "Match evidence 87%",
+        "forbidden_label": "Confidence 87%",
+        "rule": "calibration_status comes only from the passed held-out gate; an uncalibrated profile with no match evidence publishes confidence_score=null and a categorical tier; any numeric evidence score that is published while uncalibrated must be labelled 'Match evidence N%', never a calibrated probability."
+      },
+      "helpers": ["src/lib/rarityHonesty: calibrationStatusFor, confidenceLabel, computeHonestIdentityConfidence", "src/lib/telemetryContract: assertCanonicalConsistency"],
+      "helper_module": "src/lib/rarityHonesty"
+    }
+  ]
+}

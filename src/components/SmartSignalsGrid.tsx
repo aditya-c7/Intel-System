@@ -1,5 +1,8 @@
 import type { IntelVisitorResponse } from '../types/visitor';
+import type { RiskTier } from '../lib/telemetryContract';
 import { resolveCanonical, isSwiftShader, SWIFTSHADER_LABEL } from './canonical';
+
+export type { RiskTier };
 
 /**
  * Smart Signals grid.
@@ -66,11 +69,14 @@ function detailIsInconclusive(detail: string | null | undefined): boolean {
 }
 
 /**
- * Single source of truth for the incognito verdict. The server's canonical boolean is
- * read from `smartSignals.incognito.status`, `securitySignals.isIncognito` and the
- * top-level `isIncognito` mirror. A positive source always wins: a genuine private
- * window can never render "Not detected" because one mirror looked stale. Every
- * consumer (both grids, the title chip and the Event JSON) reads this same object.
+ * Single source of truth for the incognito verdict — ONE verdict, driven ONLY by the
+ * server's canonical booleans. Each boolean mirror is a vote and any positive vote wins:
+ * a genuine private window can never render "Not detected" because one mirror looked stale.
+ * The legacy status prose is consulted only when the response carries no boolean at all,
+ * so a stale "Incognito / Private Mode" string can never manufacture a claim that the
+ * server's own booleans deny. Every consumer (both grids, the title chip and the Event
+ * JSON) reads this same object, and only the sanctioned jargon-free strings below reach
+ * the DOM.
  */
 export function resolveIncognitoVerdict(
   data: IntelVisitorResponse | null | undefined
@@ -78,8 +84,7 @@ export function resolveIncognitoVerdict(
   const s = data?.securitySignals;
   const signal = data?.smartSignals?.incognito ?? s?.smartSignals?.incognito ?? null;
 
-  const statusPositive = statusSaysIncognito(signal?.status);
-  const booleanMirrors: Array<boolean | undefined> = [
+  const booleanVotes: Array<boolean | undefined> = [
     s?.isIncognito,
     data?.isIncognito,
     s?.incognito,
@@ -87,9 +92,11 @@ export function resolveIncognitoVerdict(
     s?.privateMode,
     s?.incognitoLikely,
   ];
-  // A positive canonical boolean outranks a stale negative status string — the exact
-  // false-negative that made genuine Chrome Incognito read "Not detected".
-  const isIncognito = statusPositive || booleanMirrors.some((value) => value === true);
+  const anyPositive = booleanVotes.some((value) => value === true);
+  const hasBoolean = booleanVotes.some((value) => typeof value === 'boolean');
+  // Boolean authority always wins; prose is a last-resort fallback for legacy responses
+  // that carry no boolean verdict at all (never an override of an explicit false).
+  const isIncognito = anyPositive || (!hasBoolean && statusSaysIncognito(signal?.status));
 
   const rawConfidence = (
     s as { incognitoConfidence?: 'high' | 'low' | number | null } | undefined
@@ -135,77 +142,41 @@ function toneClass(tone: SmartSignalRowData['tone']): string {
   return CLEAN.box;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Bot — verbatim server verdict, exact agent names preserved                  */
+/* -------------------------------------------------------------------------- */
+
+export interface BotVerdict {
+  /** `smartSignals.bot.status` VERBATIM — never recomputed from raw bot evidence. */
+  status: string;
+  triggered: boolean;
+  detail?: string;
+  /** Server-computed 0..10 rating from the same smart signal. */
+  score: number;
+}
+
 /**
- * Generic/legacy bot verdicts. The edge-computed `smartSignals.bot.status` is authoritative
- * whenever it carries a real (non-placeholder) verdict — e.g. `Verified · Googlebot · Google`.
- * Only these legacy placeholders may fall back to the computed verdict below.
+ * Single source of truth for the Bot row. The edge/server already reconciled every raw
+ * probe (user-agent, WebDriver, CDP leaks, ASN attribution) into `smartSignals.bot`. Its
+ * `status` is printed verbatim so an exact agent name such as
+ * `Verified · Googlebot · Google` is preserved character-for-character. Nothing here
+ * inspects `isBot`, `botSubtype`, `botSignals`, `bot_info` or any other raw evidence —
+ * recomputing a bot verdict on the client is exactly what used to contradict the JSON.
  */
-const GENERIC_BOT_STATUSES = new Set([
-  'not detected',
-  'you are a bot',
-  'unavailable',
-  'detected',
-  'verified crawler',
-  'ai agent',
-  'n/a',
-  'none',
-  'unknown',
-  'false',
-]);
-
-/** Short, human-readable bot verdict. Never leaks raw user-agent internals. */
-function botStatus(data: IntelVisitorResponse): { status: string; triggered: boolean; detail?: string } {
-  const signals = data.securitySignals;
-  const subtype = signals.botSubtype;
-
-  // Legacy fallback computation — kept verbatim for responses that still carry only the
-  // coarse subtype flags and no exact server/edge verdict.
-  const legacy = (): { status: string; triggered: boolean; detail?: string } => {
-    if (!signals.isBot && subtype !== 'bad_bot' && subtype !== 'good_bot' && subtype !== 'ai_agent') {
-      return { status: 'Not detected', triggered: false };
-    }
-    if (subtype === 'good_bot') {
-      return { status: 'Verified crawler', triggered: false, detail: signals.botProvider };
-    }
-    if (subtype === 'ai_agent') {
-      return { status: 'AI agent', triggered: true, detail: signals.botProvider };
-    }
-    if (subtype === 'bad_bot') {
-      return {
-        status: 'You are a bot',
-        triggered: true,
-        detail: signals.botReason || signals.botProvider,
-      };
-    }
-    return { status: 'You are a bot', triggered: true, detail: signals.botReason };
+export function resolveBotVerdict(data: IntelVisitorResponse): BotVerdict {
+  const signal = data.smartSignals?.bot ?? data.securitySignals?.smartSignals?.bot ?? null;
+  const status = signal?.status?.trim() || 'Not detected';
+  const rawScore = signal?.scoreOutOf10;
+  const score =
+    typeof rawScore === 'number' && Number.isFinite(rawScore)
+      ? Math.max(0, Math.min(10, rawScore))
+      : 0;
+  return {
+    status,
+    triggered: score >= 5,
+    detail: signal?.detail?.trim() || undefined,
+    score,
   };
-
-  // Vague/soft-signal wording is never a status: an exact `bot_info.name` (or the edge verdict
-  // mirrored into the smart signal) must win instead.
-  const vague = /soft signals|low[- ]confidence|weak signals|heuristic/i;
-  const exactStatus = data.smartSignals?.bot?.status?.trim();
-  if (
-    exactStatus &&
-    !GENERIC_BOT_STATUSES.has(exactStatus.toLowerCase()) &&
-    !vague.test(exactStatus)
-  ) {
-    const fallback = legacy();
-    return {
-      status: exactStatus,
-      triggered: fallback.triggered,
-      detail: data.smartSignals?.bot?.detail || fallback.detail,
-    };
-  }
-  const exactName = data.bot_info?.name?.trim();
-  if (exactName && !GENERIC_BOT_STATUSES.has(exactName.toLowerCase()) && !vague.test(exactName)) {
-    const fallback = legacy();
-    return {
-      status: exactName,
-      triggered: fallback.triggered,
-      detail: data.smartSignals?.bot?.detail || fallback.detail,
-    };
-  }
-  return legacy();
 }
 
 /**
@@ -226,15 +197,25 @@ function serverTampering(data: IntelVisitorResponse): boolean {
 /* Virtual Machine — server-canonical verdict                                  */
 /* -------------------------------------------------------------------------- */
 
-export type VmVerdictState = 'vm' | 'software' | 'unknown' | 'physical';
+export type VmVerdictState =
+  /** Confirmed hypervisor / emulator runtime. */
+  | 'vm'
+  /** Software rasterizer only — never VM proof, never physical hardware. */
+  | 'software'
+  /** GPU / environment not observable — the honest "Not determinable" state. */
+  | 'unknown'
+  /** Genuine unmasked GPU with consistent platform. */
+  | 'physical';
 
 export interface VmVerdict {
   state: VmVerdictState;
   status: string;
   detail?: string;
+  /** Canonical 0..10 observation score. Unknown and physical both score 0. */
+  score: number;
 }
 
-/** Interprets a canonical/server VM status string into one stable state. */
+/** Interprets a canonical/server VM status string into one stable four state. */
 function interpretVmText(text: string): VmVerdictState | null {
   const t = (text || '').trim().toLowerCase();
   if (!t) return null;
@@ -243,94 +224,236 @@ function interpretVmText(text: string): VmVerdictState | null {
   if (/not detected|no virtual|physical|bare metal|native silicon|dedicated hardware|^no$/.test(t))
     return 'physical';
   if (/software|swiftshader|llvmpipe|softpipe|not proven/.test(t)) return 'software';
-  if (/unknown|unavailable|indeterminate|inconclusive|n\/a|^none$/.test(t)) return 'unknown';
-  if (/virtual machine|virtualbox|vmware|\bkvm\b|\bqemu\b|hyper-?v|\bxen\b|container|cloud|\bvm\b|detected|^yes$/.test(t))
+  // Masked / unavailable / tampered environments are not observations of physical hardware.
+  if (
+    /unknown|unavailable|indeterminate|inconclusive|masked|replayed|tampered|spoofed|n\/a|^none$/.test(
+      t
+    )
+  )
+    return 'unknown';
+  if (
+    /virtual machine|virtualbox|vmware|\bkvm\b|\bqemu\b|hyper-?v|\bxen\b|container|cloud|\bvm\b|emulator|detected|^yes$/.test(
+      t
+    )
+  )
     return 'vm';
   return null;
 }
 
 /**
- * Resolves the Virtual Machine verdict from the SERVER canonical axes only:
- * `smartSignals.vm.status` and `environment.virtual_machine_label` / `software_renderer`.
- * A client-side `cloudOrMaskedGpu` / `isVirtualMachine` hint is never allowed to contradict
- * them. When the server reports software rendering or an unknown environment, the verdict
- * degrades to that honest label instead of asserting "Yes" or a physical machine. The
- * client hints are consulted only for legacy responses with no server VM authority.
+ * Four-state GPU observation, resolved from the SERVER canonical axes only:
+ * `smartSignals.vm.status`, `securitySignals.isVirtualMachine` and
+ * `environment.virtual_machine_label` / `software_renderer`.
+ *
+ *  - `vm`         — a confirmed hypervisor / emulator runtime.
+ *  - `software`   — SwiftShader / llvmpipe / masked software rendering; NOT VM proof.
+ *  - `physical`   — only a genuine unmasked GPU with a consistent platform.
+ *  - `unknown`    — the GPU or environment is unavailable / inconclusive: the status is
+ *                   "Not determinable" and the score is 0.
+ *
+ * A client-side `cloudOrMaskedGpu` / `emulatorDetected` hint is NEVER allowed to promote an
+ * unavailable or software-rendered environment into a "Yes" / "Physical Hardware" claim.
+ * If the authoritative JSON says the VM verdict is false or unobservable, the row degrades
+ * to "Not determinable" instead of contradicting `#raw-json`.
  */
 export function resolveVmVerdict(
   data: IntelVisitorResponse,
   canonicalView: ReturnType<typeof resolveCanonical> = resolveCanonical(data)
 ): VmVerdict {
   const env = canonicalView.environment;
-  const label = (env?.virtual_machine_label ?? '').trim();
-  const webglSoftware = isSwiftShader(data.hardwareSignals?.gpuRenderer);
-  const softwareRenderer = Boolean(env?.software_renderer);
-  const signal = data.smartSignals?.vm;
+  const signal = data.smartSignals?.vm ?? data.securitySignals?.smartSignals?.vm ?? null;
   const signalStatus = (signal?.status ?? '').trim();
   const signalDetail = (signal?.detail ?? '').trim();
-
-  const hasServerAuthority = Boolean(label || signalStatus || softwareRenderer || webglSoftware);
-  if (!hasServerAuthority) {
-    const clientVm = Boolean(
-      data.securitySignals?.isVirtualMachine ||
-        data.securitySignals?.cloudOrMaskedGpu ||
-        data.securitySignals?.emulatorDetected
-    );
-    return {
-      state: clientVm ? 'vm' : 'physical',
-      status: clientVm ? 'Yes' : 'Not detected',
-      detail: data.securitySignals?.emulatorReason || data.securitySignals?.vmReason,
-    };
-  }
+  const label = (env?.virtual_machine_label ?? '').trim();
+  const softwareRenderer = Boolean(env?.software_renderer);
+  const webglSoftware = isSwiftShader(data.hardwareSignals?.gpuRenderer);
+  const isVmFlag = data.securitySignals?.isVirtualMachine;
 
   const labelState = interpretVmText(label);
   const signalState = interpretVmText(signalStatus);
-  const software =
-    webglSoftware || softwareRenderer || labelState === 'software' || signalState === 'software';
-  const unknown = !software && (labelState === 'unknown' || signalState === 'unknown');
+  const unavailablePattern = /unavailable|masked|indeterminate|inconclusive|^none$|n\/a/i;
+  const unavailable = unavailablePattern.test(signalStatus) || unavailablePattern.test(label);
+  const gpuVendor = data.hardwareSignals?.gpuVendor ?? '';
+  const gpuRenderer = data.hardwareSignals?.gpuRenderer ?? '';
+  const realUnmaskedGpu =
+    !webglSoftware &&
+    !softwareRenderer &&
+    !unavailable &&
+    Boolean(gpuVendor) &&
+    gpuVendor !== 'Unavailable' &&
+    Boolean(gpuRenderer) &&
+    gpuRenderer !== 'Unavailable';
 
-  if (software) {
-    return {
-      state: 'software',
-      status: signalState === 'software' ? signalStatus : 'Software-rendered (not proven VM)',
-      detail:
-        signalDetail ||
-        (labelState === 'software' ? label : undefined) ||
-        SWIFTSHADER_LABEL,
-    };
-  }
-  if (unknown) {
-    return {
-      state: 'unknown',
-      status: signalState === 'unknown' ? signalStatus : 'Unknown',
-      // An unavailable / masked environment has no positive detail. The server's raw VM
-      // detail can still claim an "Unmasked physical GPU & consistent OS platform verified"
-      // even after its own consistency pass rewrote the status to "GPU Masked / Unavailable".
-      // Printing it here would contradict the canonical virtual_machine_label (null) and
-      // software_renderer axes, so clear it while the status stays honestly unavailable.
-      detail: undefined,
-    };
+  let state: VmVerdictState;
+  if (isVmFlag === true || signalState === 'vm' || labelState === 'vm') {
+    state = 'vm';
+  } else if (
+    softwareRenderer ||
+    webglSoftware ||
+    signalState === 'software' ||
+    labelState === 'software'
+  ) {
+    state = 'software';
+  } else if ((signalState === 'physical' || labelState === 'physical') && realUnmaskedGpu) {
+    state = 'physical';
+  } else {
+    // No server authority, or an explicitly unavailable / inconclusive observation.
+    state = 'unknown';
   }
 
-  const positive = signalState === 'vm' ? signalState : labelState === 'vm' ? labelState : null;
-  const physical = signalState === 'physical' || labelState === 'physical';
-  if (positive || physical) {
-    return {
-      state: positive ?? 'physical',
-      status: positive
-        ? signalState === 'vm'
-          ? signalStatus
-          : 'Yes'
-        : signalState === 'physical'
+  // The authoritative JSON verdict is never contradicted: a false VM boolean or an
+  // unavailable / masked GPU can never surface as "Yes" / "Physical Hardware". This is
+  // the same invariant the server applies when it reconciles `virtual_machine: false`.
+  if (isVmFlag === false && (state === 'vm' || state === 'physical')) state = 'unknown';
+  if (unavailable && (state === 'vm' || state === 'physical')) state = 'unknown';
+
+  const status =
+    state === 'vm'
+      ? signalState === 'vm'
         ? signalStatus
-        : 'Not detected',
-      detail: signalDetail || label || undefined,
-    };
-  }
-  // Server authority was present but inconclusive: report unknown, never a Yes/physical claim,
-  // and never attach a detail that would imply a confirmed (unavailable) environment.
-  return { state: 'unknown', status: 'Unknown', detail: undefined };
+        : 'Virtual Machine'
+      : state === 'software'
+      ? signalState === 'software'
+        ? signalStatus
+        : SWIFTSHADER_LABEL
+      : state === 'physical'
+      ? 'Physical Hardware'
+      : 'Not determinable';
+
+  return {
+    state,
+    status,
+    // An unavailable environment has no positive detail to print: the server's raw VM
+    // detail can still claim an unmasked physical GPU after its own consistency pass
+    // rewrote the status to "GPU Masked / Unavailable", which would contradict the JSON.
+    detail: state === 'vm' || state === 'software' ? signalDetail || undefined : undefined,
+    score: state === 'vm' ? 6 : state === 'software' ? 3 : 0,
+  };
 }
+
+/* -------------------------------------------------------------------------- */
+/* VPN — concrete methods only; timezone mismatch is context, never a method   */
+/* -------------------------------------------------------------------------- */
+
+export interface VpnVerdict {
+  status: string;
+  triggered: boolean;
+  detail?: string;
+  /** Count of concrete, tunnel-bearing methods (timezone_mismatch excluded). */
+  effectiveCount: number;
+  /** Separate context note — shown on its own row, never credited to the VPN verdict. */
+  timezoneNote?: string;
+}
+
+/** Legacy / partial payloads may omit individual method flags. */
+type VpnMethodFlags = {
+  timezone_mismatch?: boolean;
+  public_vpn?: boolean;
+  auxiliary_mobile?: boolean;
+  os_mismatch?: boolean;
+  relay?: boolean;
+  ml_prediction?: boolean;
+};
+
+/** Only these server methods represent an actual tunnel / anonymity relay. */
+const VPN_TUNNEL_METHODS = [
+  'public_vpn',
+  'relay',
+  'ml_prediction',
+  'os_mismatch',
+  'auxiliary_mobile',
+] as const;
+
+/**
+ * Single source of truth for the VPN row. The server's `vpnMethods` object is authoritative.
+ * `timezone_mismatch` is an orthogonal network axis and is NEVER counted as a VPN method or
+ * allowed to trigger the row; the legacy `vpnSuspected` flag (which used to be timezone-only)
+ * is likewise ignored unless a concrete method fired. The timezone discrepancy is returned
+ * as a separate `timezoneNote` so the UI can show it as context without implying a VPN.
+ */
+export function resolveVpnVerdict(data: IntelVisitorResponse): VpnVerdict {
+  const signals = data.securitySignals;
+  const methods: VpnMethodFlags = signals.vpnMethods ?? {};
+  const effectiveCount = VPN_TUNNEL_METHODS.filter((key) => Boolean(methods[key])).length;
+  const timezoneMismatch = Boolean(methods.timezone_mismatch ?? signals.timezoneMismatch);
+  const detected = effectiveCount > 0 || Boolean(signals.publicVpn);
+
+  let status = 'Not detected';
+  if (detected) {
+    if (methods.public_vpn || signals.publicVpn) status = 'Commercial VPN';
+    else if (methods.relay) status = 'Tor exit / relay';
+    else if (signals.datacenterAsn ?? signals.isDatacenterOrHosting) status = 'Datacenter / hosting';
+    else status = 'Detected';
+  }
+
+  return {
+    status,
+    triggered: detected,
+    detail: effectiveCount > 1 ? `${effectiveCount} matching network methods` : undefined,
+    effectiveCount,
+    timezoneNote: timezoneMismatch
+      ? 'Browser timezone differs from IP geolocation (context only — not a VPN method)'
+      : undefined,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Inspector — CDP bridge and DevTools are distinct verification states        */
+/* -------------------------------------------------------------------------- */
+
+export interface InspectorVerdict {
+  cdpAttached: boolean;
+  cdpDetail?: string;
+  /** True ONLY for a verified, actively docked DevTools inspector. */
+  developerTools: boolean;
+  inspectorState?: string;
+}
+
+/** Resolves the CDP and Developer Tools rows from the canonical inspector state. */
+export function resolveInspectorVerdict(data: IntelVisitorResponse): InspectorVerdict {
+  const automation = resolveCanonical(data).automation;
+  const inspectorState = automation?.inspector_state;
+  const developerTools = inspectorState === 'devtools_active_verified';
+  const cdpAttached =
+    Boolean(automation?.cdp_attached) || inspectorState === 'automation_protocol_attached';
+  const cdpDetail =
+    inspectorState === 'automation_protocol_attached'
+      ? 'Automation protocol attached (no docked DevTools UI)'
+      : cdpAttached
+      ? inspectorState || undefined
+      : undefined;
+  return { cdpAttached, cdpDetail, developerTools, inspectorState };
+}
+
+/** Thin alias kept stable for App.tsx callers that only need the CDP axis. */
+export function resolveCdpVerdict(data: IntelVisitorResponse): InspectorVerdict {
+  return resolveInspectorVerdict(data);
+}
+
+/** Thin alias kept stable for App.tsx callers that only need the DevTools boolean. */
+export function resolveDeveloperToolsVerdict(data: IntelVisitorResponse): boolean {
+  return resolveInspectorVerdict(data).developerTools;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Risk tier — Low / Elevated / High / Critical from canonical score10         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Derives the canonical risk tier from the server's 0..10 headline score. The cut points
+ * mirror the frozen 0..100 rubric (75 / 50 / 25) after `round(score / 10)`, so the tier is
+ * consistent with `canonical.riskScore10` instead of an ad-hoc per-tile threshold.
+ */
+export function resolveRiskTier(score10: number): RiskTier {
+  const score = Number.isFinite(score10) ? Math.max(0, Math.min(10, score10)) : 0;
+  if (score >= 8) return 'Critical';
+  if (score >= 5) return 'High';
+  if (score >= 3) return 'Elevated';
+  return 'Low';
+}
+
+/** Explicit alias for callers that want the derivation source in the name. */
+export const resolveRiskTierFromScore10 = resolveRiskTier;
 
 export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRowData[] {
   const canonicalView = resolveCanonical(data);
@@ -362,42 +485,37 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     detail: incognito.detail,
   });
 
-  const bot = botStatus(data);
+  const bot = resolveBotVerdict(data);
   rows.push({
     key: 'bot',
     label: 'Bot',
+    // Verbatim server status — exact agent names are preserved, never recomputed.
     status: bot.status,
     triggered: bot.triggered,
     detail: bot.detail,
   });
 
-  // The server's `vpnMethods` object is the single source of truth for both the method count
-  // and the status label — the same object the event JSON prints, so this tile can never claim
-  // more methods (or a different verdict) than `#raw-json`. A plain datacenter / hosting ASN is
-  // explicitly NOT a commercial VPN: only the server's `public_vpn` method earns that label.
-  const methods = signals.vpnMethods;
-  // A timezone difference is reported by the separate "Timezone" context tile. It is NOT a
-  // VPN verdict: when it is the only differing method the VPN tile must read "Not detected".
-  const vpnMethods = methods ?? {};
-  const vpnEffectiveCount = Object.entries(vpnMethods).filter(
-    ([name, active]) => name !== 'timezone_mismatch' && Boolean(active)
-  ).length;
-  const vpnDetected = Boolean(vpnEffectiveCount > 0 || signals.vpnSuspected);
-  const datacenterHosting = Boolean(signals.datacenterAsn ?? signals.isDatacenterOrHosting);
-  let vpnStatus = 'Not detected';
-  if (vpnDetected) {
-    if (methods?.public_vpn) vpnStatus = 'Commercial VPN';
-    else if (methods?.relay) vpnStatus = 'Tor exit / relay';
-    else if (datacenterHosting) vpnStatus = 'Datacenter / hosting';
-    else vpnStatus = 'Detected';
-  }
+  // The server's `vpnMethods` object is the single source of truth. Timezone mismatch is
+  // an orthogonal context axis: it is excluded from the method count and can never trigger
+  // this row. `resolveVpnVerdict` returns it as a separate note, rendered on its own row.
+  const vpn = resolveVpnVerdict(data);
   rows.push({
     key: 'vpn',
     label: 'VPN',
-    status: vpnStatus,
-    triggered: vpnDetected,
-    detail: vpnEffectiveCount > 1 ? `${vpnEffectiveCount} matching network methods` : signals.vpnReasons?.[0],
+    status: vpn.status,
+    triggered: vpn.triggered,
+    detail: vpn.detail,
   });
+  if (vpn.timezoneNote) {
+    rows.push({
+      key: 'vpnTimezoneContext',
+      label: 'Timezone Context',
+      status: 'Differs from IP region',
+      triggered: false,
+      tone: 'neutral',
+      detail: vpn.timezoneNote,
+    });
+  }
 
   // The tampering row mirrors the server's canonical verdict; it never recomputes one from
   // raw evidence. `smartSignals.tampering` (when a backend supplies it) and `data.tampering`
@@ -422,39 +540,29 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
       : undefined,
   });
 
-  // DevTools is reported only when the canonical inspector state verifies an actively docked
-  // debugger. A bare CDP bridge (automation_protocol_attached) is informational, not proof.
-  const envelopeAutomation = canonicalView.automation;
-  // Developer tools stays tied strictly to a docked/verified inspector — unchanged.
-  const developerTools = envelopeAutomation?.inspector_state === 'devtools_active_verified';
+  // DevTools and CDP are distinct canonical inspector states. Developer Tools is reported
+  // ONLY for a verified, actively docked debugger; a bare CDP bridge is informational and
+  // never promoted to DevTools proof (or vice versa).
+  const inspector = resolveInspectorVerdict(data);
   rows.push({
     key: 'developerTools',
     label: 'Developer Tools',
-    status: developerTools ? 'Yes' : 'Not detected',
-    triggered: developerTools,
+    status: inspector.developerTools ? 'Yes' : 'Not detected',
+    triggered: inspector.developerTools,
   });
 
-  // CDP / Automation Protocol is a separate, informational axis. A bare automation-protocol
-  // binding (cdp_attached / automation_protocol_attached) is never promoted to DevTools proof.
-  const cdpAttached =
-    Boolean(envelopeAutomation?.cdp_attached) ||
-    envelopeAutomation?.inspector_state === 'automation_protocol_attached';
   rows.push({
     key: 'cdpAutomation',
     label: 'CDP / Automation Protocol',
-    status: cdpAttached ? 'Attached' : 'Not detected',
+    status: inspector.cdpAttached ? 'Attached' : 'Not detected',
     triggered: false,
-    tone: cdpAttached ? 'neutral' : 'clean',
-    detail: cdpAttached
-      ? envelopeAutomation?.inspector_state === 'automation_protocol_attached'
-        ? 'Automation protocol attached (no docked DevTools UI)'
-        : envelopeAutomation?.inspector_state ?? undefined
-      : undefined,
+    tone: inspector.cdpAttached ? 'neutral' : 'clean',
+    detail: inspector.cdpDetail,
   });
 
-  // The VM row mirrors the server canonical verdict. A client GPU / emulator hint can never
-  // promote a software-rendered or unknown environment into a "Yes" / physical-machine claim
-  // that contradicts `smartSignals.vm.status` or the canonical environment label.
+  // Four-state GPU observation: Virtual Machine / Software-rendered / Physical Hardware /
+  // "Not determinable". A client GPU or emulator hint can never promote an unavailable
+  // environment into a "Yes" / Physical Hardware claim that contradicts the JSON.
   const vmVerdict = resolveVmVerdict(data, canonicalView);
   rows.push({
     key: 'virtualMachine',
@@ -558,16 +666,34 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     tone: 'clean',
   });
 
-  const suspectScore = Math.max(
-    0,
-    Math.min(10, Number(data.suspectScore ?? data.securitySignals?.suspectScore ?? 0) || 0)
-  );
+  // Both rows read the SAME canonical score10 / tier. The tier is derived from that score
+  // with the frozen rubric cut points — never from an ad-hoc per-tile threshold.
+  const suspectScore = Math.max(0, Math.min(10, canonicalView.riskScore10));
+  const riskTier = resolveRiskTier(suspectScore);
   rows.push({
     key: 'suspectScore',
     label: 'Suspect Score',
     status: `${suspectScore}/10`,
-    triggered: suspectScore >= 5,
-    tone: suspectScore >= 5 ? 'trigger' : suspectScore > 0 ? 'neutral' : 'clean',
+    triggered: riskTier === 'High' || riskTier === 'Critical',
+    tone: riskTier === 'High' || riskTier === 'Critical'
+      ? 'trigger'
+      : riskTier === 'Elevated'
+      ? 'neutral'
+      : 'clean',
+  });
+  rows.push({
+    key: 'riskTier',
+    label: 'Risk Tier',
+    status: riskTier,
+    triggered: riskTier === 'High' || riskTier === 'Critical',
+    tone: riskTier === 'Critical'
+      ? 'trigger'
+      : riskTier === 'High'
+      ? 'trigger'
+      : riskTier === 'Elevated'
+      ? 'neutral'
+      : 'clean',
+    detail: `Canonical score ${suspectScore}/10`,
   });
 
   // Fix 5 — the server always computes the metro-zone geohash synchronously, so this tile

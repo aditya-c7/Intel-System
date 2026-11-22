@@ -18,6 +18,7 @@ import {
   normalizeUserAgent,
   validateUserAgentNormalization,
   assertUserAgentNormalization,
+  parseMobileFlag,
   type NormalizeUserAgentInput,
   type NormalizedUserAgent,
 } from '../src/shared/normalization/uaNormalizer';
@@ -203,6 +204,58 @@ expectIdentity(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Cursor/0.42.3 Chrome/128.0.0.0 Safari/537.36',
   },
   { browserName: 'Cursor', browserMajorVersion: '0' },
+);
+
+/* Tranche 0-1 regression matrix --------------------------------------------- */
+
+const ELECTRON_UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) OpenCode/2.3.0 Chrome/152.0.7977.167 Electron/44.9.1 Safari/537.36';
+
+expectIdentity(
+  'Electron 44.9.1 runtime outranks the embedded Chromium brand',
+  {
+    userAgent: ELECTRON_UA,
+    platform: 'Linux',
+    clientHints: {
+      fullVersionList: [
+        { brand: 'Chromium', version: '152.0.7977.167' },
+        { brand: 'Google Chrome', version: '152.0.7977.167' },
+      ],
+      platform: 'Linux',
+      platformVersion: '6.8.0',
+      architecture: 'x86',
+      bitness: '64',
+    },
+  },
+  {
+    browserName: 'Electron',
+    browserFullVersion: '44.9.1',
+    browserMajorVersion: '44',
+  },
+);
+
+const electronResult = normalizeUserAgent({ userAgent: ELECTRON_UA, platform: 'Linux' });
+check(
+  'Electron UA is never reported as the embedded Chromium/Chrome identity',
+  electronResult.browserName === 'Electron' && electronResult.browserFullVersion !== '152.0.7977.167',
+  electronResult,
+);
+
+/** Sec-CH-UA-Mobile ?1 is a structured boolean, not a raw string. */
+check('Sec-CH-UA-Mobile ?1 parses to boolean true', parseMobileFlag('?1') === true);
+check('Sec-CH-UA-Mobile "?1" parses to boolean true', parseMobileFlag('"?1"') === true);
+check('Sec-CH-UA-Mobile ?0 parses to boolean false', parseMobileFlag('?0') === false);
+check('boolean true Sec-CH-UA-Mobile parses to true', parseMobileFlag(true) === true);
+
+expectIdentity(
+  'Sec-CH-UA-Mobile ?1 promotes an otherwise unknown device to Mobile',
+  { userAgent: 'Mozilla/5.0', clientHints: { mobile: '?1' } },
+  { device: 'Mobile' },
+);
+expectIdentity(
+  'Sec-CH-UA-Mobile ?0 does not promote an unknown device',
+  { userAgent: 'Mozilla/5.0', clientHints: { mobile: '?0' } },
+  { device: 'Unknown' },
 );
 
 /* Assertion helper ---------------------------------------------------------- */

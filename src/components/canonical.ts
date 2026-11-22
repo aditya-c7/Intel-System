@@ -14,15 +14,16 @@ import type {
   AutomationAxes,
   CanonicalTelemetryEnvelope,
   EnvironmentAxes,
+  GpuObservation,
   IdentityAxes,
   InspectorState,
+  InspectorStateTristate,
   NetworkAxes,
   OrthogonalRiskLedger,
   RiskTier,
   TamperingAxes,
   VerdictTier,
 } from '../lib/telemetryContract';
-import { riskTier } from '../lib/telemetryContract';
 import type { IntelVisitorResponse } from '../types/visitor';
 
 export const SWIFTSHADER_LABEL = 'Software-Rendered Graphics (SwiftShader)';
@@ -33,7 +34,6 @@ const VERDICT_TIERS: readonly string[] = [
   'Verified Human Interactive Session',
   'Unverified / Passive Session',
 ];
-const RISK_TIERS: readonly string[] = ['Low', 'Elevated', 'High', 'Critical'];
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -59,6 +59,8 @@ export interface CanonicalView {
   source: 'canonical' | 'legacy' | 'empty';
   eventId: string | null;
   risk: OrthogonalRiskLedger;
+  /** Verbatim mirror of `risk.evidence_ledger` for the UI / Event JSON (never re-derived). */
+  evidenceLedger: OrthogonalRiskLedger['evidence_ledger'];
   /** 0-10 headline mirrored verbatim from the canonical risk ledger (never re-derived). */
   riskScore10: number;
   /** Risk tier mirrored verbatim from the canonical risk ledger. */
@@ -85,7 +87,13 @@ export interface CanonicalView {
   verifiedAgentId?: string | null;
   signatureStatus?: string;
   cdpAttached?: boolean;
-  inspectorState?: InspectorState | null;
+  inspectorState?: InspectorStateTristate | InspectorState | null;
+  /** Server-resolved developer-tools verdict from the automation axis (verbatim). */
+  developerTools?: boolean;
+  /** Canonical GPU observation bucket from the envelope axis (verbatim). */
+  gpuObservation?: GpuObservation | null;
+  /** Server timezone-mismatch verdict from the network axis (verbatim). */
+  timezoneMismatchCanonical?: boolean;
   osTruth?: Record<string, unknown>;
 }
 
@@ -137,21 +145,19 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     : legacyScore;
   const score = clampScore(canonicalScore);
 
-  // The canonical ledger itself is the one source for the 0-10 headline and its tier mirror.
-  // Read its optional fields with the same `as unknown as` pass-through used for the other
-  // axes; the client only mirrors server values and never recomputes a score from the cards.
+  // The canonical risk ledger itself is the single source for the 0-10 headline, its tier
+  // mirror and the evidence lines. Every value below is an `as unknown as` pass-through from
+  // that server axis: the client never rounds a score, derives a tier from the family cards,
+  // or tier-shifts a server-supplied value.
   const canonicalRisk = (riskRaw ?? riskRoot) as unknown as OrthogonalRiskLedger | null;
-  const ledgerScore10 = canonicalRisk?.score10;
-  const ledgerTier = canonicalRisk?.risk_tier ?? canonicalRisk?.tier;
-  const canonicalScore10 =
-    typeof ledgerScore10 === 'number' && Number.isFinite(ledgerScore10)
-      ? ledgerScore10
-      : typeof data?.suspectScore === 'number' && Number.isFinite(data.suspectScore)
-      ? data.suspectScore
-      : 0;
-  const canonicalRiskTier: RiskTier = RISK_TIERS.includes(String(ledgerTier))
-    ? (ledgerTier as unknown as RiskTier)
-    : riskTier(score);
+  const riskScore10 = canonicalRisk?.score10 as unknown as number;
+  const riskTier = (canonicalRisk?.risk_tier ?? canonicalRisk?.tier) as unknown as RiskTier;
+  const evidenceLedger: OrthogonalRiskLedger['evidence_ledger'] = Array.isArray(
+    riskRaw?.evidence_ledger ?? riskRoot?.evidence_ledger
+  )
+    ? ((riskRaw?.evidence_ledger ??
+        riskRoot?.evidence_ledger) as unknown as OrthogonalRiskLedger['evidence_ledger'])
+    : [];
 
   const risk: OrthogonalRiskLedger = {
     automation: finiteNumber(riskRaw?.automation),
@@ -161,16 +167,11 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     velocity: finiteNumber(riskRaw?.velocity),
     raw_score: finiteNumber(riskRaw?.raw_score ?? riskRoot?.raw_score) || score,
     score_0_100: score,
-    tier: (RISK_TIERS.includes(String(riskRaw?.tier))
-      ? riskRaw?.tier
-      : riskTier(score)) as RiskTier,
-    evidence_ledger: Array.isArray(riskRaw?.evidence_ledger ?? riskRoot?.evidence_ledger)
-      ? ((riskRaw?.evidence_ledger ?? riskRoot?.evidence_ledger) as OrthogonalRiskLedger['evidence_ledger'])
-      : [],
-    // Optional server-supplied mirrors. The canonical ledger is the single source for the
-    // 0-10 headline and its tier; neither value is recomputed from the family cards here.
-    score10: canonicalScore10,
-    risk_tier: canonicalRiskTier,
+    tier: canonicalRisk?.tier as unknown as RiskTier,
+    evidence_ledger: evidenceLedger,
+    // Optional server-supplied mirrors — pass-through only, never recomputed on the client.
+    score10: riskScore10,
+    risk_tier: riskTier,
   };
 
   const verdict = typeof env?.verdict_tier === 'string' && VERDICT_TIERS.includes(env.verdict_tier)
@@ -198,23 +199,23 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     : stringArray(data?.tamperingDetails?.reasons);
 
   // Identity confidence is the server's calibrated value from the canonical envelope's
-  // `identity` axis. Mirror it verbatim (0..1 or null): the server already applies the
-  // held-out calibration gate before serializing, so nothing is gated or recomputed here.
-  const confidenceTier = identity?.confidence_tier ?? 'New Unobserved Profile';
-  const confidenceScore =
-    typeof identityRaw?.confidence_score === 'number' && Number.isFinite(identityRaw.confidence_score)
-      ? identityRaw.confidence_score
-      : null;
-  const calibrationStatus: 'uncalibrated' | 'calibrated' =
-    identityRaw?.calibration_status === 'calibrated' ? 'calibrated' : 'uncalibrated';
+  // `identity` axis. Mirror it verbatim with an `as unknown as` pass-through (0..1 or null):
+  // a null score stays null, and the client never applies its own gate, floor or recomputation.
+  const confidenceTier = (identityRaw?.confidence_tier ??
+    'New Unobserved Profile') as unknown as string;
+  const confidenceScore = (identityRaw?.confidence_score ?? null) as unknown as number | null;
+  const calibrationStatus = (identityRaw?.calibration_status ?? 'uncalibrated') as unknown as
+    | 'uncalibrated'
+    | 'calibrated';
 
   return {
     present: source === 'canonical',
     source,
     eventId: typeof env?.event_id === 'string' ? env.event_id : null,
     risk,
-    riskScore10: canonicalScore10,
-    riskTier: canonicalRiskTier,
+    evidenceLedger,
+    riskScore10,
+    riskTier,
     verdictTier: verdict,
     humanCorroboration,
     identity,
@@ -234,8 +235,14 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     aiAgent: automation?.aiAgent ?? null,
     verifiedAgentId: automation?.verifiedAgentId ?? null,
     signatureStatus: automation?.signatureStatus,
-    cdpAttached: automation?.cdp_attached,
-    inspectorState: automation?.inspector_state ?? null,
+    cdpAttached: automationRaw?.cdp_attached as unknown as boolean | undefined,
+    inspectorState: (env?.inspectorState ?? automationRaw?.inspector_state ?? null) as unknown as
+      | InspectorStateTristate
+      | InspectorState
+      | null,
+    developerTools: automationRaw?.developer_tools as unknown as boolean | undefined,
+    gpuObservation: (env?.gpuObservation ?? null) as unknown as GpuObservation | null,
+    timezoneMismatchCanonical: networkRaw?.timezone_mismatch as unknown as boolean | undefined,
     osTruth: automation
       ? {
           serverVerifiedOs: automation.serverVerifiedOs,

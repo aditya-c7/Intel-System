@@ -3,7 +3,8 @@
  *
  * Every function here is pure and total: it never throws and never reads a platform API.
  * The collector / server may call these with whatever it parsed; the functions return a
- * structured verdict that the tampering invariant and the 4-state inspector use.
+ * structured verdict that the tampering invariant and the canonical inspector / GPU-observation
+ * helpers use. This module is the single source for GPU observation truth and inspector state.
  *
  * Design rules that must not regress:
  *  - deviceMemory is the real power-of-two set. Desktop Chrome legitimately reports 16 and
@@ -14,7 +15,12 @@
  *    invariant after privacy / SwiftShader reasons have been filtered out.
  */
 
-import type { InspectorState, TamperingAxes } from './telemetryContract';
+import type {
+  // Legacy 4-state vocabulary from the telemetry contract. Aliased so this module can own the
+  // canonical 3-state `InspectorState` below without breaking the existing classifier's callers.
+  InspectorState as LegacyInspectorState,
+  TamperingAxes,
+} from './telemetryContract';
 
 export type SpecSeverity = 'hard' | 'soft';
 
@@ -68,6 +74,98 @@ export function isSwiftShaderRenderer(renderer: string): boolean {
   return /swiftshader|subzero|0x0000c0de|llvmpipe|mesa offscreen|software rasterizer/i.test(
     String(renderer || '')
   );
+}
+
+/* -------------------------------------------------------------------------- */
+/* GPU observation — the single source for GPU truth                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * How much we actually observed about the GPU. This is deliberately an *observation* class,
+ * not a machine-identification verdict:
+ *  - software_or_virtual REQUIRES an explicit, named identifier in the vendor/renderer string.
+ *  - a missing `WEBGL_debug_renderer_info` extension only ever means masked_by_privacy or
+ *    observation_unavailable; it is NEVER proof of a virtual machine.
+ */
+export type GpuObservation =
+  | 'hardware_visible'
+  | 'masked_by_privacy'
+  | 'observation_unavailable'
+  | 'software_or_virtual';
+
+/** Explicit, named software / virtual rasteriser identifiers. Nothing here is inferred. */
+const SOFTWARE_OR_VIRTUAL_GPU_IDENTIFIER =
+  /swiftshader|subzero|llvmpipe|softpipe|mesa offscreen|software rasterizer|software renderer|0x0000c0de|vmware|virtualbox|\bvbox\b|qemu|hyper-?v|microsoft basic render|basic render driver|apple software renderer|virgl/i;
+
+/** Google's SwiftShader fallback is reported under this exact vendor string. */
+const GOOGLE_SOFTWARE_VENDOR = /^google inc\.?\s*\(\s*google\s*\)$/i;
+
+/** Placeholder values written when the unmasked-info extension is absent or WebGL failed. */
+const GPU_NAME_PLACEHOLDER =
+  /^(?:unavailable|unknown|n\/?a|none|null|undefined|standard webgl (?:vendor|renderer)|webkit webgl(?: (?:renderer|vendor))?|webgl(?: (?:vendor|renderer))?|generic (?:renderer|vendor)|mozilla)/i;
+
+function normalizedGpuValue(value: string | null | undefined): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function isGpuNamePlaceholder(value: string): boolean {
+  return !value || GPU_NAME_PLACEHOLDER.test(value);
+}
+
+function hasGpuCapabilityClass(value: string | null | undefined): boolean {
+  const text = normalizedGpuValue(value).toLowerCase();
+  return Boolean(text) && !['na', 'none', 'null', 'undefined', 'unknown'].includes(text);
+}
+
+/**
+ * Pure, total resolver for GPU observation truth. `capabilityClass` is the coarse,
+ * spoof-resistant capability bucket (e.g. `t16|h|e3`); it is used ONLY to distinguish privacy
+ * masking from a genuinely unavailable probe. It is never used to claim software/virtual.
+ */
+export function resolveGpuObservation(
+  vendor: string | null | undefined,
+  renderer: string | null | undefined,
+  capabilityClass: string | null | undefined
+): GpuObservation {
+  const v = normalizedGpuValue(vendor);
+  const r = normalizedGpuValue(renderer);
+  const combined = `${v} ${r}`;
+
+  // 1. Only explicit identifiers may claim software / virtual rendering.
+  if (SOFTWARE_OR_VIRTUAL_GPU_IDENTIFIER.test(combined) || GOOGLE_SOFTWARE_VENDOR.test(v)) {
+    return 'software_or_virtual';
+  }
+
+  const noVendor = isGpuNamePlaceholder(v);
+  const noRenderer = isGpuNamePlaceholder(r);
+  const capabilitiesPresent = hasGpuCapabilityClass(capabilityClass);
+
+  // 2. An explicit, non-placeholder name was observed -> hardware identity is visible.
+  if (!noVendor || !noRenderer) return 'hardware_visible';
+
+  // 3. No usable name (extension masked / probe unavailable). Capabilities decide the bucket:
+  //    real capability limits => privacy masking; no capability data => unavailable. Absence of
+  //    the extension is NEVER rendered as VM / software proof.
+  return capabilitiesPresent ? 'masked_by_privacy' : 'observation_unavailable';
+}
+
+/** Only a directly observed hardware identity may serve as a hardware anchor. */
+export function gpuObservationIsHardwareAnchor(observation: GpuObservation): boolean {
+  return observation === 'hardware_visible';
+}
+
+/** Zero-contradiction guard: a masked/unavailable/software observation must not be promoted. */
+export function checkGpuObservationInvariants(input: {
+  gpu_observation: GpuObservation;
+  claimed_hardware_anchor?: boolean;
+}): string[] {
+  const contradictions: string[] = [];
+  if (input.claimed_hardware_anchor === true && !gpuObservationIsHardwareAnchor(input.gpu_observation)) {
+    contradictions.push(
+      `a '${input.gpu_observation}' GPU observation cannot be used as a hardware identity anchor`
+    );
+  }
+  return contradictions;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -319,6 +417,10 @@ export interface SpecInvariantInput extends PrivacyContext {
   jsHeapSizeLimit?: number | null;
   expectedJsHeapSizeLimit?: number | null;
   webglRenderer?: string;
+  /** Unmasked WebGL vendor string, when the client captured it. */
+  webglVendor?: string;
+  /** Coarse, capability-derived GPU class (e.g. `t16|h|e3`); not a spoofable string. */
+  gpuCapabilityClass?: string;
   osFamily?: string;
   deviceKind?: 'pc' | 'mobile' | 'tablet' | 'unknown';
   hasPdfFace?: boolean | null;
@@ -335,11 +437,18 @@ export interface SpecInvariantResult {
   hard_spec_violation: boolean;
   privacy_hardened: boolean;
   software_renderer: boolean;
+  /** Canonical GPU observation class; masked / unavailable is never VM proof. */
+  gpu_observation: GpuObservation;
 }
 
 export function evaluateSpecInvariants(input: SpecInvariantInput = {}): SpecInvariantResult {
   const privacyHardened = resolvePrivacyHardened(input);
   const softwareRenderer = isSwiftShaderRenderer(input.webglRenderer || '');
+  const gpuObservation = resolveGpuObservation(
+    input.webglVendor,
+    input.webglRenderer,
+    input.gpuCapabilityClass
+  );
   const violations: SpecViolation[] = [
     ...checkDeviceMemory(input.deviceMemoryGb, { privacyHardened }),
     ...checkNetworkRtt(input.networkRtt, { privacyHardened }),
@@ -360,6 +469,7 @@ export function evaluateSpecInvariants(input: SpecInvariantInput = {}): SpecInva
     hard_spec_violation: hard.length > 0,
     privacy_hardened: privacyHardened,
     software_renderer: softwareRenderer,
+    gpu_observation: gpuObservation,
   };
 }
 
@@ -392,8 +502,19 @@ export function enforceTamperingInvariant(input: {
 }
 
 /* -------------------------------------------------------------------------- */
-/* 4-state inspector_state                                                     */
+/* Inspector state — canonical 3-state vocabulary (legacy 4-state preserved)   */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * Canonical inspector state. This is the single source consumed by the flag resolver and
+ * by the verdict guard: `no` = no inspector; `yes-unattributed` = an inspector was observed
+ * but cannot be attributed to a confirmed CDP+DevTools pair; `yes-corroborated` = the CDP
+ * binding and the DevTools canary were both observed.
+ */
+export type InspectorState = 'no' | 'yes-unattributed' | 'yes-corroborated';
+
+/** Legacy alias for callers that still speak the 4-state telemetry-contract vocabulary. */
+export type LegacyInspectorStateAlias = LegacyInspectorState;
 
 export interface InspectorSignals {
   /** A CDP Runtime/Network protocol binding was observed on this load. */
@@ -405,23 +526,134 @@ export interface InspectorSignals {
 }
 
 /**
- * 4-state inspector state:
- *  - automation_protocol_attached: CDP binding -> cdp_attached:true, developer_tools:false
- *  - devtools_docked_suspected: zoom-normalized mid-session viewport contraction
- *  - devtools_active_verified: optional token-scoped source-map canary
- *  - closed: none of the above
+ * Map either vocabulary onto the canonical 3-state value. A bare CDP binding, a suspected
+ * docked DevTools or a verified DevTools canary are all `yes-unattributed` on their own: only
+ * CDP corroborated by the DevTools canary is `yes-corroborated`.
  */
-export function classifyInspectorState(signals: InspectorSignals = {}): InspectorState {
+export function toInspectorState(state: InspectorState | LegacyInspectorState): InspectorState {
+  switch (state) {
+    case 'yes-corroborated':
+      return 'yes-corroborated';
+    case 'yes-unattributed':
+    case 'automation_protocol_attached':
+    case 'devtools_docked_suspected':
+    case 'devtools_active_verified':
+      return 'yes-unattributed';
+    case 'no':
+    case 'closed':
+    default:
+      return 'no';
+  }
+}
+
+/** Resolve the canonical state directly from the raw, passive inspector probes. */
+export function resolveInspectorState(signals: InspectorSignals = {}): InspectorState {
+  const cdp = Boolean(signals.cdpAttached);
+  const devtools = Boolean(signals.devtoolsActiveVerified);
+  if (cdp && devtools) return 'yes-corroborated';
+  if (cdp || devtools || Boolean(signals.viewportContractionNormalized)) return 'yes-unattributed';
+  return 'no';
+}
+
+/**
+ * Canonical flag resolver.
+ *  - no                 -> neither flag.
+ *  - yes-unattributed   -> cdp_attached:false, developer_tools:true (an unattributed CDP signal
+ *                          is honest DevTools telemetry, never a confirmed CDP attachment).
+ *  - yes-corroborated   -> both flags true (CDP and DevTools agree).
+ * Legacy 4-state inputs are normalised first, so both vocabularies agree exactly.
+ */
+export function inspectorFlagsForState(
+  state: InspectorState | LegacyInspectorState
+): { cdp_attached: boolean; developer_tools: boolean } {
+  switch (toInspectorState(state)) {
+    case 'yes-corroborated':
+      return { cdp_attached: true, developer_tools: true };
+    case 'yes-unattributed':
+      return { cdp_attached: false, developer_tools: true };
+    case 'no':
+    default:
+      return { cdp_attached: false, developer_tools: false };
+  }
+}
+
+/**
+ * Legacy 4-state classifier, kept compatible for existing callers (same inputs, same outputs).
+ * New code should prefer `resolveInspectorState` and then `inspectorFlagsForState`.
+ */
+export function classifyInspectorState(signals: InspectorSignals = {}): LegacyInspectorState {
   if (signals.cdpAttached) return 'automation_protocol_attached';
   if (signals.devtoolsActiveVerified) return 'devtools_active_verified';
   if (signals.viewportContractionNormalized) return 'devtools_docked_suspected';
   return 'closed';
 }
 
-/** The CDP state carries cdp_attached:true and developer_tools:false by definition. */
-export function inspectorFlagsForState(state: InspectorState): { cdp_attached: boolean; developer_tools: boolean } {
+/** A "Verified Human" verdict is permitted only when no inspector was observed at all. */
+export function permitsHumanVerdict(state: InspectorState | LegacyInspectorState): boolean {
+  return toInspectorState(state) === 'no';
+}
+
+export interface InspectorInvariantInput {
+  inspector_state: InspectorState | LegacyInspectorState;
+  cdp_attached?: boolean;
+  developer_tools?: boolean;
+  /** Optional verdict tier to cross-check against the inspector state. */
+  verdict_tier?: string | null;
+}
+
+export interface InspectorInvariantResult {
+  consistent: boolean;
+  contradictions: string[];
+  canonical_state: InspectorState;
+  expected_flags: { cdp_attached: boolean; developer_tools: boolean };
+  permits_human_verdict: boolean;
+}
+
+/**
+ * Zero-contradiction checker: the reported flags and verdict must agree with the state.
+ * An empty `contradictions` array is the invariant — flags cannot drift from the state, and a
+ * "Verified Human" verdict can never be rendered while an inspector is present.
+ */
+export function checkInspectorInvariants(input: InspectorInvariantInput): InspectorInvariantResult {
+  const canonical_state = toInspectorState(input.inspector_state);
+  const expected_flags = inspectorFlagsForState(canonical_state);
+  const contradictions: string[] = [];
+
+  if (
+    input.cdp_attached !== undefined &&
+    Boolean(input.cdp_attached) !== expected_flags.cdp_attached
+  ) {
+    contradictions.push(
+      `cdp_attached=${Boolean(input.cdp_attached)} contradicts inspector_state '${canonical_state}' (expected ${expected_flags.cdp_attached})`
+    );
+  }
+  if (
+    input.developer_tools !== undefined &&
+    Boolean(input.developer_tools) !== expected_flags.developer_tools
+  ) {
+    contradictions.push(
+      `developer_tools=${Boolean(input.developer_tools)} contradicts inspector_state '${canonical_state}' (expected ${expected_flags.developer_tools})`
+    );
+  }
+
+  const permits_human_verdict = permitsHumanVerdict(canonical_state);
+  const tier = typeof input.verdict_tier === 'string' ? input.verdict_tier : '';
+  if (!permits_human_verdict && /verified\s+human/i.test(tier)) {
+    contradictions.push(
+      `"Verified Human" verdict is forbidden while inspector_state is '${canonical_state}'`
+    );
+  }
+
   return {
-    cdp_attached: state === 'automation_protocol_attached',
-    developer_tools: state === 'devtools_docked_suspected' || state === 'devtools_active_verified',
+    consistent: contradictions.length === 0,
+    contradictions,
+    canonical_state,
+    expected_flags,
+    permits_human_verdict,
   };
+}
+
+/** Boolean convenience wrapper around `checkInspectorInvariants`. */
+export function hasInspectorContradictions(input: InspectorInvariantInput): boolean {
+  return checkInspectorInvariants(input).contradictions.length > 0;
 }

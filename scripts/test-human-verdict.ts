@@ -17,6 +17,11 @@
 import assert from 'node:assert/strict';
 import { buildGradedRiskLedger, riskTierFromScore100, score10FromScore100 } from '../src/lib/riskLedger';
 import {
+  checkInspectorInvariants,
+  inspectorFlagsForState,
+  resolveInspectorState,
+} from '../src/lib/specInvariants';
+import {
   CALIBRATION_MAX_ECE,
   CALIBRATION_MIN_LABELED_PAIRS,
   computeHonestIdentityConfidence,
@@ -379,6 +384,71 @@ check(
   matchedMirror.confidence_score === 0.65 &&
     confidenceBandForScore(matchedMirror.confidence_score ?? 0) === matchedMirror.confidence_tier,
   matchedMirror,
+);
+
+/* -------------------------------------------------------------------------- */
+/* I. Tranche 0-1 — inspector tri-state                                        */
+/* -------------------------------------------------------------------------- */
+
+section('I. Inspector tri-state flags');
+
+const unattributedInspector = resolveInspectorState({ cdpAttached: true });
+check('unattributed CDP resolves to yes-unattributed', unattributedInspector === 'yes-unattributed');
+check(
+  'unattributed CDP -> cdp_attached false, developer_tools true',
+  (() => {
+    const flags = inspectorFlagsForState(unattributedInspector);
+    return flags.cdp_attached === false && flags.developer_tools === true;
+  })(),
+);
+check(
+  'legacy automation_protocol_attached normalizes to the unattributed flags',
+  (() => {
+    const flags = inspectorFlagsForState('automation_protocol_attached');
+    return flags.cdp_attached === false && flags.developer_tools === true;
+  })(),
+);
+
+const corroboratedInspector = resolveInspectorState({
+  cdpAttached: true,
+  devtoolsActiveVerified: true,
+});
+check('corroborated CDP + DevTools resolves to yes-corroborated', corroboratedInspector === 'yes-corroborated');
+check(
+  'corroborated CDP + DevTools -> both flags true',
+  (() => {
+    const flags = inspectorFlagsForState(corroboratedInspector);
+    return flags.cdp_attached === true && flags.developer_tools === true;
+  })(),
+);
+
+check(
+  'no inspector -> both flags false',
+  (() => {
+    const state = resolveInspectorState({});
+    const flags = inspectorFlagsForState(state);
+    return state === 'no' && flags.cdp_attached === false && flags.developer_tools === false;
+  })(),
+);
+
+check(
+  'inspector invariants reject a bare CDP claim of attachment',
+  (() => {
+    const result = checkInspectorInvariants({
+      inspector_state: unattributedInspector,
+      cdp_attached: true,
+      developer_tools: false,
+    });
+    return result.consistent === false && result.contradictions.length === 2;
+  })(),
+);
+check(
+  'inspector invariants accept the corroborated flags',
+  checkInspectorInvariants({
+    inspector_state: corroboratedInspector,
+    cdp_attached: true,
+    developer_tools: true,
+  }).consistent,
 );
 
 console.log(`\nHuman-verdict suite: ${passed} passed, ${failed} failed`);

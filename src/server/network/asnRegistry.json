@@ -5,7 +5,7 @@
     "handle": "RELIANCEJIO-IN",
     "asn_type": "isp",
     "datacenter_result": false,
-    "sample_prefixes": ["49.44.63.0/24", "49.44.88.0/22"]
+    "sample_prefixes": ["49.32.0.0/13", "49.44.63.0/24", "49.44.88.0/22"]
   },
   {
     "asn": 24560,

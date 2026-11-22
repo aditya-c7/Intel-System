@@ -37,6 +37,51 @@ export type PlatformFamily = 'windows' | 'mac' | 'linux' | 'android' | 'ios' | '
 
 export type DeviceKind = 'Desktop' | 'Mobile' | 'Tablet' | 'Unknown';
 
+/**
+ * The *runtime* that actually renders the page — distinct from the browser engine.
+ * Electron / IDE shells / WebViews embed Chromium, so a UA-CH brand list alone would
+ * mislabel them as generic Chromium. Ordered by detection precedence (see
+ * `resolveRuntime`).
+ */
+export type RuntimeKind =
+  | 'electron'
+  | 'node'
+  | 'ide_webview'
+  | 'host_app'
+  | 'webview'
+  | 'browser'
+  | 'unknown';
+
+/** Broker-facing classification of the client, derived from `RuntimeKind`. */
+export type ClientType =
+  | 'desktop_app'
+  | 'node'
+  | 'ide_shell'
+  | 'host_app'
+  | 'webview'
+  | 'browser'
+  | 'unknown';
+
+/**
+ * Host-runtime signals that cannot be derived from the UA string alone.
+ * Electron exposes `window.process.versions`; the collector reads those values and
+ * passes them here. Every field is optional so pure browser callers stay unchanged.
+ */
+export interface RuntimeSignals {
+  /** `process.versions.electron` when the renderer is Electron. */
+  electronVersion?: string;
+  /** `process.versions.node` when a Node/Electron runtime is present. */
+  nodeVersion?: string;
+  /** Raw `process.versions` bag (Electron/Node expose this to the renderer). */
+  processVersions?: Record<string, string | undefined> | null;
+  /** Explicit host-application name (e.g. 'Slack', 'Cursor'). */
+  hostApp?: string;
+  /** Explicit IDE-shell name (e.g. 'vscode', 'cursor'). */
+  ideShell?: string;
+  /** True when the collector knows the page is hosted in a WebView. */
+  webView?: boolean;
+}
+
 export interface NormalizedIdentity {
   os: string;
   os_version: string;
@@ -50,6 +95,16 @@ export interface NormalizedIdentity {
   platformFamily: PlatformFamily;
   /** True when the selected browser came from the HeadlessChrome UA-CH brand. */
   is_headless_brand?: boolean;
+  /** Host runtime that renders the page (engine-independent). Additive field. */
+  runtime?: RuntimeKind;
+  /** Host application name when the runtime is an Electron/IDE/WebView shell. */
+  host_app?: string;
+  /** Broker-facing client classification derived from `runtime`. */
+  client_type?: ClientType;
+  /** Normalized `Sec-CH-UA-Form-Factors` / UAData `formFactors` values. */
+  form_factors?: string[];
+  /** True when `Sec-CH-UA-Wow64` / UAData `wow64` reports a 32-bit process on 64-bit OS. */
+  wow64?: boolean;
 }
 
 export interface NormalizeIdentityInput {
@@ -58,6 +113,15 @@ export interface NormalizeIdentityInput {
   maxTouchPoints?: number;
   uaData?: UaDataHighEntropy | null;
   secCh?: Record<string, string>;
+  /** Host-runtime signals collected from the Electron/Node environment. */
+  runtime?: RuntimeSignals | null;
+  /** Flat aliases accepted for convenience (map onto `runtime`). */
+  electronVersion?: string;
+  nodeVersion?: string;
+  processVersions?: Record<string, string | undefined> | null;
+  hostApp?: string;
+  ideShell?: string;
+  webView?: boolean;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -81,6 +145,8 @@ interface SecChHints {
   architecture: string;
   bitness: string;
   formFactors: string[];
+  /** Parsed `Sec-CH-UA-Wow64` (true only for `?1` / `1` / `true`). */
+  wow64: boolean;
 }
 
 /** GREASE brand filter, per UA-CH spec ('Not.A/Brand', 'Not/A)Brand', …). */
@@ -252,6 +318,24 @@ function filterBrands(brands: BrandEntry[]): BrandEntry[] {
   return nonChromium.length > 0 ? nonChromium : real;
 }
 
+/**
+ * Reduced UA-CH sends `0.0.0.0` (and sometimes other all-zero) versions as a
+ * redacted placeholder. Treating it as a real full version produced labels like
+ * `Chromium 0.0.0.0`. Those values must be rejected so resolution falls back to
+ * the UA token / GREASE-filtered real brands.
+ */
+function isPlaceholderVersion(version: string): boolean {
+  if (typeof version !== 'string' || !version.trim()) return false;
+  return /^0+(?:\.0+)*$/.test(version.trim());
+}
+
+/** True when a brand list contains at least one non-GREASE, non-placeholder brand. */
+function hasRealBrand(brands: BrandEntry[]): boolean {
+  return brands.some(
+    (b) => !!b && !GREASE_RE.test(b.brand) && !isPlaceholderVersion(b.version),
+  );
+}
+
 function headerValue(secCh: Record<string, string> | undefined, name: string): string {
   if (!secCh) return '';
   const lower = name.toLowerCase();
@@ -270,6 +354,43 @@ function unquote(value: string): string {
   return v;
 }
 
+/**
+ * Normalizes the structured boolean used by UA-CH (`?1` / `?0`) and its common
+ * emitter variants (`1`, `0`, `true`, `false`, quoted). Previously `?1` was kept
+ * as a raw string and silently lost when compared to a boolean — causing mobile
+ * and WoW64 hints to be ignored. Accepts `?1|1|true` (case-insensitive) as true.
+ */
+export function parseStructuredBoolean(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value === 'number') return value === 1;
+  if (typeof value !== 'string') return false;
+  const token = value.trim().replace(/^[?"']+|[?"']+$/g, '').toLowerCase();
+  return token === '1' || token === 'true';
+}
+
+/** `Sec-CH-UA-Mobile ?1` (and `1` / `true`) → boolean `true`, everywhere. */
+export const parseMobileFlag = parseStructuredBoolean;
+
+/** `Sec-CH-UA-Wow64 ?1` (and `1` / `true`) → boolean `true`. */
+export const parseWow64 = parseStructuredBoolean;
+
+/**
+ * Parses a `Sec-CH-UA-Form-Factors` header or UAData `formFactors` array into a
+ * clean list of tokens (`Desktop`, `Tablet`, `Mobile`, …). Reuses the canonical
+ * brand-list parser so quoted/escaped values behave identically to UA-CH brands.
+ */
+export function parseFormFactors(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value
+      .filter((v): v is string => typeof v === 'string' && v.trim().length > 0)
+      .map((v) => v.trim());
+  }
+  if (typeof value !== 'string' || !value.trim()) return [];
+  return parseBrandList(value)
+    .map((entry) => entry.brand.trim())
+    .filter((brand) => brand.length > 0);
+}
+
 function parseSecCh(secCh: Record<string, string> | undefined): SecChHints {
   const fullListRaw = headerValue(secCh, 'sec-ch-ua-full-version-list');
   const majorListRaw = headerValue(secCh, 'sec-ch-ua');
@@ -282,10 +403,8 @@ function parseSecCh(secCh: Record<string, string> | undefined): SecChHints {
     model: unquote(headerValue(secCh, 'sec-ch-ua-model')),
     architecture: unquote(headerValue(secCh, 'sec-ch-ua-arch')),
     bitness: unquote(headerValue(secCh, 'sec-ch-ua-bitness')),
-    formFactors: unquote(headerValue(secCh, 'sec-ch-ua-form-factors'))
-      .split(',')
-      .map((f) => unquote(f))
-      .filter((f) => f.length > 0),
+    formFactors: parseFormFactors(headerValue(secCh, 'sec-ch-ua-form-factors')),
+    wow64: parseWow64(headerValue(secCh, 'sec-ch-ua-wow64')),
   };
 }
 
@@ -486,24 +605,33 @@ function resolveBrowser(
     return { name: 'Electron', full: electronVersion, major: majorOf(electronVersion) };
   }
 
-  const uadBrands = filterBrands((uad?.fullVersionList ?? []).filter((b) => !!b));
+  const rawUadBrands = (uad?.fullVersionList ?? []).filter((b) => !!b);
+  const uadBrands = filterBrands(rawUadBrands);
   const candidates: Array<{ brands: BrandEntry[]; source: 'uad' | 'secch' }> = [];
-  if (uadBrands.length > 0) candidates.push({ brands: uadBrands, source: 'uad' });
-  if (secCh.brands.length > 0) candidates.push({ brands: secCh.brands, source: 'secch' });
+  /* A GREASE-only (or all-placeholder) list is NOT evidence of any browser —
+   * never promote the `Chromium` placeholder from such a list to browser_name. */
+  if (uadBrands.length > 0 && hasRealBrand(rawUadBrands)) {
+    candidates.push({ brands: uadBrands, source: 'uad' });
+  }
+  if (secCh.brands.length > 0 && hasRealBrand(secCh.brands)) {
+    candidates.push({ brands: secCh.brands, source: 'secch' });
+  }
 
   for (const candidate of candidates) {
     const spec = brandToSpec(candidate.brands);
     if (!spec) continue;
     const entry = candidate.brands.find(
-      (b) => spec.brands.indexOf(b.brand.toLowerCase()) !== -1,
+      (b) => spec.brands.indexOf(b.brand.toLowerCase()) !== -1 && !isPlaceholderVersion(b.version),
     );
     const headlessBrand = Boolean(entry?.is_headless_brand) || spec.name === 'Headless Chrome';
     let version = entry ? entry.version : '';
+    if (isPlaceholderVersion(version)) version = '';
     /* Backfill a major-only brand version from the UA token. */
     if (version && version.indexOf('.') === -1) {
       version = pickFullerVersion(version, findUaVersion(spec, ua));
     }
     if (!version) version = findUaVersion(spec, ua) ?? '';
+    if (isPlaceholderVersion(version)) version = '';
     return { name: spec.name, full: version, major: majorOf(version), is_headless_brand: headlessBrand };
   }
 
@@ -519,9 +647,12 @@ function resolveBrowser(
     };
   }
 
-  /* uaFullVersion without a recognizable brand: report major version only. */
+  /* uaFullVersion without a recognizable brand: report major version only.
+   * Redacted `0.0.0.0` is not a real version — fall through to Unknown. */
   const uaFull = (uad?.uaFullVersion ?? '').trim();
-  if (uaFull) return { name: 'Unknown', full: uaFull, major: majorOf(uaFull) };
+  if (uaFull && !isPlaceholderVersion(uaFull)) {
+    return { name: 'Unknown', full: uaFull, major: majorOf(uaFull) };
+  }
 
   return empty;
 }
@@ -549,9 +680,10 @@ function versionSourceExists(
   uad: UaDataHighEntropy | null,
   secCh: SecChHints,
 ): boolean {
-  if ((uad?.fullVersionList ?? []).length > 0) return true;
-  if ((uad?.uaFullVersion ?? '').trim()) return true;
-  if (secCh.brands.length > 0) return true;
+  if (hasRealBrand((uad?.fullVersionList ?? []).filter((b) => !!b))) return true;
+  const uaFull = (uad?.uaFullVersion ?? '').trim();
+  if (uaFull && !isPlaceholderVersion(uaFull)) return true;
+  if (hasRealBrand(secCh.brands)) return true;
   return ua ? uaToSpec(ua) !== null : false;
 }
 
@@ -596,6 +728,12 @@ function parseIntSafe(value: string): number | null {
   return isFinite(n) ? n : null;
 }
 
+/** Windows 11 begins at UA-CH platformVersion major 13 (Windows 10 = 10). */
+const WINDOWS_11_PLATFORM_MAJOR = 13;
+
+/** Unified iPadOS multi-touch threshold (a real iPad reports >= 5 touch points). */
+const IPAD_TOUCH_THRESHOLD = 5;
+
 /**
  * Windows UA-CH platformVersion → marketing version.
  *   major ≥ 13 → '11'; 1–12 → '10'; 0.1/0.2/0.3 → '7'/'8'/'8.1'; 0.0 → null.
@@ -604,7 +742,7 @@ function windowsVersionFromPlatformVersion(pv: string): string | null {
   const parts = (pv ?? '').trim().split('.');
   const major = parseIntSafe(parts[0] ?? '');
   if (major === null) return null;
-  if (major >= 13) return '11';
+  if (major >= WINDOWS_11_PLATFORM_MAJOR) return '11';
   if (major >= 1) return '10';
   const sub = parseIntSafe(parts[1] ?? '');
   if (sub === 1) return '7';
@@ -674,8 +812,9 @@ function resolveOs(
   /* iPadOS 13+ masquerades as desktop Safari: `Macintosh` UA, `MacIntel` platform and a
    * multi-touch screen. Chrome's UA-CH platform for the same device is `macOS`, so the
    * touch count alone (with a Macintosh UA) is also accepted. */
-  const macTouch = touch > 1 && (/macintel/i.test(platformStr) || /macintosh/i.test(ua));
+  const macTouch = touch >= IPAD_TOUCH_THRESHOLD && (/macintel/i.test(platformStr) || /macintosh/i.test(ua));
   const macTabletFormFactor =
+    touch >= IPAD_TOUCH_THRESHOLD &&
     uadPlatform.toLowerCase() === 'macos' &&
     formFactors.map((f) => f.toLowerCase()).indexOf('tablet') !== -1;
 
@@ -816,7 +955,8 @@ function resolveArchitecture(
 ): { architecture: string; bitness: string } {
   const arch = (uad?.architecture ?? secCh.architecture ?? '').trim().toLowerCase();
   const bit = (uad?.bitness ?? secCh.bitness ?? '').trim();
-  const wow64 = uad?.wow64 === true;
+  /* WoW64 may arrive via UAData (`wow64: true`) or `Sec-CH-UA-Wow64: ?1`. */
+  const wow64 = uad?.wow64 === true || secCh.wow64 === true;
 
   if (arch.indexOf('arm') !== -1) {
     return { architecture: bit === '32' ? 'ARM' : 'ARM64', bitness: bit === '32' ? '32' : '64' };
@@ -866,6 +1006,176 @@ function sanitizeOs(os: string, osVersion: string): { os: string; osVersion: str
 }
 
 /* -------------------------------------------------------------------------- */
+/* Internal helpers — host runtime ladder                                      */
+/* -------------------------------------------------------------------------- */
+
+interface HostAppSpec {
+  re: RegExp;
+  name: string;
+  /** IDE shells are classified as `ide_webview` / `ide_shell`, not generic apps. */
+  ide: boolean;
+}
+
+/**
+ * Embedded shells that all ship a Chromium engine. Their UA tokens are matched
+ * in priority order so a host app / IDE is never mislabelled as generic Chromium.
+ */
+const HOST_APP_SPECS: HostAppSpec[] = [
+  { re: /vscode-webview[\s/][\d.]+/i, name: 'Visual Studio Code', ide: true },
+  { re: /VSCodium[\s/][\d.]+/i, name: 'VSCodium', ide: true },
+  { re: /Windsurf[\s/][\d.]+/i, name: 'Windsurf', ide: true },
+  { re: /OpenCode[\s/][\d.]+/i, name: 'OpenCode', ide: true },
+  { re: /Cursor[\s/][\d.]+/i, name: 'Cursor', ide: true },
+  { re: /(?:^|[\s(])Code[\s/][\d.]+/i, name: 'Visual Studio Code', ide: true },
+  { re: /Slack[\s/][\d.]+/i, name: 'Slack', ide: false },
+  { re: /Instagram[\s/][\d.]+/i, name: 'Instagram', ide: false },
+  { re: /WhatsApp[\s/][\d.]+/i, name: 'WhatsApp', ide: false },
+  { re: /(?:FBAV|FBAN)[\s/][\d.]+/i, name: 'Facebook', ide: false },
+  { re: /Twitter(?:Android)?[\s/][\d.]+/i, name: 'Twitter', ide: false },
+  { re: /Discord[\s/][\d.]+/i, name: 'Discord', ide: false },
+  { re: /Teams[\s/][\d.]+/i, name: 'Microsoft Teams', ide: false },
+  { re: /Zoom[\s/][\d.]+/i, name: 'Zoom', ide: false },
+  { re: /Line[\s/][\d.]+/i, name: 'LINE', ide: false },
+  { re: /Snapchat[\s/][\d.]+/i, name: 'Snapchat', ide: false },
+  { re: /Notion[\s/][\d.]+/i, name: 'Notion', ide: false },
+  { re: /Figma[\s/][\d.]+/i, name: 'Figma', ide: false },
+  { re: /LinkedIn[\s/][\d.]+/i, name: 'LinkedIn', ide: false },
+];
+
+/** `; wv` token in a WebView UA (Android system webview, in-app browsers). */
+const WEBVIEW_UA_RE = /;\s*wv(?:\s|\)|$)/i;
+
+const SHELL_NAME_ALIASES: Record<string, string> = {
+  vscode: 'Visual Studio Code',
+  'vs-code': 'Visual Studio Code',
+  code: 'Visual Studio Code',
+  cursor: 'Cursor',
+  windsurf: 'Windsurf',
+  vscodium: 'VSCodium',
+  opencode: 'OpenCode',
+};
+
+function normalizeShellName(name: string): string {
+  const trimmed = (name ?? '').trim();
+  return SHELL_NAME_ALIASES[trimmed.toLowerCase()] ?? trimmed;
+}
+
+function hostAppFromUa(ua: string, ideOnly: boolean): HostAppSpec | null {
+  for (const spec of HOST_APP_SPECS) {
+    if (ideOnly && !spec.ide) continue;
+    if (spec.re.test(ua)) return spec;
+  }
+  return null;
+}
+
+function explicitHost(name: string, ideOnly: boolean): HostAppSpec | null {
+  const normalized = normalizeShellName(name);
+  if (!normalized) return null;
+  const lower = normalized.toLowerCase();
+  for (const spec of HOST_APP_SPECS) {
+    if (ideOnly && !spec.ide) continue;
+    if (lower === spec.name.toLowerCase()) return spec;
+  }
+  return ideOnly ? null : { re: /^$/, name: normalized, ide: false };
+}
+
+interface RuntimeResolution {
+  runtime: RuntimeKind;
+  host_app: string;
+  client_type: ClientType;
+  /** Browser name used when engine resolution produced only a generic label. */
+  preferredBrowserName: string;
+}
+
+/**
+ * Runtime ladder (first match wins):
+ *   1. `Electron/<ver>` UA token or `process.versions.electron`
+ *   2. `process.versions.node` / nodeVersion
+ *   3. IDE-shell tokens (`Code`, `Cursor`, `OpenCode`, `Windsurf`, `VSCodium`, …)
+ *   4. WebView `; wv` token / explicit webView flag
+ *   5. Host-app tokens (`Slack`, `Instagram`, `WhatsApp`, …)
+ *   6. otherwise a plain browser
+ *
+ * Device/OS resolution is deliberately NOT touched here: `device: Desktop` keeps
+ * coming from hardware truth (platform / touch points / UA), never from the runtime.
+ */
+function resolveRuntime(ua: string, signals: RuntimeSignals): RuntimeResolution {
+  const electronVersion =
+    signals.electronVersion ||
+    String(signals.processVersions?.electron ?? '') ||
+    firstMatch(/Electron\/([\d.]+)/i, ua) ||
+    '';
+  const nodeVersion = signals.nodeVersion || String(signals.processVersions?.node ?? '');
+  const hostSpec = explicitHost(signals.hostApp ?? '', false) || hostAppFromUa(ua, false);
+  const ideSpec = explicitHost(signals.ideShell ?? '', true) || hostAppFromUa(ua, true);
+  const webview = signals.webView === true || WEBVIEW_UA_RE.test(ua);
+
+  if (electronVersion) {
+    return {
+      runtime: 'electron',
+      host_app: hostSpec?.name || signals.hostApp || '',
+      client_type: 'desktop_app',
+      preferredBrowserName: 'Electron',
+    };
+  }
+  if (nodeVersion) {
+    return {
+      runtime: 'node',
+      host_app: hostSpec?.name || signals.hostApp || '',
+      client_type: 'node',
+      preferredBrowserName: 'Node.js',
+    };
+  }
+  if (ideSpec) {
+    return {
+      runtime: 'ide_webview',
+      host_app: ideSpec.name,
+      client_type: 'ide_shell',
+      preferredBrowserName: ideSpec.name,
+    };
+  }
+  if (webview) {
+    return {
+      runtime: 'webview',
+      host_app: hostSpec?.name || signals.hostApp || '',
+      client_type: 'webview',
+      preferredBrowserName: hostSpec?.name || 'WebView',
+    };
+  }
+  if (hostSpec) {
+    return {
+      runtime: 'host_app',
+      host_app: hostSpec.name,
+      client_type: hostSpec.ide ? 'ide_shell' : 'host_app',
+      preferredBrowserName: hostSpec.name,
+    };
+  }
+  return { runtime: 'browser', host_app: '', client_type: 'browser', preferredBrowserName: '' };
+}
+
+/** Engine labels that must never stand in for a detected host runtime. */
+function isGenericBrowserName(name: string): boolean {
+  const n = name.trim().toLowerCase();
+  return n === '' || n === 'unknown' || n === 'chromium' || n === 'chrome' || n === 'google chrome';
+}
+
+/** Collects runtime signals from the flat aliases and the nested `runtime` bag. */
+function runtimeSignalsFromInput(
+  input: NormalizeIdentityInput | NormalizeUserAgentInput,
+): RuntimeSignals {
+  const runtime = input.runtime ?? null;
+  const processVersions = input.processVersions ?? runtime?.processVersions ?? null;
+  return {
+    electronVersion: input.electronVersion ?? runtime?.electronVersion ?? processVersions?.electron ?? '',
+    nodeVersion: input.nodeVersion ?? runtime?.nodeVersion ?? processVersions?.node ?? '',
+    processVersions,
+    hostApp: input.hostApp ?? runtime?.hostApp ?? '',
+    ideShell: input.ideShell ?? runtime?.ideShell ?? '',
+    webView: input.webView ?? runtime?.webView ?? false,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
 /* Public API                                                                  */
 /* -------------------------------------------------------------------------- */
 
@@ -880,6 +1190,11 @@ const BLANK_IDENTITY: NormalizedIdentity = {
   architecture: '',
   bitness: '',
   platformFamily: 'unknown',
+  runtime: 'unknown',
+  host_app: '',
+  client_type: 'unknown',
+  form_factors: [],
+  wow64: false,
 };
 
 /**
@@ -898,15 +1213,44 @@ export function normalizeIdentity(input: NormalizeIdentityInput): NormalizedIden
     const touch = typeof rawTouch === 'number' && isFinite(rawTouch) ? rawTouch : 0;
     const uad = input?.uaData ?? null;
     const secCh = parseSecCh(input?.secCh);
+    const signals = runtimeSignalsFromInput(input ?? {});
+    const runtime = resolveRuntime(ua, signals);
 
     const osRes = resolveOs(ua, platformStr, touch, uad, secCh);
     const browser = resolveBrowser(ua, uad, secCh);
     const archRes = resolveArchitecture(ua, platformStr, uad, secCh);
 
+    /* When the runtime comes from `process.versions` (no UA token), keep the
+     * version aligned with the runtime instead of the embedded engine's UA. */
+    if (runtime.runtime === 'electron' && !firstMatch(/Electron\/([\d.]+)/i, ua)) {
+      const v =
+        signals.electronVersion || String(signals.processVersions?.electron ?? '');
+      if (v.trim()) {
+        browser.full = v.trim();
+        browser.major = majorOf(v.trim());
+      }
+    } else if (runtime.runtime === 'node') {
+      const v = signals.nodeVersion || String(signals.processVersions?.node ?? '');
+      if (v.trim()) {
+        browser.full = v.trim();
+        browser.major = majorOf(v.trim());
+      }
+    }
+
+    /* A detected host runtime owns browser_name — never report the embedded
+     * Chromium engine as the client when we know it is Electron / an IDE / a
+     * WebView / a host app. Existing specific browser labels (Firefox, Safari,
+     * Edge, Cursor, Electron, …) are preserved unchanged. */
+    const browserName =
+      runtime.preferredBrowserName && isGenericBrowserName(browser.name)
+        ? runtime.preferredBrowserName
+        : browser.name;
+
+    const formFactors = [...(uad?.formFactors ?? []), ...secCh.formFactors];
     const identity: NormalizedIdentity = {
       os: osRes.os,
       os_version: osRes.os_version,
-      browser_name: browser.name,
+      browser_name: browserName,
       browser_major_version: browser.major,
       browser_full_version: browser.full,
       device: osRes.device,
@@ -914,6 +1258,11 @@ export function normalizeIdentity(input: NormalizeIdentityInput): NormalizedIden
       architecture: archRes.architecture,
       bitness: archRes.bitness,
       platformFamily: osRes.platformFamily,
+      runtime: runtime.runtime,
+      host_app: runtime.host_app,
+      client_type: runtime.client_type,
+      form_factors: formFactors,
+      wow64: uad?.wow64 === true || secCh.wow64 === true,
     };
     if (browser.is_headless_brand) identity.is_headless_brand = true;
 
@@ -970,6 +1319,15 @@ export interface NormalizeUserAgentInput {
   /** `navigator.platform` (needed for the iPadOS `MacIntel` check). */
   platform?: string;
   maxTouchPoints?: number;
+  /** Host-runtime signals collected from the Electron/Node environment. */
+  runtime?: RuntimeSignals | null;
+  /** Flat aliases accepted for convenience (map onto `runtime`). */
+  electronVersion?: string;
+  nodeVersion?: string;
+  processVersions?: Record<string, string | undefined> | null;
+  hostApp?: string;
+  ideShell?: string;
+  webView?: boolean;
 }
 
 export interface NormalizedUserAgent {
@@ -984,6 +1342,16 @@ export interface NormalizedUserAgent {
   model: string;
   /** True when the resolved browser came from the HeadlessChrome UA-CH brand. */
   is_headless_brand?: boolean;
+  /** Host runtime that renders the page (engine-independent). Additive field. */
+  runtime?: RuntimeKind;
+  /** Host application name when the runtime is an Electron/IDE/WebView shell. */
+  host_app?: string;
+  /** Broker-facing client classification derived from `runtime`. */
+  client_type?: ClientType;
+  /** Normalized `Sec-CH-UA-Form-Factors` values. Additive field. */
+  formFactors?: string[];
+  /** `Sec-CH-UA-Wow64 ?1`. Additive field. */
+  wow64?: boolean;
 }
 
 const BLANK_USER_AGENT: NormalizedUserAgent = {
@@ -996,6 +1364,11 @@ const BLANK_USER_AGENT: NormalizedUserAgent = {
   architecture: '',
   bitness: '',
   model: '',
+  runtime: 'unknown',
+  host_app: '',
+  client_type: 'unknown',
+  formFactors: [],
+  wow64: false,
 };
 
 /** Serialises a brand list back into a `Sec-CH-UA*` structured-field string. */
@@ -1064,9 +1437,14 @@ function coerceClientHints(hints: ClientHintsInput | null | undefined): {
   const architecture = hints.architecture || hintFromBag(hints, 'arch');
   const bitness = hints.bitness ?? hintFromBag(hints, 'bitness');
   const model = hints.model ?? hintFromBag(hints, 'model');
-  const mobileRaw = hints.mobile;
-  const mobile =
-    typeof mobileRaw === 'boolean' ? mobileRaw : String(mobileRaw ?? hintFromBag(hints, 'mobile')) === '?1';
+  /* `Sec-CH-UA-Mobile: ?1` used to remain a raw string; normalize once here. */
+  const mobileRaw = hints.mobile ?? readBagKey(hints, 'sec-ch-ua-mobile');
+  const mobile = parseMobileFlag(mobileRaw);
+  const wow64Raw = hints.wow64 ?? readBagKey(hints, 'sec-ch-ua-wow64');
+  const wow64 = parseWow64(wow64Raw);
+  const formFactors = hints.formFactors?.length
+    ? hints.formFactors
+    : parseFormFactors(readBagKey(hints, 'sec-ch-ua-form-factors'));
 
   const secCh: Record<string, string> = {};
   if (brands.length > 0) secCh['sec-ch-ua'] = serializeBrandList(brands);
@@ -1078,8 +1456,12 @@ function coerceClientHints(hints: ClientHintsInput | null | undefined): {
   if (architecture) secCh['sec-ch-ua-arch'] = `"${architecture}"`;
   if (bitness) secCh['sec-ch-ua-bitness'] = `"${bitness}"`;
   if (model) secCh['sec-ch-ua-model'] = `"${model}"`;
-  if (hints.formFactors && hints.formFactors.length > 0) {
-    secCh['sec-ch-ua-form-factors'] = hints.formFactors.map((f) => `"${f}"`).join(', ');
+  if (mobileRaw !== '' && mobileRaw !== undefined && mobileRaw !== null) {
+    secCh['sec-ch-ua-mobile'] = mobile ? '?1' : '?0';
+  }
+  if (wow64) secCh['sec-ch-ua-wow64'] = '?1';
+  if (formFactors.length > 0) {
+    secCh['sec-ch-ua-form-factors'] = formFactors.map((f) => `"${f}"`).join(', ');
   }
 
   const uaData: UaDataHighEntropy = {
@@ -1089,9 +1471,9 @@ function coerceClientHints(hints: ClientHintsInput | null | undefined): {
     architecture,
     bitness,
     model,
-    formFactors: hints.formFactors,
+    formFactors,
     uaFullVersion: hints.uaFullVersion,
-    wow64: hints.wow64,
+    wow64,
   };
 
   return { uaData, secCh: Object.keys(secCh).length > 0 ? secCh : undefined };
@@ -1114,10 +1496,17 @@ export function normalizeUserAgent(input: NormalizeUserAgentInput): NormalizedUs
       maxTouchPoints: input?.maxTouchPoints,
       uaData,
       secCh,
+      runtime: input?.runtime,
+      electronVersion: input?.electronVersion,
+      nodeVersion: input?.nodeVersion,
+      processVersions: input?.processVersions,
+      hostApp: input?.hostApp,
+      ideShell: input?.ideShell,
+      webView: input?.webView,
     });
 
     const mobile = input?.clientHints?.mobile;
-    const mobileFlag = mobile === true || mobile === 'true' || mobile === '?1';
+    const mobileFlag = parseMobileFlag(mobile);
     const device: DeviceKind =
       identity.device === 'Unknown' && mobileFlag ? 'Mobile' : identity.device;
 
@@ -1132,6 +1521,11 @@ export function normalizeUserAgent(input: NormalizeUserAgentInput): NormalizedUs
       bitness: identity.bitness,
       model: identity.device_model,
       is_headless_brand: identity.is_headless_brand,
+      runtime: identity.runtime,
+      host_app: identity.host_app,
+      client_type: identity.client_type,
+      formFactors: identity.form_factors,
+      wow64: identity.wow64,
     };
   } catch {
     return { ...BLANK_USER_AGENT };

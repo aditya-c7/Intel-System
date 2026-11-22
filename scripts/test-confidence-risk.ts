@@ -35,7 +35,7 @@ import {
   verifyGradedRiskFixtures,
   type GradedRiskInput,
 } from '../src/lib/riskLedger';
-import { riskTier } from '../src/lib/telemetryContract';
+import { assertCanonicalConsistency, riskTier } from '../src/lib/telemetryContract';
 
 let passed = 0;
 const failures: string[] = [];
@@ -443,7 +443,9 @@ check('storage_continuity exact -> non-null >0.85 with a High band', () => {
   assert.ok((result.confidence_score ?? 0) > 0.85, String(result.confidence_score));
   assert.equal(result.confidence_score, 1);
   assert.equal(result.confidence_tier, 'High');
-  assert.equal(result.calibration_status, 'uncalibrated');
+  // CALIBRATED_GATE (200 pairs, ECE<=0.05) now passes the real calibration gate, so a
+  // genuinely scored match is honestly 'calibrated' rather than forced 'uncalibrated'.
+  assert.equal(result.calibration_status, 'calibrated');
 });
 
 check('exact hardware anchor with <=1 seed -> non-null >0.65', () => {
@@ -737,6 +739,102 @@ check('legacy genuine-spoof input reports tampering + high spoof fields', () => 
   // Clean first-visit base 0.900 + 0 entropy - 0.35 penalty -> 0.55 (above the 0.10 floor).
   assert.equal(result.breakdown.base_tier, 0.9);
   assert.equal(result.score, 0.55);
+});
+
+/* -------------------------------------------------------------------------- */
+/* 5. Tranche 0-1 — canonical risk headline consistency                        */
+/* -------------------------------------------------------------------------- */
+
+section('5. Tranche 0-1 risk headline consistency');
+
+const canonicalHeadlineCases: ReadonlyArray<{
+  score100: number;
+  score10: number;
+  tier: string;
+}> = [
+  { score100: 67, score10: 7, tier: 'High' },
+  { score100: 100, score10: 10, tier: 'Critical' },
+  { score100: 0, score10: 0, tier: 'Low' },
+];
+
+for (const c of canonicalHeadlineCases) {
+  check(`score10/tier mapping ${c.score100} -> ${c.score10}/${c.tier}`, () => {
+    assert.equal(score10FromScore100(c.score100), c.score10);
+    assert.equal(riskTierFromScore100(c.score100), c.tier);
+    assert.equal(riskTier(c.score100), c.tier);
+  });
+}
+
+const gradedHeadlineFixtures = [
+  {
+    input: {
+      automation: { tierA: true },
+      network: { vpnOrRelay: true },
+      environment: { swiftshader: true, ephemeralOrPrivateStorage: true },
+    } as GradedRiskInput,
+    score100: 67,
+    score10: 7,
+    tier: 'High',
+  },
+  {
+    input: {
+      automation: { tierB: true },
+      tampering: { tierA: true },
+      network: { rotatingProxy: true },
+      environment: { ephemeralOrPrivateStorage: true },
+      velocity: { high: true },
+    } as GradedRiskInput,
+    score100: 100,
+    score10: 10,
+    tier: 'Critical',
+  },
+  { input: {} as GradedRiskInput, score100: 0, score10: 0, tier: 'Low' },
+];
+
+for (const fixture of gradedHeadlineFixtures) {
+  check(`graded ledger ${fixture.score100} carries score10=${fixture.score10} / ${fixture.tier}`, () => {
+    const ledger = buildGradedRiskLedger(fixture.input);
+    assert.equal(ledger.score_0_100, fixture.score100);
+    assert.equal(ledger.score10, fixture.score10);
+    assert.equal(ledger.risk_tier, fixture.tier);
+    assert.equal(ledger.tier, fixture.tier);
+  });
+}
+
+check('all frozen graded ledgers agree with the canonical consistency checker', () => {
+  for (const fixture of GRADED_RISK_FIXTURES) {
+    const ledger = buildGradedRiskLedger(fixture.input);
+    const issues = assertCanonicalConsistency({
+      risk: {
+        score_0_100: ledger.score_0_100,
+        tier: ledger.tier,
+        score10: ledger.score10,
+        risk_tier: ledger.risk_tier,
+      },
+    });
+    assert.deepEqual(issues, [], fixture.name);
+  }
+});
+
+/*
+ * The badge string is still assembled inline in App.tsx / server.ts; there is no shared
+ * `riskBadgeText` export to import. Keep the expectation local and emit an explicit SKIP
+ * so the missing parity helper is never silent.
+ */
+console.log('  SKIP  riskBadgeText parity helper (not exported from src/lib) — asserting local expected badge text');
+const expectedRiskBadgeText = (score10: number, tier: string): string => `${tier} Risk • ${score10}/10`;
+
+check('local riskBadgeText expectation matches the canonical headline math', () => {
+  assert.equal(expectedRiskBadgeText(7, 'High'), 'High Risk • 7/10');
+  assert.equal(expectedRiskBadgeText(10, 'Critical'), 'Critical Risk • 10/10');
+  assert.equal(expectedRiskBadgeText(0, 'Low'), 'Low Risk • 0/10');
+  for (const fixture of gradedHeadlineFixtures) {
+    const ledger = buildGradedRiskLedger(fixture.input);
+    assert.equal(
+      expectedRiskBadgeText(ledger.score10, ledger.risk_tier),
+      `${fixture.tier} Risk • ${fixture.score10}/10`,
+    );
+  }
 });
 
 /* -------------------------------------------------------------------------- */

@@ -35,10 +35,16 @@ import {
   isMissingGeoValue,
   mergeLocationWithEdge,
   normalizeAsnLabel,
+  parseContinentValue,
   readEdgeGeoHeaders,
   type EdgeGeoHeaders,
   type EdgeHeaderBag,
 } from './src/lib/geoFallbacks';
+import {
+  canonicalTimezone,
+  timezonesEquivalent,
+  timezoneMismatchContext,
+} from './src/lib/timezone';
 import { buildProximityInfo } from './src/lib/geohash';
 import { detectAiBotFromServerSignals } from './src/lib/aiBotDirectory';
 import { clientHintsMiddleware, type ParsedClientHints } from './src/server/middleware/clientHints';
@@ -66,6 +72,7 @@ import {
   type CanonicalTelemetryEnvelope,
   type VerdictTier,
   type InspectorState,
+  type RiskTier,
 } from './src/lib/telemetryContract';
 import {
   evaluateSpecInvariants,
@@ -74,11 +81,16 @@ import {
   inspectorFlagsForState,
   resolvePrivacyHardened,
 } from './src/lib/specInvariants';
-import { buildGradedRiskLedger, verifyGradedRiskFixtures } from './src/lib/riskLedger';
+import {
+  buildGradedRiskLedger,
+  verifyGradedRiskFixtures,
+  type GradedRiskLedger,
+} from './src/lib/riskLedger';
 import {
   computeHonestRarity,
   computeHonestProximity,
   computeHonestIdentityConfidence,
+  confidenceLabel,
 } from './src/lib/rarityHonesty';
 import {
   simhash512,
@@ -443,6 +455,16 @@ function prefixesFromNormalizedFeed(normalized: unknown, sourceId: string): stri
 dotenv.config();
 
 const PORT = Number(process.env.PORT) || 3000;
+
+/**
+ * Build provenance for the parser / worker halves. Mirrored into `/api/health` and the
+ * identify envelope so a response can be traced to the exact deployed parser and build.
+ * `GIT_SHA` is injected by CI; every field degrades to an explicit sentinel, never a guess.
+ */
+const BUILD_SHA = process.env.GIT_SHA || 'unknown';
+const PARSER_VERSION = process.env.PARSER_VERSION || 'tranche-0-1';
+const WORKER_VERSION = process.env.WORKER_VERSION || 'tranche-0-1';
+
 const SESSION_TIMEOUT_MINUTES = 30;
 const SESSION_EXPIRATION_MS = SESSION_TIMEOUT_MINUTES * 60 * 1000;
 
@@ -495,6 +517,16 @@ interface VisitRow {
   bot_name?: string | null;
   recognition_source?: string | null;
 }
+
+/** Additive edge-geo parity fields threaded into LocationInfo / Event JSON without guessing. */
+type EdgeEnrichedLocation = LocationInfo & {
+  continent?: string;
+  continentCode?: string;
+  postalCode?: string;
+  subdivisionIso?: string;
+  accuracyRadiusKm?: number | null;
+  asnNetwork?: string;
+};
 
 interface GeoCacheRow {
   ip_address: string;
@@ -4945,12 +4977,49 @@ function computeDeviceRarity(
  * family is capped, raw_score is preserved, and RFC 9421 signed agents are exempt from the
  * automation family.
  */
-function computeCanonicalRiskLedger(input: Parameters<typeof buildGradedRiskLedger>[0]): OrthogonalRiskLedger {
+function computeCanonicalRiskLedger(
+  input: Parameters<typeof buildGradedRiskLedger>[0]
+): GradedRiskLedger {
   return buildGradedRiskLedger(input);
 }
 
 function computeSuspectScore100(input: Parameters<typeof buildGradedRiskLedger>[0]): number {
   return computeCanonicalRiskLedger(input).score_0_100;
+}
+
+/** Maps the canonical 4-way risk tier onto the legacy 3-way public `RiskLevel`. */
+function riskLevelFromTier(tier: RiskTier): RiskLevel {
+  return tier === 'Critical' || tier === 'High' ? 'High' : tier === 'Elevated' ? 'Medium' : 'Low';
+}
+
+/** tierFor() agreement check: the 0–10 headline and the tier must describe the same band. */
+function riskLevelFromScore10(score10: number): RiskLevel {
+  return score10 >= 7 ? 'High' : score10 >= 3 ? 'Medium' : 'Low';
+}
+
+/**
+ * Runtime assertion: the canonical graded ledger's score10 / risk_tier are the ONLY source for
+ * the public suspectScore / riskLevel / riskBadgeText. Any divergence is logged loudly (never
+ * silently reconciled) so a parallel scoring path can never resurrect itself.
+ */
+function assertRiskHeadlineConsistency(args: {
+  score10: number;
+  risk_tier: RiskTier;
+  suspectScore: number;
+  riskLevel: RiskLevel;
+}): boolean {
+  const expectedLevel = riskLevelFromTier(args.risk_tier);
+  const ok =
+    args.suspectScore === args.score10 &&
+    args.riskLevel === expectedLevel &&
+    riskLevelFromScore10(args.score10) === expectedLevel;
+  if (!ok) {
+    console.error('[invariant] risk headline diverges from canonical ledger', {
+      ledger: { score10: args.score10, risk_tier: args.risk_tier },
+      published: { suspectScore: args.suspectScore, riskLevel: args.riskLevel },
+    });
+  }
+  return ok;
 }
 
 /**
@@ -5064,11 +5133,19 @@ interface ResolverBackedHonestConfidenceInput {
     | 'privacy_hardened'
     | 'new_enrollment';
   calibratedScore: number;
+  /** All six weighted evidence components are wired explicitly (no component left implicit). */
+  match_tier?: string;
   matchScore?: number;
   match_score?: number;
   match_mode?: string;
   structural_anchor_ratio?: number;
   structuralAnchorRatio?: number;
+  matched_anchors?: number;
+  total_anchors?: number;
+  /** Continuity corroboration (capped, matched tiers only). */
+  storageHealed?: boolean;
+  visitContinuity?: number;
+  profileAgeDays?: number;
   distinct_storage_seeds_count?: number;
   distinctStorageSeedsCount?: number;
   browser_family_consensus?: boolean;
@@ -6025,6 +6102,9 @@ app.get('/api/health', async (req, res) => {
       visitsCount,
       regionCode,
       regionLabel,
+      parser_version: PARSER_VERSION,
+      build_sha: BUILD_SHA,
+      worker_version: WORKER_VERSION,
       torCheck: {
         ip: torCheckIp,
         exitNode: verdict === 'exit',
@@ -6044,7 +6124,16 @@ app.get('/api/health', async (req, res) => {
     return;
   }
 
-  res.json({ status: 'ok', visitorsCount, visitsCount, regionCode, regionLabel });
+  res.json({
+    status: 'ok',
+    visitorsCount,
+    visitsCount,
+    regionCode,
+    regionLabel,
+    parser_version: PARSER_VERSION,
+    build_sha: BUILD_SHA,
+    worker_version: WORKER_VERSION,
+  });
 });
 
 /**
@@ -6096,57 +6185,60 @@ function readEdgeTransport(req: express.Request): {
   return { ...unavailable, ja3: 'Unavailable', ja4t: 'Unavailable', os_mismatch: 'Unavailable' };
 }
 
-const SERVER_TIMEZONE_ALIAS_MAP: Record<string, string> = {
-  'asia/calcutta': 'asia/kolkata',
-  'asia/katmandu': 'asia/kathmandu',
-  'asia/rangoon': 'asia/yangon',
-  'asia/saigon': 'asia/ho_chi_minh',
-  'europe/kiev': 'europe/kyiv',
-  'us/eastern': 'america/new_york',
-  'us/central': 'america/chicago',
-  'us/mountain': 'america/denver',
-  'us/pacific': 'america/los_angeles',
-  'etc/utc': 'utc',
-  'etc/gmt': 'utc',
-};
-
 /**
- * Canonical IANA timezone aliases. The client and the IP geolocation provider frequently
- * disagree only because one of them reports a legacy alias (e.g. Asia/Calcutta) — mapping both
- * sides through this table removes those false-positive VPN / timezone-relay mismatches.
+ * Timezone truth is owned by `src/lib/timezone.ts` (shared with the browser and the ledger).
+ * The frozen alias table there resolves legacy IANA backward aliases (`Asia/Calcutta` →
+ * `Asia/Kolkata`) so a spelling difference can never manufacture a VPN / timezone-relay signal.
+ * `timezoneMismatchContext` is the single canonical verdict used by vpn_methods, the envelope,
+ * the risk ledger and the UI flags. A mismatch is true only when BOTH sides resolve and their
+ * canonical identities genuinely differ — Calcutta vs Kolkata is therefore ALWAYS false.
  */
-const TIMEZONE_ALIAS_MAP: Record<string, string> = {
-  'Asia/Calcutta': 'Asia/Kolkata',
-  'Asia/Katmandu': 'Asia/Kathmandu',
-  'Asia/Saigon': 'Asia/Ho_Chi_Minh',
-  'Asia/Rangoon': 'Asia/Yangon',
-  'Europe/Kiev': 'Europe/Kyiv',
-  'Europe/Uzhgorod': 'Europe/Kyiv',
-  'Europe/Zaporozhye': 'Europe/Kyiv',
-  'US/Eastern': 'America/New_York',
-  'US/Central': 'America/Chicago',
-  'US/Mountain': 'America/Denver',
-  'US/Pacific': 'America/Los_Angeles',
-};
-
-/**
- * Trims a timezone identifier and canonicalizes legacy aliases, preserving the caller's
- * casing for known ids. Falsy / non-string input resolves to an empty string.
- */
+if (!timezonesEquivalent('Asia/Calcutta', 'Asia/Kolkata')) {
+  console.error(
+    '[invariant] canonical timezone regression: Asia/Calcutta must be equivalent to Asia/Kolkata'
+  );
+}
+/** Display-safe canonical id (empty string when the input carries no resolvable zone). */
 function normalizeTimezone(tz?: string | null): string {
-  if (!tz || typeof tz !== 'string') return '';
-  const trimmed = tz.trim();
-  if (!trimmed) return '';
-  return TIMEZONE_ALIAS_MAP[trimmed] || trimmed;
+  return canonicalTimezone(tz) ?? '';
 }
 
-function normalizeServerTimezoneId(tz: string | null | undefined): string {
-  if (!tz || typeof tz !== 'string') return '';
-  // Delegate alias resolution to normalizeTimezone so the two helpers never drift, then fold
-  // to the lowercase comparison form this server-side matcher has always used.
-  const canonical = normalizeTimezone(tz).toLowerCase();
-  if (!canonical || canonical === 'unknown' || canonical === 'unavailable') return '';
-  return SERVER_TIMEZONE_ALIAS_MAP[canonical] || canonical;
+/**
+ * Four-state GPU observation. A masked / unavailable renderer is an honest `unknown`, never a
+ * physical-hardware claim and never hypervisor proof. This is a local defensive mirror of the
+ * shared `resolveGpuTruth` helper (specInvariants); it is kept here so the API bundle stays
+ * correct until that helper lands, and has identical semantics.
+ */
+export type GpuTruthState =
+  | 'physical_hardware'
+  | 'software_renderer'
+  | 'virtual_gpu'
+  | 'unknown';
+
+const SOFTWARE_RENDERER_TRUTH_PATTERN =
+  /swiftshader|llvmpipe|softpipe|software|masked|unavailable|basic render driver|microsoft basic render|mesa offscreen|software rasterizer|apple software renderer|virgl/i;
+const HYPERVISOR_GPU_TRUTH_PATTERN =
+  /virtualbox|\bvbox\b|vmware|svga3d|\bqemu\b|virtio|virgl|\bbochs\b|hyper-?v|microsoft remote display|parallels|citrix|\bxen\b/i;
+
+export function resolveGpuTruth(
+  vendor: string | null | undefined,
+  renderer: string | null | undefined
+): GpuTruthState {
+  const text = `${typeof vendor === 'string' ? vendor : ''} ${
+    typeof renderer === 'string' ? renderer : ''
+  }`.toLowerCase();
+  // Software markers win over hypervisor markers (virgl is both): software is a fact, a
+  // hypervisor is an inference from the same string.
+  if (SOFTWARE_RENDERER_TRUTH_PATTERN.test(text)) return 'software_renderer';
+  if (HYPERVISOR_GPU_TRUTH_PATTERN.test(text)) return 'virtual_gpu';
+  const cleanRenderer = typeof renderer === 'string' ? renderer.trim() : '';
+  if (
+    cleanRenderer.length > 3 &&
+    !/^(standard|unknown|unavailable|masked|google inc\.?)\b/i.test(cleanRenderer)
+  ) {
+    return 'physical_hardware';
+  }
+  return 'unknown';
 }
 
 /**
@@ -6160,6 +6252,8 @@ type ExtendedHardwareSignals = HardwareSignals & {
   claimedOs?: string;
   /** Human-readable evidence for the runtime OS authority (telemetry only). */
   osProof?: string[];
+  /** Four-state GPU observation derived from the raw unmasked renderer. */
+  gpuTruthState?: GpuTruthState;
 };
 
 function sanitizeHardwareSignals(
@@ -6230,15 +6324,41 @@ function sanitizeHardwareSignals(
     browserDevice.os
   );
 
+  // Prefer the raw, unmasked renderer over a masked / placeholder string. The collector reads
+  // WEBGL_debug_renderer_info, but additive telemetry fields may also carry the unmasked value;
+  // a generic "Standard WebGL Renderer" must never hide a real unmasked renderer.
+  const webglBasics = rawHardwareExtras.webglBasics as Record<string, unknown> | undefined;
+  const gpuPlaceholderPattern = /^(standard|unknown|unavailable|masked|n\/a)\b/i;
+  const usableGpuText = (value: unknown): string => {
+    const text = typeof value === 'string' ? value.trim() : '';
+    return text.length > 3 && !gpuPlaceholderPattern.test(text) ? text : '';
+  };
+  const gpuRenderer =
+    [
+      rawHardwareExtras.gpuRendererUnmasked,
+      rawHardwareExtras.unmaskedRenderer,
+      rawHardwareExtras.rawGpuRenderer,
+      webglBasics?.renderer_unmasked,
+      raw?.gpuRenderer,
+    ]
+      .map(usableGpuText)
+      .find(Boolean) || safeStr(raw?.gpuRenderer, 'Standard Hardware Renderer', 160);
+  const gpuVendor =
+    [
+      rawHardwareExtras.gpuVendorUnmasked,
+      rawHardwareExtras.unmaskedVendor,
+      webglBasics?.vendor_unmasked,
+      raw?.gpuVendor,
+    ]
+      .map(usableGpuText)
+      .find(Boolean) || safeStr(raw?.gpuVendor, 'Standard WebGL Vendor', 120);
+  const gpuTruthState = resolveGpuTruth(gpuVendor, gpuRenderer);
+
   // Honest hardware truth: a SwiftShader / llvmpipe / software (or masked / unavailable)
   // renderer cannot name a real GPU architecture, and a nan-sign-bit architecture probe is not
   // a hardware fact. Force the architecture-derived spoof flags off so a software-rendered
   // cloud container is never labelled "spoofed / emulated OS" on architecture alone.
-  const gpuTruthText =
-    `${safeStr(raw?.gpuVendor, '', 120)} ${safeStr(raw?.gpuRenderer, '', 160)}`.toLowerCase();
-  const softwareRendererTruth = /swiftshader|llvmpipe|softpipe|software|masked|unavailable/.test(
-    gpuTruthText
-  );
+  const softwareRendererTruth = gpuTruthState === 'software_renderer';
   const rawGpuArchFamily = safeStr(rawHardwareExtras.gpuArchFamily, '', 40);
   // A software renderer must never report a real silicon family (x86 / nvidia / arm).
   const gpuArchFamily = softwareRendererTruth
@@ -6255,8 +6375,9 @@ function sanitizeHardwareSignals(
 
   return {
     hardwareId: validHwId,
-    gpuVendor: safeStr(raw?.gpuVendor, 'Standard WebGL Vendor', 120),
-    gpuRenderer: safeStr(raw?.gpuRenderer, 'Standard Hardware Renderer', 160),
+    gpuVendor,
+    gpuRenderer,
+    gpuTruthState,
     maxTextureSize,
     canvasHash: safeStr(raw?.canvasHash, 'unavailable', 40),
     audioHash: safeStr(raw?.audioHash, 'unavailable', 40),
@@ -6488,6 +6609,61 @@ function assessCorroboratedCdp(args: {
 /** A timezone / timezone-mismatch note is an orthogonal network axis, never tamper evidence. */
 function isTimezoneMismatchReason(reason: string): boolean {
   return /\btime[\s_-]?zone\b/i.test(reason);
+}
+
+/** One authoritative inspector verdict shared by the escalation gate, envelope and top level. */
+interface ResolvedInspectorState {
+  inspector_state: InspectorState;
+  cdp_attached: boolean;
+  developer_tools: boolean;
+  detail: string;
+}
+
+/**
+ * Single source of truth for `cdp_attached`, `developer_tools` and `inspector_state`.
+ *
+ * `cdp_attached` requires STRONG protocol-level proof (a real CDP/WebDriver binding). A weak
+ * `cdpRuntimeLeak` / Error-preview read is only developer-tools telemetry: it can set
+ * `developer_tools` (any DevTools / IDE / docked attach) but NEVER `cdp_attached`, and its
+ * human-readable detail must never say "CDP attached".
+ */
+function resolveInspectorState(signals: {
+  strongCdpProof?: boolean;
+  developerTools?: boolean;
+  cdpRuntimeLeak?: boolean;
+  automationEnvironment?: string;
+  devtoolsActiveVerified?: boolean;
+  viewportContractionNormalized?: boolean;
+}): ResolvedInspectorState {
+  const inspector_state = classifyInspectorState({
+    cdpAttached: Boolean(signals.strongCdpProof),
+    devtoolsActiveVerified: Boolean(signals.devtoolsActiveVerified),
+    viewportContractionNormalized: Boolean(signals.viewportContractionNormalized),
+  });
+  const cdp_attached = inspector_state === 'automation_protocol_attached';
+  // Any DevTools / IDE-webview / docked attach is developer-tools evidence — including a weak
+  // runtime leak. The CDP protocol state carries developer_tools:false by contract (the binding
+  // is reported on the cdp_attached axis instead).
+  const developer_tools =
+    !cdp_attached &&
+    Boolean(
+      signals.developerTools ||
+        signals.cdpRuntimeLeak ||
+        signals.automationEnvironment === 'electron' ||
+        signals.automationEnvironment === 'ide_webview' ||
+        signals.devtoolsActiveVerified ||
+        signals.viewportContractionNormalized
+    );
+  const detail = cdp_attached
+    ? 'CDP protocol attached; no docked DevTools UI'
+    : inspector_state === 'devtools_active_verified'
+    ? 'Docked DevTools frontend verified active'
+    : inspector_state === 'devtools_docked_suspected'
+    ? 'Docked DevTools frontend suspected'
+    : developer_tools
+    ? 'Developer tools / inspector probe observed (no CDP protocol proof)'
+    : 'No inspector / DevTools attachment detected';
+  return { inspector_state, cdp_attached, developer_tools, detail };
 }
 
 /**
@@ -6780,29 +6956,27 @@ function sanitizeAndReinforceSecuritySignals(
       ? raw.ipTimezone.trim().slice(0, 80)
       : 'Unavailable');
 
-  const normBrowserTz = normalizeServerTimezoneId(browserTimezone);
-  const normIpTz = normalizeServerTimezoneId(ipTimezone);
-  const serverTzMismatch = Boolean(normBrowserTz && normIpTz && normBrowserTz !== normIpTz);
-  const timezoneMismatch = Boolean(raw?.timezoneMismatch) || serverTzMismatch;
+  // ONE canonical timezone verdict, shared by vpn_methods.timezone_mismatch, the envelope's
+  // network axis, the risk ledger and the UI flags. Legacy IANA aliases resolve to a single
+  // identity (Asia/Calcutta vs Asia/Kolkata => mismatch:false); an unresolved side is absence
+  // of evidence, never a mismatch. A raw client `timezoneMismatch` boolean is not authoritative.
+  const timezoneVerdict = timezoneMismatchContext(browserTimezone, ipTimezone);
+  const clientTzCanonical = timezoneVerdict.canonicalBrowser ?? normalizeTimezone(browserTimezone);
+  const ipTzCanonical = timezoneVerdict.canonicalIp ?? '';
+  const hasTzMismatch = timezoneVerdict.mismatch;
+  const timezoneMismatch = hasTzMismatch;
 
   // Task 1/2 — the datacenter label now comes from the mirrored ISP classification instead
   // of the old bare-keyword regex (which mis-flagged e.g. Google Fiber AS16591 as cloud
   // because of the generic 'google' keyword).
-  const isGpuMaskedOrUnavailable =
-    !hardwareSignals.gpuVendor ||
-    hardwareSignals.gpuVendor === 'Unavailable' ||
-    /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuVendor) ||
-    !hardwareSignals.gpuRenderer ||
-    hardwareSignals.gpuRenderer === 'Unavailable' ||
-    /^Standard (GPU|WebGL|Hardware)/i.test(hardwareSignals.gpuRenderer);
-  // A software renderer (SwiftShader / llvmpipe / masked / unavailable) is neither a real
-  // unmasked GPU nor hypervisor proof. It earns an honest "software-rendered" tile and must
-  // never be shown as "Physical Hardware — unmasked physical GPU verified".
-  const SOFTWARE_GPU_PATTERN = /swiftshader|llvmpipe|softpipe|software|masked|unavailable/i;
-  const vmGpuSignatureText = `${hardwareSignals.gpuVendor || ''} ${hardwareSignals.gpuRenderer || ''}`;
-  const softwareRenderedGpu = SOFTWARE_GPU_PATTERN.test(vmGpuSignatureText);
+  // Four-state GPU truth from one resolver: a software / masked / unavailable renderer is never
+  // "Physical Hardware" and never hypervisor proof on its own.
+  const gpuTruthState = resolveGpuTruth(hardwareSignals.gpuVendor, hardwareSignals.gpuRenderer);
+  const isGpuMaskedOrUnavailable = gpuTruthState === 'unknown';
+  const softwareRenderedGpu = gpuTruthState === 'software_renderer';
+  const virtualGpuSignature = gpuTruthState === 'virtual_gpu';
   // "Physical Hardware" is only assertable with a real unmasked GPU string and no software marker.
-  const hasRealUnmaskedGpu = !isGpuMaskedOrUnavailable && !softwareRenderedGpu;
+  const hasRealUnmaskedGpu = gpuTruthState === 'physical_hardware';
 
   // Strict priority reconciliation: Tor anonymity > AI agent cloud > datacenter/VM > VPN >
   // mobile > residential > unknown. The base classifier is network-only; these verdicts are
@@ -6857,17 +7031,8 @@ function sanitizeAndReinforceSecuritySignals(
   const torOperatorHint = Boolean(requestContext.torOperatorHint);
 
   // A confirmed Tor exit relay is a network-reputation verdict in its own right; it must reach
-  // `vpnSuspected` even when the relay sits on a residential ASN.
-  // Smart-signal timezone comparison: both sides are canonicalized through normalizeTimezone so
-  // a legacy alias (Asia/Calcutta vs Asia/Kolkata, US/Pacific vs America/Los_Angeles) is never
-  // mis-reported as a timezone relay. Casing is folded for the comparison only.
-  const clientTzCanonical = normalizeTimezone(browserTimezone);
-  const ipTzCanonical = normalizeTimezone(ipTimezone === 'Unavailable' ? '' : ipTimezone);
-  const hasTzMismatch = Boolean(
-    clientTzCanonical &&
-      ipTzCanonical &&
-      clientTzCanonical.toLowerCase() !== ipTzCanonical.toLowerCase()
-  );
+  // `vpnSuspected` even when the relay sits on a residential ASN. The canonical timezone verdict
+  // was resolved once above and is reused verbatim by vpn_methods below.
 
   // A commercial VPN provider is not the same claim as a cloud/datacenter egress. Only a
   // provider-owned VPN brand/ASN match may set `public_vpn`; generic hosting operators such as
@@ -6902,6 +7067,18 @@ function sanitizeAndReinforceSecuritySignals(
     // never timezone alone — both are orthogonal axes, not tunnels.
     ml_prediction: Boolean(raw?.vpnSuspected) && concreteVpnEvidence,
   };
+  // Runtime parity assertion: the vpn_methods mirror and the serialised security-signal flag
+  // must agree with the single canonical timezone verdict (Calcutta vs Kolkata is always false).
+  if (vpnMethods.timezone_mismatch !== timezoneMismatch) {
+    console.error('[invariant] timezone mismatch parity violation', {
+      vpnMethodsTimezoneMismatch: vpnMethods.timezone_mismatch,
+      timezoneMismatch,
+      browserTimezone,
+      ipTimezone,
+      clientTzCanonical,
+      ipTzCanonical,
+    });
+  }
   // The umbrella VPN verdict counts only concrete VPN/anonymity methods. timezone_mismatch stays
   // an orthogonal axis in vpnMethods (and in the telemetry/network panel) and never promotes a
   // residential line to a commercial VPN on its own. A cloud/datacenter ASN is network ownership,
@@ -7228,9 +7405,11 @@ function sanitizeAndReinforceSecuritySignals(
     : botSubtype === 'human' && !aiAgent?.detected
       ? developerToolsAttached
         ? `Verified human interactive session · ${
-            raw?.cdpDetected || raw?.cdpRuntimeLeak
+            // Only STRONG protocol proof may say "CDP attached". A weak runtime leak / Error
+            // preview is developer-tools telemetry and must never claim a CDP attachment.
+            requestContext.strongCdpProof
               ? 'CDP protocol attached; no docked DevTools UI'
-              : 'developer tools attached'
+              : 'developer tools / inspector probe attached (no CDP protocol proof)'
           }${
             raw?.automationEnvironment && raw.automationEnvironment !== 'none'
               ? ` (${raw.automationEnvironment})`
@@ -7385,10 +7564,9 @@ function sanitizeAndReinforceSecuritySignals(
   // GPU signature (VirtualBox / VMware / QEMU / VirtIO / Hyper-V guest / Parallels / Xen), a
   // genuine emulator verdict, or host CPU / SMBIOS virtualization evidence reported by the
   // collector. Sealed-envelope tampering / replay is escalated below and never needs the network.
-  const HYPERVISOR_GPU_PATTERN =
-    /virtualbox|\bvbox\b|vmware|svga3d|\bqemu\b|virtio|virgl|\bbochs\b|hyper-?v|microsoft remote display|parallels|citrix|\bxen\b/i;
-  const gpuSignatureText = `${hardwareSignals.gpuVendor || ''} ${hardwareSignals.gpuRenderer || ''}`;
-  const hypervisorGpuProof = HYPERVISOR_GPU_PATTERN.test(gpuSignatureText);
+  // Use the same four-state resolver as the hardware sanitizer so the VM tile can never claim a
+  // hypervisor from a software / masked renderer string.
+  const hypervisorGpuProof = virtualGpuSignature;
   // The collector's "masked GPU on a datacenter ASN (cloud container)" verdict is a network
   // observation, never a hypervisor signature — it alone must never carry the VM tile.
   const cloudContainerVmReason = /cloud container|datacenter asn|masked webgl|software renderer/i.test(
@@ -7414,7 +7592,8 @@ function sanitizeAndReinforceSecuritySignals(
   const vmLike = isVm;
   // A genuine hypervisor host / spoofed environment is 6, an emulator 8, cryptographic tampering
   // 10. A software renderer is an honest environment observation (3), NEVER a confirmed VM and
-  // NEVER "Physical Hardware". A bare cloud egress scores 0 on this tile.
+  // NEVER "Physical Hardware". An UNKNOWN / masked / unavailable renderer is absence of evidence,
+  // so it scores 0 — a bare cloud egress scores 0 on this tile too.
   const vmScore = tamperedRequest || replayDetected
     ? 10
     : emulatorDetected
@@ -7427,7 +7606,7 @@ function sanitizeAndReinforceSecuritySignals(
     ? 3
     : hasRealUnmaskedGpu
     ? 0
-    : 3;
+    : 0;
   let vmStatus =
     tamperedRequest || replayDetected
       ? 'Tampered / Replayed'
@@ -7458,9 +7637,12 @@ function sanitizeAndReinforceSecuritySignals(
       : 'GPU vendor / renderer unavailable — physical hardware cannot be verified';
 
   // Consistency invariant: when the JSON verdict says `virtual_machine: false`, the tile must
-  // never read "Virtual Machine / VM" or "Physical Hardware" as a confirmed claim. A software
-  // renderer is reported honestly as software-rendered, never as an unmasked physical GPU.
-  if (!isVm && (vmStatus === 'Virtual Machine / VM' || vmStatus === 'Physical Hardware')) {
+  // never read "Virtual Machine / VM" or "Physical Hardware" as a confirmed claim. A software /
+  // unavailable renderer is reported honestly, never as an unmasked physical GPU.
+  if (
+    (!isVm && vmStatus === 'Virtual Machine / VM') ||
+    (vmStatus === 'Physical Hardware' && gpuTruthState !== 'physical_hardware')
+  ) {
     vmStatus = softwareRenderedGpu
       ? 'Software-Rendered Graphics (SwiftShader)'
       : 'GPU Masked / Unavailable';
@@ -8039,6 +8221,24 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         isVpnOrHosting: location.isVpnOrHosting || byAsn.datacenter_result,
       };
     }
+
+    // Geo parity — thread the edge's real (never fabricated) fields through LocationInfo so the
+    // Event JSON and the envelope can stop inventing accuracy_radius / subdivisions. Everything
+    // is additive and sourced from the Worker-sealed edge headers or the ASN enrichment result.
+    const continent = parseContinentValue(edgeGeo.continent);
+    const edgeGeoParity: EdgeEnrichedLocation = {
+      ...location,
+      continent: continent.name || undefined,
+      continentCode: continent.code || undefined,
+      postalCode: edgeGeo.postalCode || undefined,
+      subdivisionIso: edgeGeo.regionCode || undefined,
+      accuracyRadiusKm:
+        typeof edgeGeo.accuracyRadius === 'number' && Number.isFinite(edgeGeo.accuracyRadius)
+          ? edgeGeo.accuracyRadius
+          : null,
+      asnNetwork: edgeGeo.asnNetwork || enrichedNetwork.asn_network || undefined,
+    };
+    location = edgeGeoParity;
 
     // Task 1 — the classification is derived from the SERVER-RESOLVED location only (the
     // clientGeoHint ISP / org / ASN was merged into this location above when trusted), so it
@@ -8712,11 +8912,19 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     // match inside an inspector probe preview are weak, engine-dependent mobile artifacts: they
     // are developer-tools telemetry and MUST NOT attach CDP or brand a real phone as automation.
     const strongCdpProof = hasStrongCdpProof(rawSecuritySignals, clientExtras);
-    const earlyInspectorState = classifyInspectorState({
-      cdpAttached: strongCdpProof,
+    // ONE inspector verdict for the escalation gate, the envelope and the top-level mirrors.
+    const earlyInspector = resolveInspectorState({
+      strongCdpProof,
+      developerTools: Boolean(rawSecuritySignals?.developerTools),
+      cdpRuntimeLeak: Boolean(rawSecuritySignals?.cdpRuntimeLeak),
+      automationEnvironment:
+        typeof rawSecuritySignals?.automationEnvironment === 'string'
+          ? rawSecuritySignals.automationEnvironment
+          : undefined,
       devtoolsActiveVerified: Boolean(clientExtras.devtoolsActiveVerified),
       viewportContractionNormalized: Boolean(clientExtras.viewportContractionNormalized),
     });
+    const earlyInspectorState = earlyInspector.inspector_state;
     const cdpBridge = strongCdpProof;
     const dockedWithHumanInteraction = Boolean(
       rawSecuritySignals?.developerTools ||
@@ -9455,6 +9663,22 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     });
     const suspectScore100 = riskLedger.score_0_100;
 
+    // Canonical ledger is the SINGLE source for the public headline. The earlier heuristic
+    // `securitySignals.suspectScore` is retained only as a cross-check, then overwritten so the
+    // response, history row, DB persistence and risk badge all report the exact graded result.
+    const canonicalScore10 = riskLedger.score10;
+    const canonicalRiskLevel = riskLevelFromTier(riskLedger.risk_tier);
+    assertRiskHeadlineConsistency({
+      score10: canonicalScore10,
+      risk_tier: riskLedger.risk_tier,
+      suspectScore: securitySignals.suspectScore,
+      riskLevel: securitySignals.riskLevel,
+    });
+    securitySignals.suspectScore = canonicalScore10;
+    securitySignals.riskLevel = canonicalRiskLevel;
+    (securitySignals as unknown as Record<string, unknown>).riskBadgeText =
+      `${canonicalRiskLevel} Risk • ${canonicalScore10}/10`;
+
     // Every history row always carries suspectScore / riskLevel / recognitionSource so the UI
     // never renders `undefined`. Stored per-visit risk data is used when present; the current
     // visit falls back to the just-computed security signals; legacy rows use safe defaults.
@@ -9900,20 +10124,16 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       ),
       corroborated: false,
     });
-    const edgeTransport = readEdgeTransport(req);
-    // Single inspector verdict shared by the escalation gate and the envelope telemetry.
-    const inspectorState = earlyInspectorState;
-    const inspectorFlags = inspectorFlagsForState(inspectorState);
-    // A bare automation-protocol binding gets an explicit human-readable explanation so
-    // `cdp_attached: true` never sits next to a silent / contradictory DevTools claim.
-    const inspectorDetail =
-      inspectorState === 'automation_protocol_attached'
-        ? 'CDP protocol attached; no docked DevTools UI'
-        : inspectorState === 'devtools_docked_suspected'
-        ? 'Docked DevTools frontend suspected'
-        : inspectorState === 'devtools_active_verified'
-        ? 'Docked DevTools frontend verified active'
-        : 'No inspector / DevTools attachment detected';
+    // Single inspector verdict, resolved once by resolveInspectorState() and mirrored verbatim.
+    const inspectorState = earlyInspector.inspector_state;
+    const inspectorFlags = {
+      cdp_attached: earlyInspector.cdp_attached,
+      developer_tools: earlyInspector.developer_tools,
+    };
+    const inspectorDetail = earlyInspector.detail;
+    if (inspectorFlags.cdp_attached !== (inspectorState === 'automation_protocol_attached')) {
+      console.error('[invariant] inspector CDP parity violation', { inspectorState, inspectorFlags });
+    }
     const automationVerdict =
       securitySignals.isBot || botVerdict === 'bad' || hardAutomationSignals
         ? 'automated'
@@ -10116,7 +10336,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       // Best effort: the resolver-consistent fallback above is already honest.
     }
 
-    let structuralAnchorRatioForConfidence = storageValidForConfidence ? 1 : 0;
+    const TOTAL_IDENTITY_ANCHORS = 7;
+    let matchedAnchorsForConfidence = storageValidForConfidence ? TOTAL_IDENTITY_ANCHORS : 0;
     if (corroboratingVisitorId) {
       const anchorEvidence = structuralAnchorsMatch(
         db,
@@ -10126,23 +10347,38 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       );
       // structuralAnchorsMatch compares 7 stable anchor pairs; an exact stored hardware
       // fingerprint counts as a full (1.0) anchor agreement.
-      structuralAnchorRatioForConfidence = anchorEvidence.reasons.some((reason) =>
+      matchedAnchorsForConfidence = anchorEvidence.reasons.some((reason) =>
         reason.includes('hardware fingerprint')
       )
-        ? 1
-        : Math.min(1, anchorEvidence.reasons.length / 7);
+        ? TOTAL_IDENTITY_ANCHORS
+        : Math.min(TOTAL_IDENTITY_ANCHORS, anchorEvidence.reasons.length);
     }
+    const structuralAnchorRatioForConfidence =
+      matchedAnchorsForConfidence / TOTAL_IDENTITY_ANCHORS;
+    const profileAgeDaysForConfidence = (() => {
+      const firstMs = Date.parse(statistics.firstVisitUtc);
+      if (!Number.isFinite(firstMs)) return 0;
+      return Math.max(0, Math.floor((Date.now() - firstMs) / 86_400_000));
+    })();
 
     const honestConfidenceInput: ResolverBackedHonestConfidenceInput = {
       labeledPairs: Number(rawExtras.calibrationLabeledPairs ?? 0),
       heldOutEce: Number(rawExtras.calibrationHeldOutEce ?? 1),
       matchStage: identityStage.stage,
+      // All six weighted evidence components (tier base, match score, anchor ratio, storage
+      // seeds, browser consensus, OS consensus) are supplied explicitly and auditable.
+      match_tier: identityStage.stage,
       calibratedScore: identityConfidence.score,
       matchScore: matchScoreForConfidence,
       match_score: matchScoreForConfidence,
       match_mode: resolvedIdentity.match_mode,
       structural_anchor_ratio: structuralAnchorRatioForConfidence,
       structuralAnchorRatio: structuralAnchorRatioForConfidence,
+      matched_anchors: matchedAnchorsForConfidence,
+      total_anchors: TOTAL_IDENTITY_ANCHORS,
+      storageHealed: Boolean(storageHealed || resolvedIdentity.healed),
+      visitContinuity: statistics.totalVisits,
+      profileAgeDays: profileAgeDaysForConfidence,
       distinct_storage_seeds_count: distinctStorageSeedsForConfidence,
       distinctStorageSeedsCount: distinctStorageSeedsForConfidence,
       browser_family_consensus: browserFamilyCorroborated,
@@ -10187,7 +10423,11 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     const identityConfidenceHonest = {
       ...honestConfidenceSeed,
       confidence_score: finalIdentityConfidenceScore,
+      // No held-out calibration gate has passed: the numeric value is observable evidence
+      // strength, never a probability. The human-facing label says "Match evidence", not
+      // "Confidence"/probability.
       calibration_status: 'uncalibrated' as const,
+      confidence_label: confidenceLabel(finalIdentityConfidenceScore, false),
       ...(downgradeRecognition
         ? { confidence_tier: 'Shared Hardware Class - Ambiguous' as const }
         : {}),
@@ -10256,6 +10496,7 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       rarityReport.sampleSize,
       0.05
     );
+    const edgeTransport = readEdgeTransport(req);
     const invariantEnvelope = {
       event_id: eventId,
       identity: {
@@ -10265,6 +10506,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         confidence_tier: identityConfidenceHonest.confidence_tier,
         confidence_score: identityConfidenceHonest.confidence_score,
         calibration_status: identityConfidenceHonest.calibration_status,
+        // Evidence label only — no probability language until a calibration gate passes.
+        confidence_label: identityConfidenceHonest.confidence_label,
       },
       server_verified: {
         browser: serverVerifiedBrowser,
@@ -10300,12 +10543,9 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         // Explicit explanation for a bare CDP bridge so `cdp_attached: true` can never be
         // misread as "DevTools open" (which stays false for automation_protocol_attached).
         inspector_detail: inspectorDetail,
-        // automation_protocol_attached explicitly reports developer_tools:false (CDP binding,
-        // not a docked DevTools frontend); only the docked/verified states set it true.
-        developer_tools:
-          inspectorState === 'automation_protocol_attached'
-            ? false
-            : inspectorFlags.developer_tools || developerToolsSignals,
+        // Single resolved value: any DevTools / IDE / docked attach (including a weak runtime
+        // leak) sets this true, while a bare CDP protocol binding stays on the cdp_attached axis.
+        developer_tools: inspectorFlags.developer_tools,
       },
       tampering: {
         detected: reconciledTampering.detected || effectiveTamperingDetected,
@@ -10470,7 +10710,9 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
           // `null` for genuinely new profiles) without editing a type owned by another module.
           score: identityConfidenceHonest.confidence_score as number,
           version: identityConfidence.version,
-        },
+          calibration_status: identityConfidenceHonest.calibration_status,
+          confidence_label: identityConfidenceHonest.confidence_label,
+        } as unknown as { score: number; version: string },
         visitor_found: visitorFound,
         tampering: identityConfidence.tampering,
         spoof_likelihood: identityConfidence.spoof_likelihood,

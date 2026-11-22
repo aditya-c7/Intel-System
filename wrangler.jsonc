@@ -12,6 +12,15 @@
     "directory": "./dist",
     "binding": "ASSETS",
     "not_found_handling": "single-page-application",
+    // run_worker_first MUST stay true. The Worker has to see every request before the asset
+    // layer: it performs SSR bot-verdict injection into documents (intel:verdict / intel:bot-type
+    // meta tags, the #intel-initial-verdict JSON script, X-Intel-Bot-* headers and the 60s WBA
+    // intel_wba cookie) and routes /api/* to the Express app. With single-page-application
+    // not-found handling, serving assets first would return index.html for every path and the
+    // Worker would never run, so no injection or API routing would happen. Files that need no
+    // rewriting are explicitly forwarded to ASSETS by worker/index.js (/assets/*, /robots.txt,
+    // /llms.txt, /agents.md, /sitemap.xml). Tradeoff: every request, including static assets,
+    // invokes the Worker. Setting this to false breaks SSR verdict injection (see CLOUDFLARE.md).
     "run_worker_first": true
   },
   "durable_objects": {

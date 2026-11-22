@@ -21,6 +21,15 @@
     "test:verify": "tsx scripts/test-verification.ts",
     "test:t07": "tsx scripts/test-t07-agent-detection.ts",
     "test:human": "tsx scripts/test-human-verdict.ts",
+    "test:confidence-risk": "npx tsx scripts/test-confidence-risk.ts",
+    "test:identity-browser": "node scripts/test-identity-browser.mjs",
+    "build:worker": "node scripts/build-worker.mjs",
+    "test:browser-suite": "node -e \"const cp=require('child_process'),fs=require('fs');const c=[process.env.CHROMIUM_PATH,'/usr/bin/chromium','/usr/bin/chromium-browser','/usr/bin/google-chrome','/usr/bin/google-chrome-stable'].filter(Boolean);const b=c.find(x=>fs.existsSync(x));if(!b){console.log('SKIP test:browser: no system Chromium found (set CHROMIUM_PATH).');console.log('SKIP test:identity-browser: no system Chromium found (set CHROMIUM_PATH).');process.exit(0);}console.log('Browser available: '+b);const run=s=>{console.log('RUN  '+s);const r=cp.spawnSync('npm',['run',s],{stdio:'inherit',shell:process.platform==='win32'});return r.status||0;};let rc=run('test:browser');if(process.env.INTEL_BASE_URL){rc=run('test:identity-browser')||rc;}else{console.log('SKIP test:identity-browser: no INTEL_BASE_URL target set (point it at a running dashboard).');}process.exit(rc);\"",
+    "test:unit": "npm run test:verify && npm run test:human && npm run test:t07 && npm run test:device && npm run test:ua && npm run test:asn && npm run test:confidence-risk",
+    "test:integration": "npm run build:worker && npm run test:worker && npm run test:browser-suite",
+    "test:all": "npm run test:unit && npm run test:integration",
+    "test:meta": "node -e \"const fs=require('fs'),path=require('path');const p=JSON.parse(fs.readFileSync('package.json','utf8'));const s=p.scripts||{};const t=Object.keys(s).filter(n=>n.indexOf('test')===0);const d='.github/workflows';const f=fs.existsSync(d)?fs.readdirSync(d).filter(x=>x.slice(-4)==='.yml'||x.slice(-5)==='.yaml'):[];const corpus=f.map(x=>fs.readFileSync(path.join(d,x),'utf8')).join(' ');const r=new Set(t.filter(n=>corpus.indexOf(n)!==-1));const directCount=r.size;let ch=true;while(ch){ch=false;for(const n of t){if(r.has(n))continue;for(const m of r){if((s[m]||'').indexOf(n)!==-1){r.add(n);ch=true;break;}}}}const missing=t.filter(n=>!r.has(n));if(missing.length){console.error('META-CHECK FAILED: test* scripts not reachable from any workflow (directly or via an aggregate): '+missing.join(', '));process.exit(1);}console.log('META-CHECK OK: '+t.length+' test* scripts reachable from workflows ('+directCount+' referenced directly, '+(r.size-directCount)+' via aggregates).');\"",
+    "rollback:last": "node scripts/rollback.mjs",
     "phones:generate": "node scripts/generate-phone-models.mjs"
   },
   "dependencies": {

@@ -23,3 +23,5 @@ jobs:
         env:
           WRANGLER_SEND_METRICS: 'false'
       - run: node scripts/test-worker.mjs
+      - name: Run the full aggregate suite (unit + integration, browser suites SKIP explicitly when no Chromium)
+        run: npm run test:all

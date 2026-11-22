@@ -268,3 +268,9 @@ export function verifyGradedRiskFixtures(): {
     };
   });
 }
+
+/* Additive convenience re-export: the canonical, non-throwing consistency check lives with
+ * the contract (this module already depends on it), so importers of either module can reach
+ * the same single implementation. No existing ledger behavior is changed. */
+export { assertCanonicalConsistency } from './telemetryContract';
+export type { CanonicalConsistencyView } from './telemetryContract';

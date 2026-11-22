@@ -39,6 +39,12 @@ import {
   isSecureRequest,
   type RiskEvidenceLine,
 } from '../src/lib/telemetryContract';
+import { canonicalTimezone, timezonesEquivalent } from '../src/lib/timezone';
+import {
+  gpuObservationIsHardwareAnchor,
+  resolveGpuObservation,
+  type GpuObservation,
+} from '../src/lib/specInvariants';
 
 let passed = 0;
 const failures: string[] = [];
@@ -486,6 +492,84 @@ check(
         result.spoof_likelihood === 'high')
     );
   })(),
+);
+
+/* -------------------------------------------------------------------------- */
+/* Tranche 0-1 — canonical timezone aliases                                    */
+/* -------------------------------------------------------------------------- */
+
+section('Tranche 0-1: timezone alias equivalence');
+
+/** Local expected values: legacy IANA alias -> canonical IANA identifier. */
+const TIMEZONE_ALIAS_EXPECTATIONS: ReadonlyArray<readonly [string, string]> = [
+  ['Asia/Calcutta', 'Asia/Kolkata'],
+  ['Europe/Kiev', 'Europe/Kyiv'],
+  ['Asia/Katmandu', 'Asia/Kathmandu'],
+  ['US/Pacific', 'America/Los_Angeles'],
+];
+
+for (const [alias, canonical] of TIMEZONE_ALIAS_EXPECTATIONS) {
+  check(
+    `canonical timezone ${alias} -> ${canonical}`,
+    canonicalTimezone(alias) === canonical,
+    String(canonicalTimezone(alias)),
+  );
+  check(`timezone alias equivalence ${alias} === ${canonical}`, timezonesEquivalent(alias, canonical));
+}
+
+check(
+  'a shared UTC offset is not timezone equivalence (Singapore vs Hong Kong)',
+  timezonesEquivalent('Asia/Singapore', 'Asia/Hong_Kong') === false,
+);
+check(
+  'unresolvable timezones never fabricate equivalence',
+  timezonesEquivalent('Unknown', 'Unknown') === false,
+);
+
+/* -------------------------------------------------------------------------- */
+/* Tranche 0-1 — GPU observation honesty                                       */
+/* -------------------------------------------------------------------------- */
+
+section('Tranche 0-1: GPU observation buckets');
+
+const SWIFTSHADER_RENDERER =
+  'ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)';
+
+const swiftObservation: GpuObservation = resolveGpuObservation(
+  'Google Inc. (Google)',
+  SWIFTSHADER_RENDERER,
+  't16|h|e3',
+);
+check(
+  'SwiftShader is software_or_virtual, never a hardware anchor / VM proof',
+  swiftObservation === 'software_or_virtual' && gpuObservationIsHardwareAnchor(swiftObservation) === false,
+  swiftObservation,
+);
+
+const maskedObservation: GpuObservation = resolveGpuObservation('', '', 't16|h|e3');
+check(
+  'unmasked-info extension absence with real capabilities is masked_by_privacy',
+  maskedObservation === 'masked_by_privacy' && gpuObservationIsHardwareAnchor(maskedObservation) === false,
+  maskedObservation,
+);
+
+const unavailableObservation: GpuObservation = resolveGpuObservation('', '', null);
+check(
+  'extension absence without capability data is observation_unavailable',
+  unavailableObservation === 'observation_unavailable' &&
+    gpuObservationIsHardwareAnchor(unavailableObservation) === false,
+  unavailableObservation,
+);
+
+const hardwareObservation: GpuObservation = resolveGpuObservation(
+  'NVIDIA',
+  'NVIDIA GeForce RTX 4070',
+  't16|h|e3',
+);
+check(
+  'an explicit unmasked GPU is the only hardware_visible anchor',
+  hardwareObservation === 'hardware_visible' && gpuObservationIsHardwareAnchor(hardwareObservation),
+  hardwareObservation,
 );
 
 /* -------------------------------------------------------------------------- */

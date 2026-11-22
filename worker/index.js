@@ -29,6 +29,40 @@ const CLIENT_HINT_CRITICAL_CH =
   'Sec-CH-UA-Full-Version-List, Sec-CH-UA-Platform-Version';
 const CLIENT_HINT_VARY = 'Sec-CH-UA*';
 
+/**
+ * Version attribution. These three values are the edge's answer to "what code served this?"
+ * and are stamped on every API response and SSR document as `x-intel-*` headers, plus exposed
+ * in the native `/api/health` JSON. Defaults keep local/dev builds honest ("unknown" build SHA)
+ * while a deployment can override each one with a Worker binding — no Node crypto or git
+ * access at runtime, which keeps the health/ping routes stateless.
+ */
+const DEFAULT_PARSER_VERSION = '2.1.0';
+const DEFAULT_WORKER_VERSION = '2.1.0';
+const DEFAULT_BUILD_SHA = 'unknown';
+
+/** Conservative hardening headers. Values are chosen so the existing React/Vite/Leaflet app
+ * keeps working: inline scripts are needed for the theme bootstrap and the injected verdict,
+ * the bunny.net stylesheet/fonts and HTTPS map tiles stay reachable, and same-origin framing
+ * is allowed rather than denied. */
+const SECURITY_HEADERS = {
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'X-Frame-Options': 'SAMEORIGIN',
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+  'Content-Security-Policy': [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'self'",
+    "form-action 'self'",
+    "script-src 'self' 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline' https://fonts.bunny.net",
+    "font-src 'self' data: https://fonts.bunny.net",
+    "img-src 'self' data: blob: https:",
+    "connect-src 'self' https:",
+    "media-src 'self' blob:",
+  ].join('; '),
+};
+
 /** Headers a client could otherwise spoof to fake an IP or a location. */
 const UNTRUSTED_FORWARD_HEADERS = [
   'x-intel-edge-geo',
@@ -82,6 +116,35 @@ function cfString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : '';
 }
 
+/**
+ * Resolves the three version-attribution values from optional Worker bindings, falling back to
+ * the compiled defaults. Binding aliases are accepted so a deployment can wire whichever var
+ * its build pipeline already emits without touching this file.
+ */
+function versionInfo(env) {
+  const bag = env && typeof env === 'object' ? env : {};
+  return {
+    parserVersion: cfString(bag.INTEL_PARSER_VERSION) || DEFAULT_PARSER_VERSION,
+    buildSha:
+      cfString(bag.INTEL_BUILD_SHA) ||
+      cfString(bag.BUILD_SHA) ||
+      cfString(bag.GIT_COMMIT_SHA) ||
+      cfString(bag.CF_BUILD_SHA) ||
+      DEFAULT_BUILD_SHA,
+    workerVersion: cfString(bag.INTEL_WORKER_VERSION) || DEFAULT_WORKER_VERSION,
+  };
+}
+
+/** The `x-intel-*` header triple; shared by API responses, SSR documents and native routes. */
+function versionHeaders(env) {
+  const { parserVersion, buildSha, workerVersion } = versionInfo(env);
+  return {
+    'x-intel-parser-version': parserVersion,
+    'x-intel-build-sha': buildSha,
+    'x-intel-worker-version': workerVersion,
+  };
+}
+
 function buildEdgeGeoHeader(request) {
   const cf = request.cf || {};
   const payload = {
@@ -107,6 +170,25 @@ function buildEdgeGeoHeader(request) {
         ? cf.clientTcpRtt
         : null,
     httpProtocol: cfString(cf.httpProtocol),
+    // Seven FREE request.cf TLS/network fields available on every plan. These are raw
+    // edge-derived TLS components — NOT JA3/JA4 or any Bot-Management-only fingerprint — and
+    // are labelled as such so no downstream surface ever misreports them as a JA3/JA4 hash.
+    cfTlsLite: {
+      label: 'edge-derived TLS components',
+      tlsClientHelloLength:
+        typeof cf.tlsClientHelloLength === 'number' && Number.isFinite(cf.tlsClientHelloLength)
+          ? cf.tlsClientHelloLength
+          : null,
+      tlsClientCiphersSha1: cfString(cf.tlsClientCiphersSha1),
+      tlsClientExtensionsSha1: cfString(cf.tlsClientExtensionsSha1),
+      tlsClientRandom: cfString(cf.tlsClientRandom),
+      requestPriority: cfString(cf.requestPriority),
+      edgeL4: cfString(cf.edgeL4),
+      clientQuicRtt:
+        typeof cf.clientQuicRtt === 'number' && Number.isFinite(cf.clientQuicRtt)
+          ? cf.clientQuicRtt
+          : null,
+    },
   };
   return encodeURIComponent(JSON.stringify(payload));
 }
@@ -166,7 +248,7 @@ function forwardApiRequest(request) {
  * exactly once per response: API responses go through `apiResponse`, documents and
  * immutable assets through `applyClientHintHeaders` directly.
  */
-function applyClientHintHeaders(response) {
+function applyClientHintHeaders(response, env, request) {
   const result = new Response(response.body, response);
   result.headers.set('Accept-CH', CLIENT_HINT_ACCEPT_CH);
   result.headers.set('Critical-CH', CLIENT_HINT_CRITICAL_CH);
@@ -176,11 +258,30 @@ function applyClientHintHeaders(response) {
     'compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self), ch-ua-form-factors=(self)'
   );
   result.headers.set('X-Content-Type-Options', 'nosniff');
+
+  // Version attribution: same three values on every surface so a response can be traced to
+  // the exact parser / build / worker that produced it.
+  for (const [name, value] of Object.entries(versionHeaders(env))) result.headers.set(name, value);
+
+  // Hardening. Values are deliberately permissive where the app needs them (inline theme
+  // script, injected verdict JSON, bunny.net fonts, HTTPS map tiles) and strict elsewhere.
+  for (const [name, value] of Object.entries(SECURITY_HEADERS)) result.headers.set(name, value);
+
+  // CORS stays same-origin. The allowed origin is derived from the request URL — never from
+  // the client-controlled `Origin` header — so it needs no `Vary: Origin` and cannot be used
+  // to grant a third party access to first-party API data.
+  if (request) {
+    try {
+      result.headers.set('Access-Control-Allow-Origin', new URL(request.url).origin);
+    } catch {
+      /* malformed request URL: omit CORS rather than emit a wildcard */
+    }
+  }
   return result;
 }
 
-function apiResponse(response) {
-  const result = applyClientHintHeaders(response);
+function apiResponse(response, env, request) {
+  const result = applyClientHintHeaders(response, env, request);
   result.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, no-transform');
   return result;
 }
@@ -581,7 +682,7 @@ async function handleDocument(request, env, verdict) {
     response = rewriter.transform(asset);
   }
 
-  const result = applyClientHintHeaders(response);
+  const result = applyClientHintHeaders(response, env, request);
   for (const [name, value] of Object.entries(botVerdictHeaders(verdict))) {
     result.headers.set(name, value);
   }
@@ -617,7 +718,9 @@ async function handleApi(request, env, pathname, verdict) {
           Response.json(
             { error: 'Too many identification requests. Please retry later.' },
             { status: 429, headers: { 'Retry-After': String(retryAfter) } }
-          )
+          ),
+          env,
+          request
         );
       }
     } catch (error) {
@@ -627,7 +730,7 @@ async function handleApi(request, env, pathname, verdict) {
   }
 
   if (!env.VISITOR_HMAC_SECRET || env.VISITOR_HMAC_SECRET.length < 32) {
-    return apiResponse(Response.json({ error: 'Configure VISITOR_HMAC_SECRET with at least 32 characters.' }, { status: 503 }));
+    return apiResponse(Response.json({ error: 'Configure VISITOR_HMAC_SECRET with at least 32 characters.' }, { status: 503 }), env, request);
   }
   try {
     const forwardedRequest = forwardApiRequest(request);
@@ -639,11 +742,131 @@ async function handleApi(request, env, pathname, verdict) {
     const response = persistent
       ? await env.VISITOR_STORE.get(env.VISITOR_STORE.idFromName('visitor-store-v1')).fetch(forwardedRequest)
       : await handleAsNodeRequest(API_PORT, forwardedRequest);
-    return apiResponse(response);
+    return apiResponse(response, env, request);
   } catch (error) {
     console.error('Worker API failure:', error);
-    return apiResponse(Response.json({ error: 'Internal server error.' }, { status: 500 }));
+    return apiResponse(Response.json({ error: 'Internal server error.' }, { status: 500 }), env, request);
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Native stateless API routes                                                 */
+/* -------------------------------------------------------------------------- */
+
+async function sha256Base64Url(value) {
+  const digest = await crypto.subtle.digest('SHA-256', textEncoder.encode(value));
+  return toBase64Url(digest);
+}
+
+/** Reads the first matching visitor-id cookie, mirroring cookie-parser's decode step. */
+function readCookieValue(cookieHeader, names) {
+  if (!cookieHeader) return '';
+  for (const pair of cookieHeader.split(';')) {
+    const separator = pair.indexOf('=');
+    if (separator < 0) continue;
+    if (!names.includes(pair.slice(0, separator).trim())) continue;
+    let value = pair.slice(separator + 1).trim();
+    try {
+      value = decodeURIComponent(value);
+    } catch {
+      /* keep the raw value if it is not valid percent-encoding */
+    }
+    if (value) return value;
+  }
+  return '';
+}
+
+/** Native /api/health: no Express, no database, no Durable Object — always answerable. */
+function nativeHealth(request, env) {
+  const { parserVersion, buildSha, workerVersion } = versionInfo(env);
+  return apiResponse(
+    Response.json({
+      status: 'ok',
+      visitorsCount: null,
+      visitsCount: null,
+      regionCode: 'global-edge',
+      regionLabel: 'Global Edge Network',
+      parserVersion,
+      buildSha,
+      workerVersion,
+    }),
+    env,
+    request
+  );
+}
+
+/** Native /api/network/ping (GET + HEAD) with the Express route's exact cache contract. */
+function nativePing(method, request, env) {
+  const serverTimestamp = Date.now();
+  const baseHeaders = {
+    Pragma: 'no-cache',
+    Expires: '0',
+    'Timing-Allow-Origin': '*',
+  };
+  const response =
+    method === 'HEAD'
+      ? new Response(null, { status: 200, headers: baseHeaders })
+      : Response.json(
+          { ok: true, serverTimestamp, serverTimestampMs: serverTimestamp },
+          { headers: baseHeaders }
+        );
+  const result = apiResponse(response, env, request);
+  result.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  return result;
+}
+
+/** Native /api/intel/identity-ping: preserves the HTTP-cache identity recovery contract. */
+async function nativeIdentityPing(request, env) {
+  const cookieVisitor = readCookieValue(request.headers.get('cookie'), [
+    '_intel_vid_client',
+    'intel_http_vid',
+  ]);
+  const presented = request.headers.get('if-none-match') || '';
+  const headers = {};
+  let response;
+  if (presented) {
+    headers.ETag = presented;
+    response = new Response(null, { status: 304, headers });
+  } else if (!cookieVisitor) {
+    response = new Response(null, { status: 204 });
+  } else {
+    headers.ETag = `"${await sha256Base64Url(cookieVisitor)}"`;
+    response = Response.json(
+      {
+        identity: {
+          visitor_id: cookieVisitor,
+          hardware_fingerprint: '',
+          browser_fingerprint: '',
+          created_at: new Date().toISOString(),
+        },
+      },
+      { headers }
+    );
+  }
+  const result = applyClientHintHeaders(response, env, request);
+  // Mirror the Express route: a private, revalidatable cache and a Vary that keeps both
+  // UA-CH-negotiated and cookie-bound identities isolated in any shared cache.
+  result.headers.set('Cache-Control', 'private, max-age=0, must-revalidate');
+  result.headers.set('Vary', 'Cookie, Sec-CH-UA*');
+  return result;
+}
+
+/**
+ * Intercepts the three stateless API routes with native Response objects. Returning null lets
+ * every other /api path continue down the existing Express / Durable-Object path unchanged.
+ */
+async function handleNativeApi(request, env, pathname) {
+  const method = request.method;
+  if (pathname === '/api/health') {
+    return method === 'GET' ? nativeHealth(request, env) : null;
+  }
+  if (pathname === '/api/network/ping') {
+    return method === 'GET' || method === 'HEAD' ? nativePing(method, request, env) : null;
+  }
+  if (pathname === '/api/intel/identity-ping') {
+    return method === 'GET' ? nativeIdentityPing(request, env) : null;
+  }
+  return null;
 }
 
 export class VisitorStore extends DurableObject {
@@ -727,6 +950,13 @@ export default {
       );
     }
 
+    // Stateless native routes answer without Express, the Durable Object or WBA verification.
+    // Everything else under /api keeps the existing forwarding path unchanged.
+    if (pathname === '/api' || pathname.startsWith('/api/')) {
+      const native = await handleNativeApi(request, env, pathname);
+      if (native) return native;
+    }
+
     const verdict = await computeEdgeVerdict(request);
 
     // API branch — the only path that uses apiResponse() / the ratelimit binding.
@@ -737,13 +967,13 @@ export default {
     // Immutable hashed assets: pass through untouched — never rewritten and never branded
     // with a per-visitor bot verdict. (run_worker_first excludes /assets/* in production.)
     if (pathname.startsWith('/assets/')) {
-      return applyClientHintHeaders(await env.ASSETS.fetch(request));
+      return applyClientHintHeaders(await env.ASSETS.fetch(request), env, request);
     }
 
     // Crawler control / LLM metadata files are copied verbatim from public/ into dist/.
     // Serve them directly so they keep their own caching and are never UA-branded.
     if (PASS_THROUGH_PATHS.has(pathname)) {
-      return applyClientHintHeaders(await env.ASSETS.fetch(request));
+      return applyClientHintHeaders(await env.ASSETS.fetch(request), env, request);
     }
 
     // Document branch — every page navigation / SPA deep link.

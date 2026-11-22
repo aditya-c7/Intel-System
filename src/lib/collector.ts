@@ -16,6 +16,9 @@ import {
   CORROBORATED_CHROMIUM_CDP_REASON_ID,
   deriveBotVerdict,
 } from './verdict';
+import type { GpuObservation } from './telemetryContract';
+import { resolveGpuObservation } from './specInvariants';
+import { timezoneMismatchContext } from './timezone';
 import { probeEngineLength, resolveHardwareTruth } from './hardwareTruth';
 import { detectBotD19Signals } from './aiBotDirectory';
 import {
@@ -25,6 +28,7 @@ import {
   hashStrings,
   type CollectedSignals,
 } from '../client/signals';
+import type { BrowserCanvasHints } from '../client/signals/types';
 import { loadStoredIdentity, persistIdentity, getSessionId } from '../client/storage/identityStore';
 import { normalizeIdentity } from '../shared/normalization/uaNormalizer';
 import {
@@ -100,6 +104,143 @@ export interface ClientGeoHint {
   isVpnOrHosting: boolean;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Client runtime / host-app detection                                         */
+/* -------------------------------------------------------------------------- */
+
+export type ClientRuntime = 'browser' | 'electron' | 'ide_webview' | 'headless_shell';
+export type ClientType = 'web_browser' | 'desktop_app' | 'ide_webview' | 'headless_shell';
+
+/** The three additive runtime fields emitted on the identify payload. */
+export interface ClientRuntimeSignals {
+  /** Coarse host runtime. Electron is its own value — never reported as "Chromium". */
+  runtime: ClientRuntime;
+  /** Human-readable host app (IDE name, Electron build, headless shell, or Browser). */
+  host_app: string;
+  /** Consumer-facing client category, derived from the runtime, not the engine. */
+  client_type: ClientType;
+}
+
+interface RuntimeFacts extends ClientRuntimeSignals {
+  electron: boolean;
+  electronVersion: string;
+  nodeVersion: string;
+  ideWebview: boolean;
+  headlessShell: boolean;
+}
+
+/** UA tokens for known host applications. IDE tokens are also used for the webview verdict. */
+const HOST_APP_UA_TOKENS: Array<[RegExp, string]> = [
+  [/\bCursor\/\d/i, 'Cursor'],
+  [/\bOpenCode\/\d/i, 'OpenCode'],
+  [/\bWindsurf\/\d/i, 'Windsurf'],
+  [/VSCodium\/\d/i, 'VSCodium'],
+  [/(?:^|[\s(])(?:Code|vscode-webview)\/\d/i, 'Visual Studio Code'],
+  [/\bSlack\/\d/i, 'Slack'],
+  [/\bDiscord\/\d/i, 'Discord'],
+  [/\bTeams\/\d/i, 'Microsoft Teams'],
+  [/\bWhatsApp\/\d/i, 'WhatsApp'],
+  [/\bSpotify\/\d/i, 'Spotify'],
+  [/\bNotion\/\d/i, 'Notion'],
+  [/\bPostmanRuntime\/\d/i, 'Postman'],
+];
+
+const IDE_HOST_LABELS: ReadonlySet<string> = new Set([
+  'Cursor',
+  'OpenCode',
+  'Windsurf',
+  'VSCodium',
+  'Visual Studio Code',
+]);
+
+/**
+ * Reads the host runtime from independent immutable facts: the `Electron/<version>` UA token,
+ * `window.process.versions.electron` / `.node`, `acquireVsCodeApi`, the page protocol and known
+ * host-app tokens. No single getter is trusted, and every scope read is guarded. An Electron
+ * token is NEVER treated as the embedded Chromium engine version.
+ */
+function detectRuntimeFacts(uaOverride?: string): RuntimeFacts {
+  let ua = '';
+  if (typeof uaOverride === 'string') {
+    ua = uaOverride;
+  } else {
+    try {
+      ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+    } catch {
+      ua = '';
+    }
+  }
+
+  let electronVersion = '';
+  let nodeVersion = '';
+  let hasVsCodeApi = false;
+  let protocol = '';
+  try {
+    const scope = window as unknown as {
+      process?: { versions?: { electron?: string; node?: string } };
+      acquireVsCodeApi?: unknown;
+    };
+    electronVersion = String(scope.process?.versions?.electron || '');
+    nodeVersion = String(scope.process?.versions?.node || '');
+    hasVsCodeApi = typeof scope.acquireVsCodeApi === 'function';
+  } catch {
+    // A hostile scope is not evidence.
+  }
+  try {
+    protocol = typeof location !== 'undefined' ? location.protocol : '';
+  } catch {
+    protocol = '';
+  }
+
+  const uaElectronVersion = ua.match(/Electron\/([\d.]+)/i)?.[1] || '';
+  electronVersion = uaElectronVersion || electronVersion;
+  const electron = Boolean(uaElectronVersion || electronVersion);
+
+  const matchedHost = HOST_APP_UA_TOKENS.find(([pattern]) => pattern.test(ua));
+  const hostLabel = matchedHost ? matchedHost[1] : '';
+  const ideWebview =
+    hasVsCodeApi ||
+    /^(vscode-webview|code-oss)/i.test(protocol) ||
+    IDE_HOST_LABELS.has(hostLabel);
+  const headlessShell = /HeadlessChrome|PhantomJS|SlimerJS/i.test(ua);
+
+  let hostApp = hostLabel;
+  if (!hostApp && electron) hostApp = electronVersion ? `Electron ${electronVersion}` : 'Electron';
+  if (!hostApp && headlessShell) hostApp = 'Headless Chrome';
+  if (!hostApp && nodeVersion) hostApp = `Node.js ${nodeVersion}`;
+  if (!hostApp) hostApp = 'Browser';
+
+  let runtime: ClientRuntime = 'browser';
+  let clientType: ClientType = 'web_browser';
+  if (ideWebview) {
+    runtime = 'ide_webview';
+    clientType = 'ide_webview';
+  } else if (electron) {
+    runtime = 'electron';
+    clientType = 'desktop_app';
+  } else if (headlessShell) {
+    runtime = 'headless_shell';
+    clientType = 'headless_shell';
+  }
+
+  return {
+    runtime,
+    host_app: hostApp,
+    client_type: clientType,
+    electron,
+    electronVersion,
+    nodeVersion,
+    ideWebview,
+    headlessShell,
+  };
+}
+
+/** Public accessor used to attach `runtime` / `host_app` / `client_type` to the payload. */
+export function detectClientRuntime(ua?: string): ClientRuntimeSignals {
+  const facts = detectRuntimeFacts(ua);
+  return { runtime: facts.runtime, host_app: facts.host_app, client_type: facts.client_type };
+}
+
 const IANA_TIMEZONE_ALIASES: Record<string, string> = {
   'asia/calcutta': 'asia/kolkata',
   'asia/saigon': 'asia/ho_chi_minh',
@@ -117,6 +258,10 @@ const IANA_TIMEZONE_ALIASES: Record<string, string> = {
   'gmt': 'utc',
 };
 
+/**
+ * @deprecated Local alias folding retained for backwards compatibility only. Mismatch decisions
+ * MUST go through `isCanonicalTimezoneMismatch` / the shared `./timezone` resolver instead.
+ */
 export function normalizeTimezoneId(tz: string | null | undefined): string {
   if (!tz || typeof tz !== 'string') return '';
   const cleaned = tz.trim().toLowerCase();
@@ -124,6 +269,10 @@ export function normalizeTimezoneId(tz: string | null | undefined): string {
   return IANA_TIMEZONE_ALIASES[cleaned] || cleaned;
 }
 
+/**
+ * @deprecated Local equivalence retained for backwards compatibility only. It accepts a shared
+ * UTC offset as a match; use the canonical `./timezone` resolver for any mismatch decision.
+ */
 export function areTimezonesEquivalent(tzA: string | null | undefined, tzB: string | null | undefined): boolean {
   const normA = normalizeTimezoneId(tzA);
   const normB = normalizeTimezoneId(tzB);
@@ -144,6 +293,22 @@ export function areTimezonesEquivalent(tzA: string | null | undefined, tzB: stri
     // Ignore Intl errors on non-standard timezone strings
   }
   return false;
+}
+
+/**
+ * Canonical timezone-mismatch decision — the ONLY place a mismatch is derived.
+ *
+ * Delegates to the shared `./timezone` resolver so the browser, the server and the risk ledger
+ * compare the SAME canonical IANA identity. Legacy aliases are folded, a shared UTC offset is
+ * NOT treated as equality (Singapore != Hong Kong), and an unresolved side is absence of
+ * evidence rather than a mismatch. No raw `!==` comparison is used here, and the raw browser
+ * timezone itself is still emitted verbatim as telemetry.
+ */
+export function isCanonicalTimezoneMismatch(
+  browserTimezone: string | null | undefined,
+  ipTimezone: string | null | undefined
+): boolean {
+  return timezoneMismatchContext(browserTimezone, ipTimezone).mismatch;
 }
 
 const DATACENTER_NETWORK_PATTERN =
@@ -946,8 +1111,9 @@ async function collectClientGeoHint(): Promise<ClientGeoHint | null> {
   return null;
 }
 
-export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
+export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & ClientRuntimeSignals> {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+  const runtimeFacts = detectRuntimeFacts(ua);
   const uaData =
     typeof navigator !== 'undefined'
       ? ((navigator as unknown as { userAgentData?: NavigatorUAData }).userAgentData ?? null)
@@ -1015,7 +1181,12 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
   const chromeUa = ua.match(/Chrome\/([\d.]+)/);
   const safariUa = ua.match(/Version\/([\d.]+).*Safari/);
 
-  if (isBrave || braveBrand) {
+  if (runtimeFacts.electron) {
+    // Electron's UA contains a `Chrome/<ver>` token for the embedded engine. The Electron
+    // token (or process.versions.electron) is authoritative: label the runtime, not Chromium.
+    const ver = ua.match(/Electron\/([\d.]+)/i)?.[1] || runtimeFacts.electronVersion;
+    browser = ver ? `Electron ${ver}` : 'Electron';
+  } else if (isBrave || braveBrand) {
     const ver = braveBrand?.version || (chromeUa ? chromeUa[1] : '');
     browser = ver ? `Brave ${ver}` : 'Brave';
   } else if (detectInAppBrowser(ua)) {
@@ -1266,6 +1437,10 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo> {
     pixelRatio,
     language,
     timezone,
+    /* Additive runtime provenance — Electron is never labelled Chromium. */
+    runtime: runtimeFacts.runtime,
+    host_app: runtimeFacts.host_app,
+    client_type: runtimeFacts.client_type,
     deviceKind: deviceGate.kind,
     genuineMobile: deviceGate.genuineMobile,
     devtoolsDeviceEmulation: deviceGate.devtoolsDeviceEmulation,
@@ -1406,7 +1581,7 @@ function stableStructuralAnchors(): { fontMetric: string; mathAnchor: string } {
  */
 export async function collectHardwareSignals(
   browserDevice: BrowserDeviceInfo
-): Promise<HardwareSignals> {
+): Promise<HardwareSignals & { gpuClass: string; gpuObservation: GpuObservation }> {
   const [{ gpuVendor, gpuRenderer, maxTextureSize, gpuClass, softwareRenderer }, canvas, audio] =
     await Promise.all([
       Promise.resolve(inspectWebGlGpu()),
@@ -1539,11 +1714,18 @@ export async function collectHardwareSignals(
     // Ignore storage block
   }
 
+  // Four-state GPU observation from explicit identifiers only (canonical resolver in
+  // specInvariants.ts). A masked/unavailable extension is NEVER promoted to VM/software proof,
+  // and SwiftShader maps to `software_or_virtual` without setting any VM verdict.
+  const gpuObservation = resolveGpuObservation(gpuVendor, gpuRenderer, gpuClass);
+
   return {
     hardwareId,
     gpuVendor,
     gpuRenderer,
     maxTextureSize,
+    gpuClass,
+    gpuObservation,
     canvasHash,
     audioHash,
     cpuCores,
@@ -2316,6 +2498,53 @@ function collectCdpBridgeEvidence(stealth: StealthArtifacts, _ua?: string): stri
   return evidence;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Collector probe name -> canonical server reason id                          */
+/* -------------------------------------------------------------------------- */
+
+/** Canonical ids shared with `src/lib/verdict.ts` and the server evidence gate. */
+export const COLLECTOR_CDP_REASON_IDS = {
+  runtimeEnable: 'cdp.runtime.enable',
+  /** STRONG two-probe proof only — the uncorroborated hook alone never maps here. */
+  runtimeProof: 'cdp.runtime.enable.empty_source',
+  runtimeLeak: 'bot.cdp-runtime-leak',
+  cdcBinding: 'cdc.global.binding',
+  playwrightBinding: 'bot.playwright-binding',
+  webdriverFlag: 'navigator.webdriver',
+} as const;
+
+/**
+ * An `Error.prototype.name` preview is an engine-dependent, WEAK inspector artifact. It must
+ * never be mapped to a CDP reason id, and must never become "CDP attached" anywhere.
+ */
+const WEAK_ERROR_NAME_PREVIEW_PATTERN = /error\.?prototype\.?name|errornamepreview|name.?preview/i;
+
+/**
+ * Map a human-readable collector probe name onto the canonical server reason id. Returns
+ * `null` for weak/inconclusive probes. In particular a bare Error.name preview is ALWAYS
+ * dropped: only a CDP Runtime.enable leak corroborated by the second independent protocol
+ * probe (`cdpRuntimeProof`) may produce a CDP reason id.
+ */
+export function mapCollectorProbeToReasonId(probe: string | null | undefined): string | null {
+  const name = (probe || '').trim();
+  if (!name || WEAK_ERROR_NAME_PREVIEW_PATTERN.test(name)) return null;
+  // A single, uncorroborated Runtime.enable hook is informational only. Check this BEFORE the
+  // proof pattern: "un-corroborated" contains the word "corroborated".
+  if (/uncorroborated/i.test(name)) return COLLECTOR_CDP_REASON_IDS.runtimeLeak;
+  if (/independent protocol probe|preparestacktrace|runtimeproof|runtime\.enable\.empty_source|corroborated by/i.test(name)) {
+    return COLLECTOR_CDP_REASON_IDS.runtimeProof;
+  }
+  if (/cdp.?runtime\.enable|cdpruntimeleak|runtime enable/i.test(name)) {
+    return COLLECTOR_CDP_REASON_IDS.runtimeLeak;
+  }
+  if (/binding exposed on window or document|automation globals|\bcdc[_-]|\bcdc\.global|cdc global binding/i.test(name)) {
+    return COLLECTOR_CDP_REASON_IDS.cdcBinding;
+  }
+  if (/playwright/i.test(name)) return COLLECTOR_CDP_REASON_IDS.playwrightBinding;
+  if (/webdriver/i.test(name)) return COLLECTOR_CDP_REASON_IDS.webdriverFlag;
+  return null;
+}
+
 /**
  * Bounded, non-blocking dwell: wait (at most `CDP_CORROBORATION_DWELL_MS`) for genuine
  * trusted input before finalizing an uncorroborated-CDP escalation. Returns immediately
@@ -2351,31 +2580,12 @@ export function detectAutomationEnvironment(
   gpuRenderer?: string
 ): { environment: AutomationEnvironment; electron: boolean; ideWebview: boolean; headlessShell: boolean } {
   const userAgent = ua ?? (typeof navigator !== 'undefined' ? navigator.userAgent || '' : '');
-  let electronVersion = '';
-  let hasAcquireVsCodeApi = false;
-  let webviewProtocol = '';
-  try {
-    const scope = window as unknown as {
-      process?: { versions?: { electron?: string } };
-      acquireVsCodeApi?: unknown;
-    };
-    electronVersion = String(scope.process?.versions?.electron || '');
-    hasAcquireVsCodeApi = typeof scope.acquireVsCodeApi === 'function';
-  } catch {
-    // Hostile proxies are not evidence.
-  }
-  try {
-    webviewProtocol = typeof location !== 'undefined' ? location.protocol : '';
-  } catch {
-    // Ignore.
-  }
-
-  const electron = /Electron\/\d/i.test(userAgent) || Boolean(electronVersion);
-  const ideWebview =
-    hasAcquireVsCodeApi ||
-    IDE_WEBVIEW_UA_PATTERN.test(userAgent) ||
-    /^(vscode-webview|code-oss)/i.test(webviewProtocol);
-  const headlessShell = /HeadlessChrome|PhantomJS|SlimerJS/i.test(userAgent);
+  // Reuse the canonical runtime facts so the UA token, process.versions.electron / .node and
+  // host-app tokens all agree with the `runtime` / `host_app` / `client_type` payload fields.
+  const facts = detectRuntimeFacts(userAgent);
+  const electron = facts.electron;
+  const ideWebview = facts.ideWebview || IDE_WEBVIEW_UA_PATTERN.test(userAgent);
+  const headlessShell = facts.headlessShell;
 
   let environment: AutomationEnvironment = 'none';
   if (ideWebview) environment = 'ide_webview';
@@ -2795,9 +3005,12 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
   let desktopChromium = false;
   try {
     const ua = String(navigator.userAgent || '');
+    // An Electron UA carries the embedded Chrome token but is a distinct host runtime. Never
+    // run Chromium-only "missing window.chrome / PDF plugin" rules against an Electron shell.
     desktopChromium =
       /Chrome\/|Chromium\/|Edg\/|OPR\//i.test(ua) &&
-      !/Firefox\/|FxiOS\/|Android|iPhone|iPad|iPod|Mobile/i.test(ua);
+      !/Firefox\/|FxiOS\/|Android|iPhone|iPad|iPod|Mobile/i.test(ua) &&
+      !detectRuntimeFacts(ua).electron;
     if (desktopChromium) {
       const chromeObject = (window as unknown as { chrome?: { runtime?: unknown } }).chrome;
       if (!chromeObject || typeof chromeObject !== 'object') {
@@ -4068,6 +4281,8 @@ function resolveBrowserName(
   try {
     if (engine === 'firefox') return 'Firefox';
     if (engine === 'safari') return 'Safari';
+    // Electron embeds Chromium but is a different binary; keep the runtime label honest.
+    if (detectRuntimeFacts(ua).electron) return 'Electron';
     const brave = nav ? (nav as unknown as { brave?: unknown }).brave : undefined;
     if (brave !== undefined) return 'Brave';
     if (/Edg\//.test(ua)) return 'Edge';
@@ -4698,15 +4913,30 @@ export function isPrivacyHardenedRuntime(
 }
 
 /**
+ * Additive provenance layered onto the security payload. All fields are context/telemetry:
+ * none of them is a second bot verdict or a hardware-id anchor.
+ */
+export interface ClientProvenanceSignals extends ClientRuntimeSignals {
+  /** Four-state GPU observation (explicit identifiers only). Never a VM verdict. */
+  gpuObservation: GpuObservation;
+  /** Canonical server reason ids mapped from STRONG collector CDP probes. */
+  cdpReasonIds: string[];
+  /** True only from the two-probe Runtime proof — a weak Error.name preview never sets this. */
+  cdpAttached: boolean;
+}
+
+export type SecuritySignalsWithProvenance = SecuritySignals & ClientProvenanceSignals;
+
+/**
  * Evaluates First-Party Security & Anomaly Signals ("Smart Signals") and computes an
  * explainable Suspect & Risk Score (0-10).
  */
 export async function evaluateSecuritySignals(
   browserDevice: BrowserDeviceInfo,
-  hardwareSignals: HardwareSignals,
+  hardwareSignals: HardwareSignals & { gpuClass?: string; gpuObservation?: GpuObservation },
   clientGeoHint: ClientGeoHint | null,
   hasStoredIdentity: boolean
-): Promise<SecuritySignals> {
+): Promise<SecuritySignalsWithProvenance> {
   // 1. Automation & Headless Bot Detection (CDP bindings, native prototype checks).
   // Snapshot the CDP bridge once, up front, so the dwell decision and the authoritative
   // detector read the same probe result. A real person with DevTools open, an Electron shell
@@ -4741,6 +4971,25 @@ export async function evaluateSecuritySignals(
         : [botAssessment.botReason])
     : [];
 
+  // Map the collector's human-readable probe names onto canonical server reason ids. Weak
+  // engine-dependent artifacts (notably the Error.prototype.name preview) map to null and can
+  // never become a "CDP attached" claim; only the two-probe proof yields a CDP reason id.
+  const cdpReasonIds = Array.from(
+    new Set(
+      [...stealthSnapshot.stealthReasons, ...bridgeSnapshot, ...botSignals]
+        .map(mapCollectorProbeToReasonId)
+        .filter((id): id is string => Boolean(id))
+    )
+  );
+  const clientRuntime = detectClientRuntime(uaSnapshot);
+  const gpuObservation: GpuObservation =
+    hardwareSignals.gpuObservation ??
+    resolveGpuObservation(
+      hardwareSignals.gpuVendor,
+      hardwareSignals.gpuRenderer,
+      hardwareSignals.gpuClass ?? ''
+    );
+
   // 2. VPN / Proxy & Network Classification (Task 1 classifier)
   const browserTimezone = browserDevice.timezone || 'Unavailable';
   const ipTimezone =
@@ -4748,10 +4997,9 @@ export async function evaluateSecuritySignals(
       ? clientGeoHint.timezone
       : 'Unavailable';
 
-  const timezoneMismatch =
-    browserTimezone !== 'Unavailable' &&
-    ipTimezone !== 'Unavailable' &&
-    !areTimezonesEquivalent(browserTimezone, ipTimezone);
+  // Raw browser timezone is emitted above; the mismatch itself is derived ONLY by the
+  // canonical alias-folding helper (no raw `!==` comparison).
+  const timezoneMismatch = isCanonicalTimezoneMismatch(browserTimezone, ipTimezone);
 
   const classification = classifyIspNetwork(
     clientGeoHint?.isp ?? '',
@@ -4993,8 +5241,13 @@ export async function evaluateSecuritySignals(
     : [];
   const botVerdict = deriveBotVerdict({
     isBot: authoritativeIsBot,
+    // A hard CDP id on an exempt Electron/IDE/DevTools host must NOT make the gate disagree
+    // with the authoritative human verdict. Keep the payload ids for the server, but only
+    // feed them into the parity gate when the runtime is already a bot.
     reasonIds: authoritativeIsBot
       ? [
+          // Canonical ids from strong collector probes. Weak preview artifacts never reach here.
+          ...cdpReasonIds,
           ...botSignals,
           ...hardAutomationEvidence.map((reason) => `cdc.${reason}`),
           ...cdpEscalationReasonIds,
@@ -5104,8 +5357,16 @@ export async function evaluateSecuritySignals(
     botVerdictAssertion: botVerdict.assertion,
     vpnSuspected,
     timezoneMismatch,
+    /** Raw browser timezone — emitted verbatim (mismatch uses the canonical helper only). */
     browserTimezone,
     ipTimezone,
+    /* Additive provenance — runtime / GPU observation / strong CDP ids, never a verdict. */
+    runtime: clientRuntime.runtime,
+    host_app: clientRuntime.host_app,
+    client_type: clientRuntime.client_type,
+    gpuObservation,
+    cdpReasonIds,
+    cdpAttached: stealthSnapshot.cdpRuntimeProof,
     datacenterAsn,
     cloudOrMaskedGpu,
     vpnReasons,
@@ -6025,6 +6286,28 @@ export function saveFirstPartyStorage(
 let inFlightRequest: Promise<IntelVisitorResponse> | null = null;
 
 /**
+ * Native-farbling hints for the canvas noise classifier. These are derived from the same
+ * UA/runtime facts used everywhere else in the collector, so a Brave/Safari/Firefox/Samsung
+ * farbling pattern is classified as a privacy defence rather than an injected-noise spoof.
+ * No hint is a verdict: the classifier still requires pixel evidence.
+ */
+function buildBrowserCanvasHints(ua: string, browserLabel: string): BrowserCanvasHints {
+  const chromiumToken = /Chrome\/|Chromium\/|Edg\/|OPR\/|CriOS\//i.test(ua);
+  return {
+    isBrave: /Brave\//i.test(ua) || /\bbrave\b/i.test(browserLabel),
+    isFirefox: /Firefox\/|FxiOS\//i.test(ua) || /\bfirefox\b/i.test(browserLabel),
+    isSafari17Plus:
+      /Version\/(?:1[7-9]|[2-9]\d)(?:\.|$)/.test(ua) &&
+      /Safari\//i.test(ua) &&
+      !chromiumToken,
+    isSamsung: /SamsungBrowser\//i.test(ua) || /\bsamsung\b/i.test(browserLabel),
+    // Private mode is supplied by the dedicated storage-physics probe, not a UA guess; an
+    // unknown hint is deliberately omitted rather than assumed.
+    privateMode: undefined,
+  };
+}
+
+/**
  * Builds the tri-layer identity profile posted to `/api/visitor/identify`.
  *
  * The object is deliberately BOTH shapes at once: engine-native family objects
@@ -6186,9 +6469,13 @@ export async function identifyCurrentVisitor(options?: {
     const stored = getFirstPartyStorage();
     // The legacy hardware probe and the new tri-layer collectors run concurrently, so the
     // added wall-clock cost is the slower of the two — never the sum. Both are total.
+    const browserCanvasHints = buildBrowserCanvasHints(
+      typeof navigator !== 'undefined' ? navigator.userAgent || '' : '',
+      browserDevice.browser
+    );
     const [hardwareSignals, collectedSignals, storedIdentity] = await Promise.all([
       collectHardwareSignals(browserDevice),
-      collectAllSignals({ timeouts: 1200 }).catch(() => null),
+      collectAllSignals({ timeouts: 1200, browserHints: browserCanvasHints }).catch(() => null),
       loadStoredIdentity().catch(() => ({ identity: null, sources: [], storage_healed: false })),
     ]);
     const identitySessionId = getSessionId().sessionId;
@@ -6246,12 +6533,28 @@ export async function identifyCurrentVisitor(options?: {
           ...collectedSignals,
           systemEntropy: {
             ...collectedSignals.systemEntropy,
+            // DST / travel changes the raw minute offset. It stays as context in the payload
+            // but is neutralised here so it can never split the stable hardware identity.
+            timezoneOffset: null,
             screen: { ...collectedSignals.systemEntropy.screen, maxTouchPoints: null },
           },
         })
       : hardwareSignals.hardwareId;
     const identityBrowserFingerprint = collectedSignals
-      ? computeBrowserFingerprint(collectedSignals)
+      ? computeBrowserFingerprint({
+          ...collectedSignals,
+          systemEntropy: {
+            ...collectedSignals.systemEntropy,
+            // Storage usage churns with every cache/write; it is context, never a digest input.
+            // The quota figure is retained as low-volatility context.
+            storageQuota: collectedSignals.systemEntropy.storageQuota
+              ? {
+                  usage: null,
+                  quota: collectedSignals.systemEntropy.storageQuota.quota,
+                }
+              : null,
+          },
+        })
       : hardwareSignals.canvasHash;
     const identityProfile = collectedSignals
       ? buildIdentityProfile(
@@ -6296,6 +6599,25 @@ export async function identifyCurrentVisitor(options?: {
         // High-entropy UA-CH values; the server's own `Sec-CH-UA*` headers outrank them.
         clientHints,
         securityEnvelope,
+        /* Additive provenance (Tranche 0-1). Mirrors the security-signals copy so either
+           payload path can consume it. Electron is reported as `runtime: 'electron'`, never
+           as Chromium; the GPU observation is a four-state bucket, not a VM verdict. */
+        runtime: securitySignals.runtime,
+        host_app: securitySignals.host_app,
+        client_type: securitySignals.client_type,
+        gpuObservation: securitySignals.gpuObservation,
+        browserTimezone: securitySignals.browserTimezone,
+        // Volatile values are kept as CONTEXT only — never folded into a digest or identity key.
+        // The raw browser UTC offset also stays in `rawDeviceAttributes.timezone_offset`.
+        storageQuotaContext: collectedSignals?.systemEntropy.storageQuota ?? null,
+        cdpReasonIds: securitySignals.cdpReasonIds,
+        inspectorSignals: {
+          // Only STRONG two-probe CDP proof may claim an attached bridge. The weak
+          // Error.prototype.name preview is telemetry in `inspectorProbes` only.
+          cdpAttached: securitySignals.cdpAttached,
+          devtoolsActiveVerified: false,
+          viewportContractionNormalized: false,
+        },
         // Fresh interaction evidence / human corroboration (recomputed above on every call).
         humanCorroboration: securitySignals.isBot ? 0 : freshHuman.score,
         humanCorroborationChecks: freshHuman.checks,

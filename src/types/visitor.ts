@@ -1,3 +1,11 @@
+import type {
+  GpuObservation,
+  InspectorStateTristate,
+  RiskEvidenceLine,
+  RiskTier,
+} from '../lib/telemetryContract';
+import type { ClientType, RuntimeKind } from '../shared/normalization/uaNormalizer';
+
 export interface BrowserDeviceInfo {
   browser: string;
   os: string;
@@ -387,6 +395,14 @@ export interface SecuritySignals {
   highActivityDevice?: boolean;
   rareDevice?: boolean;
   rareDevicePercentileBucket?: string;
+
+  /* Additive canonical-risk mirrors — OPTIONAL, never re-derived on the client. */
+  /** 0–10 headline mirrored verbatim from the canonical ledger. */
+  score10?: number;
+  /** Canonical tier mirrored verbatim from the canonical ledger. */
+  risk_tier?: RiskTier;
+  /** Flat scored-line mirror of `risk.evidence_ledger`. */
+  evidence_ledger?: RiskEvidenceLine[];
 }
 
 export type LocationSource = 'edge' | 'provider' | 'consensus' | 'tor-relay' | 'none';
@@ -440,6 +456,19 @@ export interface LocationInfo {
   isNetworkLocation?: boolean;
   /** Egress-node details, populated for Tor / VPN / proxy connections. */
   networkLocation?: NetworkLocationInfo;
+
+  /* Additive geo-enrichment fields (canonical contract) — all OPTIONAL. Values come only
+     from the edge / provider; an unavailable value is never replaced with an invented one. */
+  /** ISO continent code (e.g. `NA`). The edge may report a full name instead. */
+  continent_code?: string;
+  /** Postal / ZIP code reported by the geo provider. */
+  postal_code?: string;
+  /** ISO-3166-2 subdivision code (e.g. `CA`), not the human-readable `region` name. */
+  subdivision_iso?: string;
+  /** Accuracy radius in kilometres, or null when the provider supplied none. */
+  accuracy_radius?: number | null;
+  /** Routed BGP prefix for the egress ASN (e.g. `73.136.0.0/13`). */
+  asn_network?: string;
 }
 
 export interface VisitStatistics {
@@ -583,6 +612,15 @@ export interface IntelVisitorResponse {
     visitor_found: boolean;
     tampering: boolean;
     spoof_likelihood: 'low' | 'medium' | 'high';
+    /* Additive label / calibration mirrors — OPTIONAL, mirrored from the canonical envelope. */
+    /** Human-facing label for the published score. */
+    label?: string;
+    /** Held-out calibration gate status. */
+    calibration_status?: 'uncalibrated' | 'calibrated';
+    /** Human-facing confidence label (`Confidence N%` / `Match evidence N%`). */
+    confidence_label?: string;
+    /** Version of the calibration artifact applied to the score. */
+    calibration_version?: string;
   };
   /** Cross-signal consistency verdict derived from the resolver's constraint violations. */
   consistency?: {
@@ -590,5 +628,69 @@ export interface IntelVisitorResponse {
     spoof_likelihood: 'low' | 'medium' | 'high';
     flags: string[];
     agent_verdict: string;
+    /** Optional human-facing label mirrored from the canonical envelope. */
+    label?: string;
   };
+
+  /* ------------------------------------------------------------------------ */
+  /* Additive canonical-contract fields — ALL OPTIONAL. Legacy payloads stay valid.
+     Every value below is mirrored verbatim from the server's canonical envelope; the
+     dashboard never re-derives any of them. See src/lib/telemetryContract.ts and
+     src/shared/normalization/uaNormalizer.ts for the source vocabulary. */
+  /** Host runtime that renders the page (engine-independent: electron, node, webview, …). */
+  runtime?: RuntimeKind;
+  /** Host application name when the runtime is an Electron / IDE / WebView shell. */
+  host_app?: string;
+  /** Broker-facing client classification derived from `runtime`. */
+  client_type?: ClientType;
+  /** True when the UA source (HTTP header vs client hints / JS) disagreed. */
+  ua_source_mismatch?: boolean;
+  /** Normalized GPU truth bucket from the labeling / calibration pipeline. */
+  gpuObservation?: GpuObservation;
+  /** Certainty-only inspector attachment signal carried by the canonical envelope. */
+  inspectorState?: InspectorStateTristate;
+  /** Flat inspector probe flags carried beside the canonical automation verdict. */
+  inspectorFlags?: {
+    cdp_attached?: boolean;
+    developer_tools?: boolean;
+  };
+  /** Version of the canonical envelope schema. */
+  schemaVersion?: number;
+  /** Version of the parser that produced the canonical payload. */
+  parserVersion?: string;
+  /** Source-control revision of the build that emitted the payload. */
+  buildSha?: string;
+
+  /* Flat risk mirrors — the canonical OrthogonalRiskLedger is the single source. */
+  /** Flat scored-line mirror of `risk.evidence_ledger`. */
+  evidence_ledger?: RiskEvidenceLine[];
+  /** camelCase alias of `evidence_ledger` used by the canonical envelope. */
+  evidenceLedger?: RiskEvidenceLine[];
+  /** 0–10 headline score mirrored verbatim from the canonical ledger. */
+  score10?: number;
+  /** Canonical risk tier mirrored verbatim from the canonical ledger. */
+  risk_tier?: RiskTier;
+
+  /* Labeling / calibration provenance used by the offline training pipeline. */
+  /** Ground-truth label assigned to this observation. */
+  label?: string;
+  /** When the telemetry observation was captured (ISO-8601). */
+  observation_timestamp?: string;
+  /** When the ground-truth label was assigned (ISO-8601). */
+  label_timestamp?: string;
+  /** Who or what produced the label (analyst, model id, rule set, …). */
+  label_source?: string;
+  /** Scoring model version used at observation time. */
+  model_version?: string;
+  /** Calibration artifact version applied to the score. */
+  calibration_version?: string;
+  /** Hash of the weight configuration used for scoring. */
+  weight_config_hash?: string;
+
+  /* Geo-enrichment mirrors of `location`, using the canonical snake_case names. */
+  continent_code?: string;
+  postal_code?: string;
+  subdivision_iso?: string;
+  accuracy_radius?: number | null;
+  asn_network?: string;
 }
