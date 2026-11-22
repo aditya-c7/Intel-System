@@ -310,11 +310,11 @@ export function NetworkStabilityPanel() {
     }
   }, []);
 
-  // Immediate first probe on mount so the header never sits on a placeholder while the
-  // 5-second monitor loop is still scheduling its first sample.
-  useEffect(() => {
-    void executePingProbe();
-  }, [executePingProbe]);
+  // NOTE: there is deliberately no separate "first probe on mount" effect here. The leased
+  // monitor loop below already issues its first probe immediately on start, and it is the only
+  // path that checks the single-leader lease. A mount-time probe with no lease check made every
+  // newly opened tab issue an unthrottled /api/network/ping, defeating the one-tab quota guard
+  // and producing a duplicate render-to-render ping burst.
 
   const toggleMonitor = useCallback(() => {
     setIsRunning((prev) => {
