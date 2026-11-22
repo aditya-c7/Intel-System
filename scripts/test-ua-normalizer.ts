@@ -258,6 +258,54 @@ expectIdentity(
   { device: 'Unknown' },
 );
 
+/* Chromium 156 Linux regression (additive) ---------------------------------- */
+
+const CHROMIUM_156_LINUX_UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36';
+
+const chromium156Result = expectIdentity(
+  'Chromium 156.0.8078.79 (Linux) resolves to a concrete browser (never Unknown)',
+  {
+    userAgent: CHROMIUM_156_LINUX_UA,
+    platform: 'Linux',
+    clientHints: {
+      fullVersionList: [
+        { brand: 'Not)A;Brand', version: '24.0.0.0' },
+        { brand: 'Chromium', version: '156.0.8078.79' },
+      ],
+      platform: 'Linux',
+    },
+  },
+  {
+    os: 'Linux',
+    browserName: 'Chromium',
+    browserMajorVersion: '156',
+    browserFullVersion: '156.0.8078.79',
+  },
+);
+check(
+  'Chromium 156.0.8078.79 (Linux) is never reported as Unknown',
+  chromium156Result.browserName !== 'Unknown',
+  chromium156Result,
+);
+
+const chromium156BrandsOnly = normalizeUserAgent({
+  userAgent: CHROMIUM_156_LINUX_UA,
+  platform: 'Linux',
+  clientHints: {
+    brands: [
+      { brand: 'Not)A;Brand', version: '24' },
+      { brand: 'Chromium', version: '156' },
+    ],
+    platform: 'Linux',
+  },
+});
+check(
+  'UA_DATA brands-only Chromium 156 with GREASE tokens is never Unknown',
+  chromium156BrandsOnly.browserName !== 'Unknown',
+  chromium156BrandsOnly,
+);
+
 /* Assertion helper ---------------------------------------------------------- */
 
 const badDigit = validateUserAgentNormalization({
