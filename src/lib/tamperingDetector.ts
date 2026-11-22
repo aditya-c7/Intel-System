@@ -32,7 +32,26 @@
  * artifacts that also occur on genuine mobile browsers and under privacy extensions — they
  * are NEVER promoted on their own, and only ever accompany strong proof as context. This
  * is what keeps a real Android/Chrome visitor out of the automation gate.
+ *
+ * Cross-scope "tampering lie" observations (`tamperingLies.ts`) are integrated as an
+ * ADDITIVE shadow verdict only: `resolveTamperingLies` is called with caller-supplied
+ * observations and the result is exposed as `tampering_lies`. It never feeds `tampering`,
+ * `anti_detect_browser`, `tampering_ml_score`, or any risk score / verdict tier.
+ *
+ * A rating layer enforces the false-positive rule on the SHADOW flag only: STRONG (rating 1)
+ * contradictions — user-agent / platform / brand divergence between the page and a worker,
+ * an iframe realm leak, automation stack frames, a cyclic __proto__ proxy trap, and a
+ * 12-triple shader-backend mismatch — may set the additive `anti_detect_browser`. SOFT
+ * (rating 0.5) warnings — languages / hardwareConcurrency / deviceMemory drift, ActiveText
+ * color (Windows claim + pure red), simple native getters and privacy-class audio noise —
+ * keep their score and reason but can NEVER set that flag. Privacy hardening still removes
+ * noise-only lies; cdc_* / webdriver / CDP artifacts are marked artifact-only so they can
+ * never set the flag either. Worker collection order (service → shared → dedicated) and
+ * its timeouts (4s / 3s / 3s) are collection-side concerns; this function only consumes the
+ * resulting observations.
  */
+
+import { resolveTamperingLies, type TamperingLiesResult, type WorkerScopeObservations } from './tamperingLies';
 
 export type TamperingConfidence = 'low' | 'medium' | 'high';
 
@@ -50,6 +69,9 @@ export interface TamperingDetails {
    * Error.prototype.name preview) never appear here on their own. The verdict module
    * promotes this list to the single authoritative bot gate. */
   hardAutomationEvidence?: string[];
+  /** Additive shadow mirror of the cross-scope lie verdict, colocated with the other tamper
+   * telemetry. Identical to the top-level `tampering_lies`; never a verdict input. */
+  tampering_lies?: TamperingLiesResult;
 }
 
 export interface TamperingAssessment {
@@ -59,6 +81,50 @@ export interface TamperingAssessment {
   tampering_confidence: TamperingConfidence;
   tampering_ml_score: number;
   tampering_details: TamperingDetails;
+  /** Additive, shadow-only cross-scope lie verdict. Carries the resolver's score and reasons
+   * with the false-positive rating layer applied to its flag. NEVER consumed by the canonical
+   * tampering verdict, risk score, or verdict tier. Zero/low/false when no observations
+   * are supplied. */
+  tampering_lies: TamperingLiesResult;
+  /** Additive rating metadata for `tampering_lies`: which signals were STRONG (rating 1)
+   * versus SOFT warnings (rating 0.5). Never a verdict input. */
+  tampering_lies_rating: TamperingLieRating;
+}
+
+/** Rating metadata for the additive shadow lie verdict. */
+export interface TamperingLieRating {
+  /** 1 when at least one strong contradiction fired, 0.5 for warnings only, 0 when clean. */
+  rating: 1 | 0.5 | 0;
+  /** Reasons backed by STRONG (rating 1) evidence. */
+  strong_signals: string[];
+  /** Reasons backed only by SOFT (rating 0.5) evidence. */
+  weak_signals: string[];
+  /** True when nothing stronger than a 0.5 warning fired. */
+  warning_only: boolean;
+}
+
+/**
+ * Extra shadow signals the standalone resolver cannot represent in `WorkerScopeObservations`.
+ * All are precomputed by the collector's worker/prototype/shader/audio probes; none is read
+ * from a platform API here and none can change the canonical verdict.
+ */
+export interface TamperingLieExtras {
+  /** UA-CH `navigator.userData.brands` differs between window and worker (STRONG). */
+  brandsDivergence?: boolean | null;
+  /** Clean-iframe `srcdoc` reports the same Navigator identity as the top realm (STRONG). */
+  iframeRealmLeak?: boolean | null;
+  /** Automation frames are present in the captured error stack (STRONG). */
+  automationStackFrames?: boolean | null;
+  /** Cyclic `__proto__` trap succeeded: `Object.setPrototypeOf(fn, Object.create(fn))`
+   * did not throw, which only a Proxy permits (STRONG). */
+  prototypeCyclicTrap?: boolean | null;
+  /** Intentional Brave / Firefox RFP / Safari AFP audio noise: classified as privacy, not
+   * spoofing, so the audio reasons are dropped from the additive verdict. */
+  audioPrivacyNoise?: boolean | null;
+  /** Count of `getShaderPrecisionFormat` triples (2 stages x 3 precisions x 2 types).
+   * 12 is the full OS-backend check; an explicit value below 12 downgrades the shader
+   * contradiction to a 0.5 warning. Absent counts keep the resolver's strong default. */
+  shaderPrecisionTripleCount?: number | null;
 }
 
 export interface TamperingInput {
@@ -69,6 +135,10 @@ export interface TamperingInput {
   /** Confirmed privacy-hardened runtime. Suppresses anti-detect/tamper rules that are
    * intentional defences (RFP device-width drift, getter wrappers, UA reduction). */
   privacyHardened?: boolean;
+  /** Optional cross-scope "tampering lie" observations forwarded to `resolveTamperingLies`.
+   * Additive only: the rated verdict is emitted as `tampering_lies` and cannot change this
+   * function's canonical verdict, score, or anti_detect_browser flag. */
+  tamperingLies?: (WorkerScopeObservations & TamperingLieExtras) | null;
 }
 
 /** Desktop-only platform strings. A real handheld never reports one. */
@@ -215,6 +285,73 @@ function detectAutomationTamper(): string[] {
   }
   // Only accompany genuinely strong proof with the weak artifacts as explanatory detail.
   return [...strong, ...weakAutomationArtifacts()];
+}
+
+/**
+ * Additive-only automation probe. Wider and read-only: it marks the shadow lie verdict as
+ * "automation artifact only" for every cdc_* / webdriver / CDP trace so those artifacts can
+ * never turn on the additive `anti_detect_browser` flag. It deliberately does NOT feed the
+ * canonical hard-evidence list, so no canonical verdict, score, or tier can change here.
+ */
+function observesAutomationArtifacts(hardEvidence: string[]): boolean {
+  if (hardEvidence.length > 0) return true;
+  try {
+    if (typeof navigator !== 'undefined' && navigator.webdriver === true) return true;
+  } catch {
+    // Ignore hostile proxies.
+  }
+  for (const target of [
+    typeof window !== 'undefined' ? (window as unknown as object) : null,
+    typeof document !== 'undefined' ? (document as unknown as object) : null,
+  ]) {
+    if (!target) continue;
+    try {
+      for (const key of Object.getOwnPropertyNames(target)) {
+        if (AUTOMATION_GLOBAL_PATTERN.test(key)) return true;
+      }
+    } catch {
+      // An unreadable global is not evidence either way.
+    }
+  }
+  return false;
+}
+
+/** STRONG (rating 1) lie evidence: a physical identity contradiction or an injected realm. */
+const STRONG_LIE_REASON =
+  /navigator\.(?:userAgent|platform) divergence|brands divergence|shader precision profile|iframe realm leak|automation stack frame|cyclic __proto__/i;
+
+/** SOFT (rating 0.5) lie evidence: warnings legitimately produced by Chrome privacy tools. */
+const WEAK_LIE_REASON =
+  /navigator\.(?:languages|hardwareConcurrency|deviceMemory) divergence|ActiveText color|silent audio buffer|repeated audio reads diverged|proxy-wrapped|iframe stealth trap/i;
+
+/**
+ * Rate the additive lie reasons. Only STRONG (rating 1) contradictions may set the shadow
+ * anti-detect flag; a lone 0.5 warning stays a warning (its score/reason are still reported).
+ * A shader profile collected with fewer than 12 precision triples is the weaker 8-triple
+ * CreepJS-style probe and is downgraded to a warning.
+ */
+function rateLieReasons(reasons: string[], shaderTriples?: number | null): TamperingLieRating {
+  const strong_signals: string[] = [];
+  const weak_signals: string[] = [];
+  for (const reason of reasons) {
+    const isShader = /shader precision profile/i.test(reason);
+    const shaderTooShort =
+      isShader && typeof shaderTriples === 'number' && Number.isFinite(shaderTriples) && shaderTriples < 12;
+    if (shaderTooShort) {
+      // CreepJS-style 8-triple probe: still a warning, never a hard OS-backend contradiction.
+      weak_signals.push(reason);
+    } else if (STRONG_LIE_REASON.test(reason)) {
+      strong_signals.push(reason);
+    } else if (WEAK_LIE_REASON.test(reason)) {
+      weak_signals.push(reason);
+    }
+  }
+  return {
+    rating: strong_signals.length > 0 ? 1 : weak_signals.length > 0 ? 0.5 : 0,
+    strong_signals,
+    weak_signals,
+    warning_only: strong_signals.length === 0 && weak_signals.length > 0,
+  };
 }
 
 function detectEngine(): { evalLen: number; isV8: boolean; hasChrome: boolean; isWebKit: boolean } {
@@ -507,6 +644,70 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     ? devtoolsEmulation
     : devtoolsEmulation || antiDetect || anomalyPoints >= 40;
 
+  // ADDITIVE shadow path. Every canonical value above is already final; nothing below can
+  // change `tampering`, `anti_detect_browser`, `tampering_ml_score`, or any risk/verdict tier.
+  // The resolver suppresses noise-only lies under privacy hardening; the rating layer here
+  // additionally guarantees that a lone 0.5 warning can NEVER set the shadow anti-detect
+  // flag. cdc_* / webdriver / CDP traces are marked artifact-only, so they cannot set it
+  // either. A hostile observation object degrades to the resolver's safe zero verdict.
+  let tampering_lies: TamperingLiesResult = resolveTamperingLies();
+  let tampering_lies_rating: TamperingLieRating = {
+    rating: 0,
+    strong_signals: [],
+    weak_signals: [],
+    warning_only: false,
+  };
+  try {
+    const source =
+      input.tamperingLies && typeof input.tamperingLies === 'object' ? input.tamperingLies : null;
+    const automationArtifactOnly =
+      source?.automationArtifactOnly === true || observesAutomationArtifacts(hardAutomationEvidence);
+    const resolved = resolveTamperingLies({
+      ...(source ?? {}),
+      privacyHardened: privacyHardened || source?.privacyHardened === true,
+      automationArtifactOnly,
+    });
+
+    // Brave / Firefox RFP / Safari AFP audio noise is a privacy defence, not spoofing: drop
+    // those reasons and their 0.15 weights even when the caller did not flag a hardened UA.
+    const audioReason = /silent audio buffer|repeated audio reads diverged/i;
+    const audioPrivacy = source?.audioPrivacyNoise === true;
+    const droppedAudio = audioPrivacy
+      ? resolved.reasons.filter((reason) => audioReason.test(reason)).length
+      : 0;
+    const reasons = audioPrivacy
+      ? resolved.reasons.filter((reason) => !audioReason.test(reason))
+      : [...resolved.reasons];
+
+    // Strong signals the standalone resolver cannot encode in WorkerScopeObservations.
+    if (source?.brandsDivergence === true) {
+      reasons.push('navigator.userAgentData.brands divergence between window and worker');
+    }
+    if (source?.iframeRealmLeak === true) {
+      reasons.push('clean-iframe srcdoc Navigator identity leak (stealth script)');
+    }
+    if (source?.automationStackFrames === true) {
+      reasons.push('automation stack frames detected in the error stack');
+    }
+    if (source?.prototypeCyclicTrap === true) {
+      reasons.push('cyclic __proto__ trap succeeded (Proxy-wrapped native)');
+    }
+
+    tampering_lies_rating = rateLieReasons(reasons, source?.shaderPrecisionTripleCount);
+    tampering_lies = {
+      anomaly_score: Math.max(
+        0,
+        Number((resolved.anomaly_score - droppedAudio * 0.15).toFixed(4))
+      ),
+      // Only STRONG (rating 1) evidence can set the flag, and automation artifacts never can.
+      anti_detect_browser: tampering_lies_rating.rating === 1 && !automationArtifactOnly,
+      tampering_confidence: tampering_lies_rating.rating === 1 ? 'high' : 'low',
+      reasons,
+    };
+  } catch {
+    // Keep the safe zero verdict and empty rating; never throw into the canonical pipeline.
+  }
+
   return {
     tampering: isTampered,
     developerTools,
@@ -519,6 +720,9 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
       privacy_hardened: privacyHardened,
       reasons,
       hardAutomationEvidence: privacyHardened ? [] : hardAutomationEvidence,
+      tampering_lies,
     },
+    tampering_lies,
+    tampering_lies_rating,
   };
 }

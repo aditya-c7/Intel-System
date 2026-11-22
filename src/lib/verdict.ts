@@ -67,6 +67,17 @@ const HARD_REASONS: ReadonlySet<string> = new Set([
   'page.ua.cursor',
   'page.platform.cloudflare-workers',
   'launch.ipc-flooding-switch',
+  // Shadow stealth probes mapped into THIS hard tier (no second taxonomy): a CSP
+  // bypass / injected init-script artifact is deterministic automation proof.
+  'stealth.bypass-csp',
+  'playwright.init-scripts',
+  // Confirmed (RED) stealth variants: protocol-level impossibilities that page scripts,
+  // extensions and user settings cannot reproduce. The plain ids stay medium/weak.
+  'stealth.runtime-enable-protocol',
+  'stealth.document-interception-protocol',
+  'stealth.storage-partitioning-protocol',
+  'stealth.puppeteer-source-url',
+  'stealth.playwright-source-url',
   // Real Playwright/CDC bindings and protocol-level CDP tamper are deterministic artifacts
   // of a driven runtime. A plain CDP attachment stays in the developer_tools tier (see
   // DEVELOPER_TOOLS_REASONS / the `cdp.` prefix rule); only a *corroborated* CDP bridge is
@@ -89,6 +100,9 @@ const DEVELOPER_TOOLS_REASONS: ReadonlySet<string> = new Set([
   'cdp.runtime.enable.empty_source',
   'cdp.network.enable.pre_load_message',
   'bot.cdp-runtime-leak',
+  // A stealth probe that could not decide (no CSP, thrown exception, missing
+  // preconditions) is reported at weight 0: it never escalates and never corroborates.
+  'stealth.inconclusive',
 ]);
 
 /** Reason ids that need a corroborating companion before an agent verdict. */
@@ -105,6 +119,11 @@ const MEDIUM_REASONS: ReadonlySet<string> = new Set([
   'grok.cloud-computer.environment',
   'codex.prompt.anonymous-native',
   'codex.keyboard.empty-layout-map',
+  // Conditional stealth probes (runtime-enable leak, document interception, storage
+  // partitioning): corroboration or a companion is mandatory, exactly like other mediums.
+  'stealth.runtime-enable-leak',
+  'stealth.document-interception',
+  'stealth.storage-partitioning',
 ]);
 
 /**
@@ -136,6 +155,11 @@ const WEAK_REASONS: ReadonlySet<string> = new Set([
   'bot.webdriver-getter-tampered-cdp',
   'bot.webdriver-getter-tampered',
   'bot.automation-getter-tampered',
+  // Stealth source-URL leak and popup-blocking are telemetry-only. Exact entries
+  // keep the source-URL leak in `weak` instead of the bare `cdp.` developer_tools
+  // prefix — never a hard CDP escalation.
+  'cdp.runtime.evaluate.source-url',
+  'bot.popup-blocking',
 ]);
 
 /** Prefix rules evaluated after the exact sets (first match wins). */
@@ -170,6 +194,97 @@ export function classifyReasonId(reasonId: string): ReasonWeight {
     if (id.startsWith(rule.prefix)) return rule.weight;
   }
   return 'weak';
+}
+
+/* -------------------------------------------------------------------------- */
+/* Stealth-signal → existing taxonomy bridge                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Maps `src/lib/stealthSignals.ts` signal ids onto the reason ids of THIS taxonomy.
+ * This is a bridge into the four tiers above — not a second weight vocabulary.
+ */
+export const STEALTH_SIGNAL_REASON_IDS: Readonly<Record<string, string>> = Object.freeze({
+  runtimeEnableLeak: 'stealth.runtime-enable-leak',
+  ipcFloodingProtection: 'launch.ipc-flooding-switch',
+  documentInterception: 'stealth.document-interception',
+  storagePartitioning: 'stealth.storage-partitioning',
+  cdpBindingGlobals: 'cdp.runtime.enable',
+  sourceUrlLeak: 'cdp.runtime.evaluate.source-url',
+  pwInitScripts: 'playwright.init-scripts',
+  exposeFunctionLeak: 'bot.playwright-binding',
+  bypassCsp: 'stealth.bypass-csp',
+  popupBlocking: 'bot.popup-blocking',
+  marionette: 'navigator.webdriver',
+  chromeHeadlessShell: 'ua.headless-chrome',
+});
+
+/**
+ * Qualifiers for a stealth observation. They select between reason ids that ALREADY
+ * live in the four tiers above — this is not a second RED/YELLOW weight vocabulary.
+ * RED (protocol-level impossibility) → hard; YELLOW (reproducible by page scripts,
+ * extensions or user settings) → medium/weak; inconclusive → weight-0 developer_tools.
+ */
+export interface StealthReasonOptions {
+  /** The signal's RED sub-variant was observed (exact protocol-level condition). */
+  confirmed?: boolean;
+  /** DevTools is docked: a runtime-enable leak is capped at YELLOW, never RED. */
+  docked?: boolean;
+  /** The probe could not decide (no CSP, exception, missing precondition). */
+  inconclusive?: boolean;
+  /** Only the soft/YELLOW form was seen (e.g. SwiftShader on a headless-shell host). */
+  soft?: boolean;
+  /** Attribution for a confirmed source-URL leak. */
+  source?: 'puppeteer' | 'playwright' | null;
+}
+
+/**
+ * Reason id for a stealth signal id. A corroborated CDP bridge maps to the single
+ * sanctioned hard-escalation id; a bare bridge stays in `developer_tools` (weight 0).
+ */
+export function stealthReasonId(
+  id: string,
+  corroborated = false,
+  options: StealthReasonOptions = {},
+): string | null {
+  const base = STEALTH_SIGNAL_REASON_IDS[id];
+  if (base === undefined) return null;
+  if (options.inconclusive) return 'stealth.inconclusive';
+
+  if (id === 'cdpBindingGlobals') {
+    return corroborated ? CORROBORATED_CDP_REASON_ID : base; // bare = developer_tools hint
+  }
+  if (id === 'sourceUrlLeak') {
+    if (options.confirmed) {
+      return options.source === 'puppeteer'
+        ? 'stealth.puppeteer-source-url'
+        : 'stealth.playwright-source-url';
+    }
+    return base; // bare filename = weak/yellow
+  }
+  if (id === 'chromeHeadlessShell') {
+    return options.soft ? 'headless.swiftshader.caveat' : base; // SwiftShader = weak/yellow
+  }
+  if (id === 'runtimeEnableLeak') {
+    return options.confirmed && !options.docked ? 'stealth.runtime-enable-protocol' : base;
+  }
+  if (id === 'documentInterception') {
+    return options.confirmed ? 'stealth.document-interception-protocol' : base;
+  }
+  if (id === 'storagePartitioning') {
+    return options.confirmed ? 'stealth.storage-partitioning-protocol' : base;
+  }
+  return base;
+}
+
+/** Existing-tier weight for a stealth signal id; null for an unknown id. */
+export function stealthReasonWeight(
+  id: string,
+  corroborated = false,
+  options: StealthReasonOptions = {},
+): ReasonWeight | null {
+  const reason = stealthReasonId(id, corroborated, options);
+  return reason === null ? null : classifyReasonId(reason);
 }
 
 /**

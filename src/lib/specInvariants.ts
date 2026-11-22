@@ -799,3 +799,303 @@ export function checkShadowProxyVpnInvariants(input: ShadowProxyVpnInput = {}): 
     return [];
   }
 }
+
+/* -------------------------------------------------------------------------- */
+/* Integrated fields — additive invariant helpers                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Read a published boolean that may arrive flat, or as an EventV4-style
+ * `DetectionSignal` (`{ detected }`). Only a literal `true`/`false` is evidence;
+ * `shadowField` / `shadowBool` keep hostile getters from escaping as a throw.
+ */
+function integratedBool(record: unknown, key: string): boolean | undefined {
+  const value = shadowField(record, key);
+  if (typeof value === 'boolean') return value;
+  return shadowBool(value, 'detected');
+}
+
+/** Explicit verified-good-bot / crawler exemption for a datacenter label. */
+function integratedGoodBotExempt(source: unknown): boolean {
+  return (
+    shadowBool(source, 'verified_good_bot') === true ||
+    shadowBool(source, 'verifiedGoodBot') === true ||
+    shadowBool(source, 'good_bot_exempt') === true ||
+    shadowBool(source, 'goodBotExempt') === true ||
+    shadowField(source, 'bot_subtype') === 'good_bot' ||
+    shadowField(source, 'botSubtype') === 'good_bot'
+  );
+}
+
+function integratedDatacenterLabel(value: unknown): boolean {
+  return (
+    typeof value === 'string' &&
+    /datacenter|data[_-]?center|hosting|cloud/i.test(value)
+  );
+}
+
+/**
+ * The fields the privacy / anti-detect invariant inspects. Every field is optional: a partial
+ * payload yields only the diagnostics it can actually support. `privacy_settings` accepts both
+ * the flat boolean and the EventV4 `DetectionSignal` shape; `anti_detect_browser` also accepts
+ * the canonical `tampering` axis and the flat `tampering_details` mirror.
+ */
+export interface PrivacyAntiDetectInput {
+  privacy_settings?: boolean | { detected?: boolean | null } | null;
+  privacySettings?: boolean | { detected?: boolean | null } | null;
+  anti_detect_browser?: boolean | null;
+  antiDetectBrowser?: boolean | null;
+  tampering?: { anti_detect_browser?: boolean | null } | null;
+  tampering_details?: { anti_detect_browser?: boolean | null } | null;
+  tamperingDetails?: { anti_detect_browser?: boolean | null } | null;
+  /** Explicit evidence that the privacy signature is forged / contradicted. */
+  contradiction_evidence?: boolean | null;
+  contradictionEvidence?: boolean | null;
+  forged_privacy_signature?: boolean | null;
+  [key: string]: unknown;
+}
+
+/**
+ * Privacy hardening must never *fabricate* an anti-detect-browser finding. A fired
+ * `privacy_settings` signature (Brave / Firefox RFP / Tor / Safari AFP / corroborated reduced
+ * entropy) suppresses the legacy anti-detect penalty unless the signature itself is explicitly
+ * contradicted. This is purely additive: it never touches the privacy/SwiftShader exemptions in
+ * `evaluateSpecInvariants` / `enforceTamperingInvariant`, and it reports only when both flags were
+ * explicitly published as booleans. Pure and total — never throws.
+ */
+export function checkPrivacySettingsAntiDetectInvariants(
+  input: PrivacyAntiDetectInput = {}
+): string[] {
+  try {
+    const source = input && typeof input === 'object' ? input : ({} as PrivacyAntiDetectInput);
+    const privacySettings =
+      integratedBool(source, 'privacy_settings') ?? integratedBool(source, 'privacySettings');
+    const antiDetect =
+      integratedBool(source, 'anti_detect_browser') ??
+      integratedBool(source, 'antiDetectBrowser') ??
+      shadowBool(shadowField(source, 'tampering'), 'anti_detect_browser') ??
+      shadowBool(shadowField(source, 'tampering_details'), 'anti_detect_browser') ??
+      shadowBool(shadowField(source, 'tamperingDetails'), 'anti_detect_browser');
+    const contradicted =
+      shadowBool(source, 'contradiction_evidence') === true ||
+      shadowBool(source, 'contradictionEvidence') === true ||
+      shadowBool(source, 'forged_privacy_signature') === true;
+
+    const diagnostics: string[] = [];
+    if (privacySettings === true && antiDetect === true && !contradicted) {
+      diagnostics.push(
+        'privacy_settings=true must not fabricate anti_detect_browser=true without explicit contradiction evidence (a forged/contradicted privacy signature)'
+      );
+    }
+    return diagnostics;
+  } catch {
+    return [];
+  }
+}
+
+/** Alias for callers that name the check after the two axes rather than the published field. */
+export const checkPrivacyAntiDetectInvariants = checkPrivacySettingsAntiDetectInvariants;
+
+/**
+ * Fields for the `proxy_details` vs datacenter-truth invariant. Datacenter truth can come from the
+ * explicit result/asn booleans, the canonical network ownership axis, or an ASN type label; the
+ * published proxy details can come from the nested mirror (`proxy_details` / `proxyDetails`) or
+ * the flat `proxy` / `proxy_type` mirrors. All are optional.
+ */
+export interface ProxyDetailsDatacenterInput {
+  proxy_details?: {
+    proxy?: boolean | null;
+    proxy_type?: string | null;
+    proxyType?: string | null;
+    [key: string]: unknown;
+  } | null;
+  proxyDetails?: ProxyDetailsDatacenterInput['proxy_details'];
+  proxy?: boolean | null;
+  proxy_type?: string | null;
+  proxyType?: string | null;
+  datacenter_result?: boolean | null;
+  datacenterResult?: boolean | null;
+  datacenter_asn?: boolean | null;
+  datacenterAsn?: boolean | null;
+  asn_type?: string | null;
+  asnType?: string | null;
+  network?: Partial<NetworkAxes> | null;
+  network_ownership?: NetworkAxes['network_ownership'] | null;
+  verified_good_bot?: boolean | null;
+  verifiedGoodBot?: boolean | null;
+  good_bot_exempt?: boolean | null;
+  goodBotExempt?: boolean | null;
+  bot_subtype?: string | null;
+  botSubtype?: string | null;
+  [key: string]: unknown;
+}
+
+/**
+ * `proxy_details` must never contradict datacenter truth without the verified-good-bot
+ * exemption. With an explicit datacenter/hosting truth and no exemption, a published
+ * `proxy:false` or a residential/none `proxy_type` is a contradiction; conversely, with explicit
+ * non-datacenter (residential / mobile-carrier) truth, a `data_center` claim is a fabrication.
+ * Absence of evidence is never a contradiction: only explicitly published booleans/labels are
+ * inspected, and the good-bot exemption suppresses the datacenter claim in both directions.
+ * Pure and total — never throws.
+ */
+export function checkProxyDetailsDatacenterInvariants(
+  input: ProxyDetailsDatacenterInput = {}
+): string[] {
+  try {
+    const source = input && typeof input === 'object' ? input : ({} as ProxyDetailsDatacenterInput);
+    if (integratedGoodBotExempt(source)) return [];
+
+    const explicitDatacenter =
+      shadowBool(source, 'datacenter_result') ??
+      shadowBool(source, 'datacenterResult') ??
+      shadowBool(source, 'datacenter_asn') ??
+      shadowBool(source, 'datacenterAsn');
+    const network = shadowField(source, 'network');
+    const ownership = shadowField(network, 'network_ownership') ?? shadowField(source, 'network_ownership');
+    const datacenterLabel =
+      integratedDatacenterLabel(shadowField(source, 'asn_type')) ||
+      integratedDatacenterLabel(shadowField(source, 'asnType'));
+    const datacenter =
+      explicitDatacenter === true ||
+      (explicitDatacenter === undefined && (ownership === 'hosting_datacenter' || datacenterLabel));
+    const nonDatacenter =
+      explicitDatacenter === false ||
+      (explicitDatacenter === undefined &&
+        (ownership === 'residential_isp' || ownership === 'mobile_carrier'));
+
+    const details = shadowField(source, 'proxy_details') ?? shadowField(source, 'proxyDetails');
+    const publishedProxy = shadowBool(details, 'proxy') ?? shadowBool(source, 'proxy');
+    const rawType =
+      shadowField(details, 'proxy_type') ??
+      shadowField(details, 'proxyType') ??
+      shadowField(source, 'proxy_type') ??
+      shadowField(source, 'proxyType');
+    const publishedType =
+      typeof rawType === 'string' ? rawType.trim().toLowerCase().replace(/[\s-]+/g, '_') : null;
+    const claimsDataCenter = publishedType === 'data_center' || publishedType === 'datacenter';
+    const claimsResidential =
+      publishedType === 'residential' ||
+      publishedType === 'residential_rotating' ||
+      publishedType === 'residential_proxy';
+    const claimsNone = publishedType === 'none' || publishedType === 'null' || publishedType === '';
+
+    const diagnostics: string[] = [];
+    if (datacenter) {
+      if (publishedProxy === false) {
+        diagnostics.push(
+          'proxy_details.proxy=false contradicts datacenter/hosting truth without a verified-good-bot exemption'
+        );
+      }
+      if (claimsResidential || claimsNone) {
+        diagnostics.push(
+          `proxy_details.proxy_type=${String(publishedType)} contradicts datacenter/hosting truth without a verified-good-bot exemption`
+        );
+      }
+    } else if (nonDatacenter && claimsDataCenter) {
+      diagnostics.push(
+        'proxy_details.proxy_type=data_center contradicts explicit non-datacenter truth without a verified-good-bot exemption'
+      );
+    }
+    return diagnostics;
+  } catch {
+    return [];
+  }
+}
+
+/** Alias for callers that name the check after the contradiction it reports. */
+export const checkProxyDetailsDatacenterContradictions = checkProxyDetailsDatacenterInvariants;
+
+/**
+ * Fields for the `vpn_methods.timezone_mismatch` parity invariant. The resolved side always comes
+ * from the shared canonical IANA resolver (`timezoneMismatchContext` / `timezonesEquivalent`),
+ * never from a raw string compare or a UTC-offset coincidence.
+ */
+export interface VpnMethodsTimezoneInput {
+  vpn_methods?: { timezone_mismatch?: boolean | null; [key: string]: unknown } | null;
+  vpnMethods?: VpnMethodsTimezoneInput['vpn_methods'];
+  timezone_mismatch?: boolean | null;
+  timezoneMismatch?: boolean | null;
+  network?: { timezone_mismatch?: boolean | null } | null;
+  browser_timezone?: string | null;
+  browserTimezone?: string | null;
+  ip_timezone?: string | null;
+  ipTimezone?: string | null;
+  [key: string]: unknown;
+}
+
+/**
+ * Canonical-resolver parity for the published `vpn_methods.timezone_mismatch` flag. Reports only
+ * when the flag was explicitly published and both timezone strings were supplied:
+ *  - a real canonical mismatch (two distinct canonical zone identities) published as `false`;
+ *  - a `true` flag that the canonical resolver does not support (an alias pair such as
+ *    Asia/Calcutta vs Asia/Kolkata, or identical zones).
+ * An unresolved side is absence of evidence, never a manufactured mismatch. Pure and total —
+ * never throws. This is intentionally independent of the existing shadow-parity checker so no
+ * existing check or severity is modified.
+ */
+export function checkVpnMethodsTimezoneInvariants(
+  input: VpnMethodsTimezoneInput = {}
+): string[] {
+  try {
+    const source = input && typeof input === 'object' ? input : ({} as VpnMethodsTimezoneInput);
+    const published =
+      shadowBool(shadowField(source, 'vpn_methods'), 'timezone_mismatch') ??
+      shadowBool(shadowField(source, 'vpnMethods'), 'timezone_mismatch') ??
+      shadowBool(source, 'timezone_mismatch') ??
+      shadowBool(source, 'timezoneMismatch') ??
+      shadowBool(shadowField(source, 'network'), 'timezone_mismatch');
+    if (published === undefined) return [];
+
+    const browserTz = shadowField(source, 'browser_timezone') ?? shadowField(source, 'browserTimezone');
+    const ipTz = shadowField(source, 'ip_timezone') ?? shadowField(source, 'ipTimezone');
+    if (typeof browserTz !== 'string' || typeof ipTz !== 'string') return [];
+
+    const canonical = timezoneMismatchContext(browserTz, ipTz);
+    const diagnostics: string[] = [];
+    if (canonical.mismatch && published === false) {
+      diagnostics.push(
+        `vpn_methods.timezone_mismatch=false contradicts the canonical resolver (${String(canonical.canonicalBrowser)} vs ${String(canonical.canonicalIp)})`
+      );
+    } else if (
+      published === true &&
+      !canonical.mismatch &&
+      canonical.canonicalBrowser !== null &&
+      canonical.canonicalIp !== null &&
+      timezonesEquivalent(browserTz, ipTz)
+    ) {
+      diagnostics.push(
+        `vpn_methods.timezone_mismatch=true is not supported by the canonical resolver (${browserTz} / ${ipTz} -> ${String(canonical.canonicalBrowser)}); parity must use canonical identities, not raw string inequality`
+      );
+    }
+    return diagnostics;
+  } catch {
+    return [];
+  }
+}
+
+/** Alias for callers that name the check "timezone parity". */
+export const checkVpnMethodsTimezoneParity = checkVpnMethodsTimezoneInvariants;
+
+/** Combined input for the one-call convenience wrapper below. */
+export type IntegratedFieldInput = PrivacyAntiDetectInput &
+  ProxyDetailsDatacenterInput &
+  VpnMethodsTimezoneInput;
+
+/**
+ * Convenience wrapper that runs all three integrated-field invariants and concatenates their
+ * diagnostics. It is additive: it does not feed the core spec verdict, and it never throws.
+ */
+export function checkIntegratedFieldInvariants(
+  input: IntegratedFieldInput = {}
+): string[] {
+  try {
+    return [
+      ...checkPrivacySettingsAntiDetectInvariants(input),
+      ...checkProxyDetailsDatacenterInvariants(input),
+      ...checkVpnMethodsTimezoneInvariants(input),
+    ];
+  } catch {
+    return [];
+  }
+}

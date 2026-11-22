@@ -89,3 +89,7 @@ To capture a shadow diagnostics snapshot:
 3. Paste the returned JSON into your report.
 
 The `intelDiag` flag is off by default, adds no UI, and does not affect any verdict or risk score. Never include tokens or secrets in the captured JSON or the report.
+
+## Implementation status
+
+For the honest, code-path-level state of the current integration wave — what is live/integrated, shadow-only, or backlog; the locked constraints (0–10, uncalibrated, zero alarms, no new panels, manual deploy, zero SDK); the phase history; and the diagnostics capture procedure — see [docs/IMPLEMENTATION_STATUS.md](./docs/IMPLEMENTATION_STATUS.md). This deployment guide remains the source of truth for the manual deploy command and Cloudflare configuration.

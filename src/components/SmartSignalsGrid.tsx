@@ -365,15 +365,21 @@ const VPN_TUNNEL_METHODS = [
 ] as const;
 
 /**
- * Single source of truth for the VPN row. The server's `vpnMethods` object is authoritative.
- * `timezone_mismatch` is an orthogonal network axis and is NEVER counted as a VPN method or
- * allowed to trigger the row; the legacy `vpnSuspected` flag (which used to be timezone-only)
- * is likewise ignored unless a concrete method fired. The timezone discrepancy is returned
- * as a separate `timezoneNote` so the UI can show it as context without implying a VPN.
+ * Single source of truth for the VPN row. The server's structured `vpn_methods` object is
+ * authoritative — `resolveCanonical` prefers the envelope's additive snake_case copy and falls
+ * back to the legacy `securitySignals.vpnMethods` mirror, so one server object drives both this
+ * verdict and its method count. No flags are merged or invented. `timezone_mismatch` is an
+ * orthogonal network axis and is NEVER counted as a VPN method or allowed to trigger the row;
+ * the legacy `vpnSuspected` flag (which used to be timezone-only) is likewise ignored unless a
+ * concrete method fired. The timezone discrepancy is returned as a separate `timezoneNote` so
+ * the UI can show it as context without implying a VPN.
  */
-export function resolveVpnVerdict(data: IntelVisitorResponse): VpnVerdict {
+export function resolveVpnVerdict(
+  data: IntelVisitorResponse,
+  canonicalView: ReturnType<typeof resolveCanonical> = resolveCanonical(data)
+): VpnVerdict {
   const signals = data.securitySignals;
-  const methods: VpnMethodFlags = signals.vpnMethods ?? {};
+  const methods = (canonicalView.vpnMethods ?? signals.vpnMethods ?? {}) as unknown as VpnMethodFlags;
   const effectiveCount = VPN_TUNNEL_METHODS.filter((key) => Boolean(methods[key])).length;
   const timezoneMismatch = Boolean(methods.timezone_mismatch ?? signals.timezoneMismatch);
   const detected = effectiveCount > 0 || Boolean(signals.publicVpn);
@@ -495,10 +501,10 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     detail: bot.detail,
   });
 
-  // The server's `vpnMethods` object is the single source of truth. Timezone mismatch is
-  // an orthogonal context axis: it is excluded from the method count and can never trigger
-  // this row. `resolveVpnVerdict` returns it as a separate note, rendered on its own row.
-  const vpn = resolveVpnVerdict(data);
+  // The server's structured `vpn_methods` mirror is the single source of truth. Timezone
+  // mismatch is an orthogonal context axis: it is excluded from the method count and can never
+  // trigger this row. `resolveVpnVerdict` returns it as a separate note, rendered on its own row.
+  const vpn = resolveVpnVerdict(data, canonicalView);
   rows.push({
     key: 'vpn',
     label: 'VPN',
@@ -573,15 +579,39 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     detail: vmVerdict.detail,
   });
 
+  // The server's additive `privacy_settings` mirror is read here — either the plain boolean
+  // verdict or the structured signature outcome — as one more server-provided vote beside the
+  // legacy flags. An absent mirror leaves those flags unchanged, so older payloads render exactly
+  // as before and the tile keeps the same OR semantics as the Event JSON.
+  const privacyMirror = canonicalView.privacy_settings;
+  const privacyFromMirror =
+    typeof privacyMirror === 'boolean'
+      ? privacyMirror
+      : privacyMirror && typeof privacyMirror === 'object' && typeof privacyMirror.privacy_settings === 'boolean'
+      ? privacyMirror.privacy_settings
+      : undefined;
+  const privacyMirrorReasons =
+    privacyMirror && typeof privacyMirror === 'object' && Array.isArray(privacyMirror.reasons)
+      ? privacyMirror.reasons.filter(
+          (reason): reason is string => typeof reason === 'string' && reason.trim().length > 0
+        )
+      : undefined;
   const privacySettings = Boolean(
-    signals.privacySettings || signals.isTorBrowserClient || signals.privacyProtected
+    privacyFromMirror ||
+      signals.privacySettings ||
+      signals.isTorBrowserClient ||
+      signals.privacyProtected
   );
   rows.push({
     key: 'privacySettings',
     label: 'Privacy Settings',
     status: privacySettings ? 'Yes' : 'Not detected',
     triggered: privacySettings,
-    detail: signals.privacyDetail || (signals.isTorBrowserClient ? 'Tor Browser RFP' : undefined),
+    detail:
+      signals.privacyDetail ||
+      (signals.isTorBrowserClient ? 'Tor Browser RFP' : undefined) ||
+      privacyMirrorReasons?.[0] ||
+      undefined,
   });
 
   const torNode = Boolean(signals.torExitNode);
@@ -606,12 +636,34 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
         (signals as unknown as { proxyDetected?: boolean }).proxyDetected ||
           (signals.networkType === 'VPN / Proxy Relay' && !signals.vpnSuspected)
       );
+  // Surface the server's additive `proxy_details` verbatim when it supplied one. Only real
+  // reason / type strings reach the tile; a missing mirror falls back to the legacy detail.
+  const proxyMirror = canonicalView.proxy_details;
+  const proxyMirrorReason =
+    typeof proxyMirror?.reason === 'string' && proxyMirror.reason.trim()
+      ? proxyMirror.reason
+      : Array.isArray(proxyMirror?.reasons)
+      ? proxyMirror.reasons.find(
+          (reason): reason is string => typeof reason === 'string' && reason.trim().length > 0
+        )
+      : undefined;
+  const proxyType =
+    typeof proxyMirror?.proxy_type === 'string' && proxyMirror.proxy_type !== 'none'
+      ? proxyMirror.proxy_type.replace(/_/g, ' ')
+      : undefined;
+  const proxyDetailParts = [proxyMirrorReason, proxyType ? `type: ${proxyType}` : undefined].filter(
+    (part): part is string => Boolean(part)
+  );
   rows.push({
     key: 'proxy',
     label: 'Proxy Detection',
     status: proxy ? 'Yes' : 'Not detected',
     triggered: proxy,
-    detail: proxy ? signals.proxyReasons?.[0] || signals.networkType : undefined,
+    detail: proxy
+      ? proxyDetailParts.length > 0
+        ? proxyDetailParts.join(' · ')
+        : signals.proxyReasons?.[0] || signals.networkType || undefined
+      : undefined,
   });
 
   const highActivity = Boolean(data.highActivityDevice ?? signals.highActivityDevice);
@@ -666,10 +718,23 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     tone: 'clean',
   });
 
-  // Both rows read the SAME canonical score10 / tier. The tier is derived from that score
-  // with the frozen rubric cut points — never from an ad-hoc per-tile threshold.
-  const suspectScore = Math.max(0, Math.min(10, canonicalView.riskScore10));
-  const riskTier = resolveRiskTier(suspectScore);
+  // Both risk tiles read the SAME canonical 0-10 headline and tier, mirrored verbatim from the
+  // risk ledger (the exact values App.tsx headlines and publishes to the Event JSON). A missing
+  // / non-finite headline degrades to 0, never NaN. The local derivation is only a fallback for
+  // legacy payloads that carry no canonical tier — no tier is invented on the client.
+  const rawScore10 = canonicalView.riskScore10;
+  const suspectScore =
+    typeof rawScore10 === 'number' && Number.isFinite(rawScore10)
+      ? Math.max(0, Math.min(10, rawScore10))
+      : 0;
+  const canonicalTier = canonicalView.riskTier;
+  const riskTier: RiskTier =
+    canonicalTier === 'Low' ||
+    canonicalTier === 'Elevated' ||
+    canonicalTier === 'High' ||
+    canonicalTier === 'Critical'
+      ? canonicalTier
+      : resolveRiskTier(suspectScore);
   rows.push({
     key: 'suspectScore',
     label: 'Suspect Score',

@@ -427,6 +427,14 @@ interface BrowserSpec {
  * Safari sit last because they do not send UA-CH and are only detectable from the UA string.
  * 'Cursor' and 'Manus-User' are AI-agent Chromium forks detected from their UA tokens —
  * they are listed first in the UA regex fallback chain (per spec ordering).
+ *
+ * Additive modern-browser coverage: Arc and Vivaldi are Chromium forks whose UA carries
+ * `Arc/<ver>` / `Vivaldi/<ver>` next to `Chrome/<ver>`; they must be scanned BEFORE the
+ * generic Google Chrome / Chromium specs or they would be mislabelled as Chrome. Crawler
+ * and AI-agent tokens (Googlebot, GPTBot, ClaudeBot, …) are likewise placed ahead of
+ * Google Chrome: several of their UAs embed a `Chrome/<ver>` token but name the agent
+ * later in the string. Bots do not emit UA-CH brands, so they are UA-token-only specs
+ * (`brands: []`) and intentionally never participate in the brand ladder.
  */
 const BROWSER_SPECS: BrowserSpec[] = [
   {
@@ -474,6 +482,66 @@ const BROWSER_SPECS: BrowserSpec[] = [
     uaTokens: [/HeadlessChrome\/([\d.]+)/],
   },
   {
+    // Chromium fork: UA ends with `… Chrome/<ver> Safari/<ver> Arc/<ver>`.
+    name: 'Arc',
+    brands: ['arc'],
+    uaTokens: [/Arc\/([\d.]+)/],
+  },
+  {
+    // Chromium fork: UA ends with `… Chrome/<ver> Safari/<ver> Vivaldi/<ver>`.
+    name: 'Vivaldi',
+    brands: ['vivaldi'],
+    uaTokens: [/Vivaldi\/([\d.]+)/],
+  },
+  {
+    // Search crawler. Smartphone Googlebot UAs also carry a `Chrome/<ver>` token,
+    // so this spec must precede Google Chrome in the UA regex scan.
+    name: 'Googlebot',
+    brands: [],
+    uaTokens: [/Googlebot\/([\d.]+)/, /Googlebot-Mobile\/([\d.]+)/, /Googlebot-Image\/([\d.]+)/],
+  },
+  {
+    name: 'GPTBot',
+    brands: [],
+    uaTokens: [/GPTBot\/([\d.]+)/],
+  },
+  {
+    name: 'ChatGPT-User',
+    brands: [],
+    uaTokens: [/ChatGPT-User\/([\d.]+)/],
+  },
+  {
+    name: 'OAI-SearchBot',
+    brands: [],
+    uaTokens: [/OAI-SearchBot\/([\d.]+)/],
+  },
+  {
+    name: 'ClaudeBot',
+    brands: [],
+    /* Anthropic also emits the lowercase `claudebot/<ver>` spelling. */
+    uaTokens: [/ClaudeBot\/([\d.]+)/i],
+  },
+  {
+    name: 'Claude-User',
+    brands: [],
+    uaTokens: [/Claude-User\/([\d.]+)/],
+  },
+  {
+    name: 'Claude-SearchBot',
+    brands: [],
+    uaTokens: [/Claude-SearchBot\/([\d.]+)/],
+  },
+  {
+    name: 'PerplexityBot',
+    brands: [],
+    uaTokens: [/PerplexityBot\/([\d.]+)/],
+  },
+  {
+    name: 'Perplexity-User',
+    brands: [],
+    uaTokens: [/Perplexity-User\/([\d.]+)/],
+  },
+  {
     name: 'Google Chrome',
     brands: ['google chrome', 'chrome'],
     uaTokens: [/CriOS\/([\d.]+)/, /Chrome\/([\d.]+)/],
@@ -513,6 +581,11 @@ function firstMatch(token: RegExp, ua: string): string | null {
  * Chromium. Firefox / Safari do not emit UA-CH and remain UA-only fallbacks;
  * the agent tokens (Cursor / Manus) and Samsung Internet follow the listed
  * browsers. This ordering is independent of the UA-regex chain below.
+ *
+ * Arc and Vivaldi are inserted ahead of Google Chrome so a fork's own UA-CH
+ * brand outranks the shared `Google Chrome` / `Chromium` brands when both are
+ * present. All pre-existing relative positions are unchanged. Crawler / AI-agent
+ * specs are UA-token-only (`brands: []`) and never enter this ladder.
  */
 const BRAND_PRECEDENCE: readonly string[] = [
   'Electron',
@@ -520,6 +593,8 @@ const BRAND_PRECEDENCE: readonly string[] = [
   'Microsoft Edge',
   'Brave',
   'Opera',
+  'Arc',
+  'Vivaldi',
   'Google Chrome',
   'Chromium',
   'Cursor',
@@ -697,7 +772,9 @@ function versionSourceExists(
  * but the primary resolution produced an empty major. The token matching the
  * already-detected browser name is tried first, then the spec fallback chain:
  * Cursor/, Manus-User/, EdgA?/, OPR/, FxiOS/, Firefox/, CriOS/,
- * HeadlessChrome/, Chrome/, Version/…Safari.
+ * HeadlessChrome/, Chrome/, Version/…Safari — plus the additive Arc/, Vivaldi/,
+ * Googlebot/, GPTBot/, ChatGPT-User/, OAI-SearchBot/, ClaudeBot/, Claude-User/,
+ * Claude-SearchBot/, PerplexityBot/ and Perplexity-User/ tokens.
  */
 function fallbackMajorFromUa(browserName: string, ua: string): BrowserResolution {
   if (!ua) return { name: browserName, full: '', major: '' };
@@ -1209,6 +1286,10 @@ const BLANK_IDENTITY: NormalizedIdentity = {
  * Headless Chrome → Google Chrome → Chromium → Firefox → Safari (plus the
  * Cursor / Manus agent tokens in the UA fallback chain). A genuine `Electron/<version>`
  * UA token is always resolved to `Electron` before any UA-CH brand is considered.
+ * Additively, the UA fallback chain also recognises Arc / Vivaldi forks and the
+ * Googlebot / GPTBot / ClaudeBot / ChatGPT-User / OAI-SearchBot / Claude-User /
+ * Claude-SearchBot / PerplexityBot / Perplexity-User crawler & AI-agent tokens
+ * ahead of the generic Google Chrome / Chromium tokens.
  */
 export function normalizeIdentity(input: NormalizeIdentityInput): NormalizedIdentity {
   try {

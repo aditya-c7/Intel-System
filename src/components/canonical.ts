@@ -21,9 +21,14 @@ import type {
   InspectorStateTristate,
   NetworkAxes,
   OrthogonalRiskLedger,
+  PrivacySettingsMirror,
+  ProxyDetailsMirror,
   RiskTier,
+  StealthSignalsMirror,
   TamperingAxes,
+  TamperingDetailsMirror,
   VerdictTier,
+  VpnMethodsMirror,
 } from '../lib/telemetryContract';
 import type { IntelVisitorResponse } from '../types/visitor';
 
@@ -98,6 +103,31 @@ export interface CanonicalView {
   osTruth?: Record<string, unknown>;
   /** Additive incognito probe diagnostics mirrored verbatim from the canonical envelope/data. */
   diagnostics?: IncognitoDiagnostics;
+
+  /* Additive evidence mirrors — all OPTIONAL, verbatim `as unknown as` pass-through from the
+     one canonical envelope or the response data. These are transports for server-supplied
+     values only: the client never derives, rounds, tier-shifts or computes any of them, and an
+     absent value stays absent (undefined) instead of being fabricated. Each value is exposed
+     under both the envelope's snake_case spelling and a camelCase alias so every consumer
+     reads the exact same mirrored value/reference. */
+  proxy_details?: ProxyDetailsMirror | null;
+  proxyDetails?: ProxyDetailsMirror | null;
+  vpn_methods?: VpnMethodsMirror | null;
+  vpnMethods?: VpnMethodsMirror | null;
+  privacy_settings?: boolean | PrivacySettingsMirror | null;
+  privacySettings?: boolean | PrivacySettingsMirror | null;
+  /** Four-tier stealth-evaluation mirror from the canonical envelope, verbatim. */
+  stealth_signals?: StealthSignalsMirror | null;
+  stealthSignals?: StealthSignalsMirror | null;
+  /** Verbatim nested read of `stealth_signals.ids` (the server's observed stealth ids). */
+  stealth_ids?: string[] | null;
+  stealthIds?: string[] | null;
+  tampering_details?: TamperingDetailsMirror | null;
+  tamperingDetails?: TamperingDetailsMirror | null;
+  network_layer_hash?: string | null;
+  networkLayerHash?: string | null;
+  /** Shadow-only IDB resolver rule id, mirrored verbatim — never a verdict input. */
+  idbTruthRule?: string | null;
 }
 
 /** Resolve the one canonical envelope from every supported response shape. */
@@ -141,6 +171,63 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
   // otherwise undefined. Never re-derived or gated on the client.
   const diagnosticsRaw = env?.diagnostics ?? base?.diagnostics ?? data?.securitySignals?.diagnostics;
   const diagnostics = diagnosticsRaw ? (diagnosticsRaw as unknown as IncognitoDiagnostics) : undefined;
+
+  // Additive evidence mirrors — verbatim pass-through, never derived. The resolved canonical
+  // envelope is authoritative; root-level and `securitySignals` mirrors are transport fallbacks
+  // only. `as unknown as` is used throughout because these fields are intentionally not part of
+  // the typed legacy contract yet. No Boolean()/Number() coercion, rounding, tier mapping or
+  // default fabrication: a missing field stays undefined exactly as the server left it.
+  const signalExtras = (data?.securitySignals ?? {}) as unknown as Record<string, unknown>;
+  const proxy_details = (env?.proxy_details ??
+    base?.proxy_details ??
+    base?.proxyDetails ??
+    signalExtras.proxy_details ??
+    signalExtras.proxyDetails) as unknown as ProxyDetailsMirror | null | undefined;
+  const vpn_methods = (env?.vpn_methods ??
+    base?.vpn_methods ??
+    base?.vpnMethods ??
+    signalExtras.vpn_methods ??
+    signalExtras.vpnMethods) as unknown as VpnMethodsMirror | null | undefined;
+  const privacy_settings = (env?.privacy_settings ??
+    base?.privacy_settings ??
+    base?.privacySettings ??
+    signalExtras.privacy_settings ??
+    signalExtras.privacySettings) as unknown as
+    | boolean
+    | PrivacySettingsMirror
+    | null
+    | undefined;
+  const stealth_signals = (env?.stealth_signals ??
+    base?.stealth_signals ??
+    base?.stealthSignals ??
+    signalExtras.stealth_signals ??
+    signalExtras.stealthSignals) as unknown as StealthSignalsMirror | null | undefined;
+  const stealth_ids = (env?.stealth_ids ??
+    base?.stealth_ids ??
+    base?.stealthIds ??
+    stealth_signals?.ids ??
+    base?.stealthReasons ??
+    signalExtras.stealth_ids ??
+    signalExtras.stealthIds ??
+    signalExtras.stealthReasons) as unknown as string[] | null | undefined;
+  const tampering_details = (env?.tampering_details ??
+    base?.tampering_details ??
+    base?.tamperingDetails ??
+    data?.tamperingDetails ??
+    signalExtras.tampering_details ??
+    signalExtras.tamperingDetails) as unknown as TamperingDetailsMirror | null | undefined;
+  const network_layer_hash = (env?.network_layer_hash ??
+    base?.network_layer_hash ??
+    base?.networkLayerHash ??
+    base?.ja4h ??
+    signalExtras.network_layer_hash ??
+    signalExtras.networkLayerHash ??
+    signalExtras.ja4h) as unknown as string | null | undefined;
+  const idbTruthRule = (env?.idbTruthRule ??
+    base?.idbTruthRule ??
+    diagnostics?.idbTruthRule ??
+    data?.diagnostics?.idbTruthRule ??
+    data?.securitySignals?.diagnostics?.idbTruthRule) as unknown as string | null | undefined;
 
   // The 0-100 ledger is canonical. Before it lands, the server's own
   // `suspectScore100` is the only acceptable server-provided fallback — never a
@@ -266,6 +353,24 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
         }
       : {},
     diagnostics,
+    // Additive mirrors: same value/reference on both spellings, no recomputation. The risk
+    // headline above (riskScore10 / riskTier / evidenceLedger) stays an independent pure
+    // pass-through and is deliberately untouched here.
+    proxy_details,
+    proxyDetails: proxy_details,
+    vpn_methods,
+    vpnMethods: vpn_methods,
+    privacy_settings,
+    privacySettings: privacy_settings,
+    stealth_signals,
+    stealthSignals: stealth_signals,
+    stealth_ids,
+    stealthIds: stealth_ids,
+    tampering_details,
+    tamperingDetails: tampering_details,
+    network_layer_hash,
+    networkLayerHash: network_layer_hash,
+    idbTruthRule,
   };
 }
 

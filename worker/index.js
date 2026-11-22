@@ -18,6 +18,9 @@ createServer(app).listen(API_PORT);
  */
 const EDGE_GEO_HEADER = 'x-intel-edge-geo';
 
+/** Additive, approximate JA4H-style HTTP fingerprint from the inbound request. */
+const JA4H_HEADER = 'x-intel-ja4h';
+
 /**
  * Client-hint response headers. Kept byte-for-byte identical to the Express
  * constants in src/server/middleware/clientHints.ts so both targets advertise
@@ -66,6 +69,7 @@ const SECURITY_HEADERS = {
 /** Headers a client could otherwise spoof to fake an IP or a location. */
 const UNTRUSTED_FORWARD_HEADERS = [
   'x-intel-edge-geo',
+  JA4H_HEADER,
   'x-intel-original-ua',
   'x-intel-original-authority',
   'x-intel-original-signature-agent',
@@ -145,8 +149,21 @@ function versionHeaders(env) {
   };
 }
 
+/**
+ * p in the RTT → light-distance approximation. Typical networks fall between 1.5 and 2; the
+ * conservative value 2 is used here. This is an ESTIMATE, never JA4L.
+ */
+const LIGHT_DISTANCE_PROPAGATION_FACTOR = 2;
+
+function lightDistanceKm(rttMs) {
+  if (typeof rttMs !== 'number' || !Number.isFinite(rttMs) || rttMs < 0) return null;
+  const km = ((rttMs / 2) * 1000 * 0.206) / LIGHT_DISTANCE_PROPAGATION_FACTOR;
+  return { rttMs, estimatedKm: Math.round(km) };
+}
+
 function buildEdgeGeoHeader(request) {
   const cf = request.cf || {};
+  const botManagement = cf.botManagement;
   const payload = {
     v: 1,
     country: cfString(cf.country),
@@ -170,7 +187,22 @@ function buildEdgeGeoHeader(request) {
         ? cf.clientTcpRtt
         : null,
     httpProtocol: cfString(cf.httpProtocol),
-    // Seven FREE request.cf TLS/network fields available on every plan. These are raw
+    // Bot-Management-only hash fields (Enterprise plans). Null-guarded and isolated in a
+    // distinctly named field so the free-plan TLS-lite components below are NEVER reported
+    // as JA3 / JA4. Absent on free plans: "out of list" means unavailable, not malicious.
+    cfJa4Enterprise: {
+      label: 'Cloudflare Bot Management fingerprints (Enterprise only; null on free plans)',
+      ja3Hash: typeof botManagement?.ja3Hash === 'string' ? botManagement.ja3Hash : null,
+      ja4: typeof botManagement?.ja4 === 'string' ? botManagement.ja4 : null,
+    },
+    // RTT-derived distance estimate, explicitly NOT JA4L.
+    rttLightDistance: {
+      label: 'RTT-based light-distance estimate (approximation)',
+      propagationFactor: LIGHT_DISTANCE_PROPAGATION_FACTOR,
+      tcp: lightDistanceKm(cf.clientTcpRtt),
+      quic: lightDistanceKm(cf.clientQuicRtt),
+    },
+    // Eight FREE request.cf TLS/network fields available on every plan. These are raw
     // edge-derived TLS components — NOT JA3/JA4 or any Bot-Management-only fingerprint — and
     // are labelled as such so no downstream surface ever misreports them as a JA3/JA4 hash.
     cfTlsLite: {
@@ -182,6 +214,7 @@ function buildEdgeGeoHeader(request) {
       tlsClientCiphersSha1: cfString(cf.tlsClientCiphersSha1),
       tlsClientExtensionsSha1: cfString(cf.tlsClientExtensionsSha1),
       tlsClientRandom: cfString(cf.tlsClientRandom),
+      tlsClientAuth: cfString(cf.tlsClientAuth),
       requestPriority: cfString(cf.requestPriority),
       edgeL4: cfString(cf.edgeL4),
       clientQuicRtt:
@@ -215,13 +248,75 @@ function applyDiagHeader(headers, request) {
 }
 
 /**
+ * JA4H-style HTTP header fingerprint — APPROXIMATE, never an exact JA4H hash. Cloudflare and
+ * the Workers runtime may strip, normalise or reorder headers, and the hash is over the
+ * EXPOSED header names rather than raw wire order.
+ *
+ * section a = method2 + version2 + cookie(c/n) + referer(r/n) + headerCount2 + acceptLang4
+ * section b = first 12 hex chars of WebCrypto SHA-256 over exposed header names in order,
+ *             excluding Cookie / Referer.
+ */
+function httpVersionCode(request) {
+  const protocol = cfString(request.cf?.httpProtocol);
+  if (/HTTP\/3/i.test(protocol)) return '30';
+  if (/HTTP\/2/i.test(protocol)) return '20';
+  if (/HTTP\/1\.1/i.test(protocol)) return '11';
+  if (/HTTP\/1\.0/i.test(protocol)) return '10';
+  return '00';
+}
+
+function acceptLanguageCode(request) {
+  const primary = (request.headers.get('accept-language') || '').split(',')[0] || '';
+  const code = primary.trim().toLowerCase().replace(/-/g, '').slice(0, 4);
+  return code ? code.padEnd(4, '0') : '0000';
+}
+
+async function buildJa4hHeader(request) {
+  const headers = request.headers;
+  const allNames = [];
+  headers.forEach((_value, name) => allNames.push(name.toLowerCase()));
+  const exposedNames = allNames.filter((name) => name !== 'cookie' && name !== 'referer');
+
+  const digest = await crypto.subtle.digest('SHA-256', textEncoder.encode(exposedNames.join(',')));
+  const sectionB = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, '0')
+  )
+    .join('')
+    .slice(0, 12);
+
+  const method = (request.method || 'GET').toUpperCase().slice(0, 2).padEnd(2, '0');
+  const cookie = headers.has('cookie') ? 'c' : 'n';
+  const referer = headers.has('referer') || headers.has('referrer') ? 'r' : 'n';
+  const count = String(allNames.length).padStart(2, '0');
+  const sectionA = method + httpVersionCode(request) + cookie + referer + count + acceptLanguageCode(request);
+  return `ja4h${sectionA}_${sectionB}`;
+}
+
+/**
+ * Optional, opt-in origin enforcement. The ONLY switch is the exact query flag
+ * `intelStrictOrigin=1`; without it (or with any other value) this is a no-op and no request
+ * is ever rejected on origin grounds. A missing / `null` / unparseable Origin fails open.
+ */
+function strictOriginMismatch(request) {
+  try {
+    if (new URL(request.url).searchParams.get('intelStrictOrigin') !== '1') return false;
+    const origin = (request.headers.get('origin') || '').trim();
+    if (!origin || origin === 'null') return false;
+    const expected = new URL(request.url).origin;
+    return origin.replace(/\/+$/, '').toLowerCase() !== expected.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Forwards the request to the API with a sanitized header set.
  *
  * Cloudflare overwrites `cf-connecting-ip`, so that value is the only trustworthy client
  * address. Any inbound geo/IP header is deleted and replaced, which closes the spoofing
  * path where a client could send `x-vercel-ip-country` through Cloudflare untouched.
  */
-function forwardApiRequest(request) {
+async function forwardApiRequest(request) {
   const headers = new Headers(request.headers);
   for (const name of UNTRUSTED_FORWARD_HEADERS) headers.delete(name);
 
@@ -263,6 +358,10 @@ function forwardApiRequest(request) {
 
   // Additive diagnostics: mirror the exact `intelDiag=1` opt-in to the upstream request.
   applyDiagHeader(headers, request);
+
+  // Additive JA4H-style fingerprint: recomputed from the REAL inbound headers and stamped
+  // over any client-supplied copy (which was stripped above via UNTRUSTED_FORWARD_HEADERS).
+  headers.set(JA4H_HEADER, await buildJa4hHeader(request));
 
   return new Request(request, { headers });
 }
@@ -307,6 +406,20 @@ function applyClientHintHeaders(response, env, request) {
 function apiResponse(response, env, request) {
   const result = applyClientHintHeaders(response, env, request);
   result.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, no-transform');
+  return result;
+}
+
+/**
+ * API counterpart of the document branding pass: the same apiResponse() contract plus the
+ * additive verdict/JA4H headers. Native routes deliberately bypass this helper so their
+ * health / ping / identity-ping contracts stay byte-for-byte unchanged.
+ */
+async function apiResponseWithVerdict(response, env, request, verdict) {
+  const result = apiResponse(response, env, request);
+  for (const [name, value] of Object.entries(botVerdictHeaders(verdict))) {
+    result.headers.set(name, value);
+  }
+  result.headers.set(JA4H_HEADER, await buildJa4hHeader(request));
   return result;
 }
 
@@ -618,6 +731,10 @@ function botVerdictHeaders(verdict) {
     'X-Intel-Bot-Verdict': verdict.name || 'not_detected',
     'X-Intel-Bot-Agent': verdict.botType || 'none',
     'X-Intel-Bot-Identity': verdict.identity || 'unknown',
+    // Additive lower-case aliases derived from the SAME edge verdict — no new verdict logic.
+    'x-intel-bot-result': verdict.name || 'not_detected',
+    'x-intel-bot-category': verdict.botType || 'none',
+    'x-intel-bot-identity': verdict.identity || 'unknown',
   };
 }
 
@@ -740,13 +857,14 @@ async function handleApi(request, env, pathname, verdict) {
         const resetMs =
           typeof limitVerdict.reset === 'number' ? limitVerdict.reset : Date.now() + 60_000;
         const retryAfter = Math.max(0, Math.ceil((resetMs - Date.now()) / 1000));
-        return apiResponse(
+        return await apiResponseWithVerdict(
           Response.json(
             { error: 'Too many identification requests. Please retry later.' },
             { status: 429, headers: { 'Retry-After': String(retryAfter) } }
           ),
           env,
-          request
+          request,
+          verdict
         );
       }
     } catch (error) {
@@ -756,10 +874,10 @@ async function handleApi(request, env, pathname, verdict) {
   }
 
   if (!env.VISITOR_HMAC_SECRET || env.VISITOR_HMAC_SECRET.length < 32) {
-    return apiResponse(Response.json({ error: 'Configure VISITOR_HMAC_SECRET with at least 32 characters.' }, { status: 503 }), env, request);
+    return await apiResponseWithVerdict(Response.json({ error: 'Configure VISITOR_HMAC_SECRET with at least 32 characters.' }, { status: 503 }), env, request, verdict);
   }
   try {
-    const forwardedRequest = forwardApiRequest(request);
+    const forwardedRequest = await forwardApiRequest(request);
     // Visitor routes need request-scoped Durable-Object SQLite access; every other API
     // route runs statelessly so it cannot consume the daily row-write quota.
     const persistent =
@@ -768,10 +886,10 @@ async function handleApi(request, env, pathname, verdict) {
     const response = persistent
       ? await env.VISITOR_STORE.get(env.VISITOR_STORE.idFromName('visitor-store-v1')).fetch(forwardedRequest)
       : await handleAsNodeRequest(API_PORT, forwardedRequest);
-    return apiResponse(response, env, request);
+    return await apiResponseWithVerdict(response, env, request, verdict);
   } catch (error) {
     console.error('Worker API failure:', error);
-    return apiResponse(Response.json({ error: 'Internal server error.' }, { status: 500 }), env, request);
+    return await apiResponseWithVerdict(Response.json({ error: 'Internal server error.' }, { status: 500 }), env, request, verdict);
   }
 }
 
@@ -981,6 +1099,23 @@ export default {
     if (pathname === '/api' || pathname.startsWith('/api/')) {
       const native = await handleNativeApi(request, env, pathname);
       if (native) return native;
+    }
+
+    // Optional origin enforcement. ONLY the exact `intelStrictOrigin=1` query flag can produce
+    // a rejection; without it no request is ever rejected for its Origin. Native routes were
+    // already answered above, and assets / pass-through files are excluded so they stay
+    // verbatim even when a deployment opts in.
+    if (strictOriginMismatch(request)) {
+      if (pathname === '/api' || pathname.startsWith('/api/')) {
+        return apiResponse(
+          Response.json({ error: 'Origin check failed.' }, { status: 403 }),
+          env,
+          request
+        );
+      }
+      if (!pathname.startsWith('/assets/') && !PASS_THROUGH_PATHS.has(pathname)) {
+        return applyClientHintHeaders(new Response('Forbidden', { status: 403 }), env, request);
+      }
     }
 
     const verdict = await computeEdgeVerdict(request);

@@ -281,6 +281,68 @@ export interface IncognitoDiagnostics {
   serverWouldVeto?: boolean | null;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Additive integration mirrors (shapes mirror src/types/visitor.ts)           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * These local shapes keep this module dependency-free: `visitor.ts` imports from here, so the
+ * canonical envelope cannot import its interfaces back. Every member is OPTIONAL and the
+ * vocabulary matches the corresponding `SecuritySignals` / response fields verbatim. Nothing
+ * here is re-derived — a producer copies the server verdict across unchanged.
+ */
+
+/** Canonical proxy verdict mirror (`proxyDetected` / `proxyReasons` on the visitor response). */
+export interface ProxyDetailsMirror {
+  proxy?: boolean;
+  /** Accepts both the legacy `datacenter` / `none` and the resolver's `data_center` vocabulary. */
+  proxy_type?: string | null;
+  confidence?: 'low' | 'medium' | 'high';
+  reason?: string;
+  reasons?: string[];
+}
+
+/** Server `vpnMethods` block mirror (the single source of truth for the VPN tile count). */
+export interface VpnMethodsMirror {
+  timezone_mismatch?: boolean;
+  public_vpn?: boolean;
+  auxiliary_mobile?: boolean;
+  os_mismatch?: boolean;
+  relay?: boolean;
+  ml_prediction?: boolean;
+  origin_country?: string | null;
+  reasons?: string[];
+}
+
+/** Structured privacy-signature mirror; `privacy_settings` itself is also accepted as a boolean. */
+export interface PrivacySettingsMirror {
+  privacy_settings?: boolean;
+  privacy_hardened?: boolean;
+  signatures?: string[];
+  suppressAntiDetectPenalty?: boolean;
+  confidence?: 'high' | 'medium' | 'low';
+  reasons?: string[];
+}
+
+/** Four-tier stealth-evaluation mirror (`stealthPluginDetected` on the visitor response). */
+export interface StealthSignalsMirror {
+  detected?: boolean;
+  ids?: string[];
+  hard?: string[];
+  reasons?: string[];
+  stealthPluginDetected?: boolean;
+}
+
+/** Mirror of `tamperingDetails` on the visitor response / `TamperingDetails`. */
+export interface TamperingDetailsMirror {
+  anomaly_score?: number;
+  anti_detect_browser?: boolean;
+  devtools_device_emulation?: boolean;
+  privacy_hardened?: boolean;
+  reasons?: string[];
+  hardAutomationEvidence?: string[];
+}
+
 /** The single response envelope consumed by the dashboard and the Event JSON. */
 export interface CanonicalTelemetryEnvelope {
   event_id: string;
@@ -339,6 +401,25 @@ export interface CanonicalTelemetryEnvelope {
   inspectorState?: InspectorStateTristate | InspectorState;
   /** Additive incognito / private-mode diagnostic readout, when the probe pipeline supplied one. */
   diagnostics?: IncognitoDiagnostics;
+
+  /* ------------------------------------------------------------------------ */
+  /* Additive integration mirrors (ALL OPTIONAL — legacy payloads stay valid).  */
+  /* Each value is copied verbatim from the corresponding visitor-response field */
+  /* (src/types/visitor.ts); the envelope never re-derives any of them. The local */
+  /* shapes above exist only to keep this file import-free.                      */
+  /* ------------------------------------------------------------------------ */
+  /** Canonical proxy verdict mirror (`proxyDetected` / `proxyReasons`). */
+  proxy_details?: ProxyDetailsMirror | null;
+  /** Server `vpnMethods` block mirror. */
+  vpn_methods?: VpnMethodsMirror | null;
+  /** Privacy-signature / private-browsing mirror (`privacySettings`). */
+  privacy_settings?: boolean | PrivacySettingsMirror | null;
+  /** Four-tier stealth-evaluation mirror (`stealthPluginDetected`). */
+  stealth_signals?: StealthSignalsMirror | null;
+  /** Tampering detail mirror (`tamperingDetails`). */
+  tampering_details?: TamperingDetailsMirror | null;
+  /** Network-layer fingerprint hash, when the edge supplied one. */
+  network_layer_hash?: string | null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -449,6 +530,112 @@ export function assertCanonicalConsistency(view: CanonicalConsistencyView): stri
     }
   }
 
+  return issues;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Integrated consistency (pure, non-throwing)                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Structural view for `assertIntegratedConsistency`. Every field is optional so a partial
+ * integration still yields diagnostics instead of a type error. The canonical `risk` core is
+ * the same one `assertCanonicalConsistency` reads; the flat `score10` / `risk_tier` members are
+ * the mirrors republished on the visitor response and the Event JSON.
+ */
+export interface IntegratedConsistencyView {
+  /** Canonical risk ledger (or any structurally compatible view). */
+  risk?: {
+    score_0_100: number;
+    tier: RiskTier;
+    score10?: number;
+    risk_tier?: RiskTier;
+  } | null;
+  /** Flat 0-10 headline mirror on the visitor response / Event JSON. */
+  score10?: number;
+  /** Flat canonical-tier mirror on the visitor response. */
+  risk_tier?: RiskTier;
+  /** Optional tier-shaped label mirror. */
+  label?: string;
+  /** Extra envelope / response fields are accepted and ignored by this check. */
+  [key: string]: unknown;
+}
+
+/**
+ * Pure, non-throwing parity check over every risk mirror published at more than one
+ * integration point. `risk.tier` is the single source of truth for the tier and
+ * `canonicalScore10(risk.score_0_100)` for the headline: `risk.score10`, `risk.risk_tier`,
+ * the flat `score10` / `risk_tier` mirrors and a tier-shaped `label` must all agree with them.
+ *
+ * This helper is additive and independent: it never calls or mutates any existing helper and
+ * never throws — malformed / hostile payloads degrade to a list of human-readable issues.
+ * An empty array means every mirror that is actually present agrees.
+ */
+export function assertIntegratedConsistency(view: IntegratedConsistencyView): string[] {
+  const issues: string[] = [];
+  try {
+    if (!view || typeof view !== 'object') {
+      issues.push('view must be an object');
+      return issues;
+    }
+
+    const risk = view.risk;
+    if (!risk || typeof risk !== 'object' || !Number.isFinite(risk.score_0_100)) {
+      issues.push('risk.score_0_100 must be a finite number');
+      return issues;
+    }
+
+    const composite = risk.score_0_100;
+    const expectedScore10 = canonicalScore10(composite);
+    const expectedTier = riskTier(composite);
+
+    /* 0. The canonical tier itself must be well-formed before it can be a reference. */
+    if (!CANONICAL_RISK_TIERS.has(risk.tier)) {
+      issues.push(`risk.tier=${String(risk.tier)} is not a canonical risk tier`);
+    } else if (risk.tier !== expectedTier) {
+      issues.push(`risk.tier=${risk.tier} disagrees with score_0_100=${composite} (expected ${expectedTier})`);
+    }
+
+    /* 1. score10 mirrors (ledger-local and flat response mirror). */
+    if (risk.score10 !== undefined) {
+      if (typeof risk.score10 !== 'number' || !Number.isFinite(risk.score10)) {
+        issues.push('risk.score10 must be a finite number when present');
+      } else if (risk.score10 !== expectedScore10) {
+        issues.push(`risk.score10=${risk.score10} disagrees with score_0_100=${composite} (expected ${expectedScore10})`);
+      }
+    }
+    if (view.score10 !== undefined) {
+      if (typeof view.score10 !== 'number' || !Number.isFinite(view.score10)) {
+        issues.push('score10 mirror must be a finite number when present');
+      } else if (view.score10 !== expectedScore10) {
+        issues.push(`score10 mirror=${view.score10} disagrees with canonical score10=${expectedScore10}`);
+      }
+    }
+
+    /* 2. tier mirrors (ledger-local and flat response mirror). */
+    if (risk.risk_tier !== undefined) {
+      if (!CANONICAL_RISK_TIERS.has(risk.risk_tier)) {
+        issues.push(`risk.risk_tier=${String(risk.risk_tier)} is not a canonical risk tier`);
+      } else if (risk.risk_tier !== expectedTier || risk.risk_tier !== risk.tier) {
+        issues.push(`risk.risk_tier=${risk.risk_tier} disagrees with canonical tier ${expectedTier}`);
+      }
+    }
+    if (view.risk_tier !== undefined) {
+      if (!CANONICAL_RISK_TIERS.has(view.risk_tier)) {
+        issues.push(`risk_tier mirror=${String(view.risk_tier)} is not a canonical risk tier`);
+      } else if (view.risk_tier !== expectedTier || view.risk_tier !== risk.tier) {
+        issues.push(`risk_tier mirror=${view.risk_tier} disagrees with canonical tier ${expectedTier}`);
+      }
+    }
+
+    /* 3. A tier-shaped label is a mirror too; other label vocabularies are ignored. */
+    if (typeof view.label === 'string' && CANONICAL_RISK_TIERS.has(view.label) && view.label !== expectedTier) {
+      issues.push(`label=${view.label} disagrees with canonical tier ${expectedTier}`);
+    }
+  } catch {
+    /* Hostile getters / proxies must never turn a diagnostic helper into a crash. */
+    issues.push('integrated consistency check could not read the view');
+  }
   return issues;
 }
 

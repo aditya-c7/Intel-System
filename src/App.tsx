@@ -1748,6 +1748,25 @@ export default function App() {
       // Tri-layer identity evidence from the server resolver + calibrated confidence v2.0.
       identity_layers: data.identity_layers ?? null,
       consistency: data.consistency ?? null,
+      // Additive canonical truth mirrors — surfaced verbatim in this detail view only. Each
+      // value is the single canonical envelope's pass-through (never re-derived or computed on
+      // the client), so every extra field the server supplied — e.g.
+      // `vpn_methods.latency_distance_mismatch`, a `proxy_details.proxy_type` of
+      // `data_center`/`residential`, or the JA4H-style `network_layer_hash` — is preserved as-is.
+      // A mirror the server did not supply stays absent (no fabricated empty object/false/zero),
+      // and these spreads come last so a supplied mirror wins over any legacy flat fallback.
+      ...(canonical.proxy_details != null ? { proxy_details: canonical.proxy_details } : {}),
+      ...(canonical.vpn_methods != null ? { vpn_methods: canonical.vpn_methods } : {}),
+      ...(canonical.privacy_settings != null
+        ? { privacy_settings: canonical.privacy_settings }
+        : {}),
+      ...(canonical.stealth_ids != null ? { stealth_ids: canonical.stealth_ids } : {}),
+      ...(canonical.tampering_details != null
+        ? { tampering_details: canonical.tampering_details }
+        : {}),
+      ...(canonical.network_layer_hash != null
+        ? { network_layer_hash: canonical.network_layer_hash }
+        : {}),
     };
   }, [
     data,

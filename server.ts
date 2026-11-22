@@ -132,6 +132,12 @@ import {
   type WbaTrustedSigner,
   type WbaVerifyOptions,
 } from './src/lib/wbaVerifier';
+// Shadow-only, additive truth helpers. Every verdict they produce is a SECOND OPINION:
+// nothing below reads these values into the 0-10 headline, the 0-100 ledger, the verdict
+// tier, the bot/isBot gate, the uncalibrated confidence gate or the blocklist/auth flow.
+import { resolveProxyDetails, type ProxyDetails } from './src/lib/proxyTruth';
+import { resolveVpnMethods } from './src/lib/vpnMethods';
+import { checkStrictOrigin, ipReplayRate, replayWindowStatus } from './src/lib/zeroTrust';
 
 /* -------------------------------------------------------------------------- */
 /* Shared agent registry adapter                                                */
@@ -6444,6 +6450,8 @@ interface RequestIntegrityContext {
   replayDetected?: boolean;
   requestIntegrityReason?: string;
   requestNonce?: string;
+  /** Real edge-observed RTT (ms) for the additive RTT-based light-distance estimate only. */
+  clientTcpRttMs?: number | null;
   torExitNode?: boolean;
   /** True when the address belongs to the Tor network (exit *or* relay). */
   torRelay?: boolean;
@@ -7057,6 +7065,51 @@ function sanitizeAndReinforceSecuritySignals(
     commercialVpnProvider ||
     Boolean(requestContext.torExitNode || requestContext.torRelay) ||
     verifiedProxyRelay;
+  // Shadow-only canonical vpnMethods resolver. Its output is additive: the six legacy flags
+  // above remain the single source for the VPN tile, vpnSuspected and the risk ledger. Only an
+  // explicit verified IP-geolocation country may become origin_country; a timezone is never
+  // turned into a country, and a legacy mismatch hint is diagnostic-only inside the resolver.
+  const shadowVpnVerdict = resolveVpnMethods({
+    browserTimezone,
+    ipTimezone,
+    canonicalMismatch: hasTzMismatch,
+    ipCountry: location.countryCode,
+    publicVpn: commercialVpnProvider,
+    relay: Boolean(torExitNode),
+    osMismatch: Boolean(raw?.isOsTampered),
+    mlPrediction: Boolean(raw?.vpnSuspected) && concreteVpnEvidence,
+  });
+  // Real RTT only: an edge-observed clientTcpRtt (preferred) or a positive
+  // navigator.connection.rtt sample. rtt === 0 means "unknown" in the Network Information
+  // API and is never treated as a measurement.
+  const rawSignalBagForRtt = (raw ?? {}) as Record<string, unknown>;
+  const clientReportedRtt =
+    typeof rawSignalBagForRtt.networkRtt === 'number' && Number.isFinite(rawSignalBagForRtt.networkRtt)
+      ? rawSignalBagForRtt.networkRtt
+      : null;
+  const observedRttMs =
+    typeof requestContext.clientTcpRttMs === 'number' &&
+    Number.isFinite(requestContext.clientTcpRttMs) &&
+    requestContext.clientTcpRttMs > 0
+      ? requestContext.clientTcpRttMs
+      : clientReportedRtt !== null && clientReportedRtt > 0
+      ? clientReportedRtt
+      : null;
+  // km = (RTT_ms / 2) * 1000 * 0.206 / p with a path factor p ~= 1.5..2. This is an
+  // APPROXIMATION ("RTT-based light-distance estimate"), NOT JA4L and not a fingerprint/ladder.
+  // With no verified client<->server distance reference a contradiction can never be proven, so
+  // we never assert a mismatch: emit an explicit non-claim only when a real RTT exists, and omit
+  // the field entirely otherwise. No points are charged anywhere from this object.
+  const latencyBasis =
+    observedRttMs !== null
+      ? {
+          label: 'RTT-based light-distance estimate (approximation)',
+          rtt_ms: Math.round(observedRttMs),
+          estimated_distance_km_low: Math.round(((observedRttMs / 2) * 1000 * 0.206) / 2),
+          estimated_distance_km_high: Math.round(((observedRttMs / 2) * 1000 * 0.206) / 1.5),
+          note: 'Approximation from real RTT only; not JA4L; no mismatch asserted without a verified distance reference',
+        }
+      : null;
   const vpnMethods = {
     timezone_mismatch: hasTzMismatch,
     public_vpn: commercialVpnProvider,
@@ -7067,6 +7120,10 @@ function sanitizeAndReinforceSecuritySignals(
     // corroborates it (provider-owned VPN, Tor relay or verified proxy chain). Never ASN alone,
     // never timezone alone — both are orthogonal axes, not tunnels.
     ml_prediction: Boolean(raw?.vpnSuspected) && concreteVpnEvidence,
+    // Additive shadow fields — never read by the tile score, composite, ledger or tier.
+    origin_country: shadowVpnVerdict.origin_country,
+    reasons: shadowVpnVerdict.reasons,
+    ...(latencyBasis ? { latency_distance_mismatch: { mismatch: false, ...latencyBasis } } : {}),
   };
   // Runtime parity assertion: the vpn_methods mirror and the serialised security-signal flag
   // must agree with the single canonical timezone verdict (Calcutta vs Kolkata is always false).
@@ -7806,6 +7863,20 @@ function sanitizeAndReinforceSecuritySignals(
 
   const proxyAssessment = detectProxyHeaders(requestContext.headers, location.publicIp);
 
+  // Shadow-only second opinion from proxyTruth. It is NEVER read by suspectScore, the graded
+  // ledger, the verdict tier, isBot or the legacy proxyDetected flag. A verified good bot is an
+  // explicit exemption for the data_center label; a bare hosting/cloud ASN stays reason-only and
+  // cannot manufacture a residential claim.
+  const proxyAsnMatch = String(location.asn || '').match(/\d+/);
+  const proxyDetails: ProxyDetails = resolveProxyDetails({
+    datacenterResult: datacenterAsn,
+    verifiedGoodBot: verifiedGoodCrawler || botSubtype === 'good_bot',
+    asnType: datacenterAsn ? 'datacenter' : undefined,
+    asn: proxyAsnMatch ? Number.parseInt(proxyAsnMatch[0], 10) : null,
+    vpn: concreteVpnEvidence || proxyAssessment.detected,
+    knownProxyPrefix: false,
+  });
+
   const securitySignalsCore: SecuritySignals = {
     isBot,
     botSignals,
@@ -7906,6 +7977,8 @@ function sanitizeAndReinforceSecuritySignals(
       // Phase 5 — explicit proxy relay markers (Via / Forwarded / Proxy-Authorization chains)
       proxyDetected: proxyAssessment.detected,
       proxyReasons: proxyAssessment.reasons,
+      // Additive proxy truth second opinion (never a verdict input).
+      proxy_details: proxyDetails,
       // Phase 3 — mobile emulator / simulator verdict
       emulatorDetected,
       emulatorReason,
@@ -7936,7 +8009,7 @@ function sanitizeAndReinforceSecuritySignals(
       // Task 3 — visit velocity / IP rotation (display only, never scored)
       distinctIpsLastHour: velocity.distinctIpsLastHour,
       visitsLastHour: velocity.visitsLastHour,
-    } as Partial<SecuritySignals> & { cloudOrMaskedGpu?: boolean }),
+    } as Partial<SecuritySignals> & { cloudOrMaskedGpu?: boolean; proxy_details?: ProxyDetails }),
   };
 }
 
@@ -8929,6 +9002,97 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     const hasTrustedInteractionEvidence =
       envelopeSignedAndClean && earlyInteractionEvidence > 0;
 
+    /* ---- Additive zero-trust + network-fingerprint shadow diagnostics ------------
+     * These are OBSERVATIONS ONLY. Nothing here is wired into auth, the blocklist, the
+     * 0-10 headline, the 0-100 graded ledger, the verdict tier or isBot. The strict-origin
+     * check is opt-in via env and even when enabled it only reports (`enforced: false`);
+     * no request is ever rejected by this block.
+     */
+    const strictOriginOptIn =
+      process.env.INTEL_STRICT_ORIGIN === '1' ||
+      process.env.INTEL_ZERO_TRUST_STRICT_ORIGIN === '1';
+    const firstClientText = (...values: unknown[]): string | null => {
+      for (const value of values) {
+        if (typeof value === 'string' && value.trim()) return value.trim();
+      }
+      return null;
+    };
+    const envelopeExtra = (requestBody.securityEnvelope ?? {}) as Record<string, unknown>;
+    const strictOriginResult = checkStrictOrigin({
+      origin: readRequestHeader(rawRequestHeaders, 'origin'),
+      referer: readRequestHeader(rawRequestHeaders, 'referer'),
+      clientUrl: firstClientText(
+        clientExtras.clientUrl,
+        clientExtras.documentUrl,
+        clientExtras.pageUrl,
+        clientExtras.href,
+        envelopeExtra.url
+      ),
+      clientReferrer: firstClientText(
+        clientExtras.clientReferrer,
+        clientExtras.documentReferrer,
+        clientExtras.referrer
+      ),
+      nowMs,
+    });
+    const envTimestampRaw = envelopeExtra.timestamp;
+    const envelopeTimestampMs =
+      typeof envTimestampRaw === 'number' && Number.isFinite(envTimestampRaw) && envTimestampRaw > 0
+        ? envTimestampRaw
+        : Number.parseFloat(readRequestHeader(rawRequestHeaders, 'x-intel-timestamp'));
+    const replayWindow = replayWindowStatus(
+      envelopeTimestampMs,
+      nowMs,
+      envelopeVerdict.replayDetected ? envelopeVerdict.requestNonce : null,
+      ENVELOPE_MAX_AGE_MS
+    );
+    const ipLedgerReasons = suspiciousIpReasons.get(location.publicIp) ?? [];
+    const replayLedgerReasons = ipLedgerReasons.filter((reason) => /replay/i.test(reason));
+    const replayRate = ipReplayRate(replayLedgerReasons.length, ipLedgerReasons.length, 7);
+    const zeroTrustShadow = {
+      strict_origin: {
+        enabled: strictOriginOptIn,
+        ok: strictOriginResult.ok,
+        reason: strictOriginResult.reason,
+        // Purely additive: never enforced, never changes the existing auth flow.
+        enforced: false,
+      },
+      replay_window: {
+        fresh: replayWindow.fresh,
+        duplicate: replayWindow.duplicate,
+        reason: replayWindow.reason,
+      },
+      replay_rate: {
+        ...replayRate,
+        replays: replayLedgerReasons.length,
+        observations: ipLedgerReasons.length,
+        window_days: 7,
+        note: 'Replay share over the in-process abuse ledger; diagnostic only, never a verdict input',
+      },
+    };
+    const edgeTransportForTrust = readEdgeTransport(req);
+    const networkFingerprintShadow = {
+      // A Worker cannot observe raw wire order and Cloudflare rewrites headers, so an exact
+      // JA4H is never asserted. Keep only the honestly computable, distinctly-labelled value.
+      network_layer_hash: null,
+      network_layer_hash_label:
+        'JA4H-style HTTP-header fingerprint (not exact JA4H: raw wire order is unavailable to Workers and Cloudflare rewrites headers)',
+      // All-plan Cloudflare TLS-lite components: never JA3/JA4, never a JA3/JA4-shaped hash.
+      edge_tls: {
+        label: 'edge-derived TLS components',
+        tlsVersion: edgeTransportForTrust.tlsVersion || null,
+        tlsCipher: edgeTransportForTrust.tlsCipher || null,
+        clientTcpRttMs: edgeTransportForTrust.clientTcpRtt,
+        httpProtocol: edgeTransportForTrust.httpProtocol || null,
+        colo: edgeTransportForTrust.colo || null,
+        ja3: edgeTransportForTrust.ja3,
+        ja4t: edgeTransportForTrust.ja4t,
+        // cf.botManagement.ja3Hash / ja4 are Enterprise-only: null-guarded, never claimed on free.
+        cfJa4Enterprise: null,
+        note: 'Free-plan TLS-lite components only; Enterprise cf.botManagement hashes are not claimed',
+      },
+    };
+
     // STRONG protocol-level CDP proof is the only path to `cdp_attached` / CDP escalation.
     // Error.name preview reads, a `cdpRuntimeLeak`, a patched webdriver getter or a substring
     // match inside an inspector probe preview are weak, engine-dependent mobile artifacts: they
@@ -9343,6 +9507,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         replayDetected: envelopeVerdict.replayDetected,
         requestIntegrityReason: envelopeVerdict.requestIntegrityReason,
         requestNonce: envelopeVerdict.requestNonce,
+        // Real edge RTT feeds only the labelled RTT-based light-distance estimate in vpn_methods.
+        clientTcpRttMs: edgeTransportForTrust.clientTcpRtt,
         torExitNode,
         torRelay: torStatus.isRelay,
         torVerdict: torStatus.verdict,
@@ -10522,6 +10688,11 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       0.05
     );
     const edgeTransport = readEdgeTransport(req);
+    // Additive shadow mirrors — verbatim pass-through only. None of these values are read back
+    // into the 0-10 headline, the 0-100 graded ledger, the verdict tier, isBot or auth.
+    const shadowProxyDetails =
+      (securitySignals as SecuritySignals & { proxy_details?: ProxyDetails }).proxy_details ?? null;
+    const shadowVpnMethods = securitySignals.vpnMethods ?? null;
     const invariantEnvelope = {
       event_id: eventId,
       identity: {
@@ -10615,6 +10786,13 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       verdict_tier: effectiveVerdictTier,
       // Additive incognito diagnostics — verbatim, flag-gated pass-through (never scored).
       ...(diagnostics ? { diagnostics } : {}),
+      // Additive shadow truth mirrors. proxy_details / vpn_methods match the shapes the
+      // dashboard adapter already reads; the zero-trust and fingerprint blocks are diagnostics
+      // only (strict-origin is opt-in and never enforced here).
+      proxy_details: shadowProxyDetails,
+      vpn_methods: shadowVpnMethods,
+      zero_trust: zeroTrustShadow,
+      network_fingerprint_truth: networkFingerprintShadow,
     } as unknown as CanonicalTelemetryEnvelope;
 
     const payload: IntelVisitorResponse & {
@@ -10636,6 +10814,11 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       /** Which high-activity rule produced `highActivityDevice`. */
       highActivityThresholdMode: 'fixed_small_corpus' | 'p98';
       highActivityThreshold: number;
+      /** Additive shadow truth mirrors — verbatim, never scored or enforced. */
+      proxy_details: ProxyDetails | null;
+      vpn_methods: unknown;
+      zero_trust: unknown;
+      network_fingerprint_truth: unknown;
     } = {
       visitorId,
       visitorToken,
@@ -10753,6 +10936,11 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       replayed: envelopeVerdict.replayDetected,
       tampered: envelopeVerdict.tamperedRequest,
       requestIntegrityReason: envelopeVerdict.requestIntegrityReason,
+      // Additive shadow truth mirrors — the exact same references carried in the envelope.
+      proxy_details: shadowProxyDetails,
+      vpn_methods: shadowVpnMethods,
+      zero_trust: zeroTrustShadow,
+      network_fingerprint_truth: networkFingerprintShadow,
       // Phase 3–6 canonical mirrors. The single envelope above is the source of truth; these
       // top-level mirrors keep existing clients working without any parallel scoring math.
       envelope: invariantEnvelope,

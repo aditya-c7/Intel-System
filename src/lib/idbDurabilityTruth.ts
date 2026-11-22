@@ -52,6 +52,32 @@ function bool(value: unknown): boolean {
   return value === true;
 }
 
+/**
+ * Whether the first-party persistent-marker veto should override a private verdict.
+ *
+ * A private window keeps its first-party cookie/localStorage for the lifetime of that private
+ * session, so every page after the first carries the marker. The veto must not erase a decisive
+ * RAM-backed physics verdict in that case. Normal disk-backed profiles (ratio far above 1.1),
+ * deadband/inconclusive probes and all hard vetoes keep the original marker behavior.
+ */
+export function shouldApplyMarkerVeto(
+  markerPresent: boolean | null | undefined,
+  truth: IdbDurabilityTruth,
+  ratio: number | null | undefined
+): boolean {
+  if (markerPresent !== true) return false;
+  if (
+    truth.incognito &&
+    truth.rule === 'strong_ram_signature' &&
+    typeof ratio === 'number' &&
+    Number.isFinite(ratio) &&
+    ratio <= 1.1
+  ) {
+    return false;
+  }
+  return true;
+}
+
 export function resolveIdbDurabilityTruth(input: IdbDurabilityInput = {}): IdbDurabilityTruth {
   let source: Record<string, unknown> = {};
   try {

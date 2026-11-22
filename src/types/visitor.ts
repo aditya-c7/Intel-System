@@ -1,8 +1,13 @@
 import type {
   GpuObservation,
   InspectorStateTristate,
+  PrivacySettingsMirror,
+  ProxyDetailsMirror,
   RiskEvidenceLine,
   RiskTier,
+  StealthSignalsMirror,
+  TamperingDetailsMirror,
+  VpnMethodsMirror,
 } from '../lib/telemetryContract';
 import type { ClientType, RuntimeKind } from '../shared/normalization/uaNormalizer';
 
@@ -252,6 +257,82 @@ export interface IncognitoDiagnostics {
   serverWouldVeto?: boolean | null;
 }
 
+/* -------------------------------------------------------------------------- */
+/* Additive OPTIONAL evidence mirrors — all fields below are transport-only.   */
+/* Every value is copied verbatim from the server verdict; no consumer may      */
+/* re-derive a risk score, tier or bot verdict from any of them.                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Canonical proxy verdict produced by `resolveProxyDetails` (`src/lib/proxyTruth.ts`).
+ * `proxy_type` uses the resolver vocabulary; legacy `datacenter` / `none` labels
+ * arrive through the looser `ProxyDetailsMirror` alias.
+ */
+export interface ProxyDetails {
+  proxy: boolean;
+  proxy_type: 'data_center' | 'residential' | null;
+  confidence: 'low' | 'medium' | 'high';
+  reason: string;
+}
+
+/**
+ * Server `vpnMethods` block. The six legacy flags stay required; the two additive
+ * keys mirror `resolveVpnMethods` (`src/lib/vpnMethods.ts`).
+ */
+export interface VpnMethods {
+  timezone_mismatch: boolean;
+  public_vpn: boolean;
+  auxiliary_mobile: boolean;
+  os_mismatch: boolean;
+  relay: boolean;
+  ml_prediction: boolean;
+  /** Verified ISO 3166-1 alpha-2 origin country, never inferred from a timezone. */
+  origin_country?: string | null;
+  /** Human-readable audit trail for every resolved method. */
+  reasons?: string[];
+}
+
+/**
+ * Structured privacy-signature verdict from `resolvePrivacySignatures`
+ * (`src/lib/privacySignatures.ts`). Informational only — never a risk input.
+ */
+export interface PrivacySettings {
+  privacy_settings?: boolean;
+  privacy_hardened?: boolean;
+  signatures?: string[];
+  suppressAntiDetectPenalty?: boolean;
+  confidence?: 'low' | 'medium' | 'high';
+  reasons?: string[];
+  /** Flat mirror of the fired signature tokens used by the collector payload. */
+  privacy_signature_ids?: string[];
+}
+
+/**
+ * Four-tier stealth-evaluation mirror from `evaluateStealthSignals`
+ * (`src/lib/stealthSignals.ts`). Informational only — never a bot verdict.
+ */
+export interface StealthSignals {
+  detected?: boolean;
+  ids?: string[];
+  hard?: string[];
+  reasons?: string[];
+  stealthPluginDetected?: boolean;
+  /** Flat mirror of `ids` used by the collector payload. */
+  stealth_signal_ids?: string[];
+}
+
+/** Structured browser-tampering details (extracted from the two inline mirrors). */
+export interface TamperingDetails {
+  anomaly_score: number;
+  anti_detect_browser: boolean;
+  devtools_device_emulation: boolean;
+  reasons: string[];
+  /** True when the runtime is a confirmed privacy-hardened browser (RFP/FPP/ATFP). */
+  privacy_hardened?: boolean;
+  /** Strongly-corroborated CDP/Playwright/CDC artifacts promoted to the bot gate. */
+  hardAutomationEvidence?: string[];
+}
+
 export interface SecuritySignals {
   isBot: boolean;
   botSignals: string[];
@@ -296,14 +377,9 @@ export interface SecuritySignals {
   /* Network anonymity methods — the single source of truth for the VPN tile count */
   /** True only for a real commercial VPN provider, never for plain hosting/datacenter. */
   publicVpn?: boolean;
-  vpnMethods?: {
-    timezone_mismatch: boolean;
-    public_vpn: boolean;
-    auxiliary_mobile: boolean;
-    os_mismatch: boolean;
-    relay: boolean;
-    ml_prediction: boolean;
-  };
+  vpnMethods?: VpnMethods;
+  /** Envelope spelling of `vpnMethods` — the same object, mirrored verbatim. */
+  vpn_methods?: VpnMethodsMirror | null;
 
   /* Task 3 — deep technical detection payloads */
   webrtcLeak?: boolean;
@@ -366,6 +442,10 @@ export interface SecuritySignals {
   /** Explicit proxy relay markers observed on the request (Via / Forwarded / proxy auth). */
   proxyDetected?: boolean;
   proxyReasons?: string[];
+  /** Additive canonical proxy verdict — never a second proxy/VPN gate. */
+  proxyDetails?: ProxyDetails;
+  /** Envelope spelling of `proxyDetails`; accepts legacy `datacenter` / `none` labels. */
+  proxy_details?: ProxyDetailsMirror | null;
   /** Client-side Tor Browser fingerprint (Gecko RFP + letterboxing). */
   isTorBrowserClient?: boolean;
   /** Tri-state server verdict: an anonymous relay known to be an exit node or a relay. */
@@ -393,17 +473,9 @@ export interface SecuritySignals {
   tampering?: boolean;
   tamperingConfidence?: 'low' | 'medium' | 'high';
   tamperingMlScore?: number;
-  tamperingDetails?: {
-    anomaly_score: number;
-    anti_detect_browser: boolean;
-    devtools_device_emulation: boolean;
-    reasons: string[];
-    /** True when the runtime is a confirmed privacy-hardened browser (RFP/FPP/ATFP). */
-    privacy_hardened?: boolean;
-    /** Strongly-corroborated CDP/Playwright/CDC artifacts promoted to the bot gate. Weak,
-     * engine-dependent artifacts never appear here on their own. */
-    hardAutomationEvidence?: string[];
-  };
+  tamperingDetails?: TamperingDetails;
+  /** Envelope spelling of `tamperingDetails`. */
+  tampering_details?: TamperingDetailsMirror | null;
   developerTools?: boolean;
 
   /* Phase 5 — active call detection (supported ⇒ the row is rendered) */
@@ -413,6 +485,30 @@ export interface SecuritySignals {
 
   /* Phase 5 — privacy settings (Tor Browser RFP / Brave Shields / canvas noise) */
   privacySettings?: boolean;
+
+  /* Additive privacy / stealth / network-edge mirrors — all OPTIONAL, informational only.
+     None of these may feed suspectScore, riskLevel, riskFactors or any verdict. */
+  /** Structured privacy-signature verdict (envelope spelling). */
+  privacy_settings?: boolean | PrivacySettings | null;
+  /** Confirmed privacy-hardening posture from the privacy-signature resolver. */
+  privacy_hardened?: boolean;
+  /** Fired privacy signature tokens, mirrored from the collector payload. */
+  privacy_signature_ids?: string[];
+  /** Structured four-tier stealth-evaluation mirror. */
+  stealthSignals?: StealthSignals;
+  /** Envelope spelling of `stealthSignals`. */
+  stealth_signals?: StealthSignalsMirror | null;
+  /** Flat stealth-id mirrors read beside the nested evaluation. */
+  stealth_ids?: string[] | null;
+  stealthIds?: string[] | null;
+  stealth_signal_ids?: string[];
+  stealthReasons?: string[];
+  /** Edge-derived network-layer fingerprint hash (JA4H-style, never JA3/JA4). */
+  networkLayerHash?: string | null;
+  network_layer_hash?: string | null;
+  ja4h?: string | null;
+  /** Flat mirror of `diagnostics.idbTruthRule`; never a verdict input. */
+  idbTruthRule?: string | null;
 
   /* Phase 6 — raw device attributes (font, emoji, canvas, WebGL, math entropy) */
   rawDeviceAttributes?: unknown;
@@ -484,6 +580,16 @@ export interface LocationInfo {
   isNetworkLocation?: boolean;
   /** Egress-node details, populated for Tor / VPN / proxy connections. */
   networkLocation?: NetworkLocationInfo;
+
+  /* Additive network-edge evidence — OPTIONAL, verbatim mirrors, never a location verdict. */
+  /** Canonical proxy verdict for the egress network. */
+  proxyDetails?: ProxyDetails;
+  /** Envelope spelling of `proxyDetails`; accepts legacy `datacenter` / `none` labels. */
+  proxy_details?: ProxyDetailsMirror | null;
+  /** Edge-derived network-layer fingerprint hash (JA4H-style, never JA3/JA4). */
+  networkLayerHash?: string | null;
+  network_layer_hash?: string | null;
+  ja4h?: string | null;
 
   /* Additive geo-enrichment fields (canonical contract) — all OPTIONAL. Values come only
      from the edge / provider; an unavailable value is never replaced with an invented one. */
@@ -587,6 +693,30 @@ export interface IntelVisitorResponse {
   incognito?: boolean;
   /** Additive structured incognito probe diagnostics mirrored from the collector. */
   diagnostics?: IncognitoDiagnostics;
+
+  /* Additive evidence mirrors — ALL OPTIONAL, copied verbatim from the canonical envelope
+     or its `securitySignals` transport mirror. Nothing here is re-derived or fed back into a
+     verdict. Both the envelope's snake_case spelling and a camelCase alias are accepted. */
+  proxyDetails?: ProxyDetails;
+  proxy_details?: ProxyDetailsMirror | null;
+  vpnMethods?: VpnMethods;
+  vpn_methods?: VpnMethodsMirror | null;
+  privacySettings?: boolean | PrivacySettings;
+  privacy_settings?: boolean | PrivacySettings | null;
+  privacy_hardened?: boolean;
+  privacy_signature_ids?: string[];
+  stealthSignals?: StealthSignals;
+  stealth_signals?: StealthSignalsMirror | null;
+  stealth_ids?: string[] | null;
+  stealthIds?: string[] | null;
+  stealth_signal_ids?: string[];
+  stealthReasons?: string[] | null;
+  networkLayerHash?: string | null;
+  network_layer_hash?: string | null;
+  ja4h?: string | null;
+  /** Shadow-only IDB resolver rule id, mirrored verbatim — never a verdict input. */
+  idbTruthRule?: string | null;
+
   suspectScore?: number;
   riskLevel?: RiskLevel;
   riskBadgeText?: string;
@@ -599,17 +729,9 @@ export interface IntelVisitorResponse {
   rareDevicePercentileBucket?: string;
   tampering?: boolean;
   tamperingConfidence?: 'low' | 'medium' | 'high';
-  tamperingDetails?: {
-    anomaly_score: number;
-    anti_detect_browser: boolean;
-    devtools_device_emulation: boolean;
-    reasons: string[];
-    /** True when the runtime is a confirmed privacy-hardened browser (RFP/FPP/ATFP). */
-    privacy_hardened?: boolean;
-    /** Strongly-corroborated CDP/Playwright/CDC artifacts promoted to the bot gate. Weak,
-     * engine-dependent artifacts never appear here on their own. */
-    hardAutomationEvidence?: string[];
-  };
+  tamperingDetails?: TamperingDetails;
+  /** Envelope spelling of `tamperingDetails`. */
+  tampering_details?: TamperingDetailsMirror | null;
   activeCall?: boolean;
   activeCallSupported?: boolean;
   rawDeviceAttributes?: unknown;

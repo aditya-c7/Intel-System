@@ -60,6 +60,10 @@ export interface BotVerifierWebBotAuth {
   identity?: string | null;
   /** Verification status alias used by the WBA verifier (`verified` | `signed` | …). */
   status?: string | null;
+  /** RFC 9421 tri-state outcome: `valid` | `invalid` | `neutral` (NEUTRAL falls back to IP/UA). */
+  result?: string | null;
+  /** Reason code for an INVALID signature — never contributes to a good verdict. */
+  invalidReason?: string | null;
   /** Agent category from the registry (`ai_assistant` / `ai_agent` / `assistant` / `agent`). */
   category?: string | null;
 }
@@ -86,11 +90,37 @@ export interface BotVerifierClientProbe {
   reasons?: string[];
 }
 
+/** Additive shadow stealth evidence (mirrors `StealthEvaluation`). */
+export interface BotVerifierStealth {
+  /** Evaluator's detected flag; signed-good callers still keep their good verdict. */
+  detected?: boolean | null;
+  /** Observed stealth signal ids. */
+  ids?: ReadonlyArray<string> | null;
+  /** Hard-tier stealth ids; only a corroborated CDP bridge appears here. */
+  hard?: ReadonlyArray<string> | null;
+  /** Ids whose RED sub-variant fired (exact protocol-level condition). */
+  confirmed?: ReadonlyArray<string> | null;
+  /** Ids the probe could not decide (no CSP, exception): reported at weight 0. */
+  inconclusive?: ReadonlyArray<string> | null;
+  /** Ids seen only in a soft/YELLOW form (e.g. SwiftShader on a headless-shell host). */
+  soft?: ReadonlyArray<string> | null;
+  /** Ids observed while DevTools is docked (runtime-enable leak capped at YELLOW). */
+  docked?: ReadonlyArray<string> | null;
+  /** Attribution for a confirmed source-URL leak. */
+  sourceUrlSource?: 'puppeteer' | 'playwright' | null;
+}
+
 export interface BotVerdictInput {
   webBotAuth?: BotVerifierWebBotAuth | null;
   directory?: BotVerifierDirectory | null;
   clientProbe?: BotVerifierClientProbe | null;
-  /** Resolved IP falls inside an official bot-operator CIDR range. */
+  /** Shadow stealth-signal evaluation folded into the probe-evidence channel. */
+  stealth?: BotVerifierStealth | null;
+  /**
+   * Resolved IP matches an EXACT published CIDR prefix from an official operator feed
+   * (OpenAI / Google / Anthropic / Perplexity), never a whole cloud ASN. Out-of-list
+   * means unverified — not proven malicious — and stays inconclusive below.
+   */
   ipInKnownBotCidr?: boolean;
   /** User-agent matches a known bot / crawler pattern. */
   uaLooksLikeBot?: boolean;
@@ -108,6 +138,10 @@ export interface BotVerdict {
   agent_verdict: string | null;
   /** Cryptographic or directory-grade verification. */
   verified: boolean;
+  /**
+   * Detection confidence, NOT a claim of malicious intent: `bad` means deterministic
+   * automation or identity misrepresentation — a "bad bot" label is not an accusation.
+   */
   severity: BotSeverity;
   /** API-facing bot signal derived from `verdict`. */
   bot: BotSignal;
@@ -150,6 +184,16 @@ export const HARD_AGENT_REASON_IDS = [
   'page.ua.cursor',
   'page.platform.cloudflare-workers',
   'launch.ipc-flooding-switch',
+  // Shadow stealth probes mapped into THIS hard tier (no second taxonomy).
+  'stealth.bypass-csp',
+  'playwright.init-scripts',
+  // Confirmed (RED) stealth variants: protocol-level impossibilities. Plain ids stay
+  // medium/weak, so page-script / extension / user-setting artifacts cannot escalate.
+  'stealth.runtime-enable-protocol',
+  'stealth.document-interception-protocol',
+  'stealth.storage-partitioning-protocol',
+  'stealth.puppeteer-source-url',
+  'stealth.playwright-source-url',
   'bot.cdp-tampered',
   'bot.playwright-binding',
   'cdc.global.binding',
@@ -162,6 +206,8 @@ const DEVELOPER_TOOLS_REASON_IDS: ReadonlySet<string> = new Set([
   'cdp.runtime.enable.empty_source',
   'cdp.network.enable.pre_load_message',
   'bot.cdp-runtime-leak',
+  // Inconclusive stealth probes: reported at weight 0, never escalate or corroborate.
+  'stealth.inconclusive',
 ]);
 
 /** Meaningful only in pairs, or paired with any weak reason. */
@@ -178,6 +224,10 @@ const MEDIUM_REASON_IDS: ReadonlySet<string> = new Set([
   'grok.cloud-computer.environment',
   'codex.prompt.anonymous-native',
   'codex.keyboard.empty-layout-map',
+  // Conditional stealth probes: corroboration or a companion is mandatory.
+  'stealth.runtime-enable-leak',
+  'stealth.document-interception',
+  'stealth.storage-partitioning',
 ]);
 
 /** Real humans trip these regularly — telemetry only, never sufficient alone. */
@@ -200,6 +250,10 @@ const WEAK_REASON_IDS: ReadonlySet<string> = new Set([
   'bot.webdriver-getter-tampered-cdp',
   'bot.webdriver-getter-tampered',
   'bot.automation-getter-tampered',
+  // Telemetry-only stealth artifacts. Exact entries keep the source-URL leak in
+  // `weak` rather than the bare `cdp.` developer_tools prefix — never hard.
+  'cdp.runtime.evaluate.source-url',
+  'bot.popup-blocking',
 ]);
 
 /** Prefix rules evaluated after the exact sets (first match wins). */
@@ -269,10 +323,98 @@ export function reasonNamespace(reasonId: string): ReasonNamespace {
     return 'verdict';
   }
   if (AUTOMATION_REASON_IDS.has(id)) return 'automation';
-  if (/^(launch\.|behavior\.|cdp\.|ua\.|muse$|grok-bot$|codex-browser$|instinct$|chatgpt\.|claude\.)/.test(id)) {
+  if (/^(launch\.|behavior\.|cdp\.|stealth\.|ua\.|muse$|grok-bot$|codex-browser$|instinct$|chatgpt\.|claude\.)/.test(id)) {
     return 'automation';
   }
   return 'verdict';
+}
+
+/* -------------------------------------------------------------------------- */
+/* Stealth-signal → existing taxonomy bridge (mirror of src/lib/verdict.ts)      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Maps `src/lib/stealthSignals.ts` signal ids onto the reason ids of THIS taxonomy.
+ * A bridge into the four tiers above — not a second weight vocabulary.
+ */
+export const STEALTH_SIGNAL_REASON_IDS: Readonly<Record<string, string>> = Object.freeze({
+  runtimeEnableLeak: 'stealth.runtime-enable-leak',
+  ipcFloodingProtection: 'launch.ipc-flooding-switch',
+  documentInterception: 'stealth.document-interception',
+  storagePartitioning: 'stealth.storage-partitioning',
+  cdpBindingGlobals: 'cdp.runtime.enable',
+  sourceUrlLeak: 'cdp.runtime.evaluate.source-url',
+  pwInitScripts: 'playwright.init-scripts',
+  exposeFunctionLeak: 'bot.playwright-binding',
+  bypassCsp: 'stealth.bypass-csp',
+  popupBlocking: 'bot.popup-blocking',
+  marionette: 'navigator.webdriver',
+  chromeHeadlessShell: 'ua.headless-chrome',
+});
+
+/**
+ * Qualifiers selecting between reason ids that ALREADY live in the four tiers — not a
+ * second RED/YELLOW vocabulary. RED (protocol-level impossibility) → hard; YELLOW
+ * (reproducible by page scripts / extensions / user settings) → medium/weak;
+ * inconclusive → weight-0 developer_tools.
+ */
+export interface StealthReasonOptions {
+  /** The signal's RED sub-variant was observed (exact protocol-level condition). */
+  confirmed?: boolean;
+  /** DevTools is docked: a runtime-enable leak is capped at YELLOW, never RED. */
+  docked?: boolean;
+  /** The probe could not decide (no CSP, exception, missing precondition). */
+  inconclusive?: boolean;
+  /** Only the soft/YELLOW form was seen (e.g. SwiftShader on a headless-shell host). */
+  soft?: boolean;
+  /** Attribution for a confirmed source-URL leak. */
+  source?: 'puppeteer' | 'playwright' | null;
+}
+
+/** Reason id for a stealth signal id; a corroborated CDP bridge maps to the single hard id. */
+export function stealthReasonId(
+  id: string,
+  corroborated = false,
+  options: StealthReasonOptions = {},
+): string | null {
+  const base = STEALTH_SIGNAL_REASON_IDS[id];
+  if (base === undefined) return null;
+  if (options.inconclusive) return 'stealth.inconclusive';
+
+  if (id === 'cdpBindingGlobals') {
+    return corroborated ? CORROBORATED_CDP_REASON_ID : base; // bare = developer_tools hint
+  }
+  if (id === 'sourceUrlLeak') {
+    if (options.confirmed) {
+      return options.source === 'puppeteer'
+        ? 'stealth.puppeteer-source-url'
+        : 'stealth.playwright-source-url';
+    }
+    return base; // bare filename = weak/yellow
+  }
+  if (id === 'chromeHeadlessShell') {
+    return options.soft ? 'headless.swiftshader.caveat' : base; // SwiftShader = weak/yellow
+  }
+  if (id === 'runtimeEnableLeak') {
+    return options.confirmed && !options.docked ? 'stealth.runtime-enable-protocol' : base;
+  }
+  if (id === 'documentInterception') {
+    return options.confirmed ? 'stealth.document-interception-protocol' : base;
+  }
+  if (id === 'storagePartitioning') {
+    return options.confirmed ? 'stealth.storage-partitioning-protocol' : base;
+  }
+  return base;
+}
+
+/** Existing-tier weight for a stealth signal id; null for an unknown id. */
+export function stealthReasonWeight(
+  id: string,
+  corroborated = false,
+  options: StealthReasonOptions = {},
+): ReasonWeight | null {
+  const reason = stealthReasonId(id, corroborated, options);
+  return reason === null ? null : classifyReasonId(reason);
 }
 
 export interface GatedAgentEvidence {
@@ -364,6 +506,20 @@ function hasSignedIdentity(values: unknown[]): boolean {
   return values.some((value) => normalizeIdentity(value) === 'signed');
 }
 
+/**
+ * RFC 9421 tri-state gate. Only a VALID signature grants the good paths; INVALID and
+ * NEUTRAL never do. NEUTRAL simply falls through to the IP / UA inconclusive paths.
+ * An explicit `result`/`status` overrides the looser `verified` compatibility boolean.
+ */
+function isWbaValid(wba: BotVerifierWebBotAuth): boolean {
+  const result = typeof wba.result === 'string' ? wba.result.trim().toLowerCase() : '';
+  if (result === 'invalid' || result === 'neutral') return false;
+  if (result === 'valid') return true;
+  const status = typeof wba.status === 'string' ? wba.status.trim().toLowerCase() : '';
+  if (status === 'invalid' || status === 'neutral') return false;
+  return wba.verified === true;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Composition                                                                 */
 /* -------------------------------------------------------------------------- */
@@ -402,11 +558,40 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
   const probeVerdict = typeof clientProbe.verdict === 'string' ? clientProbe.verdict.toLowerCase() : '';
   const directoryStatus = typeof directory.status === 'string' ? directory.status.toLowerCase() : '';
 
+  // Fold shadow stealth evidence into the SAME probe-evidence channel so the precedence
+  // ladder below (signed good > WBA > spoofed > directory > automation) applies unchanged:
+  // step 0 still wins over any stealth escalation. No second taxonomy, no second verdict.
+  const stealth = input.stealth ?? null;
+  const stealthIdsRaw = stealth?.ids;
+  const stealthHardRaw = stealth?.hard;
+  const stealthIds = Array.isArray(stealthIdsRaw)
+    ? stealthIdsRaw.filter((id): id is string => typeof id === 'string' && id.length > 0)
+    : [];
+  const stealthHard = Array.isArray(stealthHardRaw)
+    ? stealthHardRaw.filter((id): id is string => typeof id === 'string')
+    : [];
+  const stealthDetected = stealth?.detected === true;
+  const inList = (list: readonly string[] | null | undefined, id: string): boolean =>
+    Array.isArray(list) && (list as readonly string[]).includes(id);
+  const stealthReasons: string[] = [];
+  for (const id of stealthIds) {
+    const reason = stealthReasonId(id, stealthHard.includes(id), {
+      confirmed: inList(stealth?.confirmed, id),
+      inconclusive: inList(stealth?.inconclusive, id),
+      soft: inList(stealth?.soft, id),
+      docked: inList(stealth?.docked, id),
+      source: stealth?.sourceUrlSource ?? null,
+    });
+    if (reason && !stealthReasons.includes(reason)) stealthReasons.push(reason);
+  }
+  const allProbeReasons = [...probeReasons, ...stealthReasons];
+  const effectiveProbeVerdict = probeVerdict === 'agent' || stealthDetected ? 'agent' : probeVerdict;
+
   /* 0 — Signed good agent: WBA cryptographic proof + signed identity + an
    *     assistant/agent category. This outranks every bad path (including a
    *     spoofed directory claim and a hard client probe). */
   const signedWba =
-    webBotAuth.verified === true &&
+    isWbaValid(webBotAuth) &&
     (hasSignedIdentity([webBotAuth.identity, webBotAuth.status]) ||
       hasSignedIdentity([directory.identity, directory.status, directory.signed === true ? 'signed' : null]));
   if (
@@ -416,7 +601,7 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
     return {
       verdict: 'good',
       reason: 'signed-agent',
-      reason_ids: ['signed-agent', ...probeReasons],
+      reason_ids: ['signed-agent', ...allProbeReasons],
       agent_verdict:
         webBotAuth.bot_id || webBotAuth.operator || directory.bot_id || directory.operator || null,
       verified: true,
@@ -424,8 +609,9 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
     };
   }
 
-  /* 1 — Web Bot Auth: cryptographic proof outranks everything else. */
-  if (webBotAuth.verified === true) {
+  /* 1 — Web Bot Auth: a VALID cryptographic proof outranks everything else.
+   *     INVALID / NEUTRAL results fall through to the IP / UA paths below. */
+  if (isWbaValid(webBotAuth)) {
     return {
       verdict: 'good',
       reason: 'verified-agent',
@@ -441,7 +627,7 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
     return {
       verdict: 'bad',
       reason: 'spoofed-impersonation',
-      reason_ids: ['spoofed-impersonation', ...probeReasons],
+      reason_ids: ['spoofed-impersonation', ...allProbeReasons],
       agent_verdict: directory.bot_id || directory.operator || null,
       verified: false,
       severity: 'high',
@@ -453,7 +639,7 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
     return {
       verdict: 'good',
       reason: directoryStatus === 'verified' ? 'verified-agent' : 'signed-agent',
-      reason_ids: [directoryStatus === 'verified' ? 'verified-agent' : 'signed-agent', ...probeReasons],
+      reason_ids: [directoryStatus === 'verified' ? 'verified-agent' : 'signed-agent', ...allProbeReasons],
       agent_verdict: directory.bot_id || directory.operator || null,
       verified: directoryStatus === 'verified',
       severity: 'none',
@@ -462,11 +648,11 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
 
   /* 4 — Client probe found corroborated automated-runtime evidence.
    *     A bare cdp.* reason is developer_tools (weight 0) and cannot get here. */
-  if (probeVerdict === 'agent' && isHardAgentReason(probeReasons)) {
+  if (effectiveProbeVerdict === 'agent' && isHardAgentReason(allProbeReasons)) {
     return {
       verdict: 'bad',
       reason: 'automated-runtime',
-      reason_ids: ['automated-runtime', ...probeReasons],
+      reason_ids: ['automated-runtime', ...allProbeReasons],
       agent_verdict: null,
       verified: false,
       severity: 'high',
@@ -474,11 +660,11 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
   }
 
   /* 5 — Client probe says agent, but only weak evidence. */
-  if (probeVerdict === 'agent') {
+  if (effectiveProbeVerdict === 'agent') {
     return {
       verdict: 'not_detected',
       reason: 'suspected-automation',
-      reason_ids: ['suspected-automation', ...probeReasons],
+      reason_ids: ['suspected-automation', ...allProbeReasons],
       agent_verdict: null,
       verified: false,
       severity: 'low',
@@ -490,7 +676,7 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
     return {
       verdict: 'known-operator-network',
       reason: 'known-operator-network',
-      reason_ids: ['known-operator-network', ...probeReasons],
+      reason_ids: ['known-operator-network', ...allProbeReasons],
       agent_verdict: null,
       verified: false,
       severity: 'low',
@@ -502,7 +688,7 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
     return {
       verdict: 'not_detected',
       reason: 'suspected-automation',
-      reason_ids: ['suspected-automation', ...probeReasons],
+      reason_ids: ['suspected-automation', ...allProbeReasons],
       agent_verdict: null,
       verified: false,
       severity: 'low',
@@ -513,7 +699,7 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
   return {
     verdict: 'human-or-unverified',
     reason: 'not_detected',
-    reason_ids: ['not_detected', ...probeReasons],
+    reason_ids: ['not_detected', ...allProbeReasons],
     agent_verdict: null,
     verified: false,
     severity: 'none',

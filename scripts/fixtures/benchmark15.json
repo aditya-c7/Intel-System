@@ -1,0 +1,1007 @@
+{
+  "schema_version": 1,
+  "title": "Benchmark-15 SHADOW-OFFLINE regression corpus",
+  "note": "Frozen, purely declarative regression corpus for scripts/test-benchmark15.ts. Every case is a frozen input snapshot plus declarative expectations pinned to pure, already-in-repo SHADOW helper modules. No live requests, no browser, no deploy, no writes. Expectations are golden: never edit an expected field to make a failing suite green - fix the implementation instead. A missing helper is reported as SKIP with an explicit reason, not silently ignored.",
+  "generated_on": "2026-11-22",
+  "frozen": true,
+  "offline": true,
+  "helper_modules": {
+    "proxyTruth": "src/lib/proxyTruth.ts",
+    "vpnMethods": "src/lib/vpnMethods.ts",
+    "privacySignatures": "src/lib/privacySignatures.ts",
+    "stealthSignals": "src/lib/stealthSignals.ts",
+    "tamperingLies": "src/lib/tamperingLies.ts",
+    "hexProximity": "src/lib/hexProximity.ts",
+    "zeroTrust": "src/lib/zeroTrust.ts",
+    "velocityThresholds": "src/lib/velocityThresholds.ts",
+    "idbDurabilityTruth": "src/lib/idbDurabilityTruth.ts",
+    "uaNormalizer": "src/shared/normalization/uaNormalizer.ts"
+  },
+  "cases": [
+    {
+      "id": "B01",
+      "name": "Standard browsers",
+      "scenario": "standard_browsers",
+      "input": {
+        "chrome": {
+          "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+          "clientHints": {
+            "fullVersionList": [
+              { "brand": "Not.A/Brand", "version": "99.0.0.0" },
+              { "brand": "Chromium", "version": "153.0.8010.52" },
+              { "brand": "Google Chrome", "version": "153.0.8010.52" }
+            ],
+            "platform": "Windows",
+            "platformVersion": "15.0.0",
+            "architecture": "x86",
+            "bitness": "64"
+          }
+        },
+        "firefox": {
+          "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0"
+        },
+        "geoPoint": { "lat": 52.37, "lon": 4.89, "accuracyMeters": 12 },
+        "cleanPrivacy": {},
+        "cleanProxy": {},
+        "cleanTamper": {}
+      },
+      "expected": [
+        {
+          "id": "B01-chrome",
+          "helper": "uaNormalizer",
+          "fn": "normalizeUserAgent",
+          "args": [{ "$input": "chrome" }],
+          "fields": [
+            { "path": "os", "op": "eq", "value": "Windows" },
+            { "path": "osVersion", "op": "eq", "value": "11" },
+            { "path": "browserName", "op": "eq", "value": "Google Chrome" },
+            { "path": "browserMajorVersion", "op": "eq", "value": "153" },
+            { "path": "architecture", "op": "eq", "value": "x86_64" },
+            { "path": "device", "op": "eq", "value": "Desktop" }
+          ]
+        },
+        {
+          "id": "B01-firefox",
+          "helper": "uaNormalizer",
+          "fn": "normalizeUserAgent",
+          "args": [{ "$input": "firefox" }],
+          "fields": [
+            { "path": "os", "op": "eq", "value": "Windows" },
+            { "path": "osVersion", "op": "eq", "value": "10" },
+            { "path": "browserName", "op": "eq", "value": "Firefox" }
+          ]
+        },
+        {
+          "id": "B01-ua-invariants",
+          "helper": "uaNormalizer",
+          "fn": "validateUserAgentNormalization",
+          "args": [{ "$result": "B01-chrome" }],
+          "fields": [{ "path": "", "op": "lengthEq", "value": 0 }]
+        },
+        {
+          "id": "B01-privacy",
+          "helper": "privacySignatures",
+          "fn": "resolvePrivacySignatures",
+          "args": [{ "$input": "cleanPrivacy" }],
+          "fields": [
+            { "path": "privacy_settings", "op": "false" },
+            { "path": "signatures", "op": "lengthEq", "value": 0 },
+            { "path": "suppressAntiDetectPenalty", "op": "false" }
+          ]
+        },
+        {
+          "id": "B01-proxy",
+          "helper": "proxyTruth",
+          "fn": "resolveProxyDetails",
+          "args": [{ "$input": "cleanProxy" }],
+          "fields": [
+            { "path": "proxy", "op": "false" },
+            { "path": "proxy_type", "op": "null" },
+            { "path": "confidence", "op": "eq", "value": "low" }
+          ]
+        },
+        {
+          "id": "B01-tamper",
+          "helper": "tamperingLies",
+          "fn": "resolveTamperingLies",
+          "args": [{ "$input": "cleanTamper" }],
+          "fields": [
+            { "path": "anti_detect_browser", "op": "false" },
+            { "path": "anomaly_score", "op": "eq", "value": 0 }
+          ]
+        },
+        {
+          "id": "B01-proximity",
+          "helper": "hexProximity",
+          "fn": "proximityFromGeolocation",
+          "args": [{ "$input": "geoPoint" }, "benchmark-salt"],
+          "fields": [
+            { "path": "proximity.id", "op": "matches", "value": "^hex_[0-9a-f]{32}$" },
+            { "path": "proximity.precision_radius", "op": "eq", "value": 75 },
+            { "path": "proximity.confidence", "op": "gt", "value": 0 },
+            { "path": "reason", "op": "matches", "value": "no IP-geolocation fallback" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B02",
+      "name": "Incognito",
+      "scenario": "incognito",
+      "input": {
+        "ram": { "ratio": 0.531, "highVariance": false },
+        "normal": { "ratio": 2.701, "highVariance": true },
+        "deadband": { "ratio": 1.41, "highVariance": true },
+        "vetoed": { "ratio": 0.4, "persistedGrant": true }
+      },
+      "expected": [
+        {
+          "id": "B02-ram",
+          "helper": "idbDurabilityTruth",
+          "fn": "resolveIdbDurabilityTruth",
+          "args": [{ "$input": "ram" }],
+          "fields": [
+            { "path": "incognito", "op": "true" },
+            { "path": "confidence", "op": "eq", "value": "high" },
+            { "path": "rule", "op": "eq", "value": "strong_ram_signature" }
+          ]
+        },
+        {
+          "id": "B02-normal",
+          "helper": "idbDurabilityTruth",
+          "fn": "resolveIdbDurabilityTruth",
+          "args": [{ "$input": "normal" }],
+          "fields": [
+            { "path": "incognito", "op": "false" },
+            { "path": "confidence", "op": "eq", "value": "high" },
+            { "path": "rule", "op": "eq", "value": "disk_backed" }
+          ]
+        },
+        {
+          "id": "B02-deadband",
+          "helper": "idbDurabilityTruth",
+          "fn": "resolveIdbDurabilityTruth",
+          "args": [{ "$input": "deadband" }],
+          "fields": [
+            { "path": "incognito", "op": "false" },
+            { "path": "confidence", "op": "eq", "value": "low" },
+            { "path": "rule", "op": "eq", "value": "deadband" }
+          ]
+        },
+        {
+          "id": "B02-veto",
+          "helper": "idbDurabilityTruth",
+          "fn": "resolveIdbDurabilityTruth",
+          "args": [{ "$input": "vetoed" }],
+          "fields": [
+            { "path": "incognito", "op": "false" },
+            { "path": "rule", "op": "eq", "value": "vetoed" }
+          ]
+        },
+        {
+          "id": "B02-marker-keep",
+          "helper": "idbDurabilityTruth",
+          "fn": "shouldApplyMarkerVeto",
+          "args": [true, { "$result": "B02-ram" }, 0.531],
+          "fields": [{ "path": "", "op": "false" }]
+        },
+        {
+          "id": "B02-marker-veto",
+          "helper": "idbDurabilityTruth",
+          "fn": "shouldApplyMarkerVeto",
+          "args": [true, { "$result": "B02-normal" }, 2.701],
+          "fields": [{ "path": "", "op": "true" }]
+        }
+      ]
+    },
+    {
+      "id": "B03",
+      "name": "Cross-browser",
+      "scenario": "cross_browser",
+      "input": {
+        "chrome": {
+          "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+          "clientHints": { "platform": "Windows", "platformVersion": "15.0.0" }
+        },
+        "firefox": {
+          "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0"
+        }
+      },
+      "expected": [
+        {
+          "id": "B03-chrome",
+          "helper": "uaNormalizer",
+          "fn": "normalizeUserAgent",
+          "args": [{ "$input": "chrome" }],
+          "fields": [
+            { "path": "os", "op": "eq", "value": "Windows" },
+            { "path": "osVersion", "op": "eq", "value": "11" },
+            { "path": "browserName", "op": "eq", "value": "Google Chrome" }
+          ]
+        },
+        {
+          "id": "B03-firefox",
+          "helper": "uaNormalizer",
+          "fn": "normalizeUserAgent",
+          "args": [{ "$input": "firefox" }],
+          "fields": [
+            { "path": "os", "op": "eqResult", "value": { "result": "B03-chrome", "path": "os" } },
+            { "path": "osVersion", "op": "eq", "value": "10" },
+            { "path": "browserName", "op": "eq", "value": "Firefox" },
+            { "path": "browserName", "op": "neq", "value": "Google Chrome" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B04",
+      "name": "Good bot",
+      "scenario": "good_bot",
+      "input": {
+        "proxyExempt": {
+          "datacenterResult": true,
+          "verifiedGoodBot": true,
+          "asnType": "datacenter",
+          "asn": 16509
+        },
+        "proxyNoEvidence": {},
+        "stealthObservations": [
+          { "id": "marionette", "observed": true },
+          { "id": "pwInitScripts", "observed": true }
+        ],
+        "signedGood": true
+      },
+      "expected": [
+        {
+          "id": "B04-proxy-exempt",
+          "helper": "proxyTruth",
+          "fn": "resolveProxyDetails",
+          "args": [{ "$input": "proxyExempt" }],
+          "fields": [
+            { "path": "proxy", "op": "false" },
+            { "path": "proxy_type", "op": "null" },
+            { "path": "reason", "op": "includes", "value": "good-bot" }
+          ]
+        },
+        {
+          "id": "B04-proxy-none",
+          "helper": "proxyTruth",
+          "fn": "resolveProxyDetails",
+          "args": [{ "$input": "proxyNoEvidence" }],
+          "fields": [
+            { "path": "proxy", "op": "false" },
+            { "path": "confidence", "op": "eq", "value": "low" }
+          ]
+        },
+        {
+          "id": "B04-stealth-signed",
+          "helper": "stealthSignals",
+          "fn": "evaluateStealthSignals",
+          "args": [{ "$input": "stealthObservations" }, { "$input": "signedGood" }],
+          "fields": [
+            { "path": "detected", "op": "false" },
+            { "path": "hard", "op": "includes", "value": "marionette" },
+            { "path": "reasons", "op": "includes", "value": "signed-agent" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B05",
+      "name": "Spoofed bot",
+      "scenario": "spoofed_bot",
+      "input": {
+        "claimedBotUA": {
+          "userAgent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+        },
+        "stealthObservations": [
+          { "id": "marionette", "observed": true },
+          { "id": "ipcFloodingProtection", "observed": true }
+        ],
+        "datacenterProxy": {
+          "datacenterResult": true,
+          "verifiedGoodBot": false,
+          "asnType": "datacenter",
+          "asn": 16509
+        }
+      },
+      "expected": [
+        {
+          "id": "B05-ua-claim",
+          "helper": "uaNormalizer",
+          "fn": "normalizeUserAgent",
+          "args": [{ "$input": "claimedBotUA" }],
+          "fields": [
+            { "path": "browserName", "op": "eq", "value": "Googlebot" },
+            { "path": "browserMajorVersion", "op": "eq", "value": "2" }
+          ]
+        },
+        {
+          "id": "B05-stealth",
+          "helper": "stealthSignals",
+          "fn": "evaluateStealthSignals",
+          "args": [{ "$input": "stealthObservations" }],
+          "fields": [
+            { "path": "detected", "op": "true" },
+            { "path": "hard", "op": "lengthEq", "value": 2 },
+            { "path": "reasons", "op": "includes", "value": "automated-runtime" }
+          ]
+        },
+        {
+          "id": "B05-proxy",
+          "helper": "proxyTruth",
+          "fn": "resolveProxyDetails",
+          "args": [{ "$input": "datacenterProxy" }],
+          "fields": [
+            { "path": "proxy", "op": "true" },
+            { "path": "proxy_type", "op": "eq", "value": "data_center" },
+            { "path": "confidence", "op": "eq", "value": "high" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B06",
+      "name": "Stealth frameworks",
+      "scenario": "stealth_frameworks",
+      "input": {
+        "playwright": [
+          { "id": "pwInitScripts", "observed": true },
+          { "id": "exposeFunctionLeak", "observed": true }
+        ],
+        "cdpCorroborated": [{ "id": "cdpBindingGlobals", "observed": true, "corroborated": true }],
+        "mediumBare": [{ "id": "runtimeEnableLeak", "observed": true }],
+        "mediumWithWeak": [
+          { "id": "storagePartitioning", "observed": true },
+          { "id": "popupBlocking", "observed": true }
+        ],
+        "weakPair": [
+          { "id": "sourceUrlLeak", "observed": true },
+          { "id": "popupBlocking", "observed": true }
+        ]
+      },
+      "expected": [
+        {
+          "id": "B06-playwright",
+          "helper": "stealthSignals",
+          "fn": "evaluateStealthSignals",
+          "args": [{ "$input": "playwright" }],
+          "fields": [
+            { "path": "detected", "op": "true" },
+            { "path": "hard", "op": "includes", "value": "pwInitScripts" },
+            { "path": "hard", "op": "includes", "value": "exposeFunctionLeak" }
+          ]
+        },
+        {
+          "id": "B06-cdp-corroborated",
+          "helper": "stealthSignals",
+          "fn": "evaluateStealthSignals",
+          "args": [{ "$input": "cdpCorroborated" }],
+          "fields": [
+            { "path": "detected", "op": "true" },
+            { "path": "hard", "op": "includes", "value": "cdpBindingGlobals" }
+          ]
+        },
+        {
+          "id": "B06-medium-bare",
+          "helper": "stealthSignals",
+          "fn": "evaluateStealthSignals",
+          "args": [{ "$input": "mediumBare" }],
+          "fields": [
+            { "path": "detected", "op": "false" },
+            { "path": "reasons", "op": "notIncludes", "value": "automated-runtime" }
+          ]
+        },
+        {
+          "id": "B06-medium-with-weak",
+          "helper": "stealthSignals",
+          "fn": "evaluateStealthSignals",
+          "args": [{ "$input": "mediumWithWeak" }],
+          "fields": [{ "path": "detected", "op": "true" }]
+        },
+        {
+          "id": "B06-weak-pair",
+          "helper": "stealthSignals",
+          "fn": "evaluateStealthSignals",
+          "args": [{ "$input": "weakPair" }],
+          "fields": [
+            { "path": "detected", "op": "false" },
+            { "path": "hard", "op": "lengthEq", "value": 0 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B07",
+      "name": "DevTools",
+      "scenario": "devtools",
+      "input": {
+        "cdpBare": [{ "id": "cdpBindingGlobals", "observed": true }],
+        "cdpInactive": [{ "id": "cdpBindingGlobals", "observed": false }],
+        "cdpWithMedium": [
+          { "id": "runtimeEnableLeak", "observed": true },
+          { "id": "cdpBindingGlobals", "observed": true }
+        ]
+      },
+      "expected": [
+        {
+          "id": "B07-cdp-bare",
+          "helper": "stealthSignals",
+          "fn": "evaluateStealthSignals",
+          "args": [{ "$input": "cdpBare" }],
+          "fields": [
+            { "path": "detected", "op": "false" },
+            { "path": "ids", "op": "includes", "value": "cdpBindingGlobals" },
+            { "path": "reasons", "op": "includes", "value": "developer_tools" }
+          ]
+        },
+        {
+          "id": "B07-cdp-inactive",
+          "helper": "stealthSignals",
+          "fn": "evaluateStealthSignals",
+          "args": [{ "$input": "cdpInactive" }],
+          "fields": [
+            { "path": "ids", "op": "lengthEq", "value": 0 },
+            { "path": "reasons", "op": "includes", "value": "not_detected" }
+          ]
+        },
+        {
+          "id": "B07-cdp-does-not-corroborate",
+          "helper": "stealthSignals",
+          "fn": "evaluateStealthSignals",
+          "args": [{ "$input": "cdpWithMedium" }],
+          "fields": [
+            { "path": "detected", "op": "false" },
+            { "path": "hard", "op": "lengthEq", "value": 0 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B08",
+      "name": "OS spoof",
+      "scenario": "os_spoof",
+      "input": {
+        "osSpoof": {
+          "window": {
+            "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "platform": "Win32",
+            "cores": 8
+          },
+          "claimedOs": "Windows",
+          "activeTextColor": "rgb(255, 0, 0)"
+        },
+        "shaderSpoof": {
+          "claimedGpuOs": "linux",
+          "shaderPrecisionProfile": "ANGLE (D3D11) Direct3D"
+        },
+        "claimedUA": {
+          "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+        }
+      },
+      "expected": [
+        {
+          "id": "B08-activetext",
+          "helper": "tamperingLies",
+          "fn": "resolveTamperingLies",
+          "args": [{ "$input": "osSpoof" }],
+          "fields": [
+            { "path": "anti_detect_browser", "op": "true" },
+            { "path": "anomaly_score", "op": "gt", "value": 0 },
+            { "path": "reasons", "op": "includes", "value": "ActiveText color implies" }
+          ]
+        },
+        {
+          "id": "B08-shader-contradiction",
+          "helper": "tamperingLies",
+          "fn": "resolveTamperingLies",
+          "args": [{ "$input": "shaderSpoof" }],
+          "fields": [
+            { "path": "anti_detect_browser", "op": "true" },
+            { "path": "reasons", "op": "includes", "value": "shader precision profile implies" }
+          ]
+        },
+        {
+          "id": "B08-ua-claim",
+          "helper": "uaNormalizer",
+          "fn": "normalizeUserAgent",
+          "args": [{ "$input": "claimedUA" }],
+          "fields": [
+            { "path": "os", "op": "eq", "value": "Windows" },
+            { "path": "osVersion", "op": "eq", "value": "10" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B09",
+      "name": "Noise injection",
+      "scenario": "noise_injection",
+      "input": {
+        "noiseNoHardening": {
+          "audioSilentBufferNonZero": true,
+          "prototypeProxy": true,
+          "iframeStealthTrap": true
+        },
+        "noiseHardened": {
+          "audioSilentBufferNonZero": true,
+          "prototypeProxy": true,
+          "privacyHardened": true
+        },
+        "automationOnly": {
+          "audioSilentBufferNonZero": true,
+          "automationArtifactOnly": true
+        },
+        "reducedOneCorroboration": {
+          "reducedEntropy": true,
+          "hardwareMasked": true
+        }
+      },
+      "expected": [
+        {
+          "id": "B09-noise-raw",
+          "helper": "tamperingLies",
+          "fn": "resolveTamperingLies",
+          "args": [{ "$input": "noiseNoHardening" }],
+          "fields": [
+            { "path": "anti_detect_browser", "op": "true" },
+            { "path": "tampering_confidence", "op": "eq", "value": "medium" },
+            { "path": "anomaly_score", "op": "gt", "value": 0 }
+          ]
+        },
+        {
+          "id": "B09-noise-suppressed",
+          "helper": "tamperingLies",
+          "fn": "resolveTamperingLies",
+          "args": [{ "$input": "noiseHardened" }],
+          "fields": [
+            { "path": "anti_detect_browser", "op": "false" },
+            { "path": "anomaly_score", "op": "eq", "value": 0 }
+          ]
+        },
+        {
+          "id": "B09-automation-decoupled",
+          "helper": "tamperingLies",
+          "fn": "resolveTamperingLies",
+          "args": [{ "$input": "automationOnly" }],
+          "fields": [
+            { "path": "anti_detect_browser", "op": "false" },
+            { "path": "anomaly_score", "op": "gt", "value": 0 }
+          ]
+        },
+        {
+          "id": "B09-reduced-entropy-abstains",
+          "helper": "privacySignatures",
+          "fn": "resolvePrivacySignatures",
+          "args": [{ "$input": "reducedOneCorroboration" }],
+          "fields": [
+            { "path": "privacy_settings", "op": "false" },
+            { "path": "signatures", "op": "includes", "value": "reduced-entropy" },
+            { "path": "confidence", "op": "eq", "value": "low" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B10",
+      "name": "Privacy hardened",
+      "scenario": "privacy_hardened",
+      "input": {
+        "brave": { "braveNavigator": true, "braveShields": true },
+        "rfp": { "firefoxRfpUtc": true, "firefoxRfpRoundedViewport": true },
+        "tor": { "torExit": true, "torLetterboxing": true },
+        "safariContradiction": { "safariAfp": true, "contradictionEvidence": true },
+        "hardenedNoise": {
+          "audioSilentBufferNonZero": true,
+          "iframeStealthTrap": true,
+          "privacyHardened": true
+        }
+      },
+      "expected": [
+        {
+          "id": "B10-brave",
+          "helper": "privacySignatures",
+          "fn": "resolvePrivacySignatures",
+          "args": [{ "$input": "brave" }],
+          "fields": [
+            { "path": "privacy_settings", "op": "true" },
+            { "path": "privacy_hardened", "op": "true" },
+            { "path": "suppressAntiDetectPenalty", "op": "true" },
+            { "path": "confidence", "op": "eq", "value": "high" },
+            { "path": "signatures", "op": "includes", "value": "brave-navigator" }
+          ]
+        },
+        {
+          "id": "B10-rfp",
+          "helper": "privacySignatures",
+          "fn": "resolvePrivacySignatures",
+          "args": [{ "$input": "rfp" }],
+          "fields": [
+            { "path": "privacy_settings", "op": "true" },
+            { "path": "confidence", "op": "eq", "value": "high" },
+            { "path": "signatures", "op": "includes", "value": "firefox-rfp-utc" }
+          ]
+        },
+        {
+          "id": "B10-tor",
+          "helper": "privacySignatures",
+          "fn": "resolvePrivacySignatures",
+          "args": [{ "$input": "tor" }],
+          "fields": [
+            { "path": "privacy_settings", "op": "true" },
+            { "path": "signatures", "op": "includes", "value": "tor-letterboxing" }
+          ]
+        },
+        {
+          "id": "B10-contradiction-withholds",
+          "helper": "privacySignatures",
+          "fn": "resolvePrivacySignatures",
+          "args": [{ "$input": "safariContradiction" }],
+          "fields": [
+            { "path": "privacy_settings", "op": "true" },
+            { "path": "privacy_hardened", "op": "false" },
+            { "path": "suppressAntiDetectPenalty", "op": "false" },
+            { "path": "confidence", "op": "eq", "value": "low" }
+          ]
+        },
+        {
+          "id": "B10-hardened-noise",
+          "helper": "tamperingLies",
+          "fn": "resolveTamperingLies",
+          "args": [{ "$input": "hardenedNoise" }],
+          "fields": [
+            { "path": "anti_detect_browser", "op": "false" },
+            { "path": "anomaly_score", "op": "eq", "value": 0 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B11",
+      "name": "VPN mismatch",
+      "scenario": "vpn_mismatch",
+      "input": {
+        "tzMismatch": {
+          "browserTimezone": "Asia/Singapore",
+          "ipTimezone": "Asia/Hong_Kong",
+          "ipCountry": "SG",
+          "publicVpn": true
+        },
+        "vpnOnly": { "vpn": true }
+      },
+      "expected": [
+        {
+          "id": "B11-tz-mismatch",
+          "helper": "vpnMethods",
+          "fn": "resolveVpnMethods",
+          "args": [{ "$input": "tzMismatch" }],
+          "fields": [
+            { "path": "timezone_mismatch", "op": "true" },
+            { "path": "public_vpn", "op": "true" },
+            { "path": "origin_country", "op": "eq", "value": "SG" },
+            { "path": "reasons", "op": "includes", "value": "canonical identities differ" }
+          ]
+        },
+        {
+          "id": "B11-vpn-unknown-type",
+          "helper": "proxyTruth",
+          "fn": "resolveProxyDetails",
+          "args": [{ "$input": "vpnOnly" }],
+          "fields": [
+            { "path": "proxy", "op": "true" },
+            { "path": "proxy_type", "op": "null" },
+            { "path": "confidence", "op": "eq", "value": "medium" }
+          ]
+        },
+        {
+          "id": "B11-parity-divergence",
+          "helper": "vpnMethods",
+          "fn": "vpnMethodsParityIssue",
+          "args": [{ "timezone_mismatch": false }, { "$result": "B11-tz-mismatch" }],
+          "fields": [
+            { "path": "", "op": "includes", "value": "timezone_mismatch: existing=false resolved=true" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B12",
+      "name": "VPN matching tz",
+      "scenario": "vpn_matching_tz",
+      "input": {
+        "alias": {
+          "browserTimezone": "Asia/Calcutta",
+          "ipTimezone": "Asia/Kolkata",
+          "ipCountry": "IN"
+        },
+        "unresolved": { "browserTimezone": "Asia/Calcutta", "ipTimezone": null },
+        "invalidCountry": {
+          "browserTimezone": "Asia/Tokyo",
+          "ipTimezone": "Asia/Tokyo",
+          "ipCountry": "XX"
+        },
+        "ispOnly": { "asnType": "isp" }
+      },
+      "expected": [
+        {
+          "id": "B12-alias",
+          "helper": "vpnMethods",
+          "fn": "resolveVpnMethods",
+          "args": [{ "$input": "alias" }],
+          "fields": [
+            { "path": "timezone_mismatch", "op": "false" },
+            { "path": "origin_country", "op": "eq", "value": "IN" },
+            { "path": "reasons", "op": "includes", "value": "same canonical identity" }
+          ]
+        },
+        {
+          "id": "B12-unresolved",
+          "helper": "vpnMethods",
+          "fn": "resolveVpnMethods",
+          "args": [{ "$input": "unresolved" }],
+          "fields": [
+            { "path": "timezone_mismatch", "op": "false" },
+            { "path": "reasons", "op": "includes", "value": "unresolved timezone side" }
+          ]
+        },
+        {
+          "id": "B12-no-invented-country",
+          "helper": "vpnMethods",
+          "fn": "resolveVpnMethods",
+          "args": [{ "$input": "invalidCountry" }],
+          "fields": [
+            { "path": "timezone_mismatch", "op": "false" },
+            { "path": "origin_country", "op": "null" }
+          ]
+        },
+        {
+          "id": "B12-isp-not-proxy",
+          "helper": "proxyTruth",
+          "fn": "resolveProxyDetails",
+          "args": [{ "$input": "ispOnly" }],
+          "fields": [
+            { "path": "proxy", "op": "false" },
+            { "path": "proxy_type", "op": "null" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B13",
+      "name": "Proxy classification",
+      "scenario": "proxy_classification",
+      "input": {
+        "datacenter": {
+          "datacenterResult": true,
+          "asnType": "datacenter",
+          "asn": 16509
+        },
+        "residential": { "knownProxyPrefix": true },
+        "bareVpn": { "vpn": true }
+      },
+      "expected": [
+        {
+          "id": "B13-datacenter",
+          "helper": "proxyTruth",
+          "fn": "resolveProxyDetails",
+          "args": [{ "$input": "datacenter" }],
+          "fields": [
+            { "path": "proxy", "op": "true" },
+            { "path": "proxy_type", "op": "eq", "value": "data_center" },
+            { "path": "confidence", "op": "eq", "value": "high" },
+            { "path": "reason", "op": "matches", "value": "ASN 16509" }
+          ]
+        },
+        {
+          "id": "B13-residential",
+          "helper": "proxyTruth",
+          "fn": "resolveProxyDetails",
+          "args": [{ "$input": "residential" }],
+          "fields": [
+            { "path": "proxy", "op": "true" },
+            { "path": "proxy_type", "op": "eq", "value": "residential" },
+            { "path": "confidence", "op": "eq", "value": "high" }
+          ]
+        },
+        {
+          "id": "B13-vpn-unknown",
+          "helper": "proxyTruth",
+          "fn": "resolveProxyDetails",
+          "args": [{ "$input": "bareVpn" }],
+          "fields": [
+            { "path": "proxy", "op": "true" },
+            { "path": "proxy_type", "op": "null" }
+          ]
+        },
+        {
+          "id": "B13-parity-divergence",
+          "helper": "proxyTruth",
+          "fn": "proxyDetailsParityIssue",
+          "args": [{ "proxy": false, "proxy_type": "datacenter" }, { "$result": "B13-datacenter" }],
+          "fields": [
+            { "path": "", "op": "includes", "value": "proxy divergence: existing=false, resolved=true" }
+          ]
+        },
+        {
+          "id": "B13-parity-clean",
+          "helper": "proxyTruth",
+          "fn": "proxyDetailsParityIssue",
+          "args": [{ "proxy": true, "proxy_type": "datacenter" }, { "$result": "B13-datacenter" }],
+          "fields": [{ "path": "", "op": "lengthEq", "value": 0 }]
+        }
+      ]
+    },
+    {
+      "id": "B14",
+      "name": "SwiftShader vs VM",
+      "scenario": "swiftshader_vs_vm",
+      "input": {
+        "swiftShader": {
+          "claimedGpuOs": "linux",
+          "shaderPrecisionProfile": "SwiftShader Device (Subzero)"
+        },
+        "hardwareShaderContradiction": {
+          "claimedGpuOs": "linux",
+          "shaderPrecisionProfile": "ANGLE (D3D11) Direct3D"
+        },
+        "crossScopeLie": {
+          "window": { "ua": "chrome-153", "cores": 8 },
+          "dedicated": { "ua": "firefox-130", "cores": 8 }
+        }
+      },
+      "expected": [
+        {
+          "id": "B14-swiftshader-abstains",
+          "helper": "tamperingLies",
+          "fn": "resolveTamperingLies",
+          "args": [{ "$input": "swiftShader" }],
+          "fields": [
+            { "path": "anti_detect_browser", "op": "false" },
+            { "path": "anomaly_score", "op": "eq", "value": 0 },
+            { "path": "reasons", "op": "lengthEq", "value": 0 }
+          ]
+        },
+        {
+          "id": "B14-hardware-shader-contradiction",
+          "helper": "tamperingLies",
+          "fn": "resolveTamperingLies",
+          "args": [{ "$input": "hardwareShaderContradiction" }],
+          "fields": [
+            { "path": "anti_detect_browser", "op": "true" },
+            { "path": "reasons", "op": "includes", "value": "shader precision profile implies" }
+          ]
+        },
+        {
+          "id": "B14-cross-scope-lie",
+          "helper": "tamperingLies",
+          "fn": "resolveTamperingLies",
+          "args": [{ "$input": "crossScopeLie" }],
+          "fields": [
+            { "path": "anti_detect_browser", "op": "true" },
+            { "path": "anomaly_score", "op": "gt", "value": 0 },
+            { "path": "reasons", "op": "includes", "value": "cross-scope navigator.userAgent divergence" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "B15",
+      "name": "Replay / zero-trust",
+      "scenario": "replay_zero_trust",
+      "input": {
+        "originContradiction": {
+          "origin": "https://evil.example",
+          "clientUrl": "https://intel.example/dashboard"
+        },
+        "legacyHeaders": { "clientUrl": "https://intel.example/" },
+        "freshTimestamp": 1000000,
+        "nowFresh": 1000500,
+        "nowStale": 1065001,
+        "duplicateNonce": "nonce-abc",
+        "attackRate": { "replayed": 15, "total": 20 },
+        "smallSampleRate": { "replayed": 15, "total": 19 },
+        "velocityCounts": {
+          "distinct": { "5_minutes": 100, "1_hour": 500, "24_hours": 10001 },
+          "events": 999999,
+          "ip_events": 1234567
+        },
+        "rarityCold": { "frequency14d": 1, "total14d": 199, "observed": true }
+      },
+      "expected": [
+        {
+          "id": "B15-origin-contradiction",
+          "helper": "zeroTrust",
+          "fn": "checkStrictOrigin",
+          "args": [{ "$input": "originContradiction" }],
+          "fields": [
+            { "path": "ok", "op": "false" },
+            { "path": "reason", "op": "matches", "value": "contradicts" }
+          ]
+        },
+        {
+          "id": "B15-origin-legacy",
+          "helper": "zeroTrust",
+          "fn": "checkStrictOrigin",
+          "args": [{ "$input": "legacyHeaders" }],
+          "fields": [
+            { "path": "ok", "op": "true" },
+            { "path": "reason", "op": "matches", "value": "legacy" }
+          ]
+        },
+        {
+          "id": "B15-fresh",
+          "helper": "zeroTrust",
+          "fn": "replayWindowStatus",
+          "args": [{ "$input": "freshTimestamp" }, { "$input": "nowFresh" }],
+          "fields": [
+            { "path": "fresh", "op": "true" },
+            { "path": "duplicate", "op": "false" }
+          ]
+        },
+        {
+          "id": "B15-stale",
+          "helper": "zeroTrust",
+          "fn": "replayWindowStatus",
+          "args": [{ "$input": "freshTimestamp" }, { "$input": "nowStale" }],
+          "fields": [
+            { "path": "fresh", "op": "false" },
+            { "path": "reason", "op": "matches", "value": "stale" }
+          ]
+        },
+        {
+          "id": "B15-replay",
+          "helper": "zeroTrust",
+          "fn": "replayWindowStatus",
+          "args": [{ "$input": "freshTimestamp" }, { "$input": "nowFresh" }, { "$input": "duplicateNonce" }],
+          "fields": [
+            { "path": "fresh", "op": "true" },
+            { "path": "duplicate", "op": "true" },
+            { "path": "reason", "op": "matches", "value": "duplicate nonce" }
+          ]
+        },
+        {
+          "id": "B15-rate-attack",
+          "helper": "zeroTrust",
+          "fn": "ipReplayRate",
+          "args": [{ "$input": "attackRate.replayed" }, { "$input": "attackRate.total" }],
+          "fields": [
+            { "path": "attack_source", "op": "true" },
+            { "path": "ratio", "op": "eq", "value": 0.75 }
+          ]
+        },
+        {
+          "id": "B15-rate-small-sample",
+          "helper": "zeroTrust",
+          "fn": "ipReplayRate",
+          "args": [{ "$input": "smallSampleRate.replayed" }, { "$input": "smallSampleRate.total" }],
+          "fields": [{ "path": "attack_source", "op": "false" }]
+        },
+        {
+          "id": "B15-velocity-cap",
+          "helper": "velocityThresholds",
+          "fn": "velocityCap",
+          "args": [{ "$input": "velocityCounts" }],
+          "fields": [
+            { "path": "omitShortWindows", "op": "true" },
+            { "path": "capped24h", "op": "eq", "value": 10000 },
+            { "path": "eventsExact", "op": "eq", "value": 999999 }
+          ]
+        },
+        {
+          "id": "B15-rarity-cold",
+          "helper": "velocityThresholds",
+          "fn": "rarityBucket",
+          "args": [
+            { "$input": "rarityCold.frequency14d" },
+            { "$input": "rarityCold.total14d" },
+            { "$input": "rarityCold.observed" }
+          ],
+          "fields": [
+            { "path": "bucket", "op": "eq", "value": "insufficient_data" },
+            { "path": "rare", "op": "false" }
+          ]
+        }
+      ]
+    }
+  ]
+}

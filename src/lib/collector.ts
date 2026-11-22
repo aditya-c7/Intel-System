@@ -19,9 +19,15 @@ import {
 import type { GpuObservation } from './telemetryContract';
 import { resolveGpuObservation } from './specInvariants';
 import { timezoneMismatchContext } from './timezone';
-import { resolveIdbDurabilityTruth } from './idbDurabilityTruth';
+import { resolveIdbDurabilityTruth, shouldApplyMarkerVeto } from './idbDurabilityTruth';
 import { probeEngineLength, resolveHardwareTruth } from './hardwareTruth';
 import { detectBotD19Signals } from './aiBotDirectory';
+import { resolvePrivacySignatures, type PrivacySignalsInput } from './privacySignatures';
+import {
+  evaluateStealthSignals,
+  type StealthObservation,
+  type StealthSignalId,
+} from './stealthSignals';
 import {
   collectAllSignals,
   computeBrowserFingerprint,
@@ -4476,6 +4482,21 @@ function hasFirstPartyPersistentMarker(): boolean {
  */
 function applyPersistentMarkerVeto(result: IncognitoDetectionResult): IncognitoDetectionResult {
   if (!result.isPrivate || !hasFirstPartyPersistentMarker()) return result;
+  // A private window keeps first-party storage for the whole private session, so later pages
+  // carry the marker written by the first page. Do not let that erase a decisive RAM-backed
+  // IDB verdict; the veto remains fully in force for every weaker signal.
+  if (
+    shouldApplyMarkerVeto(
+      true,
+      resolveIdbDurabilityTruth({
+        ratio: result.idbDurabilityRatio,
+        highVariance: result.idbHighVariance,
+      }),
+      result.idbDurabilityRatio
+    ) === false
+  ) {
+    return result;
+  }
   return {
     ...result,
     isPrivate: false,
@@ -5065,9 +5086,287 @@ export interface ClientProvenanceSignals extends ClientRuntimeSignals {
   cdpReasonIds: string[];
   /** True only from the two-probe Runtime proof — a weak Error.name preview never sets this. */
   cdpAttached: boolean;
+  /**
+   * Additive, informational privacy-signature telemetry from `./privacySignatures`.
+   * These are NOT the existing `privacySettings` risk signal: no consumer may feed them
+   * into suspectScore, riskLevel, the 0-10 headline or any verdict.
+   */
+  privacy_settings?: boolean;
+  privacy_hardened?: boolean;
+  privacy_signature_ids?: string[];
+  /** Additive, informational stealth evidence ids from `./stealthSignals` (never a verdict). */
+  stealth_signal_ids?: string[];
 }
 
 export type SecuritySignalsWithProvenance = SecuritySignals & ClientProvenanceSignals;
+
+/* ------------------------------------------------------------------------------------------------
+ * Additive privacy / stealth telemetry helpers
+ *
+ * Both resolvers are INFORMATIONAL. Their outputs are emitted beside the canonical verdicts but
+ * are NEVER read by suspectScore, riskLevel, riskFactors or the single authoritative bot verdict.
+ * Inputs are already-collected facts plus bounded, lightweight channel reads modelled on the
+ * rebrowser/brotector taxonomy — no third-party SDK, no new heavy probe, no new UI. Probes whose
+ * infrastructure is absent (cross-site iframes, a declared CSP) are skipped, never fabricated.
+ * ---------------------------------------------------------------------------------------------- */
+
+interface AdditivePrivacyEvidence {
+  ua: string;
+  browserLabel: string;
+  torSignals: string[];
+  torDetected: boolean;
+  canvasNoiseDetected: boolean;
+  maskedByPrivacyGpu: boolean;
+  privacyHardenedRuntime: boolean;
+  devtoolsDeviceEmulation: boolean;
+  isBot: boolean;
+  hardAutomationEvidence: string[];
+  cdpReasonIds: string[];
+  webdriver: boolean;
+  stealthPluginDetected: boolean;
+}
+
+/** Builds `privacySignatures` input exclusively from facts already resolved above. */
+function buildPrivacySignalsInput(evidence: AdditivePrivacyEvidence): PrivacySignalsInput {
+  const hasTorSignal = (token: string): boolean => evidence.torSignals.includes(token);
+  const gecko = /firefox|fxiOS|gecko/i.test(`${evidence.browserLabel} ${evidence.ua}`);
+  let braveApi = false;
+  try {
+    const brave = (navigator as unknown as { brave?: { isBrave?: unknown } }).brave;
+    braveApi = Boolean(brave && typeof brave.isBrave === 'function');
+  } catch {
+    // A hostile navigator proxy is not a vendor signature.
+  }
+  const safariAfp =
+    /Version\/2[6-9](?:\.|$)/.test(evidence.ua) &&
+    /Safari\//i.test(evidence.ua) &&
+    !/Chrome|Chromium|Edg|OPR/i.test(evidence.ua);
+  const automationArtifact =
+    evidence.isBot ||
+    evidence.webdriver ||
+    evidence.stealthPluginDetected ||
+    evidence.cdpReasonIds.length > 0;
+  return {
+    braveNavigator: braveApi || /\bbrave\b/i.test(evidence.browserLabel),
+    firefoxRfpUtc: gecko && hasTorSignal('tor-browser-rfp-timezone-utc'),
+    firefoxRfpRoundedViewport: gecko && hasTorSignal('tor-letterboxing-viewport'),
+    firefoxRfpCoresCapped: gecko && hasTorSignal('tor-browser-rfp-hardware-clamp'),
+    torLetterboxing: evidence.torDetected && hasTorSignal('tor-letterboxing-viewport'),
+    safariAfp,
+    reducedEntropy: evidence.privacyHardenedRuntime,
+    // Only the precise four-state privacy mask counts as corroboration. SwiftShader maps to
+    // `software_or_virtual` and is deliberately excluded (software-rasteriser exemption).
+    hardwareMasked: evidence.maskedByPrivacyGpu,
+    contradictionEvidence:
+      evidence.devtoolsDeviceEmulation ||
+      (evidence.isBot && evidence.hardAutomationEvidence.length > 0),
+    // Diagnostic only: the resolver can never count this as a privacy signature.
+    automationArtifact,
+  };
+}
+
+interface LightweightStealthEvidence {
+  ua: string;
+  gpuRenderer: string;
+  chromium: boolean;
+  headlessShell: boolean;
+  dockedDevTools: boolean;
+  cdpRuntimeLeak: boolean;
+  webdriver: boolean;
+  frameworkGlobals: string[];
+  playwrightMarkTargets: number;
+  stealthReasons: string[];
+}
+
+/**
+ * Collects lightweight stealth observations for `evaluateStealthSignals`. Every probe is bounded
+ * and best-effort; every failure omits the observation rather than inventing one. The evaluator's
+ * `detected` output is deliberately NOT consumed here: ids are additive telemetry only, so a
+ * developer-tools bridge stays separated from the bot verdict and no DO alarm is raised.
+ * Signed-good precedence remains with the evaluator's optional `verifiedGoodBot` argument (no
+ * signed-good attestation exists in this collector, so it is left unset).
+ */
+function buildStealthObservations(evidence: LightweightStealthEvidence): StealthObservation[] {
+  const observations: StealthObservation[] = [];
+  const add = (id: StealthSignalId, observed: boolean, corroborated?: boolean): void => {
+    if (observed) observations.push({ id, observed: true, corroborated });
+  };
+
+  // runtimeEnableLeak — three channels: the existing two-protocol CDP Runtime proof, a bounded
+  // `error.name` getter round count, and framework-driver globals. On Chromium >1.5 name reads
+  // per round is decisive; a docked DevTools layout caps the weak channel to a yellow hint.
+  let extraNameReads = 0;
+  if (!evidence.dockedDevTools && typeof window !== 'undefined' && typeof console !== 'undefined') {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(Error.prototype, 'name');
+      if (descriptor && descriptor.configurable) {
+        let reads = 0;
+        Object.defineProperty(Error.prototype, 'name', {
+          configurable: true,
+          enumerable: false,
+          get() {
+            reads += 1;
+            return typeof descriptor.value === 'string' ? descriptor.value : 'Error';
+          },
+        });
+        try {
+          for (let round = 0; round < 2; round += 1) {
+            console.debug(new Error('intel-runtime-enable-probe'));
+          }
+        } finally {
+          Object.defineProperty(Error.prototype, 'name', descriptor);
+        }
+        extraNameReads = reads / 2;
+      }
+    } catch {
+      extraNameReads = 0;
+    }
+  }
+  add(
+    'runtimeEnableLeak',
+    evidence.cdpRuntimeLeak ||
+      (evidence.chromium && extraNameReads > 1.5) ||
+      evidence.frameworkGlobals.length > 0,
+    false
+  );
+
+  // ipcFloodingProtection — 300 history.replaceState calls in a hidden same-origin iframe.
+  // Chromium throttles history flooding, so an exception is inconclusive; only all 300 applied
+  // is decisive. Chromium-only, bounded and synchronous; the frame is always removed.
+  if (evidence.chromium && typeof document !== 'undefined' && typeof window !== 'undefined') {
+    let frame: HTMLIFrameElement | null = null;
+    try {
+      frame = document.createElement('iframe');
+      frame.style.cssText = 'position:absolute;left:-9999px;top:0;width:1px;height:1px;opacity:0;border:0';
+      frame.setAttribute('aria-hidden', 'true');
+      frame.src = 'about:blank';
+      document.body.appendChild(frame);
+      const child = frame.contentWindow;
+      let applied = 0;
+      if (child) {
+        for (let i = 0; i < 300; i += 1) {
+          child.history.replaceState(null, '', `#intel-ipc-${i}`);
+          applied += 1;
+        }
+      }
+      add('ipcFloodingProtection', applied === 300);
+    } catch {
+      // Throttled / blocked API — inconclusive, no observation fabricated.
+    } finally {
+      try {
+        frame?.remove();
+      } catch {
+        // Frame already gone.
+      }
+    }
+  }
+
+  // documentInterception — reads navigation timing already collected by the browser. No new
+  // network request and no fabricated values.
+  if (
+    evidence.chromium &&
+    typeof performance !== 'undefined' &&
+    typeof performance.getEntriesByType === 'function'
+  ) {
+    try {
+      const nav = performance.getEntriesByType('navigation')[0] as unknown as
+        | Record<string, unknown>
+        | undefined;
+      if (
+        nav &&
+        nav.nextHopProtocol === '' &&
+        Number(nav.transferSize) > 0 &&
+        nav.deliveryType === '' &&
+        Number(nav.workerStart) === 0
+      ) {
+        add('documentInterception', true, false);
+      }
+    } catch {
+      // Performance entries unavailable — omit.
+    }
+  }
+
+  // storagePartitioning requires Chromium >= 148 plus cross-site iframe infrastructure that this
+  // collector does not have. It is SKIPPED — never inferred from a UA version alone.
+
+  // cdpBindingGlobals — yellow hint only: window functions with an empty name whose source is
+  // native. `corroborated` is false so a bare bridge stays in the developer_tools tier and can
+  // NEVER promote to a hard bot signal (CDP stays separated from DevTools).
+  if (typeof window !== 'undefined') {
+    try {
+      const scope = window as unknown as Record<string, unknown>;
+      const emptyNamedNative = Object.keys(scope).some((key) => {
+        const value = scope[key];
+        if (typeof value !== 'function' || (value as { name?: string }).name !== '') return false;
+        try {
+          return /\[native code\]/.test(Function.prototype.toString.call(value));
+        } catch {
+          return false;
+        }
+      });
+      add('cdpBindingGlobals', emptyNamedNative, false);
+    } catch {
+      // Hostile global proxy — omit.
+    }
+  }
+
+  // sourceUrlLeak / pwInitScripts — Puppeteer stack markers and Playwright init-script bindings.
+  if (typeof window !== 'undefined') {
+    try {
+      const stack = new Error().stack || '';
+      add('sourceUrlLeak', /pptr:|UtilityScript\./i.test(stack), false);
+      const scope = window as unknown as Record<string, unknown>;
+      add('pwInitScripts', '__pwInitScripts' in scope || '__playwright__binding__' in scope, false);
+    } catch {
+      // Omit on any scope error.
+    }
+  }
+
+  // exposeFunctionLeak — distinctive binding globals left by page.exposeFunction (already
+  // tracked by the passive trusted-input tracker, so no new listener is installed).
+  add(
+    'exposeFunctionLeak',
+    evidence.frameworkGlobals.some((key) =>
+      /playwright|puppeteer|__pw|cdc[_-]|webdriver/i.test(key)
+    ) || evidence.playwrightMarkTargets > 0,
+    false
+  );
+
+  // bypassCsp is only meaningful on a page that actually declares a CSP. Without one the probe
+  // is omitted; no decisive client-side observable exists here, so nothing is fabricated.
+  if (typeof document !== 'undefined') {
+    try {
+      void document.querySelector('meta[http-equiv="Content-Security-Policy"]');
+    } catch {
+      // Omit.
+    }
+  }
+
+  // popupBlocking is a yellow-only hint with no decisive client observable — omitted.
+
+  // headless-shell — explicit headless UA, desktop Chromium without window.chrome, or a denied
+  // Notification permission (synchronous read only; requestPermission needs a gesture). A bare
+  // SwiftShader renderer is a yellow VM hint and is NOT emitted here, preserving the exemption.
+  let notificationDenied = false;
+  if (typeof Notification !== 'undefined') {
+    try {
+      notificationDenied = Notification.permission === 'denied';
+    } catch {
+      // Omit.
+    }
+  }
+  const noWindowChrome = /without a window\.chrome object/i.test(evidence.stealthReasons.join(' '));
+  add(
+    'chromeHeadlessShell',
+    evidence.headlessShell || (evidence.chromium && (noWindowChrome || notificationDenied)),
+    false
+  );
+
+  // marionette — navigator.webdriver, read from the already-computed authoritative probe.
+  add('marionette', evidence.webdriver, false);
+
+  return observations;
+}
 
 /**
  * Evaluates First-Party Security & Anomaly Signals ("Smart Signals") and computes an
@@ -5401,6 +5700,43 @@ export async function evaluateSecuritySignals(
     botSignals.unshift(...hardAutomationEvidence);
   }
 
+  // Additive, informational privacy / stealth telemetry. Both resolvers are pure and their
+  // outputs are never read by suspectScore, riskLevel, riskFactors, botVerdict or the 0-10
+  // headline. Every input is an already-collected fact (or a bounded lightweight channel read).
+  const chromiumEngine =
+    /Chrome\/|Chromium\/|Edg\/|OPR\/|CriOS\//i.test(uaSnapshot) && !/Firefox|FxiOS/i.test(uaSnapshot);
+  const privacyVerdict = resolvePrivacySignatures(
+    buildPrivacySignalsInput({
+      ua: uaSnapshot,
+      browserLabel: browserDevice.browser,
+      torSignals: torBrowserClient.signals,
+      torDetected: torBrowserClient.detected,
+      canvasNoiseDetected,
+      maskedByPrivacyGpu: gpuObservation === 'masked_by_privacy',
+      privacyHardenedRuntime: privacyHardened,
+      devtoolsDeviceEmulation: Boolean(browserDevice.devtoolsDeviceEmulation),
+      isBot: authoritativeIsBot,
+      hardAutomationEvidence,
+      cdpReasonIds,
+      webdriver: botAssessment.webdriver,
+      stealthPluginDetected: Boolean(botAssessment.stealthPluginDetected),
+    })
+  );
+  const stealthEvaluation = evaluateStealthSignals(
+    buildStealthObservations({
+      ua: uaSnapshot,
+      gpuRenderer: hardwareSignals.gpuRenderer,
+      chromium: chromiumEngine,
+      headlessShell: runtimeHostSnapshot.headlessShell,
+      dockedDevTools: exemptDockedHost,
+      cdpRuntimeLeak: stealthSnapshot.cdpRuntimeLeak,
+      webdriver: botAssessment.webdriver,
+      frameworkGlobals: interactionCounters.frameworkGlobals,
+      playwrightMarkTargets: interactionCounters.playwrightMarkTargets,
+      stealthReasons: stealthSnapshot.stealthReasons,
+    })
+  );
+
   // Active call — WebRTC audio transceivers, navigator.audioSession, voice-routed AudioContext.
   const activeCall = detectActiveCall();
 
@@ -5509,6 +5845,11 @@ export async function evaluateSecuritySignals(
     gpuObservation,
     cdpReasonIds,
     cdpAttached: stealthSnapshot.cdpRuntimeProof,
+    /* Additive, informational privacy/stealth telemetry — never a verdict or risk input. */
+    privacy_settings: privacyVerdict.privacy_settings,
+    privacy_hardened: privacyVerdict.privacy_hardened,
+    privacy_signature_ids: privacyVerdict.signatures,
+    stealth_signal_ids: stealthEvaluation.ids,
     datacenterAsn,
     cloudOrMaskedGpu,
     vpnReasons,
@@ -6597,6 +6938,321 @@ function buildIdentityProfile(
   };
 }
 
+/**
+ * Deployable WebGPU entropy slice: static `adapter.info`, device features and four limit
+ * counters, plus timestamp-query availability. Bounded and additive — no atomic-contention /
+ * DrawnApart timing identity (that research path is unstable and is deliberately omitted).
+ * Called only AFTER the canvas/WebGL probes have finished, because WebGL can perturb canvas.
+ * Never throws; a missing adapter or a timeout yields `null` rather than fabricated numbers.
+ */
+interface WebGpuEntropyTelemetry {
+  available: boolean;
+  info?: { vendor: string; architecture: string; device: string; description: string };
+  features?: string[];
+  /** Only counters the device actually reported — never zero-filled placeholders. */
+  limits?: Partial<
+    Record<
+      | 'maxComputeWorkgroupSizeX'
+      | 'maxComputeWorkgroupSizeY'
+      | 'maxComputeWorkgroupSizeZ'
+      | 'maxComputeWorkgroupsPerDimension',
+      number
+    >
+  >;
+  timestamp_query?: boolean;
+}
+
+async function collectWebGpuEntropy(): Promise<WebGpuEntropyTelemetry | null> {
+  if (typeof navigator === 'undefined') return null;
+  const gpu = (navigator as unknown as {
+    gpu?: {
+      requestAdapter?: () => Promise<{
+        info?: {
+          vendor?: string;
+          architecture?: string;
+          device?: string;
+          description?: string;
+        } | null;
+        requestDevice?: () => Promise<{
+          features?: unknown;
+          limits?: unknown;
+        }>;
+      } | null>;
+    };
+  }).gpu;
+  if (!gpu || typeof gpu.requestAdapter !== 'function') return null;
+
+  const WEBGPU_BUDGET_MS = 250;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), WEBGPU_BUDGET_MS);
+  });
+  try {
+    return await Promise.race([
+      (async (): Promise<WebGpuEntropyTelemetry | null> => {
+        try {
+          const adapter = await gpu.requestAdapter?.();
+          if (!adapter || typeof adapter.requestDevice !== 'function') return null;
+          const device = await adapter.requestDevice();
+          const result: WebGpuEntropyTelemetry = { available: true };
+          try {
+            const info = adapter.info;
+            if (info && typeof info === 'object') {
+              result.info = {
+                vendor: typeof info.vendor === 'string' ? info.vendor : '',
+                architecture: typeof info.architecture === 'string' ? info.architecture : '',
+                device: typeof info.device === 'string' ? info.device : '',
+                description: typeof info.description === 'string' ? info.description : '',
+              };
+            }
+          } catch {
+            // Adapter info is often empty/restricted; omit rather than guess.
+          }
+          try {
+            const features = device.features;
+            const list =
+              features && typeof (features as Iterable<string>)[Symbol.iterator] === 'function'
+                ? Array.from(features as Iterable<string>)
+                    .filter((name): name is string => typeof name === 'string')
+                    .sort()
+                : [];
+            if (list.length > 0) result.features = list;
+            result.timestamp_query =
+              typeof (features as { has?: (name: string) => boolean })?.has === 'function'
+                ? Boolean((features as { has: (name: string) => boolean }).has('timestamp-query'))
+                : list.includes('timestamp-query');
+          } catch {
+            // Feature enumeration unavailable — omit both fields.
+          }
+          try {
+            const raw = (device.limits ?? {}) as Record<string, unknown>;
+            const limits: NonNullable<WebGpuEntropyTelemetry['limits']> = {};
+            for (const key of [
+              'maxComputeWorkgroupSizeX',
+              'maxComputeWorkgroupSizeY',
+              'maxComputeWorkgroupSizeZ',
+              'maxComputeWorkgroupsPerDimension',
+            ] as const) {
+              const value = raw[key];
+              if (typeof value === 'number' && Number.isFinite(value)) limits[key] = value;
+            }
+            if (Object.keys(limits).length > 0) result.limits = limits;
+          } catch {
+            // Limit enumeration unavailable — omit.
+          }
+          return result;
+        } catch {
+          return null;
+        }
+      })(),
+      deadline,
+    ]);
+  } catch {
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Additive worker-scope triangulation. ServiceWorker and SharedWorker scopes need an active
+ * registration / owned script that this collector does not have, so they are abstained from;
+ * a short-lived same-origin Blob DedicatedWorker is the bounded fallback. `brands` is the only
+ * STRONG field; userAgent, platform, languages and hardwareConcurrency are SOFT (0.5) and
+ * `language`/`languages` are never counted as a hard contradiction (Chrome legitimately switches
+ * engine language). Purely informational — no verdict or risk input.
+ */
+interface WorkerTriangulationTelemetry {
+  available: boolean;
+  strong: boolean;
+  soft: boolean;
+  strong_fields: string[];
+  soft_fields: string[];
+}
+
+async function collectWorkerTriangulation(): Promise<WorkerTriangulationTelemetry | null> {
+  if (
+    typeof Worker === 'undefined' ||
+    typeof navigator === 'undefined' ||
+    typeof URL === 'undefined' ||
+    typeof URL.createObjectURL !== 'function'
+  ) {
+    return null;
+  }
+  const source = [
+    'self.onmessage=function(){var n=navigator,u=n.userAgentData;',
+    'self.postMessage({',
+    'userAgent:n.userAgent||"",',
+    'platform:n.platform||"",',
+    'hardwareConcurrency:(typeof n.hardwareConcurrency==="number"?n.hardwareConcurrency:null),',
+    'deviceMemory:(typeof n.deviceMemory==="number"?n.deviceMemory:null),',
+    'brands:(u&&Array.isArray(u.brands))?u.brands.map(function(b){return b.brand;}):[],',
+    'languages:Array.isArray(n.languages)?n.languages.slice():[]',
+    '});};',
+  ].join('');
+
+  const compare = (data: Record<string, unknown>): WorkerTriangulationTelemetry => {
+    const strongFields: string[] = [];
+    const softFields: string[] = [];
+    const windowNav = navigator as unknown as Record<string, unknown>;
+    const uaData = (navigator as unknown as {
+      userAgentData?: { brands?: Array<{ brand?: string }> };
+    }).userAgentData;
+    const windowBrands = (uaData?.brands ?? [])
+      .map((entry) => entry.brand)
+      .filter((brand): brand is string => typeof brand === 'string')
+      .sort();
+    const workerBrands = Array.isArray(data.brands)
+      ? (data.brands as unknown[]).filter((b): b is string => typeof b === 'string').sort()
+      : [];
+    if (
+      windowBrands.length > 0 &&
+      workerBrands.length > 0 &&
+      JSON.stringify(windowBrands) !== JSON.stringify(workerBrands)
+    ) {
+      strongFields.push('brands');
+    }
+    // UserAgent / platform / languages / hardwareConcurrency / deviceMemory are SOFT only.
+    // Language / languages are deliberately excluded from hard contradictions.
+    for (const field of ['userAgent', 'platform', 'languages', 'hardwareConcurrency', 'deviceMemory']) {
+      const workerValue = data[field];
+      const windowValue = windowNav[field];
+      if (typeof workerValue === 'string' && typeof windowValue === 'string' && workerValue !== windowValue) {
+        softFields.push(field);
+      } else if (typeof workerValue === 'number' && typeof windowValue === 'number' && workerValue !== windowValue) {
+        softFields.push(field);
+      }
+    }
+    return {
+      available: true,
+      strong: strongFields.length > 0,
+      soft: softFields.length > 0,
+      strong_fields: strongFields,
+      soft_fields: softFields,
+    };
+  };
+
+  let url: string | null = null;
+  let worker: Worker | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    const blobWorker = new Worker(url);
+    worker = blobWorker;
+    return await Promise.race([
+      new Promise<WorkerTriangulationTelemetry | null>((resolve) => {
+        blobWorker.onmessage = (event: MessageEvent) => {
+          const data = event.data;
+          resolve(data && typeof data === 'object' ? compare(data as Record<string, unknown>) : null);
+        };
+        blobWorker.onerror = () => resolve(null);
+        blobWorker.postMessage('probe');
+      }),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), 200);
+      }),
+    ]);
+  } catch {
+    // Workers unavailable / blocked — abstain.
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+    try {
+      worker?.terminate();
+    } catch {
+      // Already terminated.
+    }
+    if (url) {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        // Ignore.
+      }
+    }
+  }
+}
+
+/**
+ * ActiveText is a Chrome >= 138 light-scheme signal: Windows resolves `ActiveText` to
+ * rgb(0,102,204), Linux/macOS to rgb(255,0,0). Forced-colors and dark schemes abstain. A browser
+ * claiming Windows but resolving red is only a 0.5 SOFT warning — never a hard verdict.
+ */
+function collectActiveTextHint(): Record<string, unknown> | null {
+  if (typeof document === 'undefined' || typeof window === 'undefined') return null;
+  try {
+    const matchMedia = typeof window.matchMedia === 'function' ? window.matchMedia.bind(window) : null;
+    if (matchMedia?.('(forced-colors: active)').matches) return null;
+    if (matchMedia?.('(prefers-color-scheme: dark)').matches) return null;
+    const chromeMajor = Number.parseInt(
+      (navigator.userAgent.match(/Chrome\/(\d+)/) || [])[1] || '',
+      10
+    );
+    if (!Number.isFinite(chromeMajor) || chromeMajor < 138) return null;
+    const probe = document.createElement('span');
+    probe.style.cssText = 'forced-color-adjust:none;color:ActiveText;position:absolute;left:-9999px';
+    probe.textContent = 'x';
+    document.body.appendChild(probe);
+    const color = getComputedStyle(probe).color;
+    probe.remove();
+    const windowsBlue = /rgb\(\s*0\s*,\s*102\s*,\s*204\s*\)/.test(color);
+    const red = /rgb\(\s*255\s*,\s*0\s*,\s*0\s*\)/.test(color);
+    const claimsWindows =
+      /Windows/i.test(navigator.platform || '') || /Windows NT/i.test(navigator.userAgent || '');
+    return {
+      supported: true,
+      color: color || null,
+      windows_blue: windowsBlue,
+      ...(claimsWindows && red ? { warning_soft: 0.5 } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Additive cross-browser incognito CORROBORATION context only. It mirrors facts the verdict has
+ * already resolved (engine length, brand, method, IDB/OPFS probes) and documents the deliberate
+ * guards — no absolute OPFS threshold, IDB treated as corroborating with fail-open. It never
+ * changes `isPrivate`, the persistent-marker veto, confidence or any risk field.
+ */
+function buildIncognitoCorroboration(incog: IncognitoDetectionResult): Record<string, unknown> {
+  const engineLength = getEngineErrorLength();
+  const engineFamily =
+    engineLength === 51
+      ? 'v8'
+      : engineLength === 25
+      ? 'spidermonkey'
+      : engineLength === 43 || engineLength === 44
+      ? 'jsc'
+      : 'unknown';
+  let brand: 'brave' | 'edge' | 'opera' | 'chrome' | 'unknown' = 'unknown';
+  if (engineFamily === 'v8') {
+    try {
+      const nav = navigator as unknown as {
+        brave?: { isBrave?: unknown };
+        userAgent?: string;
+      };
+      if (nav.brave && typeof nav.brave.isBrave === 'function') brand = 'brave';
+      else if (/Edg\//i.test(nav.userAgent || '')) brand = 'edge';
+      else if (/OPR\//i.test(nav.userAgent || '')) brand = 'opera';
+      else brand = 'chrome';
+    } catch {
+      brand = 'unknown';
+    }
+  }
+  return {
+    engine_family: engineFamily,
+    brand,
+    method: incog.method,
+    confidence: incog.confidence,
+    idb_durability_ratio: incog.idbDurabilityRatio,
+    opfs_flush_ms: incog.opfsFlushMs,
+    // Documented resolver guards — informational facts, never decision inputs.
+    opfs_absolute_threshold_used: false,
+    idb_corroborating_only: true,
+  };
+}
+
 export async function identifyCurrentVisitor(options?: {
   manualRefresh?: boolean;
 }): Promise<IntelVisitorResponse> {
@@ -6710,6 +7366,62 @@ export async function identifyCurrentVisitor(options?: {
         )
       : null;
 
+    // Additive entropy telemetry — re-emitted verbatim from probes that already ran. No hash is
+    // recomputed and no risk is re-derived. The WebGPU slice runs only here, AFTER canvas/WebGL
+    // (WebGL can perturb canvas), is bounded to 250 ms, and is the static deployable slice only.
+    const webGpuEntropy = await collectWebGpuEntropy();
+    const workerTriangulation = await collectWorkerTriangulation();
+    const activeText = collectActiveTextHint();
+    const additiveEntropy = collectedSignals
+      ? {
+          fontPreferences: {
+            widths: collectedSignals.fontPreferences.widths,
+            widthsExactIntegers: collectedSignals.fontPreferences.widthsExactIntegers,
+          },
+          emoji: {
+            font: collectedSignals.emoji.font,
+            width: collectedSignals.emoji.width,
+            height: collectedSignals.emoji.height,
+            x: collectedSignals.emoji.x,
+            y: collectedSignals.emoji.y,
+          },
+          webglShaderPrecisionHash: collectedSignals.webglExtensions.shaderPrecisions,
+          webglLimits: collectedSignals.webglGpuIdentity.invariantLimits,
+          webgpu: webGpuEntropy,
+          workerTriangulation,
+          activeText,
+          canvas: {
+            geometry: collectedSignals.canvas.geometry,
+            text: collectedSignals.canvas.text,
+            noise: collectedSignals.canvasNoise.classification,
+            flags: collectedSignals.canvasNoise.flags,
+          },
+          audio: {
+            // The already-rendered float is mirrored verbatim; it is never re-derived here.
+            sum: collectedSignals.audio.sum,
+            baseLatency: collectedSignals.audio.audioBaseLatency,
+            code: collectedSignals.audio.code,
+          },
+          screen: collectedSignals.systemEntropy.screen,
+          colorGamut: hardwareSignals.colorGamut,
+          hdrSupported: hardwareSignals.hdrSupported,
+        }
+      : null;
+    // Additive timing — emitted ONLY from timings the orchestrator actually recorded. A skipped
+    // or timed-out collector produces no fabricated number.
+    const recordedTimings = collectedSignals?.meta?.timingsMs;
+    const recordedTotalDuration = collectedSignals?.meta?.totalDurationMs ?? null;
+    const loadGetTiming =
+      recordedTimings && typeof recordedTimings === 'object' && Object.keys(recordedTimings).length > 0
+        ? {
+            source: 'signals.meta',
+            timings_ms: recordedTimings,
+            ...(typeof recordedTotalDuration === 'number' && Number.isFinite(recordedTotalDuration)
+              ? { total_duration_ms: recordedTotalDuration }
+              : {}),
+          }
+        : null;
+
     // Fresh, post-interaction corroboration on EVERY identify payload — never a value
     // cached at page load. Mirrored at top level for the server verdict state machine and
     // inspector telemetry as well as inside `securitySignals`.
@@ -6737,6 +7449,9 @@ export async function identifyCurrentVisitor(options?: {
         // The flag-gated diagnostic mirror is emitted once, here, additively.
         ...(incog.diagnostics ? { diagnostics: incog.diagnostics } : {}),
         identityProfile,
+        // Additive entropy/timing mirrors — informational only, never a verdict or rank input.
+        ...(additiveEntropy ? { entropyTelemetry: additiveEntropy } : {}),
+        ...(loadGetTiming ? { load_get_timing: loadGetTiming } : {}),
         hardwareFingerprint: identityHardwareFingerprint,
         browserFingerprint: identityBrowserFingerprint,
         sessionId: stored.sessionId || identitySessionId,
@@ -6753,6 +7468,11 @@ export async function identifyCurrentVisitor(options?: {
         client_type: securitySignals.client_type,
         gpuObservation: securitySignals.gpuObservation,
         browserTimezone: securitySignals.browserTimezone,
+        // Additive, informational privacy/stealth telemetry mirrored from securitySignals.
+        privacy_settings: securitySignals.privacy_settings,
+        privacy_hardened: securitySignals.privacy_hardened,
+        privacy_signature_ids: securitySignals.privacy_signature_ids,
+        stealth_signal_ids: securitySignals.stealth_signal_ids,
         // Volatile values are kept as CONTEXT only — never folded into a digest or identity key.
         // The raw browser UTC offset also stays in `rawDeviceAttributes.timezone_offset`.
         storageQuotaContext: collectedSignals?.systemEntropy.storageQuota ?? null,
@@ -6778,6 +7498,8 @@ export async function identifyCurrentVisitor(options?: {
         incognitoLikely: incognitoVerified,
         privateMode: incognitoVerified,
         incognitoMethod: incog.method,
+        // Additive cross-browser corroboration context — never a verdict or risk input.
+        incognitoCorroboration: buildIncognitoCorroboration(incog),
         // 'high' for a genuine incognito verdict (the decisive storage-denial gate);
         // 'low' verdicts are always emitted as false above.
         incognitoConfidence: incog.confidence,
