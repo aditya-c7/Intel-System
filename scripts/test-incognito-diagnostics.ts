@@ -83,6 +83,7 @@ const TELEMETRY_DIAG_FIELDS = [
   'headroomGiB',
   'idbDurabilityRatio',
   'idbHighVariance',
+  'idbTruthRule',
   'opfsFlushMs',
   'persistedStorageGrant',
   'isolatedContextVeto',
@@ -102,6 +103,7 @@ const VISITOR_DIAG_FIELDS = [
   'headroomGiB',
   'idbDurabilityRatio',
   'idbHighVariance',
+  'idbTruthRule',
   'opfsFlushMs',
   'persistedStorageGrant',
   'isolatedContextVeto',
@@ -130,6 +132,7 @@ const OPTIONAL_FIELD_KINDS: Readonly<Record<string, FieldKind>> = Object.freeze(
   headroomGiB: 'number',
   idbDurabilityRatio: 'number',
   idbHighVariance: 'boolean',
+  idbTruthRule: 'string',
   opfsFlushMs: 'number',
   persistedStorageGrant: 'boolean',
   isolatedContextVeto: 'boolean',
@@ -235,9 +238,9 @@ function main(): void {
   section('1. Additive shape: optional + nullable, enabled:false valid');
   /* ------------------------------------------------------------------------ */
 
-  check('telemetryContract and visitor type manifests name the same 16 fields', () => {
+  check('telemetryContract and visitor type manifests name the same 17 fields', () => {
     assert.deepEqual([...VISITOR_DIAG_FIELDS], [...TELEMETRY_DIAG_FIELDS]);
-    assert.equal(TELEMETRY_DIAG_FIELDS.length, 16);
+    assert.equal(TELEMETRY_DIAG_FIELDS.length, 17);
     assert.equal(TELEMETRY_DIAG_FIELDS[0], 'enabled');
     assert.equal(new Set(TELEMETRY_DIAG_FIELDS).size, TELEMETRY_DIAG_FIELDS.length);
   });

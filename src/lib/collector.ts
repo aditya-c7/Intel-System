@@ -19,6 +19,7 @@ import {
 import type { GpuObservation } from './telemetryContract';
 import { resolveGpuObservation } from './specInvariants';
 import { timezoneMismatchContext } from './timezone';
+import { resolveIdbDurabilityTruth } from './idbDurabilityTruth';
 import { probeEngineLength, resolveHardwareTruth } from './hardwareTruth';
 import { detectBotD19Signals } from './aiBotDirectory';
 import {
@@ -1867,6 +1868,8 @@ export interface IncognitoDiagnostics {
   headroomGiB: number | null;
   idbDurabilityRatio: number | null;
   idbHighVariance: boolean | null;
+  /** Shadow-only rule id from the additive IDB durability resolver. */
+  idbTruthRule?: string | null;
   opfsFlushMs: number | null;
   persistedStorageGrant: boolean | null;
   isolatedContextVeto: boolean | null;
@@ -4802,11 +4805,26 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       const opfsDecisive = opfsDirDecisive || opfsWrite.literal || opfsWrite.restricted;
       const opfsCorroboration =
         opfsDirClass.restricted || opfsIndicatesIncognito || auxiliary.restricted;
+
+      // Evidence-based IDB resolver. Modern Chromium no longer rejects OPFS in incognito, so
+      // requiring OPFS corroboration suppressed even a clean 0.531 RAM-backed ratio. A strong
+      // strict/relaxed ratio (<1.40) is now self-sufficient, while the original deadband and
+      // all hard vetoes remain. This is the single decision path for the IDB vector.
+      const idbTruth = resolveIdbDurabilityTruth({
+        ratio: idbRatio,
+        highVariance: idbHighVariance,
+        persistedGrant: persistentGrant,
+        isolatedContext,
+        opfsCorroboration,
+      });
+      noteDiag('idbTruthRule', idbTruth.rule);
+
       const incognitoDetected =
         !persistentGrant &&
         !isolatedContext &&
         (opfsDecisive ||
           auxiliary.literal ||
+          idbTruth.incognito ||
           (opfsCorroboration && idbPrivateEvidence));
 
       if (incognitoDetected) {

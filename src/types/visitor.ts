@@ -241,6 +241,8 @@ export interface IncognitoDiagnostics {
   headroomGiB?: number | null;
   idbDurabilityRatio?: number | null;
   idbHighVariance?: boolean | null;
+  /** Shadow-only IDB resolver rule id; never a verdict input. */
+  idbTruthRule?: string | null;
   opfsFlushMs?: number | null;
   persistedStorageGrant?: boolean | null;
   isolatedContextVeto?: boolean | null;
