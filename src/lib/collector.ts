@@ -1456,6 +1456,7 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & Cl
     incognitoMethod: incognitoVerdict.method,
     idbDurabilityRatio: incognitoVerdict.idbDurabilityRatio,
     opfsFlushMs: incognitoVerdict.opfsFlushMs,
+    ...(incognitoVerdict.diagnostics ? { diagnostics: incognitoVerdict.diagnostics } : {}),
   };
 }
 
@@ -1850,6 +1851,55 @@ const METHOD_PRIVATE_STORAGE = 'private-storage-detected';
 const METHOD_STANDARD_STORAGE = 'standard-storage';
 const METHOD_INCONCLUSIVE = 'storage-check-inconclusive';
 
+/**
+ * Additive, flag-gated incognito probe diagnostics. Every field beyond `enabled` is
+ * nullable so a partially observed probe still yields a valid record. This is a
+ * READ-ONLY mirror of values the probe already computes — it never feeds the verdict,
+ * the risk score or any downstream decision.
+ */
+export interface IncognitoDiagnostics {
+  enabled: boolean;
+  engine: string | null;
+  method: string | null;
+  confidence: IncognitoConfidence | null;
+  isPrivate: boolean | null;
+  quotaBytes: number | null;
+  headroomGiB: number | null;
+  idbDurabilityRatio: number | null;
+  idbHighVariance: boolean | null;
+  opfsFlushMs: number | null;
+  persistedStorageGrant: boolean | null;
+  isolatedContextVeto: boolean | null;
+  sessionLockHit: boolean | null;
+  lowConfidenceVeto: boolean | null;
+  clientReportedIncognito: boolean | null;
+  serverWouldVeto: boolean | null;
+}
+
+/**
+ * Module-level flag gate for additive incognito diagnostics. True only when the page
+ * URL carries `intelDiag=1` or this tab's sessionStorage holds `intel_diag_v1 = '1'`.
+ * Never throws: a blocked or hostile scope simply means "off", the default everywhere.
+ */
+export function isIncognitoDiagnosticsEnabled(): boolean {
+  try {
+    if (typeof window !== 'undefined' && window.location) {
+      const search = window.location.search;
+      if (typeof search === 'string' && search.includes('intelDiag=1')) return true;
+    }
+  } catch {
+    // Scope access denied — diagnostics stay off.
+  }
+  try {
+    if (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('intel_diag_v1') === '1') {
+      return true;
+    }
+  } catch {
+    // Storage blocked — diagnostics stay off.
+  }
+  return false;
+}
+
 export interface IncognitoDetectionResult {
   isPrivate: boolean;
   browserName: string;
@@ -1864,6 +1914,8 @@ export interface IncognitoDetectionResult {
   opfsFlushMs: number | null;
   /** Weak Chromium-only off-the-record context hints; telemetry, never a verdict input. */
   storagePrivateHints?: boolean;
+  /** Optional, flag-gated diagnostic mirror. No decision path ever reads this. */
+  diagnostics?: IncognitoDiagnostics;
 }
 
 /**
@@ -4458,14 +4510,61 @@ function finalizeIncognitoVerdict(result: IncognitoDetectionResult): IncognitoDe
 export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
   if (cachedIncognitoPromise) return cachedIncognitoPromise;
 
+  // Diagnostics are strictly additive: when the flag is off no object is created and
+  // nothing is recorded. When on, values are copied from probes that run regardless.
+  const diagEnabled = isIncognitoDiagnosticsEnabled();
+  const diag: IncognitoDiagnostics | null = diagEnabled
+    ? {
+        enabled: true,
+        engine: null,
+        method: null,
+        confidence: null,
+        isPrivate: null,
+        quotaBytes: null,
+        headroomGiB: null,
+        idbDurabilityRatio: null,
+        idbHighVariance: null,
+        opfsFlushMs: null,
+        persistedStorageGrant: null,
+        isolatedContextVeto: null,
+        sessionLockHit: null,
+        lowConfidenceVeto: null,
+        clientReportedIncognito: null,
+        serverWouldVeto: null,
+      }
+    : null;
+  const noteDiag = <K extends keyof IncognitoDiagnostics>(
+    key: K,
+    value: IncognitoDiagnostics[K]
+  ): void => {
+    if (diag) diag[key] = value;
+  };
+
   // Deterministic per-session lock: reuse a HIGH-confidence verdict computed earlier
   // in this tab — unless a fresh decisive OPFS rejection proves a cached "normal"
   // verdict stale. Low-confidence entries are never returned by the reader.
   const locked = readIncognitoSessionLock();
   if (locked && (locked.isPrivate || !(await cachedNormalIsStale()))) {
-    cachedIncognitoPromise = Promise.resolve(locked);
+    noteDiag('sessionLockHit', true);
+    if (diag) {
+      noteDiag('method', locked.method);
+      noteDiag('confidence', locked.confidence);
+      noteDiag('isPrivate', locked.isPrivate);
+      noteDiag('quotaBytes', locked.quotaBytes);
+      noteDiag('headroomGiB', locked.headroomGiB);
+      noteDiag('idbDurabilityRatio', locked.idbDurabilityRatio);
+      noteDiag('idbHighVariance', locked.idbHighVariance ?? null);
+      noteDiag('opfsFlushMs', locked.opfsFlushMs);
+      noteDiag('clientReportedIncognito', locked.isPrivate);
+      noteDiag('lowConfidenceVeto', false);
+      noteDiag('serverWouldVeto', false);
+      cachedIncognitoPromise = Promise.resolve({ ...locked, diagnostics: diag });
+    } else {
+      cachedIncognitoPromise = Promise.resolve(locked);
+    }
     return cachedIncognitoPromise;
   }
+  noteDiag('sessionLockHit', false);
 
   cachedIncognitoPromise = (async (): Promise<IncognitoDetectionResult> => {
     const nav = typeof navigator !== 'undefined' ? navigator : undefined;
@@ -4501,6 +4600,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       engine = 'chromium';
     }
 
+    noteDiag('engine', engine);
     const browserName = resolveBrowserName(engine, ua, nav);
 
     let quotaBytes: number | null = null;
@@ -4530,6 +4630,8 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
     const headroomBytes = quotaBytes !== null ? quotaBytes - usageBytes : null;
     const headroomGiB =
       headroomBytes !== null ? Number((Math.max(0, headroomBytes) / GIB_BYTES).toFixed(2)) : null;
+    noteDiag('quotaBytes', quotaBytes);
+    noteDiag('headroomGiB', headroomGiB);
     // Weak Chromium-only context hints, reported for telemetry but never used as
     // verdict evidence (see `probeChromiumAuxiliarySignals`).
     let storagePrivateHints = false;
@@ -4659,8 +4761,11 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       const idbProbe = await probeChromiumIdbDurability();
       const idbRatio = idbProbe.ratio;
       const idbHighVariance = idbProbe.highVariance;
+      noteDiag('idbDurabilityRatio', idbRatio);
+      noteDiag('idbHighVariance', idbHighVariance);
       const opfsProbe = await probeChromiumOpfsWorkerFlush();
       const opfsFlushMs = opfsProbe ? opfsProbe.medianFlushMs : null;
+      noteDiag('opfsFlushMs', opfsFlushMs);
 
       // Chromium deadband: below 1.12 the store is RAM-backed (private), above 1.55 it
       // is disk-backed (normal). The 1.12–1.55 band and an inconclusive ratio fail open.
@@ -4691,6 +4796,8 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       const idbConclusivePrivate = idbVerdict === 'private' && !idbHighVariance;
       const persistentGrant = await hasPersistedStorageGrant();
       const isolatedContext = isIsolatedStorageContext();
+      noteDiag('persistedStorageGrant', persistentGrant);
+      noteDiag('isolatedContextVeto', isolatedContext);
       const idbPrivateEvidence = idbConclusivePrivate || (idbLowRatio && !idbHighVariance);
       const opfsDecisive = opfsDirDecisive || opfsWrite.literal || opfsWrite.restricted;
       const opfsCorroboration =
@@ -4752,6 +4859,19 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
     // fail-open branches — is normalized here before the lock write, so the cached
     // verdict is always complete and low-confidence never means incognito.
     const finalized = finalizeIncognitoVerdict(result);
+    // Diagnostics are derived from the finalized verdict, never from any decision input.
+    if (diag) {
+      noteDiag('method', finalized.method);
+      noteDiag('confidence', finalized.confidence);
+      noteDiag('isPrivate', finalized.isPrivate);
+      noteDiag('clientReportedIncognito', finalized.isPrivate);
+      // Mirror the server's confidence gate (server.ts: low label / numeric < 0.9 is a
+      // hard veto). This is a readout of an existing decision, never a new veto path.
+      const lowVeto = finalized.confidence === 'low';
+      noteDiag('lowConfidenceVeto', lowVeto);
+      noteDiag('serverWouldVeto', lowVeto);
+      return { ...finalized, diagnostics: diag };
+    }
     writeIncognitoSessionLock(finalized);
     return finalized;
   });
@@ -5380,6 +5500,8 @@ export async function evaluateSecuritySignals(
     headroomGiB: incognito.headroomGiB,
     idbDurabilityRatio: incognito.idbDurabilityRatio,
     opfsFlushMs: incognito.opfsFlushMs,
+    // Additive, flag-gated incognito diagnostics — never a verdict or scoring input.
+    ...(incognito.diagnostics ? { diagnostics: incognito.diagnostics } : {}),
     storageQuotaMb,
     persistenceMode,
     suspectScore,
@@ -6590,6 +6712,8 @@ export async function identifyCurrentVisitor(options?: {
         browserDevice,
         hardwareSignals,
         securitySignals,
+        // The flag-gated diagnostic mirror is emitted once, here, additively.
+        ...(incog.diagnostics ? { diagnostics: incog.diagnostics } : {}),
         identityProfile,
         hardwareFingerprint: identityHardwareFingerprint,
         browserFingerprint: identityBrowserFingerprint,
@@ -6637,6 +6761,9 @@ export async function identifyCurrentVisitor(options?: {
         incognitoConfidence: incog.confidence,
         idbDurabilityRatio: incog.idbDurabilityRatio,
         opfsFlushMs: incog.opfsFlushMs,
+        // Additive, flag-gated diagnostics — absent unless intelDiag=1 or the session
+        // key is set. Never consumed by any verdict or risk path.
+        ...(incog.diagnostics ? { diagnostics: incog.diagnostics } : {}),
       }),
     });
 
