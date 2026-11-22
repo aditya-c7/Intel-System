@@ -77,3 +77,15 @@ node scripts/test-worker.mjs
 npm run build
 node scripts/build-worker.mjs
 ```
+
+## Incognito diagnostics capture (shadow)
+
+This is a manual, opt-in procedure gated by the same deploy rules as everything else: deploy only via the human gate above after verification passes; there is no auto-deploy.
+
+To capture a shadow diagnostics snapshot:
+
+1. Open https://intel.adityahq.me/?intelDiag=1 in a real private/incognito window (not a regular tab with a spoofed user agent).
+2. Open the browser console and run `window.__intelDiag()`.
+3. Paste the returned JSON into your report.
+
+The `intelDiag` flag is off by default, adds no UI, and does not affect any verdict or risk score. Never include tokens or secrets in the captured JSON or the report.
