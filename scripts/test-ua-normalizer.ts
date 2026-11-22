@@ -263,6 +263,15 @@ expectIdentity(
 const CHROMIUM_156_LINUX_UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36';
 
+// The actual Chromium-156 fix is the bare `/Chromium\/(\d[\d.]*)/` UA token added to the
+// Chromium spec. Exercise that path directly (no Sec-CH-UA / UA_DATA brands) so CI catches a
+// regression in the fix itself rather than only in the already-working brand ladder.
+check(
+  'bare Chromium/156 UA token with no client hints resolves to Chromium (never Unknown)',
+  normalizeUserAgent({ userAgent: 'Mozilla/5.0 Chromium/156.0.8078.79', platform: 'Linux' })
+    .browserName !== 'Unknown'
+);
+
 const chromium156Result = expectIdentity(
   'Chromium 156.0.8078.79 (Linux) resolves to a concrete browser (never Unknown)',
   {

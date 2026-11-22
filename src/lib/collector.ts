@@ -4859,6 +4859,11 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
     // fail-open branches — is normalized here before the lock write, so the cached
     // verdict is always complete and low-confidence never means incognito.
     const finalized = finalizeIncognitoVerdict(result);
+    // The session lock is written BEFORE the diagnostics branch, so enabling diagnostics never
+    // changes verdict stability: without this, the flag silently skipped the only lock write and
+    // every later load in the tab re-ran the noisy probes instead of reusing the high-confidence
+    // verdict. Diagnostics must not alter behavior in any mode.
+    writeIncognitoSessionLock(finalized);
     // Diagnostics are derived from the finalized verdict, never from any decision input.
     if (diag) {
       noteDiag('method', finalized.method);
@@ -4872,7 +4877,6 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       noteDiag('serverWouldVeto', lowVeto);
       return { ...finalized, diagnostics: diag };
     }
-    writeIncognitoSessionLock(finalized);
     return finalized;
   });
 
