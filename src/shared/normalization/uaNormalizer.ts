@@ -481,7 +481,12 @@ const BROWSER_SPECS: BrowserSpec[] = [
   {
     name: 'Chromium',
     brands: [CHROMIUM_PLACEHOLDER],
-    uaTokens: [/Chrome\/([\d.]+)/],
+    /* `Chromium/<ver>` is emitted by bare/unbranded Chromium builds (e.g. the
+     * Chromium 156.0.8078.79 Linux payload). Without a brand list it was the only
+     * recognizable token yet matched no spec, so resolution fell through to
+     * 'Unknown'. `Chrome/` stays FIRST so UAs carrying both tokens keep resolving
+     * to Google Chrome (no existing classification changes). */
+    uaTokens: [/Chrome\/([\d.]+)/, /Chromium\/([\d.]+)/],
   },
   {
     name: 'Firefox',

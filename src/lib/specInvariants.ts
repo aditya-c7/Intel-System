@@ -19,8 +19,10 @@ import type {
   // Legacy 4-state vocabulary from the telemetry contract. Aliased so this module can own the
   // canonical 3-state `InspectorState` below without breaking the existing classifier's callers.
   InspectorState as LegacyInspectorState,
+  NetworkAxes,
   TamperingAxes,
 } from './telemetryContract';
+import { timezonesEquivalent, timezoneMismatchContext } from './timezone';
 
 export type SpecSeverity = 'hard' | 'soft';
 
@@ -656,4 +658,144 @@ export function checkInspectorInvariants(input: InspectorInvariantInput): Inspec
 /** Boolean convenience wrapper around `checkInspectorInvariants`. */
 export function hasInspectorContradictions(input: InspectorInvariantInput): boolean {
   return checkInspectorInvariants(input).contradictions.length > 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Shadow parity — proxy / VPN truth diagnostics (additive)                     */
+/* -------------------------------------------------------------------------- */
+
+/** The published `vpn_methods` mirror, narrowed to the flag shadow parity inspects. */
+export interface ShadowVpnMethods {
+  timezone_mismatch?: boolean | null;
+  [key: string]: unknown;
+}
+
+/**
+ * Everything the shadow-parity check needs. All fields are optional: the checker reports only
+ * contradictions it can actually observe, so partial payloads yield fewer diagnostics, never a
+ * guessed verdict. Both the canonical network axis and the flat mirrors are accepted.
+ */
+export interface ShadowProxyVpnInput {
+  /** Canonical network axis (verbatim from the envelope), when available. */
+  network?: Partial<NetworkAxes> | null;
+  /** Explicit datacenter truth; when present it overrides `network.network_ownership`. */
+  datacenterAsn?: boolean | null;
+  /** Published proxy flag; only an explicit `false` counts as "published as proxy:false". */
+  proxy?: boolean | null;
+  /** Server `vpn_methods` mirror (camelCase spelling). */
+  vpnMethods?: ShadowVpnMethods | null;
+  /** Server `vpn_methods` mirror (snake_case spelling). */
+  vpn_methods?: ShadowVpnMethods | null;
+  /** Published canonical timezone flag, used when no `vpn_methods` mirror was supplied. */
+  timezoneMismatch?: boolean | null;
+  /** Raw timezone strings resolved through the shared canonical IANA resolver. */
+  browserTimezone?: string | null;
+  ipTimezone?: string | null;
+  /** Verified good-bot / crawler network exemption for a datacenter ASN. */
+  verifiedGoodBot?: boolean | null;
+  botSubtype?: string | null;
+  /** snake_case / raw-payload aliases, accepted so callers can forward server fields verbatim. */
+  datacenter_asn?: boolean | null;
+  datacenter_result?: boolean | null;
+  asn_type?: string | null;
+  network_ownership?: NetworkAxes['network_ownership'] | null;
+  good_bot_exempt?: boolean | null;
+  verified_good_bot?: boolean | null;
+  bot_subtype?: string | null;
+  browser_timezone?: string | null;
+  ip_timezone?: string | null;
+  timezone_mismatch?: boolean | null;
+}
+
+/** Defensive field read: hostile getters / proxies can throw, and this module must stay total. */
+function shadowField(record: unknown, key: string): unknown {
+  try {
+    if (record === null || record === undefined) return undefined;
+    if (typeof record !== 'object' && typeof record !== 'function') return undefined;
+    return (record as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function shadowBool(record: unknown, key: string): boolean | undefined {
+  const value = shadowField(record, key);
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+/**
+ * Detects shadow-parity contradictions between the published proxy / VPN mirrors and the
+ * canonical truth they are supposed to shadow:
+ *  1. a datacenter / hosting ASN published as `proxy:false` with no verified-good-bot exemption;
+ *  2. a real canonical timezone mismatch published as `vpn_methods.timezone_mismatch=false`;
+ *  3. a legacy alias pair (e.g. `Asia/Calcutta` vs `Asia/Kolkata`) published as `=true`.
+ *
+ * Pure and total: returns diagnostics and never throws. Absence of evidence is never a diagnostic
+ * — a flag is inspected only when it was explicitly published as a boolean.
+ */
+export function checkShadowProxyVpnInvariants(input: ShadowProxyVpnInput = {}): string[] {
+  try {
+    const source = input && typeof input === 'object' ? input : ({} as ShadowProxyVpnInput);
+    const diagnostics: string[] = [];
+    const network = shadowField(source, 'network');
+
+    // 1. Datacenter ASN published as proxy:false without the verified-good-bot exemption.
+    const explicitDatacenter =
+      shadowBool(source, 'datacenterAsn') ??
+      shadowBool(source, 'datacenter_asn') ??
+      shadowBool(source, 'datacenter_result');
+    const ownership = shadowField(network, 'network_ownership') ?? shadowField(source, 'network_ownership');
+    const asnType = shadowField(source, 'asn_type');
+    const datacenterAsnLabel =
+      typeof asnType === 'string' && /datacenter|data[_-]?center|hosting|cloud/i.test(asnType);
+    const datacenter =
+      explicitDatacenter === true ||
+      (explicitDatacenter === undefined &&
+        (ownership === 'hosting_datacenter' || datacenterAsnLabel));
+    const publishedProxy = shadowBool(source, 'proxy') ?? shadowBool(network, 'proxy');
+    const goodBotExempt =
+      shadowBool(source, 'verifiedGoodBot') === true ||
+      shadowBool(source, 'verified_good_bot') === true ||
+      shadowBool(source, 'good_bot_exempt') === true ||
+      shadowField(source, 'botSubtype') === 'good_bot' ||
+      shadowField(source, 'bot_subtype') === 'good_bot';
+    if (datacenter && publishedProxy === false && !goodBotExempt) {
+      diagnostics.push(
+        'datacenter/hosting ASN is published as proxy:false without a verified-good-bot exemption'
+      );
+    }
+
+    // 2 & 3. Canonical timezone truth vs the published vpn_methods mirror.
+    const browserTz = shadowField(source, 'browserTimezone') ?? shadowField(source, 'browser_timezone');
+    const ipTz = shadowField(source, 'ipTimezone') ?? shadowField(source, 'ip_timezone');
+    if (typeof browserTz === 'string' && typeof ipTz === 'string') {
+      const canonical = timezoneMismatchContext(browserTz, ipTz);
+      const methods = shadowField(source, 'vpnMethods') ?? shadowField(source, 'vpn_methods');
+      const publishedMismatch =
+        shadowBool(methods, 'timezone_mismatch') ??
+        shadowBool(source, 'timezoneMismatch') ??
+        shadowBool(source, 'timezone_mismatch') ??
+        shadowBool(network, 'timezone_mismatch');
+
+      if (canonical.mismatch && publishedMismatch === false) {
+        diagnostics.push(
+          `canonical timezone mismatch (${String(canonical.canonicalBrowser)} vs ${String(canonical.canonicalIp)}) is published as vpn_methods.timezone_mismatch=false`
+        );
+      }
+
+      // An alias pair resolves to one canonical zone despite different raw spellings, so a
+      // published mismatch=true is a false positive (Calcutta/Kolkata). Unresolved zones are
+      // never treated as an alias pair — absence of evidence is not a contradiction.
+      const rawSpellingsDiffer = browserTz.trim() !== ipTz.trim();
+      if (rawSpellingsDiffer && publishedMismatch === true && timezonesEquivalent(browserTz, ipTz)) {
+        diagnostics.push(
+          `timezone alias pair (${browserTz} / ${ipTz} -> ${String(canonical.canonicalBrowser)}) is published as vpn_methods.timezone_mismatch=true`
+        );
+      }
+    }
+
+    return diagnostics;
+  } catch {
+    return [];
+  }
 }

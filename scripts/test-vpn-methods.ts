@@ -352,7 +352,15 @@ function run(): void {
 
   check('E5', 'partial / malformed legacy fields fail closed to false', () => {
     const resolved = resolveVpnMethods({});
-    assert.deepEqual(vpnMethodsParityIssue({ publicVpn: true, relay: 'true' }, resolved), []);
+    // Deliberately malformed string value: must fail closed, with a cast so the test can feed
+    // a legacy/hostile shape that the typed API would otherwise reject at compile time.
+    assert.deepEqual(
+      vpnMethodsParityIssue(
+        { publicVpn: true, relay: 'true' } as unknown as Parameters<typeof vpnMethodsParityIssue>[0],
+        resolved
+      ),
+      []
+    );
     assert.deepEqual(vpnMethodsParityIssue({}, resolved), []);
   });
 

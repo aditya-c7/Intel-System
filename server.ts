@@ -23,6 +23,7 @@ import type {
   VisitHistoryRecord,
   SignedHistoryBackup,
   IntelVisitorResponse,
+  IncognitoDiagnostics,
   SmartSignal,
   SmartSignals,
   SmartSignalLevel,
@@ -8036,6 +8037,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       opfsFlushMs?: number | null;
       browserInfo?: { incognito?: boolean; isIncognito?: boolean } | null;
       telemetry?: { incognito?: boolean; isIncognito?: boolean } | null;
+      /** Additive incognito probe diagnostics (flag-gated via `diagnostics.enabled`). */
+      diagnostics?: IncognitoDiagnostics | null;
     };
 
     const {
@@ -8809,6 +8812,25 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       rawSecuritySignals?.isIncognito || rawSecuritySignals?.incognito ||
       rawSecuritySignals?.privateMode || rawSecuritySignals?.incognitoLikely
     );
+
+    // Additive incognito diagnostics passthrough. Gated by `diagnostics.enabled` on the raw
+    // identify body. This block ONLY builds an inert readout: it never feeds the gate above,
+    // the verdict, any score, the incognito boolean, or any history row. The client-supplied
+    // values are echoed verbatim (no re-derivation); only the two explicitly server-side
+    // fields are overwritten here from the EXISTING gate input above, without changing that
+    // gate. A low confidence label (or numeric < 0.9) is the server's hard veto, so both
+    // readout fields report that same gate result (shadow fixture: deadband -> both true).
+    const rawDiagnostics = requestBody.diagnostics;
+    const diagnostics: IncognitoDiagnostics | undefined =
+      rawDiagnostics && typeof rawDiagnostics === 'object' && rawDiagnostics.enabled === true
+        ? {
+            // Verbatim client pass-through.
+            ...rawDiagnostics,
+            // Server-computed from the existing gate input (read-only; gate unchanged).
+            lowConfidenceVeto,
+            serverWouldVeto: lowConfidenceVeto,
+          }
+        : undefined;
 
     // Fingerprint.com-style ephemeral-storage correlation. Only meaningful when NO persistent
     // client state survived (no verified cookie, no verified body visitor id, no signed backup).
@@ -10591,6 +10613,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       velocity: velocityReport.velocity,
       risk: riskLedger,
       verdict_tier: effectiveVerdictTier,
+      // Additive incognito diagnostics — verbatim, flag-gated pass-through (never scored).
+      ...(diagnostics ? { diagnostics } : {}),
     } as unknown as CanonicalTelemetryEnvelope;
 
     const payload: IntelVisitorResponse & {
@@ -10655,6 +10679,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       // Top-level mirrors so clients can read the 4-signal verdict without digging.
       isIncognito: securitySignals.isIncognito,
       incognito: securitySignals.isIncognito,
+      // Additive, flag-gated console diagnostics — inert pass-through, never scored.
+      ...(diagnostics ? { diagnostics } : {}),
       suspectScore: securitySignals.suspectScore,
       riskLevel: securitySignals.riskLevel,
       riskBadgeText: securitySignals.riskBadgeText,
