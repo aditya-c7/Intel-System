@@ -194,6 +194,27 @@ function buildEdgeGeoHeader(request) {
 }
 
 /**
+ * Additive diagnostic opt-in. Diagnostics are enabled ONLY by the exact query flag
+ * `intelDiag=1` on the incoming URL. When enabled, a single `x-intel-diag: 1` request header
+ * is propagated to the upstream fetch; when absent, any client-supplied copy is removed so
+ * the header is never emitted unless the flag is exactly present.
+ */
+const DIAG_HEADER = 'x-intel-diag';
+
+function hasDiagFlag(request) {
+  try {
+    return new URL(request.url).searchParams.get('intelDiag') === '1';
+  } catch {
+    return false;
+  }
+}
+
+function applyDiagHeader(headers, request) {
+  if (hasDiagFlag(request)) headers.set(DIAG_HEADER, '1');
+  else headers.delete(DIAG_HEADER);
+}
+
+/**
  * Forwards the request to the API with a sanitized header set.
  *
  * Cloudflare overwrites `cf-connecting-ip`, so that value is the only trustworthy client
@@ -239,6 +260,9 @@ function forwardApiRequest(request) {
     headers.set('x-forwarded-for', clientIp);
   }
   headers.set(EDGE_GEO_HEADER, buildEdgeGeoHeader(request));
+
+  // Additive diagnostics: mirror the exact `intelDiag=1` opt-in to the upstream request.
+  applyDiagHeader(headers, request);
 
   return new Request(request, { headers });
 }
@@ -633,7 +657,9 @@ async function handleDocument(request, env, verdict) {
   // Fetch the ORIGINAL path. With `not_found_handling: single-page-application`, the asset
   // layer serves index.html for any document path. Requesting `/index.html` explicitly makes
   // Wrangler's SPA canonicalisation 307 back to `/`, which loops when the Worker runs first.
-  const asset = await env.ASSETS.fetch(request);
+  const assetHeaders = new Headers(request.headers);
+  applyDiagHeader(assetHeaders, request);
+  const asset = await env.ASSETS.fetch(new Request(request, { headers: assetHeaders }));
 
   const alreadyInjected = Boolean(asset.headers.get('x-intel-bot-verdict'));
   const compressed = Boolean(asset.headers.get('content-encoding'));

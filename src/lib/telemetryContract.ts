@@ -255,6 +255,30 @@ export interface IdentityAxes {
   calibration_status: 'uncalibrated' | 'calibrated';
 }
 
+/**
+ * Additive diagnostic readout for incognito / private-mode detection. Every field beyond
+ * `enabled` is OPTIONAL and nullable so a partially observed probe still yields a valid
+ * record; no consumer re-derives these values from the envelope.
+ */
+export interface IncognitoDiagnostics {
+  enabled: boolean;
+  engine?: string | null;
+  method?: string | null;
+  confidence?: string | null;
+  isPrivate?: boolean | null;
+  quotaBytes?: number | null;
+  headroomGiB?: number | null;
+  idbDurabilityRatio?: number | null;
+  idbHighVariance?: boolean | null;
+  opfsFlushMs?: number | null;
+  persistedStorageGrant?: boolean | null;
+  isolatedContextVeto?: boolean | null;
+  sessionLockHit?: boolean | null;
+  lowConfidenceVeto?: boolean | null;
+  clientReportedIncognito?: boolean | null;
+  serverWouldVeto?: boolean | null;
+}
+
 /** The single response envelope consumed by the dashboard and the Event JSON. */
 export interface CanonicalTelemetryEnvelope {
   event_id: string;
@@ -311,6 +335,8 @@ export interface CanonicalTelemetryEnvelope {
   gpuObservation?: GpuObservation;
   /** Certainty-only inspector attachment signal; legacy four-state values are accepted verbatim. */
   inspectorState?: InspectorStateTristate | InspectorState;
+  /** Additive incognito / private-mode diagnostic readout, when the probe pipeline supplied one. */
+  diagnostics?: IncognitoDiagnostics;
 }
 
 /* -------------------------------------------------------------------------- */

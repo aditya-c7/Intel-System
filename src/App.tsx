@@ -880,6 +880,27 @@ function JsonPreview({ value }: { value: unknown }) {
   );
 }
 
+/**
+ * Additive, console-only diagnostic hook. Inert unless `?intelDiag=1` is in the URL or
+ * sessionStorage `intel_diag_v1` === '1'. When disabled it never touches `window` and never
+ * captures response data. No UI, verdict, or network behaviour depends on this.
+ */
+const INTEL_DIAG_STORAGE_KEY = 'intel_diag_v1';
+
+function isIntelDiagEnabled(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    if (new URLSearchParams(window.location.search).get('intelDiag') === '1') return true;
+  } catch {
+    // ignore malformed location
+  }
+  try {
+    return window.sessionStorage.getItem(INTEL_DIAG_STORAGE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
 export default function App() {
   const [data, setData] = useState<IntelVisitorResponse | null>(null);
   // Server-rendered edge verdict. Pure fallback — it never seeds `data` or triggers a fetch.
@@ -894,6 +915,9 @@ export default function App() {
   const [copiedJson, setCopiedJson] = useState<boolean>(false);
   // Monotonic token: a newer load (or unmount) cancels any in-flight geo retry loop.
   const geoPollToken = useRef(0);
+  // Flag-gated console diagnostics: the latest identify response's `diagnostics` object.
+  // A ref so capturing it never re-renders the dashboard.
+  const diagRef = useRef<unknown>(null);
 
   // Swiss light mode is the only theme: strip any legacy class before the first paint.
   useLayoutEffect(enforceLightTheme, []);
@@ -950,6 +974,13 @@ export default function App() {
         setData(response);
         setSelectedVisitIndex(0);
 
+        // Additive diagnostic capture: only when the flag is on. Reads the `diagnostics`
+        // object off the response we already received; no extra calls or re-renders.
+        if (isIntelDiagEnabled()) {
+          diagRef.current =
+            (response as IntelVisitorResponse & { diagnostics?: unknown }).diagnostics ?? null;
+        }
+
         const token = geoPollToken.current + 1;
         geoPollToken.current = token;
         // Only a request the server could tie to a public IP can ever resolve; on a
@@ -980,6 +1011,13 @@ export default function App() {
     void detectIncognitoMode();
     loadVisitorData(false);
   }, [loadVisitorData]);
+
+  useEffect(() => {
+    // Expose the read-only console helper only when flagged. The closure reads the ref at
+    // call time, so it always returns the most recent identify diagnostics (or null).
+    if (!isIntelDiagEnabled()) return;
+    (window as unknown as { __intelDiag?: () => unknown }).__intelDiag = () => diagRef.current;
+  }, []);
 
   const handleCopyText = async (
     value: string | undefined,

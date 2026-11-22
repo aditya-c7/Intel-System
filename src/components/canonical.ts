@@ -16,6 +16,7 @@ import type {
   EnvironmentAxes,
   GpuObservation,
   IdentityAxes,
+  IncognitoDiagnostics,
   InspectorState,
   InspectorStateTristate,
   NetworkAxes,
@@ -95,6 +96,8 @@ export interface CanonicalView {
   /** Server timezone-mismatch verdict from the network axis (verbatim). */
   timezoneMismatchCanonical?: boolean;
   osTruth?: Record<string, unknown>;
+  /** Additive incognito probe diagnostics mirrored verbatim from the canonical envelope/data. */
+  diagnostics?: IncognitoDiagnostics;
 }
 
 /** Resolve the one canonical envelope from every supported response shape. */
@@ -132,6 +135,12 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
   const tamperingRaw = asRecord(env?.tampering);
   const networkRaw = asRecord(env?.network);
   const environmentRaw = asRecord(env?.environment);
+
+  // Additive incognito diagnostics — verbatim `as unknown as` pass-through from the one
+  // canonical envelope (or its data mirrors). Present only when the server supplied it;
+  // otherwise undefined. Never re-derived or gated on the client.
+  const diagnosticsRaw = env?.diagnostics ?? base?.diagnostics ?? data?.securitySignals?.diagnostics;
+  const diagnostics = diagnosticsRaw ? (diagnosticsRaw as unknown as IncognitoDiagnostics) : undefined;
 
   // The 0-100 ledger is canonical. Before it lands, the server's own
   // `suspectScore100` is the only acceptable server-provided fallback — never a
@@ -256,6 +265,7 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
           engine: automation.engine,
         }
       : {},
+    diagnostics,
   };
 }
 

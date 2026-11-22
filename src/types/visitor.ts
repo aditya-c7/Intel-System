@@ -226,6 +226,30 @@ export interface SecurityEnvelope {
   protocol: string;
 }
 
+/**
+ * Additive, optional structured diagnostics for the incognito / private-browsing
+ * verdict. Every member except `enabled` is optional and nullable so older
+ * payloads and partial collectors stay valid; no existing field is changed.
+ */
+export interface IncognitoDiagnostics {
+  enabled: boolean;
+  engine?: string | null;
+  method?: string | null;
+  confidence?: string | null;
+  isPrivate?: boolean | null;
+  quotaBytes?: number | null;
+  headroomGiB?: number | null;
+  idbDurabilityRatio?: number | null;
+  idbHighVariance?: boolean | null;
+  opfsFlushMs?: number | null;
+  persistedStorageGrant?: boolean | null;
+  isolatedContextVeto?: boolean | null;
+  sessionLockHit?: boolean | null;
+  lowConfidenceVeto?: boolean | null;
+  clientReportedIncognito?: boolean | null;
+  serverWouldVeto?: boolean | null;
+}
+
 export interface SecuritySignals {
   isBot: boolean;
   botSignals: string[];
@@ -308,6 +332,8 @@ export interface SecuritySignals {
   idbDurabilityRatio?: number | null;
   /** Median OPFS sync-access-handle `flush()` time in ms from the worker probe. */
   opfsFlushMs?: number | null;
+  /** Additive structured incognito probe diagnostics nested beside the flat mirrors. */
+  diagnostics?: IncognitoDiagnostics;
   isHeadless?: boolean;
   botReason?: string;
   webdriver?: boolean;
@@ -557,6 +583,8 @@ export interface IntelVisitorResponse {
   /* Mirrored at the top level so clients can read them without digging. */
   isIncognito?: boolean;
   incognito?: boolean;
+  /** Additive structured incognito probe diagnostics mirrored from the collector. */
+  diagnostics?: IncognitoDiagnostics;
   suspectScore?: number;
   riskLevel?: RiskLevel;
   riskBadgeText?: string;
