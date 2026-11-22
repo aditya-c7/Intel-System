@@ -279,15 +279,15 @@ export function CpuActivityPanel() {
     };
   }, []);
 
-  // Inspect HTTP Permissions-Policy header from same-origin server for diagnostic logging
+  // Inspect the HTTP Permissions-Policy header from the stateless health route. Using
+  // /api/network/ping here would make every open tab issue an RTT probe on mount, defeating
+  // the single-leader lease that keeps a visible dashboard within its Worker quota.
   useEffect(() => {
     let active = true;
-    fetch('/api/network/ping', { method: 'GET', cache: 'no-store' })
+    fetch('/api/health', { method: 'GET', cache: 'no-store' })
       .then((res) => {
         if (!active) return;
-        const headerVal = res.headers.get('permissions-policy');
-        setHttpPolicyHeader(headerVal);
-        console.log('[CPU Pressure Diagnostics] HTTP Permissions-Policy header:', headerVal || '(none)');
+        setHttpPolicyHeader(res.headers.get('permissions-policy'));
       })
       .catch(() => {
         // Ignore network check error

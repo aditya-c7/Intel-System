@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -33,18 +33,26 @@ function chromiumPath() {
 
 async function startWorker() {
   logs = '';
-  child = spawn('npx', [
+  const args = [
     '--yes', 'wrangler@4.161.0', 'dev', '--ip', '127.0.0.1', '--port', String(port),
     '--inspector-port', '0', '--persist-to', state,
     '--var', 'VISITOR_HMAC_SECRET:local-browser-test-secret-with-more-than-32-chars',
-  ], {
+  ];
+  const options = {
     detached: true,
     env: { ...process.env, WRANGLER_SEND_METRICS: 'false' },
     stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  };
+  // Windows needs the .cmd shim through a shell; Linux can spawn npx directly.
+  child = process.platform === 'win32'
+    ? spawn(['npx.cmd', ...args].join(' '), { ...options, shell: true })
+    : spawn('npx', args, options);
   child.stdout.on('data', chunk => { logs += chunk; });
   child.stderr.on('data', chunk => { logs += chunk; });
+  let launchError;
+  child.on('error', error => { launchError = error; });
   for (let i = 0; i < 120; i++) {
+    if (launchError) throw launchError;
     if (child.exitCode !== null) throw new Error(logs);
     try {
       const response = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(2000) });
@@ -59,9 +67,15 @@ async function stopWorker() {
   if (!child) return;
   const processToStop = child;
   child = undefined;
-  try { process.kill(-processToStop.pid, 'SIGTERM'); } catch {}
+  if (process.platform === 'win32') {
+    // A shell-spawned npx.cmd leaves a process tree holding the persist-to files.
+    try { spawnSync('taskkill', ['/PID', String(processToStop.pid), '/T', '/F'], { stdio: 'ignore' }); } catch {}
+  } else {
+    try { process.kill(-processToStop.pid, 'SIGTERM'); } catch {}
+    await delay(1000);
+    try { process.kill(-processToStop.pid, 'SIGKILL'); } catch {}
+  }
   await delay(1000);
-  try { process.kill(-processToStop.pid, 'SIGKILL'); } catch {}
 }
 
 async function waitForPanel(page) {
@@ -133,5 +147,13 @@ try {
 } finally {
   if (browser) await browser.close().catch(() => {});
   await stopWorker();
-  await rm(state, { recursive: true, force: true });
+  // Miniflare keeps the observability store open briefly on Windows; retry the cleanup.
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await rm(state, { recursive: true, force: true });
+      break;
+    } catch {
+      await delay(500);
+    }
+  }
 }

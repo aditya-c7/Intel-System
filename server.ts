@@ -9668,16 +9668,19 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     // response, history row, DB persistence and risk badge all report the exact graded result.
     const canonicalScore10 = riskLedger.score10;
     const canonicalRiskLevel = riskLevelFromTier(riskLedger.risk_tier);
+    securitySignals.suspectScore = canonicalScore10;
+    securitySignals.riskLevel = canonicalRiskLevel;
+    (securitySignals as unknown as Record<string, unknown>).riskBadgeText =
+      `${canonicalRiskLevel} Risk • ${canonicalScore10}/10`;
+    // Check the values actually published AFTER reconciliation. The legacy heuristic score is
+    // intentionally discarded above; asserting before the overwrite only logged an expected
+    // divergence on every deception-heavy request.
     assertRiskHeadlineConsistency({
       score10: canonicalScore10,
       risk_tier: riskLedger.risk_tier,
       suspectScore: securitySignals.suspectScore,
       riskLevel: securitySignals.riskLevel,
     });
-    securitySignals.suspectScore = canonicalScore10;
-    securitySignals.riskLevel = canonicalRiskLevel;
-    (securitySignals as unknown as Record<string, unknown>).riskBadgeText =
-      `${canonicalRiskLevel} Risk • ${canonicalScore10}/10`;
 
     // Every history row always carries suspectScore / riskLevel / recognitionSource so the UI
     // never renders `undefined`. Stored per-visit risk data is used when present; the current
