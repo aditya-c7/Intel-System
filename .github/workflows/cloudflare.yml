@@ -9,6 +9,9 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      CHROMIUM_PATH: /usr/bin/google-chrome
+      CI: 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -16,6 +19,10 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
+      - name: Pin headless Chrome — early, must succeed
+        run: |
+          test -x "$CHROMIUM_PATH"
+          "$CHROMIUM_PATH" --headless --no-sandbox --disable-gpu --dump-dom about:blank > /dev/null
       - run: npm run lint
       - run: npm run build
       - run: node scripts/build-worker.mjs
@@ -23,5 +30,5 @@ jobs:
         env:
           WRANGLER_SEND_METRICS: 'false'
       - run: node scripts/test-worker.mjs
-      - name: Run the full aggregate suite (unit + integration, browser suites SKIP explicitly when no Chromium)
+      - name: Run the full aggregate suite (strict browser mode: a browser SKIP fails CI)
         run: npm run test:all

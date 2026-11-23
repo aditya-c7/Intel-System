@@ -6,10 +6,14 @@
  * Drives the 15 frozen scenarios in scripts/fixtures/benchmark15.json against the
  * pure, already-in-repo SHADOW helper modules only. No live requests, no browser,
  * no deploy, no writes, no timers, no randomness: the only I/O is reading the
- * frozen fixture file. Each case reports PASS / FAIL / SKIP, with an explicit
+ * frozen fixture files. Each case reports PASS / FAIL / SKIP, with an explicit
  * reason whenever a helper module or helper function is missing. The final
- * RESULT line summarizes cases, checks and field assertions; any FAIL makes the
- * process exit non-zero.
+ * RESULT line summarizes cases, checks and field assertions; any FAIL **or SKIP**
+ * makes the process exit non-zero (a skipped assertion is not a green build).
+ * A second frozen fixture, scripts/fixtures/gemini-exit-gate.json, pins the locked
+ * Gemini wave constraints (0-10 score, uncalibrated, "Match evidence" prefix,
+ * zero new panels / third-party SDKs / alarms, no auto-deploy) using the same
+ * field-assertion engine.
  *
  * The expectations in the fixture are golden. Never edit an expected value to
  * make a failing case green — fix the implementation instead.
@@ -51,6 +55,22 @@ interface Fixture {
   frozen: boolean;
   helper_modules: Record<string, string>;
   cases: CaseDefinition[];
+}
+
+/** Frozen contract pinned by scripts/fixtures/gemini-exit-gate.json. */
+interface GeminiExitGateFixture {
+  schema_version: number;
+  frozen: boolean;
+  description?: string;
+  gate: {
+    score: number;
+    calibration_status: string;
+    confidence_label_prefix: string;
+    new_panel_count: number;
+    third_party_sdk_count: number;
+    do_alarm_count: number;
+    auto_deploy: boolean;
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -219,6 +239,23 @@ async function loadFixture(): Promise<Fixture> {
   return deepFreeze(parsed);
 }
 
+async function loadGeminiExitGate(): Promise<GeminiExitGateFixture> {
+  const url = new URL('./fixtures/gemini-exit-gate.json', import.meta.url);
+  const parsed = JSON.parse(await readFile(url, 'utf8')) as GeminiExitGateFixture;
+  if (!parsed || typeof parsed !== 'object' || !parsed.gate || typeof parsed.gate !== 'object') {
+    throw new Error('gemini exit gate fixture is malformed: gate must be an object');
+  }
+  const actualKeys = Object.keys(parsed.gate).sort();
+  const expectedKeys = [...GEMINI_GATE_KEYS].sort();
+  if (!isDeepStrictEqual(actualKeys, expectedKeys)) {
+    throw new Error(
+      `gemini exit gate key drift: missing=${fmt(expectedKeys.filter((k) => !actualKeys.includes(k)))} ` +
+        `extra=${fmt(actualKeys.filter((k) => !expectedKeys.includes(k)))}`,
+    );
+  }
+  return deepFreeze(parsed);
+}
+
 const EXPECTED_SCENARIOS: readonly string[] = Object.freeze([
   'standard_browsers',
   'incognito',
@@ -235,6 +272,38 @@ const EXPECTED_SCENARIOS: readonly string[] = Object.freeze([
   'proxy_classification',
   'swiftshader_vs_vm',
   'replay_zero_trust',
+]);
+
+/** Exact frozen key set of the Gemini exit gate — extra keys are contract drift. */
+const GEMINI_GATE_KEYS: readonly string[] = Object.freeze([
+  'auto_deploy',
+  'calibration_status',
+  'confidence_label_prefix',
+  'do_alarm_count',
+  'new_panel_count',
+  'score',
+  'third_party_sdk_count',
+]);
+
+interface GateExpectation {
+  path: string;
+  label: string;
+  op: string;
+  value?: unknown;
+}
+
+const GEMINI_GATE_EXPECTATIONS: readonly GateExpectation[] = Object.freeze([
+  { path: 'schema_version', label: 'schema_version is 1', op: 'eq', value: 1 },
+  { path: 'frozen', label: 'fixture is frozen', op: 'true' },
+  // gte/lte also reject non-numeric values: Number(NaN) fails both comparisons.
+  { path: 'gate.score', label: 'score is a number >= 0', op: 'gte', value: 0 },
+  { path: 'gate.score', label: 'score is a number <= 10', op: 'lte', value: 10 },
+  { path: 'gate.calibration_status', label: 'calibration_status is uncalibrated', op: 'eq', value: 'uncalibrated' },
+  { path: 'gate.confidence_label_prefix', label: 'confidence label uses the "Match evidence" prefix', op: 'matches', value: '^Match evidence' },
+  { path: 'gate.new_panel_count', label: 'new_panel_count is 0', op: 'eq', value: 0 },
+  { path: 'gate.third_party_sdk_count', label: 'third_party_sdk_count is 0', op: 'eq', value: 0 },
+  { path: 'gate.do_alarm_count', label: 'do_alarm_count is 0', op: 'eq', value: 0 },
+  { path: 'gate.auto_deploy', label: 'auto_deploy is false', op: 'false' },
 ]);
 
 function validateFixture(fixture: Fixture): string[] {
@@ -532,6 +601,36 @@ async function runCase(testCase: CaseDefinition): Promise<void> {
     (checksFail > 0 ? `, ${checksFail} failed` : ''));
 }
 
+/** Verifies every frozen Gemini exit-gate constraint through the shared field engine. */
+function runGeminiExitGate(gate: GeminiExitGateFixture): void {
+  section('GEMINI EXIT GATE (frozen lock constraints)');
+  const results = new Map<string, unknown>();
+  let pass = 0;
+  let fail = 0;
+  for (const expectation of GEMINI_GATE_EXPECTATIONS) {
+    const actual = readDotted(gate, expectation.path).value;
+    const evaluated = evalField(
+      actual,
+      { path: expectation.path, op: expectation.op, value: expectation.value },
+      results,
+    );
+    if (evaluated.ok) {
+      pass += 1;
+      counters.fieldsPass += 1;
+      console.log(`  ok    [gemini-gate] ${expectation.label}`);
+    } else {
+      fail += 1;
+      counters.fieldsFail += 1;
+      console.log(`  FAIL  [gemini-gate] ${expectation.label}: ${evaluated.detail}`);
+    }
+  }
+  if (fail === 0) counters.checksPass += 1;
+  else counters.checksFail += 1;
+  console.log(
+    `  ${fail === 0 ? 'PASS' : 'FAIL'}  [gemini-gate] ${pass}/${GEMINI_GATE_EXPECTATIONS.length} lock constraints verified`,
+  );
+}
+
 async function run(): Promise<void> {
   const fixture = await loadFixture();
   const problems = validateFixture(fixture);
@@ -545,9 +644,13 @@ async function run(): Promise<void> {
   console.log(`cases: ${fixture.cases.length}; helper modules: ${Object.keys(HELPERS).length}`);
   console.log('policy: pure helpers only — no live requests, browser, deploy, timers or writes.');
 
+  const gate = await loadGeminiExitGate();
+  console.log(`gemini exit gate: scripts/fixtures/gemini-exit-gate.json (frozen=${gate.frozen})`);
+
   for (const testCase of fixture.cases) {
     await runCase(testCase);
   }
+  runGeminiExitGate(gate);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -562,14 +665,32 @@ try {
   const totalCases = counters.casesPass + counters.casesFail + counters.casesSkip;
   const totalChecks = counters.checksPass + counters.checksFail + counters.checksSkip;
   const totalFields = counters.fieldsPass + counters.fieldsFail;
-  const failed = fatal || counters.casesFail > 0 || counters.checksFail > 0 || counters.fieldsFail > 0;
+  const executedChecks = counters.checksPass + counters.checksFail;
+  // Pass-with-no-tests is banned: at least one check AND one field must actually execute.
+  const noTestsExecuted = executedChecks === 0 || totalFields === 0 || totalCases === 0;
+  // A SKIP is not a green build: any skipped case or check fails this gate.
+  const failed =
+    fatal ||
+    noTestsExecuted ||
+    counters.casesFail > 0 ||
+    counters.checksFail > 0 ||
+    counters.fieldsFail > 0 ||
+    counters.casesSkip > 0 ||
+    counters.checksSkip > 0;
 
   section('RESULT');
   console.log(`Cases:  ${totalCases} total — ${counters.casesPass} PASS, ${counters.casesFail} FAIL, ${counters.casesSkip} SKIP`);
   console.log(`Checks: ${totalChecks} total — ${counters.checksPass} PASS, ${counters.checksFail} FAIL, ${counters.checksSkip} SKIP`);
   console.log(`Fields: ${totalFields} total — ${counters.fieldsPass} PASS, ${counters.fieldsFail} FAIL`);
   if (failed) {
-    console.log('RESULT: FAIL — benchmark-15 regression harness detected failures');
+    const reasons: string[] = [];
+    if (fatal) reasons.push('fatal error');
+    if (counters.casesFail) reasons.push(`${counters.casesFail} failed case(s)`);
+    if (counters.checksFail) reasons.push(`${counters.checksFail} failed check(s)`);
+    if (counters.fieldsFail) reasons.push(`${counters.fieldsFail} failed field assertion(s)`);
+    if (counters.casesSkip) reasons.push(`${counters.casesSkip} skipped case(s)`);
+    if (counters.checksSkip) reasons.push(`${counters.checksSkip} skipped check(s)`);
+    console.log(`RESULT: FAIL — ${reasons.join(', ')} (SKIP is treated as FAIL here)`);
     process.exitCode = 1;
   } else {
     console.log('RESULT: PASS — all 15 SHADOW-OFFLINE benchmark scenarios green');

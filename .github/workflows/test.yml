@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   meta:
-    name: Meta-check (every test* script is wired into CI)
+    name: Meta-check (pinned counts, anti-orphan, read-only workflows)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -22,6 +22,13 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run test:meta
+      - name: Per-project count assertions — benchmark-15 and Gemini exit gate
+        run: |
+          set -o pipefail
+          npx tsx scripts/test-benchmark15.ts | tee "$RUNNER_TEMP/benchmark15.log"
+          grep -F 'Cases:  15 total — 15 PASS, 0 FAIL, 0 SKIP' "$RUNNER_TEMP/benchmark15.log"
+          grep -F 'Checks: 66 total — 66 PASS, 0 FAIL, 0 SKIP' "$RUNNER_TEMP/benchmark15.log"
+          grep -F '[gemini-gate] 10/10 lock constraints verified' "$RUNNER_TEMP/benchmark15.log"
 
   unit:
     name: Unit (test:unit aggregate)
@@ -37,9 +44,12 @@ jobs:
       - run: npm run test:unit
 
   integration:
-    name: Integration (test:integration aggregate)
+    name: Integration (test:integration aggregate, strict browser mode)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      CHROMIUM_PATH: /usr/bin/google-chrome
+      CI: 'true'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -47,9 +57,56 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
+      - name: Pin headless Chrome — early, must succeed
+        run: |
+          test -x "$CHROMIUM_PATH"
+          "$CHROMIUM_PATH" --headless --no-sandbox --disable-gpu --dump-dom about:blank > /dev/null
       - name: Build the dashboard the browser harnesses drive
         run: npm run build
-      - name: Run worker + browser harnesses (browser suites SKIP explicitly when no Chromium)
+      - name: Run worker + browser harnesses (a browser SKIP fails CI)
         run: npm run test:integration
       - name: Shadow diagnostics (test:diag / test:proxy / test:vpn via test:shadow)
         run: npm run test:shadow
+
+  live:
+    name: Live server suites (test:live = test:signals + test:truth)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      INTEL_BASE_URL: http://127.0.0.1:3000
+      VISITOR_HMAC_SECRET: ci-only-hmac-secret-with-more-than-thirty-two-characters
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Start the local dashboard server
+        run: |
+          npm run start > "$RUNNER_TEMP/intel-server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/intel-server.pid"
+          for i in $(seq 1 90); do
+            if curl -fsS "$INTEL_BASE_URL/api/health" > /dev/null; then
+              echo "Server ready on $INTEL_BASE_URL"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server did not become ready; log follows:"
+          cat "$RUNNER_TEMP/intel-server.log"
+          exit 1
+      - name: Run test:live with per-project count assertions
+        run: |
+          set -o pipefail
+          npm run test:live | tee "$RUNNER_TEMP/live.log"
+          grep -F 'RESULT: PASS — all Smart Signals assertions passed.' "$RUNNER_TEMP/live.log"
+          grep -F 'Truth-corpus suite: 19 passed, 0 failed, 0 skipped' "$RUNNER_TEMP/live.log"
+      - name: Stop the local dashboard server
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/intel-server.pid" ]; then
+            PID=$(cat "$RUNNER_TEMP/intel-server.pid")
+            kill "$PID"
+          fi
+          echo "local server stopped"

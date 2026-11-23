@@ -153,6 +153,12 @@ import { stabilizeConfidence } from './src/lib/confidenceStability';
 import { resolveGpuTruthState, type GpuTruthState as SharedGpuTruthState } from './src/lib/gpuTruth';
 import { resolveActiveCdp } from './src/lib/activeCdp';
 import { resolveIdentityScope } from './src/lib/identityScope';
+import {
+  resolveIdbDurabilityTruth,
+  STRONG_RAM_RATIO_MAX,
+  IDB_PRIVATE_RATIO_MAX,
+  IDB_NORMAL_RATIO_MIN,
+} from './src/lib/idbDurabilityTruth';
 import { buildExtraEvidenceLines } from './src/lib/riskEvidenceExtra';
 // Additive, pure/SDK-free diagnostic helpers. Their outputs are published ONLY as mirrors;
 // none is read into the 0-10 headline, 0-100 ledger, verdict tier, isBot, auth or cal status.
@@ -485,11 +491,37 @@ dotenv.config();
 const PORT = Number(process.env.PORT) || 3000;
 
 /**
- * Build provenance for the parser / worker halves. Mirrored into `/api/health` and the
- * identify envelope so a response can be traced to the exact deployed parser and build.
- * `GIT_SHA` is injected by CI; every field degrades to an explicit sentinel, never a guess.
+ * Build provenance for the parser / worker halves. Mirrored into `/api/health` (RS-A) and the
+ * identify response as a *runtime identity probe* so a deployed response can be traced to the
+ * exact parser/build and compared against the repository HEAD. Both health and identify are
+ * `no-store`: a cached build stamp would defeat that comparison.
+ *
+ * `GIT_SHA` is injected by CI and is authoritative. Locally we fall back to the read-only git
+ * HEAD of the checkout so the published value is directly comparable to `git rev-parse HEAD`.
+ * A Worker bundle (no `.git`) or an unresolvable ref degrades to the explicit `unknown`
+ * sentinel — never a guessed or synthesized revision.
  */
-const BUILD_SHA = process.env.GIT_SHA || 'unknown';
+function resolveBuildSha(): string {
+  const fromEnv = typeof process.env.GIT_SHA === 'string' ? process.env.GIT_SHA.trim() : '';
+  if (/^[0-9a-f]{7,40}$/i.test(fromEnv)) return fromEnv.toLowerCase();
+  try {
+    const gitDir = path.join(process.cwd(), '.git');
+    const headRaw = fs.readFileSync(path.join(gitDir, 'HEAD'), 'utf8').trim();
+    if (/^[0-9a-f]{40}$/i.test(headRaw)) return headRaw.toLowerCase();
+    const refMatch = /^ref:\s*(.+)$/i.exec(headRaw);
+    if (refMatch?.[1]) {
+      const refPath = path.resolve(gitDir, refMatch[1].trim());
+      if (refPath.startsWith(gitDir)) {
+        const refRaw = fs.readFileSync(refPath, 'utf8').trim();
+        if (/^[0-9a-f]{40}$/i.test(refRaw)) return refRaw.toLowerCase();
+      }
+    }
+  } catch {
+    // No .git directory in a deployed bundle — fall through to the honest sentinel.
+  }
+  return 'unknown';
+}
+const BUILD_SHA = resolveBuildSha();
 const PARSER_VERSION = process.env.PARSER_VERSION || 'tranche-0-1';
 const WORKER_VERSION = process.env.WORKER_VERSION || 'tranche-0-1';
 
@@ -4548,7 +4580,10 @@ interface EnvelopeVerdict {
   replayDetected: boolean;
   requestIntegrityReason: string;
   requestNonce: string;
-  /** True only when the payload integrity hash actually verified for a signed envelope. */
+  /**
+   * True only when the UNKEYED payload integrity hash matched. Integrity/bookkeeping only:
+   * NEVER origin authenticity, never a trust or authorization signal (P0-4 / RS-D).
+   */
   signatureVerified: boolean;
 }
 
@@ -4587,9 +4622,10 @@ function rememberEnvelopeNonce(nonce: string, nowMs: number): boolean {
 }
 
 /**
- * Phase 4 — verifies the sealed request envelope. A missing signature is accepted (older
- * cached bundles), but a present-and-wrong signature, a stale timestamp or a header that
- * contradicts the JS payload marks the request tampered. A reused nonce is a replay.
+ * Phase 4 — verifies the sealed request envelope's INTEGRITY and freshness only (P0-4 / RS-D).
+ * The "signature" is an unkeyed SHA-256 over public fields: a mismatch, stale timestamp or a
+ * header/JS contradiction marks the request tampered, and a reused nonce is a replay. It is NOT
+ * an authenticity gate — callers must never treat `signatureVerified` as proof of origin.
  */
 function verifySecurityEnvelope(args: {
   envelope: Partial<SecurityEnvelope> | null | undefined;
@@ -6105,6 +6141,11 @@ app.get('/api/intel/geolocation', async (req, res) => {
 app.use(express.json({ limit: '512kb' }));
 
 app.get('/api/health', async (req, res) => {
+  // RS-A: health publishes the build/runtime identity probe; it must never be cached,
+  // otherwise a stale stamp cannot be compared to the deployed repository HEAD.
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
   let visitorsCount: number | null = null;
   let visitsCount: number | null = null;
   try {
@@ -9076,9 +9117,9 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
 
     // Post-interaction human corroboration. The client reports a 0..1 confidence that a real
     // person is driving this runtime, carried in the sealed request's raw signals. It is
-    // clamped / finiteness-checked and only TRUSTED when a clean, signed envelope is present:
-    // a bare client flag without a valid envelope is capped low so it cannot manufacture human
-    // corroboration. This same trusted value feeds the canonical envelope and the CDP gate.
+    // clamped / finiteness-checked and is CAPPED unless independently verified (P0-4/RS-D):
+    // the envelope hash is integrity-only and is NOT such verification. This same capped value
+    // feeds the canonical envelope, the corroboration gate and the CDP escalation gate.
     const rawSignalExtras = (rawSecuritySignals || {}) as Record<string, unknown>;
     // New clients post interaction evidence / inspector probes at the top level; older clients
     // nest them inside securitySignals. Merge both so genuine interaction is never invisible.
@@ -9109,13 +9150,22 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         rawSignalExtras.humanCorroboration ??
         topLevelExtras.humanCorroboration
     );
-    // Trust the client number only behind an actually verified, clean envelope. A valid signed
-    // envelope with real interaction can still earn human_corroboration 1 below; a bare client
-    // flag is capped low and automated / tampered sessions stay 0 via decideVerdictTier.
+    // P0-4 / RS-D — the envelope "signature" is an UNKEYED SHA-256 over public fields
+    // (INTEL_ENVELOPE_V1|timestamp|nonce|hardwareId|UA|platform|screen|timezone). It is an
+    // INTEGRITY / replay bookkeeping hash only: it grants NO origin authentication. Anyone who
+    // can write the body can recompute it; secret-prefix and encrypt-and-MAC variants would add
+    // length-extension / malleability risk. Keep the hash + nonce bookkeeping in
+    // verifySecurityEnvelope, but never let it assert authenticity here.
+    //
+    // Authenticity (a boolean gate) and human corroboration (a separate authorization decision)
+    // are deliberately distinct. With no keyed verifier in this release the authenticity gate is
+    // always false, so client-claimed corroboration stays capped and a forged hash can never
+    // suppress CDP escalation. A future keyed release should use versioned alg+kid+ts+nonce+tag,
+    // strict kid lookup, constant-time compare, (kid, sender, nonce)-scoped replay and fail-closed
+    // verifier-first rotation — none of that is implemented or claimed here (no HMAC / AEAD).
+    const keyedEnvelopeAuthenticityAvailable = false;
     const envelopeSignedAndClean = Boolean(
-      requestBody.securityEnvelope &&
-        envelopeVerdict.signatureVerified &&
-        envelopeVerdict.requestNonce &&
+      keyedEnvelopeAuthenticityAvailable &&
         !envelopeVerdict.tamperedRequest &&
         !envelopeVerdict.replayDetected
     );
@@ -9686,6 +9736,24 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       ? `Server headers report ${serverVerifiedBrowser} on ${serverVerifiedOs}, but the client reported ${browserDevice.browser} on ${browserDevice.os}`
       : '';
 
+    // P0-2 / RS-B — first-party OS / browser truth envelope. Sources are server-verified
+    // headers, UA client hints and runtime probes only; the automation axis is never read,
+    // client assertions are never promoted to ground truth, and absent fields are explicit
+    // null-with-reason. This is an inert readout: it feeds no gate, score or verdict.
+    const osTruthBlock = buildOsTruthBlock({
+      securitySignals,
+      hardware: hardwareSignals as ExtendedHardwareSignals,
+      browserDevice,
+      uaBrowser:
+        uaIdentity.browserName && uaIdentity.browserName !== 'Unknown'
+          ? uaIdentity.browserName
+          : browserDevice.browser,
+      uaOs: uaIdentity.os && uaIdentity.os !== 'Unknown' ? uaIdentity.os : browserDevice.os,
+      clientHints: (req as express.Request & { intelClientHints?: ParsedClientHints })
+        .intelClientHints,
+      runtimeOsVerdict,
+    });
+
     // Phase 2 — SQLite velocity windows, device rarity and the calibrated 0–100 Suspect Score.
     // These are additive to the 0–10 per-tile grid: the tiles keep their own calibrated scale
     // while the Risk Meter consumes the 0–100 composite.
@@ -9821,6 +9889,10 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       expectedJsHeapSizeLimit:
         typeof rawExtras.expectedJsHeapSizeLimit === 'number' ? rawExtras.expectedJsHeapSizeLimit : null,
       webglRenderer: hardwareSignals.gpuRenderer,
+      // P0-3 — feed the unmasked vendor + capability class so the computed GPU observation
+      // distinguishes privacy masking from an unavailable probe instead of defaulting blind.
+      webglVendor: hardwareSignals.gpuVendor,
+      gpuCapabilityClass: hardwareSignals.gpuClass,
       osFamily: browserDevice.os,
       deviceKind: browserDevice.deviceKind,
       hasPdfFace: typeof rawExtras.pdfViewerEnabled === 'boolean' ? rawExtras.pdfViewerEnabled : null,
@@ -10253,10 +10325,37 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     const verifierSpoofed =
       botVerifierVerdict.reason === 'spoofed-impersonation' ||
       botVerifierVerdict.identity === 'spoofed';
+    // P0-5 — consume the shared verifier's composition. A signed / verified good agent is
+    // authoritative and outranks hard client automation artifacts: publish bot:'good',
+    // identity:'signed' and NO stealth/automation bot type BEFORE the hard-automation branch.
+    // `cdc_*` protocol inspection is passed to the verifier as a weight-0 axis only, so it can
+    // never contribute a stealth reason here.
+    const verifierSignedGood =
+      !verifierSpoofed &&
+      (botVerifierVerdict.reason === 'signed-agent' ||
+        botVerifierVerdict.reason === 'verified-agent' ||
+        botVerifierVerdict.identity === 'signed' ||
+        botVerifierVerdict.identity === 'verified');
     const spoofedVerifiedBotClaim =
-      (claimedVerifiedBotUa && !signedGoodBot && !aiAgent?.verified) || verifierSpoofed;
+      !verifierSignedGood &&
+      ((claimedVerifiedBotUa && !signedGoodBot && !aiAgent?.verified) || verifierSpoofed);
 
-    if (hardAutomationSignals) {
+    if (verifierSignedGood) {
+      // Signed good bot: no stealth-automation type and no spoof / automation reasons are emitted.
+      botInfo = {
+        category: registryAgent?.category || 'ai_agent',
+        provider:
+          aiAgent?.operator || registryAgent?.provider || effectiveBotClassification.provider || 'Unknown',
+        name:
+          botVerifierVerdict.agent_verdict ||
+          aiAgent?.agentName ||
+          registryAgent?.displayName ||
+          'Signed Agent',
+        identity: 'signed',
+      };
+      botType = registryAgent?.id || aiAgent?.agentId || 'ai_agent';
+      botVerdict = 'good';
+    } else if (hardAutomationSignals) {
       // A stealth / anti-detect runtime is always an automation verdict — never let a crawler
       // directory match or an AI-agent attribution report this session as human / good.
       botInfo = {
@@ -10551,6 +10650,13 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     }
     let visitorFound = Boolean(existingVisitor) || !resolvedIdentity.is_new;
 
+    // P0-6 — profile age is computed once, before both confidence paths, so the same
+    // continuity evidence reaches the legacy scorer and the honest resolver-backed scorer.
+    const profileAgeDaysForConfidence = (() => {
+      const firstMs = Date.parse(statistics.firstVisitUtc);
+      if (!Number.isFinite(firstMs)) return 0;
+      return Math.max(0, Math.floor((Date.now() - firstMs) / 86_400_000));
+    })();
     const identityConfidence = scoreConfidence({
       match_mode: resolvedIdentity.match_mode,
       match_score: resolvedIdentity.match_score,
@@ -10562,7 +10668,13 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       rfpOrTor:
         Boolean(securitySignals.torExitNode) || Boolean(securitySignals.isTorBrowserClient),
       genuineSpoof: botVerdict === 'bad' && botInfo?.identity === 'spoofed',
-    });
+      // P0-6 continuity corroboration. The scorer's input types are owned by another module;
+      // the cast keeps this call compatible with both the legacy and evidence shapes. The
+      // calibration/publication gate is untouched — only the evidence input is forwarded.
+      storageHealed: Boolean(storageHealed || resolvedIdentity.healed),
+      visitContinuity: statistics.totalVisits,
+      profileAgeDays: profileAgeDaysForConfidence,
+    } as Parameters<typeof scoreConfidence>[0]);
     const identityConsistencyFlags = Array.from(new Set(resolvedIdentity.reasons));
     const identityConsistency = {
       score: Math.max(
@@ -10846,11 +10958,6 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     }
     const structuralAnchorRatioForConfidence =
       matchedAnchorsForConfidence / TOTAL_IDENTITY_ANCHORS;
-    const profileAgeDaysForConfidence = (() => {
-      const firstMs = Date.parse(statistics.firstVisitUtc);
-      if (!Number.isFinite(firstMs)) return 0;
-      return Math.max(0, Math.floor((Date.now() - firstMs) / 86_400_000));
-    })();
 
     const honestConfidenceInput: ResolverBackedHonestConfidenceInput = {
       labeledPairs: Number(rawExtras.calibrationLabeledPairs ?? 0),
@@ -10963,6 +11070,107 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         clientExtras.contextSaltPresent === true || rawExtras.contextSaltPresent === true,
     });
 
+    // P0-8 / RS-J — complete the flag-gated incognito diagnostics readout on a decisive
+    // session-lock hit. ADDITIVE ONLY: never feeds the incognito gate, verdict tier, risk score,
+    // identity or any history row. Client evidence is echoed verbatim; missing first-party
+    // slots are filled, never overwritten. No ground truth is derived from detector output and
+    // the thresholds below are frozen mirrors of the existing resolver constants (no retuning).
+    if (diagnostics && diagnostics.sessionLockHit === true) {
+      const rawDiag = (rawDiagnostics ?? {}) as Record<string, unknown>;
+      const extHw = hardwareSignals as ExtendedHardwareSignals;
+      const diagString = (value: unknown): string | null =>
+        typeof value === 'string' && value.trim() ? value.trim().slice(0, 160) : null;
+
+      // Complete only absent diagnostic slots (engineId is the runtime probe identity).
+      if (diagnostics.engine === undefined || diagnostics.engine === null) {
+        diagnostics.engine = diagString(extHw.engine) ?? diagString(rawDiag.engineId) ?? null;
+      }
+      if (
+        diagnostics.persistedStorageGrant === undefined ||
+        diagnostics.persistedStorageGrant === null
+      ) {
+        diagnostics.persistedStorageGrant = hadPersistentClientState;
+      }
+      if (diagnostics.isolatedContextVeto === undefined || diagnostics.isolatedContextVeto === null) {
+        diagnostics.isolatedContextVeto = identityScope.context_isolated;
+      }
+      if (diagnostics.idbTruthRule === undefined || diagnostics.idbTruthRule === null) {
+        const ratio =
+          typeof diagnostics.idbDurabilityRatio === 'number' &&
+          Number.isFinite(diagnostics.idbDurabilityRatio)
+            ? diagnostics.idbDurabilityRatio
+            : null;
+        diagnostics.idbTruthRule = resolveIdbDurabilityTruth({
+          ratio,
+          highVariance: diagnostics.idbHighVariance ?? null,
+          persistedGrant: diagnostics.persistedStorageGrant ?? null,
+          isolatedContext: diagnostics.isolatedContextVeto ?? null,
+        }).rule;
+      }
+
+      // Fail-open abstention: a confounder or missing raw evidence means the detector readout
+      // is descriptive only. `groundTruth` is always null — never inferred from the detector.
+      const missingEvidence: string[] = [];
+      if (
+        typeof diagnostics.idbDurabilityRatio !== 'number' ||
+        !Number.isFinite(diagnostics.idbDurabilityRatio)
+      ) {
+        missingEvidence.push('idbDurabilityRatio');
+      }
+      if (typeof diagnostics.quotaBytes !== 'number') missingEvidence.push('quotaBytes');
+      if (typeof diagnostics.opfsFlushMs !== 'number') missingEvidence.push('opfsFlushMs');
+      if (!diagnostics.engine) missingEvidence.push('engineId');
+      const confounderActive =
+        rawDiag.webview === true ||
+        rawDiag.guest === true ||
+        rawDiag.clearedStorage === true ||
+        rawDiag.enterprisePolicy === true;
+      const abstainReason = confounderActive
+        ? 'CONFOUNDER_PRESENT'
+        : missingEvidence.length > 0
+        ? `INSUFFICIENT_RAW_EVIDENCE: ${missingEvidence.join(', ')}`
+        : null;
+
+      // Extra keys are cast so type homes owned by other modules need no edit; they stay on
+      // the wire verbatim and are never read by any gate.
+      Object.assign(diagnostics, {
+        engineId: diagString(rawDiag.engineId) ?? diagString(extHw.engine) ?? null,
+        rawEvidence: {
+          quotaBytes: diagnostics.quotaBytes ?? null,
+          headroomGiB: diagnostics.headroomGiB ?? null,
+          opfsFlushMs: diagnostics.opfsFlushMs ?? null,
+          idbDurabilityRatio: diagnostics.idbDurabilityRatio ?? null,
+          idbHighVariance: diagnostics.idbHighVariance ?? null,
+          // Verbatim collector sample arrays / error strings; absent stays null.
+          idbSamples: Array.isArray(rawDiag.idbSamples) ? rawDiag.idbSamples : null,
+          opfsSamples: Array.isArray(rawDiag.opfsSamples) ? rawDiag.opfsSamples : null,
+          errors: Array.isArray(rawDiag.errors) ? rawDiag.errors : null,
+          confounders: {
+            webview: typeof rawDiag.webview === 'boolean' ? rawDiag.webview : null,
+            guest: typeof rawDiag.guest === 'boolean' ? rawDiag.guest : null,
+            clearedStorage:
+              typeof rawDiag.clearedStorage === 'boolean' ? rawDiag.clearedStorage : null,
+            enterprisePolicy:
+              typeof rawDiag.enterprisePolicy === 'boolean' ? rawDiag.enterprisePolicy : null,
+          },
+        },
+        verdict: {
+          isPrivate: diagnostics.isPrivate ?? null,
+          confidence: diagnostics.confidence ?? null,
+          lowConfidenceVeto: diagnostics.lowConfidenceVeto ?? null,
+          groundTruth: null,
+        },
+        abstainReason,
+        thresholds: Object.freeze({
+          idbStrongRamMax: STRONG_RAM_RATIO_MAX,
+          idbPrivateMax: IDB_PRIVATE_RATIO_MAX,
+          idbNormalMin: IDB_NORMAL_RATIO_MIN,
+          incognitoConfidenceVetoBelow: 0.9,
+          frozenUntilLabeledData: true,
+        }),
+      });
+    }
+
     // A downgraded storage-less cloud / hardware-class collision must never be reported as a
     // verified returning device (this also clears the UI's "Returning Device" chip).
     if (downgradeRecognition) {
@@ -11071,6 +11279,10 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       (rawExtras.headless_mode === 'shell' || rawExtras.headless_mode === 'new')
         ? (rawExtras.headless_mode as typeof uaIdentity.headless_mode)
         : (uaIdentity.headless_mode ?? null);
+    // P0-3 — `evaluateSpecInvariants` already computed the canonical GPU observation at
+    // `specAssessment.gpu_observation`; it used to be dropped. Publish it verbatim in the
+    // envelope and the identify response, beside (never instead of) the canonical mirrors.
+    const publishedGpuObservation = specAssessment.gpu_observation;
     const publishedGpuTruthState: typeof identifyGpuTruth.state =
       typeof rawExtras.gpu_truth_state === 'string'
         ? (rawExtras.gpu_truth_state as typeof identifyGpuTruth.state)
@@ -11199,12 +11411,19 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
          Informational only: never scored, never an identity seed, never a verdict input. */
       gpu_truth_state: publishedGpuTruthState,
       gpu_answer_unreliable: publishedGpuAnswerUnreliable,
+      // P0-3 — verbatim server-computed observation (never re-derived or fabricated).
+      gpuObservation: publishedGpuObservation,
       headless_mode: publishedHeadlessMode,
       audio_stability_class: publishedAudioStabilityClass,
       confidence_stability_key: publishedConfidenceStabilityKey,
       media_preferences: mediaPreferencesMirror,
       id_scope: identityScope.id_scope,
       context_isolated: identityScope.context_isolated,
+      // RS-A additive runtime identity probe (env-first, degrades to 'unknown', never cached).
+      build_sha: BUILD_SHA,
+      worker_version: WORKER_VERSION,
+      // P0-2 — nine first-party truth fields, each {value,status,reason,observations,confidence}.
+      os_truth: osTruthBlock,
       // Omitted entirely when permission was denied / no valid granted fix. Never IP-derived.
       ...(honestProximity ? { proximity: honestProximity } : {}),
       rarity: {
@@ -11414,12 +11633,23 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       // top-level mirrors keep existing clients working without any parallel scoring math.
       gpu_truth_state: publishedGpuTruthState,
       gpu_answer_unreliable: publishedGpuAnswerUnreliable,
+      // P0-3 — verbatim server-computed observation (never re-derived or fabricated).
+      gpuObservation: publishedGpuObservation,
       headless_mode: publishedHeadlessMode,
       audio_stability_class: publishedAudioStabilityClass,
       confidence_stability_key: publishedConfidenceStabilityKey,
       media_preferences: mediaPreferencesMirror,
       id_scope: identityScope.id_scope,
       context_isolated: identityScope.context_isolated,
+      // RS-A additive build/runtime mirrors — same values as /api/health, verbatim and never
+      // re-derived from client input. The identify route is already `no-store`. Spread through
+      // a cast because the response type is owned by another module; the keys stay on the wire.
+      ...({
+        build_sha: BUILD_SHA,
+        worker_version: WORKER_VERSION,
+        // P0-2 — same first-party block as the envelope; no client-authoritative promotion.
+        os_truth: osTruthBlock,
+      } as unknown as Record<string, unknown>),
       envelope: invariantEnvelope,
       verdict_tier: effectiveVerdictTier,
       human_corroboration: verdictState.human_corroboration,
@@ -11779,6 +12009,280 @@ function inferRuntimeOsVerdict(
       glFamily ? `WebGL backend: ${RUNTIME_OS_LABELS[glFamily]}` : '',
       probeFamily ? `High-confidence runtime probe: ${RUNTIME_OS_LABELS[probeFamily]}` : '',
     ].filter(Boolean),
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* P0-2 / RS-B — first-party OS / browser truth envelope                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Evidence tiers, strongest first. Sec-CH-* headers are UA-CONTROLLED evidence (not proof of
+ * origin), so truth here is CROSS-LAYER COHERENCE, never a majority vote and never a client
+ * assertion promoted to ground truth. VERIFIED requires >= 2 independent tiers agreeing with
+ * zero unresolved conflicts; a single tier is at most REPORTED. Conflicts are reported with all
+ * raw candidates rather than silently discarded or guessed.
+ */
+type OsTruthTier = 'TRANSPORT' | 'UA_CH_HEADER' | 'UA_CH_JS' | 'CLIENT_SIGNAL' | 'LEGACY_UA';
+type OsTruthStatus = 'VERIFIED' | 'REPORTED' | 'INFERRED' | 'CONFLICTED' | 'ABSENT';
+
+interface OsTruthObservation {
+  tier: OsTruthTier;
+  source: string;
+  value: string | number | boolean | null;
+}
+
+interface OsTruthField {
+  value: string | number | boolean | null;
+  status: OsTruthStatus;
+  /** Always non-empty; mandatory and explicit whenever `value` is null. */
+  reason: string;
+  observations: OsTruthObservation[];
+  confidence: number;
+}
+
+function osObs(tier: OsTruthTier, source: string, value: unknown): OsTruthObservation {
+  return {
+    tier,
+    source,
+    value:
+      typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+        ? value
+        : null,
+  };
+}
+
+function osTruthAbsent(reason: string, observations: OsTruthObservation[] = []): OsTruthField {
+  return { value: null, status: 'ABSENT', reason, observations, confidence: 0 };
+}
+
+function osTruthIsGrease(value: unknown): boolean {
+  if (value === null || value === undefined) return false;
+  const text = String(value).trim();
+  if (!text) return false;
+  if (/\bgrease\b/i.test(text)) return true;
+  return /^(\?|unknown|unavailable|masked|redacted|none|null|n\/a|na|not\s*a\s*\(?\s*brand\s*\)?)$/i.test(
+    text
+  );
+}
+
+function osTruthField(
+  observations: readonly OsTruthObservation[],
+  options: {
+    normalize?: (value: string | number | boolean | null) => string;
+    valueOverride?: string | number | boolean | null;
+    inferredReason?: string;
+  } = {}
+): OsTruthField {
+  const all = observations.map((item) => ({ ...item }));
+  const present = all.filter(
+    (item) => item.value !== null && String(item.value).trim().length > 0
+  );
+  const grease = present.find((item) => osTruthIsGrease(item.value));
+  if (grease) {
+    return osTruthAbsent(
+      `GREASE_OR_PLACEHOLDER: ${grease.source} reported ${JSON.stringify(grease.value)}`,
+      all
+    );
+  }
+  if (present.length === 0) return osTruthAbsent('NO_FIRST_PARTY_OBSERVATION', all);
+
+  // Derived coherence verdicts (mismatch flags / source labels) are INFERRED, never VERIFIED.
+  if (options.inferredReason) {
+    const value = options.valueOverride ?? null;
+    return {
+      value,
+      status: value === null ? 'ABSENT' : 'INFERRED',
+      reason: value === null ? 'NO_FIRST_PARTY_OBSERVATION' : options.inferredReason,
+      observations: all,
+      confidence: value === null ? 0 : 0.5,
+    };
+  }
+
+  const normalize =
+    options.normalize ?? ((value: string | number | boolean | null) => String(value ?? ''));
+  const byKey = new Map<string, OsTruthObservation['value']>();
+  for (const item of present) {
+    const key = normalize(item.value);
+    if (key && !byKey.has(key)) byKey.set(key, item.value);
+  }
+  if (byKey.size === 0) return osTruthAbsent('NO_FIRST_PARTY_OBSERVATION', all);
+  if (byKey.size > 1) {
+    const candidates = Array.from(byKey.entries())
+      .map(([key, raw]) => `${key} => ${JSON.stringify(raw)}`)
+      .join(' | ');
+    return {
+      value: null,
+      status: 'CONFLICTED',
+      reason: `CONFLICTING_TIERS (no majority guess): ${candidates}`,
+      observations: all,
+      confidence: 0,
+    };
+  }
+
+  const tiers = Array.from(new Set(present.map((item) => item.tier))).sort();
+  const firstRaw = byKey.values().next().value as OsTruthObservation['value'];
+  const value = options.valueOverride !== undefined ? options.valueOverride : firstRaw;
+  if (value === null) return osTruthAbsent('NO_FIRST_PARTY_OBSERVATION', all);
+  if (tiers.length >= 2) {
+    return {
+      value,
+      status: 'VERIFIED',
+      reason: `Independent tiers agree (${tiers.join(' + ')})`,
+      observations: all,
+      confidence: Math.min(0.99, 0.6 + 0.15 * (tiers.length - 1)),
+    };
+  }
+  return {
+    value,
+    status: 'REPORTED',
+    reason: `Single tier ${tiers[0]}; not independently corroborated`,
+    observations: all,
+    confidence: 0.4,
+  };
+}
+
+function buildOsTruthBlock(input: {
+  securitySignals: SecuritySignals;
+  hardware: ExtendedHardwareSignals;
+  browserDevice: BrowserDeviceInfo;
+  uaBrowser: string;
+  uaOs: string;
+  clientHints: ParsedClientHints | undefined;
+  runtimeOsVerdict: RuntimeOsVerdict;
+}): Record<string, OsTruthField> {
+  const { securitySignals: signals, hardware, browserDevice, clientHints } = input;
+  const chPlatform = clientHints?.platform || '';
+  const chArch = clientHints?.architecture || '';
+  const chBrand = clientHints?.brands?.[0]?.brand || '';
+  const jsPlatform = browserDevice.platform || '';
+
+  const osFamily = (value: string | number | boolean | null) => osFamilyKey(String(value ?? ''));
+  const browserFamily = (value: string | number | boolean | null) =>
+    browserFamilyKey(String(value ?? ''));
+  const archFamily = (value: string | number | boolean | null) => {
+    const text = String(value ?? '').toLowerCase();
+    if (/arm|aarch64|arm64/.test(text)) return 'arm';
+    if (/x86|x86_64|amd64|i[3-6]86|intel|amd/.test(text)) return 'x86';
+    return text.replace(/[^a-z0-9]/g, '');
+  };
+  const engineFamily = (value: string | number | boolean | null) => {
+    const text = String(value ?? '').toLowerCase();
+    if (/v8|chromium|chrome/.test(text)) return 'v8';
+    if (/spidermonkey|gecko|firefox/.test(text)) return 'spidermonkey';
+    if (/javascriptcore|jsc|webkit|safari/.test(text)) return 'jsc';
+    return '';
+  };
+  // brand ↔ engine coherence: iOS is always WebKit regardless of the branded browser.
+  const platformFamily = String(chPlatform || input.uaOs || browserDevice.os || '').toLowerCase();
+  const brand = browserFamily(chBrand || input.uaBrowser || browserDevice.browser);
+  const expectedEngine = /iphone|ipad|ipod|ios/.test(platformFamily)
+    ? 'jsc'
+    : brand === 'firefox'
+    ? 'spidermonkey'
+    : brand === 'safari'
+    ? 'jsc'
+    : brand === 'chrome' || brand === 'edge' || brand === 'opera'
+    ? 'v8'
+    : '';
+
+  const browserObservations: OsTruthObservation[] = [
+    osObs('UA_CH_HEADER', 'sec-ch-ua brand', chBrand),
+    osObs('LEGACY_UA', 'HTTP User-Agent browser family', input.uaBrowser || browserDevice.browser),
+  ];
+  const osObservations: OsTruthObservation[] = [
+    osObs('UA_CH_HEADER', 'sec-ch-ua-platform', chPlatform),
+    // Linux-on-Android / Linux-on-ChromeOS navigator.platform spellings are equivalent, not
+    // contradictions; they are omitted rather than reported as a false conflict.
+    ...(!/linux/i.test(jsPlatform) ||
+      !/android|cros|chrome ?os/i.test(String(chPlatform || input.uaOs || browserDevice.os || ''))
+      ? [osObs('UA_CH_JS', 'navigator.platform', jsPlatform)]
+      : []),
+    osObs('LEGACY_UA', 'HTTP User-Agent OS family', input.uaOs || browserDevice.os),
+    osObs(
+      'CLIENT_SIGNAL',
+      input.runtimeOsVerdict.evidence.join('; ') || 'runtime OS probe',
+      input.runtimeOsVerdict.family ? input.runtimeOsVerdict.label : null
+    ),
+  ];
+  // NOTE: edge TRANSPORT metadata (TLS / HTTP) is context, not an OS value. It is deliberately
+  // NOT emitted as an observation: inventing a family from it would fabricate a conflict.
+
+  const hostOs = hardware.hostOs || '';
+  const architecture = hardware.architecture || '';
+  const architectureSource = hardware.architectureSource || '';
+  const engine = hardware.engine || '';
+
+  return {
+    // The three first-party server-verified fields.
+    serverVerifiedBrowser: osTruthField(browserObservations, {
+      normalize: browserFamily,
+      valueOverride: signals.serverVerifiedBrowser,
+    }),
+    serverVerifiedOs: osTruthField(osObservations, {
+      normalize: osFamily,
+      valueOverride: signals.serverVerifiedOs,
+    }),
+    headerMismatch: osTruthField([...osObservations, ...browserObservations], {
+      inferredReason: signals.headerMismatch
+        ? signals.headerMismatchReason ||
+          'Header/transport-resolved identity disagrees with the client claim'
+        : 'No cross-layer browser/OS disagreement observed',
+      valueOverride: Boolean(signals.headerMismatch),
+    }),
+    // Six first-party runtime truth fields.
+    hostOs: hostOs
+      ? osTruthField(
+          [osObs('CLIENT_SIGNAL', 'libm host-OS probe', hostOs), osObs('UA_CH_HEADER', 'sec-ch-ua-platform', chPlatform)],
+          { normalize: osFamily, valueOverride: hostOs }
+        )
+      : osTruthAbsent('NO_HOST_OS_PROBE'),
+    architecture: architecture
+      ? osTruthField(
+          [
+            osObs('CLIENT_SIGNAL', `${architectureSource || 'runtime'} architecture`, architecture),
+            osObs('UA_CH_HEADER', 'sec-ch-ua-arch', chArch),
+          ],
+          { normalize: archFamily, valueOverride: architecture }
+        )
+      : osTruthAbsent('NO_ARCHITECTURE_PROBE'),
+    architectureSource: architectureSource
+      ? osTruthField([osObs('CLIENT_SIGNAL', 'runtime architecture source', architectureSource)], {
+          inferredReason: 'Resolver-reported architecture provenance',
+          valueOverride: architectureSource,
+        })
+      : osTruthAbsent('NO_ARCHITECTURE_SOURCE'),
+    osUaMismatch: osTruthField(
+      [
+        osObs('CLIENT_SIGNAL', 'libm host-OS probe', hostOs),
+        osObs('UA_CH_HEADER', 'sec-ch-ua-platform', chPlatform),
+        osObs('LEGACY_UA', 'HTTP User-Agent OS family', input.uaOs || browserDevice.os),
+      ],
+      {
+        inferredReason: 'Cross-layer host-OS vs UA/Sec-CH OS coherence verdict (read-only mirror)',
+        valueOverride: Boolean(hardware.osUaMismatch),
+      }
+    ),
+    archUaMismatch: osTruthField(
+      [
+        osObs('CLIENT_SIGNAL', `${architectureSource || 'runtime'} architecture`, architecture),
+        osObs('UA_CH_HEADER', 'sec-ch-ua-arch', chArch),
+        osObs('CLIENT_SIGNAL', 'claimed architecture', hardware.claimedArchitecture),
+      ],
+      {
+        inferredReason: 'Cross-layer silicon architecture vs UA/Sec-CH architecture coherence verdict',
+        valueOverride: Boolean(hardware.archUaMismatch),
+      }
+    ),
+    engine: engine
+      ? osTruthField(
+          [
+            osObs('CLIENT_SIGNAL', 'RangeError engine probe', engine),
+            osObs('LEGACY_UA', 'brand ↔ engine coherence', expectedEngine),
+          ],
+          { normalize: engineFamily, valueOverride: engine }
+        )
+      : osTruthAbsent('NO_ENGINE_PROBE'),
   };
 }
 

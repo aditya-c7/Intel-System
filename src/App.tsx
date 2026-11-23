@@ -556,6 +556,155 @@ function SignalRow(row: SignalRowModel & { className?: string }) {
   );
 }
 
+/* -----------------------------------------------------------------------------------------
+ * Server OS truth — evidence-with-provenance, read ONLY from the new `os_truth` server block.
+ * Every field carries a text status (never colour alone); null values stay null through to
+ * display as a dash + "Unavailable" + the server's reason. Contradictions are shown as
+ * CONFLICTED, never silently resolved into a fabricated "verified" OS.
+ * ----------------------------------------------------------------------------------------- */
+
+function asOsTruthRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+interface OsTruthEvidence {
+  value: unknown;
+  status: string | null;
+  reason: string | null;
+  confidence: unknown;
+  present: boolean;
+}
+
+const OS_TRUTH_STATUSES = new Set([
+  'VERIFIED',
+  'REPORTED',
+  'INFERRED',
+  'CONFLICTED',
+  'ABSENT',
+]);
+
+function readOsTruthEvidence(raw: unknown): OsTruthEvidence {
+  const record = asOsTruthRecord(raw);
+  if (!record) {
+    return {
+      value: raw,
+      status: null,
+      reason: raw == null ? 'Not collected by the server' : null,
+      confidence: null,
+      present: raw !== null && raw !== undefined,
+    };
+  }
+  const isEvidenceShape = ['value', 'status', 'reason', 'confidence'].some(
+    (key) => record[key] !== undefined
+  );
+  if (!isEvidenceShape) {
+    return { value: record, status: null, reason: null, confidence: null, present: true };
+  }
+  const value = record.value;
+  const present = value !== null && value !== undefined;
+  const status = typeof record.status === 'string' ? record.status.trim().toUpperCase() : null;
+  const serverReason =
+    typeof record.reason === 'string' && record.reason.trim() ? record.reason.trim() : null;
+  return {
+    value,
+    status,
+    reason: serverReason ?? (present ? null : 'Server did not supply a reason'),
+    confidence: record.confidence ?? null,
+    present,
+  };
+}
+
+function osTruthStatusLabel(evidence: OsTruthEvidence): string {
+  if (evidence.status && OS_TRUTH_STATUSES.has(evidence.status)) return evidence.status;
+  return evidence.present ? 'UNSPECIFIED' : 'NOT COLLECTED';
+}
+
+function formatOsTruthValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return 'Unavailable';
+  }
+}
+
+/** Renders the raw server `os_truth` block verbatim — no stale automation-axis fallback. */
+function OsTruthBlock({ raw }: { raw: Record<string, unknown> | null | undefined }) {
+  if (raw == null) return null;
+  const fields =
+    asOsTruthRecord(raw.fields) ?? asOsTruthRecord(raw.axes) ?? asOsTruthRecord(raw.values) ?? raw;
+  const metaKeys = new Set(['fields', 'axes', 'values', 'value', 'status', 'reason', 'confidence']);
+  const entries = Object.entries(fields).filter(([key]) => !metaKeys.has(key.toLowerCase()));
+  return (
+    <div className="mt-2 rounded-lg border border-slate-200 bg-white/70 px-2 py-1.5">
+      <div className="text-[10px] font-semibold text-slate-700">Server-verified OS</div>
+      <div className="mt-1 space-y-1">
+        {entries.length === 0 ? (
+          <div className="text-[10px] text-slate-600">
+            <span aria-hidden="true" className="font-mono">
+              —
+            </span>{' '}
+            Unavailable · no os_truth fields collected
+          </div>
+        ) : (
+          entries.map(([key, entryRaw]) => {
+            const evidence = readOsTruthEvidence(entryRaw);
+            const label = osTruthStatusLabel(evidence);
+            const conflicted = label === 'CONFLICTED';
+            return (
+              <div key={key} className="text-[10px] leading-snug">
+                <span className="font-medium text-slate-600">
+                  {key.replace(/_/g, ' ')}
+                </span>{' '}
+                {evidence.present ? (
+                  <span className="font-mono font-semibold text-slate-900">
+                    {formatOsTruthValue(evidence.value)}
+                  </span>
+                ) : (
+                  <span className="font-mono text-slate-600">
+                    <span aria-hidden="true">—</span> Unavailable
+                  </span>
+                )}{' '}
+                <span
+                  className={`inline-flex items-center rounded border px-1 py-px text-[9px] font-semibold ${
+                    conflicted
+                      ? 'border-rose-300 bg-rose-50 text-rose-800'
+                      : 'border-slate-300 bg-slate-50 text-slate-700'
+                  }`}
+                  title="Provenance status supplied by the server's os_truth block"
+                >
+                  {label}
+                </span>
+                {conflicted && (
+                  <span className="ml-1 font-medium text-rose-800">Contradiction shown, not resolved</span>
+                )}
+                {evidence.confidence != null && (
+                  <span className="ml-1 text-slate-500">
+                    · confidence {formatOsTruthValue(evidence.confidence)}
+                  </span>
+                )}
+                {evidence.reason && (
+                  <span className="mt-0.5 block text-[9px] text-slate-500">
+                    Reason: {evidence.reason}
+                  </span>
+                )}
+              </div>
+            );
+          })
+        )}
+      </div>
+      <div className="mt-1.5 border-t border-slate-200 pt-1 text-[9px] leading-snug text-slate-500">
+        Legend: VERIFIED observed/verified · REPORTED self-reported · INFERRED derived ·
+        CONFLICTED contradiction shown, not resolved · ABSENT / NOT COLLECTED missing (—). Status
+        is text-labelled, never colour-only.
+      </div>
+    </div>
+  );
+}
+
 /**
  * Builds the 4-signal core grid strictly from the server-computed smart signals.
  *
@@ -913,6 +1062,10 @@ export default function App() {
   const [selectedVisitIndex, setSelectedVisitIndex] = useState<number>(0);
   const [visibleVisitsCount, setVisibleVisitsCount] = useState<number>(5);
   const [copiedJson, setCopiedJson] = useState<boolean>(false);
+  // Mobile primary-nav disclosure. The toggle is the only mobile affordance; focus moves to the
+  // first link on open and returns to the button on Escape / link activation.
+  const [mobileNavOpen, setMobileNavOpen] = useState<boolean>(false);
+  const mobileNavButtonRef = useRef<HTMLButtonElement>(null);
   // Monotonic token: a newer load (or unmount) cancels any in-flight geo retry loop.
   const geoPollToken = useRef(0);
   // Flag-gated console diagnostics: the latest identify response's `diagnostics` object.
@@ -1011,6 +1164,22 @@ export default function App() {
     void detectIncognitoMode();
     loadVisitorData(false);
   }, [loadVisitorData]);
+
+  useEffect(() => {
+    if (!mobileNavOpen) return;
+    const firstLink = document
+      .getElementById('primary-navigation')
+      ?.querySelector<HTMLAnchorElement>('a');
+    firstLink?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMobileNavOpen(false);
+        mobileNavButtonRef.current?.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [mobileNavOpen]);
 
   useEffect(() => {
     // Expose the read-only console helper only when flagged. The closure reads the ref at
@@ -1699,13 +1868,22 @@ export default function App() {
         server_verified: canonical.serverVerified,
         client_claimed: canonical.clientClaimed,
         reconciled_display: canonical.reconciledDisplay,
-        os_truth: canonical.osTruth,
+        // Publish the raw server os_truth block ONLY when the server supplied that new block.
+        // Never substitute stale automation-axis values here — absent means absent.
+        ...(canonical.os_truth != null ? { os_truth: canonical.os_truth } : {}),
         verified_agent_id: canonical.verifiedAgentId ?? null,
         signature_status: canonical.signatureStatus ?? null,
         inspector_state: canonicalInspectorState,
         cdp_attached: canonicalCdpAttached,
         developer_tools: canonicalDeveloperTools,
-        gpu_observation: canonical.gpuObservation ?? null,
+        ...(canonical.gpuObservation != null
+          ? { gpu_observation: canonical.gpuObservation }
+          : {}),
+        ...(canonical.renderer_reported_unverified != null
+          ? { renderer_reported_unverified: canonical.renderer_reported_unverified }
+          : {}),
+        ...(canonical.build_sha != null ? { build_sha: canonical.build_sha } : {}),
+        ...(canonical.worker_version != null ? { worker_version: canonical.worker_version } : {}),
         timezone_mismatch_canonical: canonical.timezoneMismatchCanonical ?? null,
         calibration_status: canonical.calibrationStatus,
         identity: {
@@ -1714,6 +1892,9 @@ export default function App() {
           confidence_tier: canonical.confidenceTier,
           confidence_score: canonical.confidenceScore,
           calibration_status: canonical.calibrationStatus,
+          ...(canonical.confidence_label != null
+            ? { confidence_label: canonical.confidence_label }
+            : {}),
         },
         network: {
           hosting_asn: (() => {
@@ -1827,6 +2008,16 @@ export default function App() {
       ...(canonical.benchmark_policy != null
         ? { benchmark_policy: canonical.benchmark_policy }
         : {}),
+      // New server provenance / honesty mirrors — published verbatim and ONLY when present.
+      // No coercion, no fabricated empty value, no client-side derivation.
+      ...(canonical.renderer_reported_unverified != null
+        ? { renderer_reported_unverified: canonical.renderer_reported_unverified }
+        : {}),
+      ...(canonical.build_sha != null ? { build_sha: canonical.build_sha } : {}),
+      ...(canonical.worker_version != null ? { worker_version: canonical.worker_version } : {}),
+      ...(canonical.confidence_label != null
+        ? { confidence_label: canonical.confidence_label }
+        : {}),
     };
   }, [
     data,
@@ -1880,9 +2071,32 @@ export default function App() {
 
   return (
     <div className="bg-[#F4F5F7] text-[#111827] min-h-screen flex flex-col">
+      {/* Focus ring and reduced-motion policy. Spatial motion is disabled while the final
+          state is preserved; focus is always visible with a >=2px non-colour-only outline. */}
+      <style>{`
+        :where(a, button, [tabindex], summary):focus-visible {
+          outline: 2px solid #0f172a;
+          outline-offset: 2px;
+        }
+        @media (prefers-reduced-motion: reduce) {
+          *, *::before, *::after {
+            animation-duration: 0.01ms !important;
+            animation-iteration-count: 1 !important;
+            transition-duration: 0.01ms !important;
+            scroll-behavior: auto !important;
+          }
+        }
+      `}</style>
+      {/* Skip link — the first focusable element on the page. */}
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:absolute focus:left-3 focus:top-3 focus:z-50 focus:rounded-md focus:border focus:border-slate-900 focus:bg-white focus:px-3 focus:py-2 focus:text-xs focus:font-semibold focus:text-slate-900"
+      >
+        Skip to main content
+      </a>
       {/* Responsive Top Navigation Bar */}
       <header className="bg-white border-b border-[#E5E7EB] px-4 sm:px-6 py-3.5">
-        <div className="max-w-7xl mx-auto flex items-center justify-between gap-4 sm:gap-8">
+        <div className="relative max-w-7xl mx-auto flex items-center justify-between gap-4 sm:gap-8">
           <a
             href="#overview"
             className="text-base font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0 font-display"
@@ -1890,17 +2104,54 @@ export default function App() {
             Intel System
           </a>
 
-          <nav className="hidden md:flex items-center gap-6 text-xs font-medium text-slate-600">
-            <a href="#overview" className="hover:text-slate-900 whitespace-nowrap shrink-0">
+          <button
+            ref={mobileNavButtonRef}
+            type="button"
+            aria-expanded={mobileNavOpen}
+            aria-controls="primary-navigation"
+            aria-label={mobileNavOpen ? 'Close navigation menu' : 'Open navigation menu'}
+            onClick={() => setMobileNavOpen((open) => !open)}
+            className="md:hidden inline-flex items-center gap-1.5 rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800"
+          >
+            <span aria-hidden="true">{mobileNavOpen ? '✕' : '☰'}</span>
+            {mobileNavOpen ? 'Close' : 'Menu'}
+          </button>
+
+          <nav
+            id="primary-navigation"
+            aria-label="Primary navigation"
+            className={`${
+              mobileNavOpen
+                ? 'absolute left-0 right-0 top-full z-40 flex flex-col gap-2 rounded-b-lg border border-slate-200 bg-white p-3 shadow-md'
+                : 'hidden'
+            } md:static md:z-auto md:flex md:flex-row md:items-center md:gap-6 md:border-0 md:bg-transparent md:p-0 md:shadow-none text-xs font-medium text-slate-600`}
+          >
+            <a
+              href="#overview"
+              onClick={() => setMobileNavOpen(false)}
+              className="hover:text-slate-900 whitespace-nowrap shrink-0"
+            >
               Visitor Dashboard
             </a>
-            <a href="#signals" className="hover:text-slate-900 whitespace-nowrap shrink-0">
+            <a
+              href="#signals"
+              onClick={() => setMobileNavOpen(false)}
+              className="hover:text-slate-900 whitespace-nowrap shrink-0"
+            >
               Smart Signals
             </a>
-            <a href="#diagnostics" className="hover:text-slate-900 whitespace-nowrap shrink-0">
+            <a
+              href="#diagnostics"
+              onClick={() => setMobileNavOpen(false)}
+              className="hover:text-slate-900 whitespace-nowrap shrink-0"
+            >
               Network &amp; CPU
             </a>
-            <a href="#history" className="hover:text-slate-900 whitespace-nowrap shrink-0">
+            <a
+              href="#history"
+              onClick={() => setMobileNavOpen(false)}
+              className="hover:text-slate-900 whitespace-nowrap shrink-0"
+            >
               Visit History
             </a>
           </nav>
@@ -1910,7 +2161,11 @@ export default function App() {
         </div>
       </header>
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-6 py-4 sm:py-7 space-y-6">
+      <main
+        id="main-content"
+        tabIndex={-1}
+        className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-6 py-4 sm:py-7 space-y-6"
+      >
         {/* Top-centered Risk Meter: 0-10 suspect score */}
         <section className="w-full max-w-2xl mx-auto flex flex-col items-center justify-center text-center pt-4 pb-2 px-4">
           <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
@@ -1961,8 +2216,17 @@ export default function App() {
             </a>
           </div>
         </section>
+        {/* Routine progress / errors are announced politely; role="alert" is reserved for
+            time-sensitive interruptions and is deliberately not used here. */}
+        <span role="status" aria-live="polite" className="sr-only">
+          {refreshing ? 'Analyzing browser again' : loading && !data ? 'Loading visitor intelligence' : ''}
+        </span>
         {error && (
-          <div className="bg-white border border-red-300 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div
+            role="status"
+            aria-live="polite"
+            className="bg-white border border-red-300 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+          >
             <div className="flex items-center gap-2.5 text-xs text-red-700">
               <AlertCircle className="w-4 h-4 shrink-0" />
               <span>{error}</span>
@@ -2160,31 +2424,57 @@ export default function App() {
                 {data.identification ? (
                   <div className="mt-2 flex items-center gap-1.5 flex-wrap">
                     {(() => {
-                      // This is observable match evidence, NOT a calibrated probability.
-                      // Mirror the server's 0..1 score as an integer 0..100; an absent score
-                      // stays an honest 0% and the chip is explicitly labelled uncalibrated.
-                      const numeric = canonical?.confidenceScore;
-                      const percent =
-                        typeof numeric === 'number' && Number.isFinite(numeric)
-                          ? Math.max(0, Math.min(100, Math.round(numeric * 100)))
-                          : 0;
+                      // Observable match evidence, NOT a calibrated probability. The copy is
+                      // bound verbatim to the server's `confidence_label`. A null / absent label
+                      // stays null through to display: a dash + hatch + explicit "unavailable"
+                      // legend, NEVER a fabricated 0% (which would claim a measured empty match).
+                      const serverLabel =
+                        typeof canonical?.confidenceLabel === 'string' &&
+                        canonical.confidenceLabel.trim()
+                          ? canonical.confidenceLabel.trim()
+                          : null;
                       const isUncalibrated = canonical?.calibrationStatus !== 'calibrated';
                       return (
                         <>
                           <span
-                            className="inline-flex items-center gap-1 rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-700"
-                            title="Evidence-based match score — not a calibrated probability"
+                            className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+                              serverLabel
+                                ? 'border-slate-200 bg-slate-50 text-slate-700'
+                                : 'border-dashed border-slate-400 bg-slate-100 text-slate-600'
+                            }`}
+                            title={
+                              serverLabel
+                                ? 'Evidence-based match label from the server — not a calibrated probability'
+                                : 'Not collected by the server — no match evidence is available (this is not a measured 0%)'
+                            }
                           >
-                            Match evidence {percent}%
+                            {!serverLabel && (
+                              <span aria-hidden="true" className="font-mono">
+                                —
+                              </span>
+                            )}
+                            {serverLabel ?? 'Match evidence unavailable'}
                           </span>
                           {isUncalibrated && (
                             <span
-                              className="inline-flex items-center rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700"
+                              className="inline-flex items-center rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-800"
                               title="No held-out calibration gate has passed for this score"
                             >
+                              <span aria-hidden="true" className="mr-1">
+                                !
+                              </span>
                               uncalibrated
                             </span>
                           )}
+                          {/* "why?" path — the authoritative value and its provenance live in
+                              the canonical Event JSON below; no new panel is introduced. */}
+                          <a
+                            href="#raw-json"
+                            className="text-[10px] font-medium text-slate-600 underline underline-offset-2 hover:text-slate-900"
+                            title="See canonical.identity.confidence_label and calibration_status in the Event JSON"
+                          >
+                            why?
+                          </a>
                         </>
                       );
                     })()}
@@ -2508,6 +2798,9 @@ export default function App() {
                             Spoofed / Emulated OS Blocked: claimed {spoofedOsClaim}
                           </span>
                         )}
+                        {/* Rendered only from the new server os_truth block — absent fields stay
+                            unavailable with a reason, never stale automation-axis values. */}
+                        <OsTruthBlock raw={canonical.os_truth} />
                       </div>
                     </div>
 

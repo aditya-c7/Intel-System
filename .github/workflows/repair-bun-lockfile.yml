@@ -1,36 +1,39 @@
-name: Repair Bun lockfile
+name: Verify Bun lockfile (PR only)
+
 on:
+  pull_request:
+    paths:
+      - bun.lock
+      - package.json
+      - .github/workflows/repair-bun-lockfile.yml
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths: [.github/workflows/repair-bun-lockfile.yml]
+
+# Read-only by design: contributors regenerate the lockfile locally and commit it.
+# This job never writes to the repository and never targets main with a write.
 permissions:
-  contents: write
+  contents: read
+
 jobs:
-  repair:
+  verify:
+    name: Lockfile in sync (read-only verification)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: main
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
-      - name: Regenerate lockfile
-        run: bun install --lockfile-only
       - name: Verify frozen installation
         run: bun install --frozen-lockfile
-      - name: Commit only the repaired lockfile
+      - name: Fail if regeneration would change the lockfile
         run: |
+          bun install --lockfile-only
           if ! git diff --quiet -- bun.lock; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add bun.lock
-            git commit -m 'fix: synchronize Bun lockfile with package.json'
-            git push origin HEAD:main
+            echo "bun.lock is out of sync. Run 'bun install --lockfile-only' locally and commit the result."
+            git diff -- bun.lock
+            exit 1
           fi
       - name: Check build
         run: bun run build
       - name: Check types
-        if: always()
         run: bun run lint

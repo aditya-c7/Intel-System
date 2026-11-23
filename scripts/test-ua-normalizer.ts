@@ -206,6 +206,19 @@ expectIdentity(
   { browserName: 'Cursor', browserMajorVersion: '0' },
 );
 
+expectIdentity(
+  'Plain Chrome 152 (no client hints, no Chromium/fork token) is Google Chrome',
+  {
+    userAgent:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36',
+  },
+  {
+    browserName: 'Google Chrome',
+    browserMajorVersion: '152',
+    browserFullVersion: '152.0.0.0',
+  },
+);
+
 /* Tranche 0-1 regression matrix --------------------------------------------- */
 
 const ELECTRON_UA =

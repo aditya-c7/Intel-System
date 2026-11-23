@@ -604,12 +604,14 @@ const BROWSER_SPECS: BrowserSpec[] = [
   {
     name: 'Chromium',
     brands: [CHROMIUM_PLACEHOLDER],
-    /* `Chromium/<ver>` is emitted by bare/unbranded Chromium builds (e.g. the
-     * Chromium 156.0.8078.79 Linux payload). Without a brand list it was the only
-     * recognizable token yet matched no spec, so resolution fell through to
-     * 'Unknown'. `Chrome/` stays FIRST so UAs carrying both tokens keep resolving
-     * to Google Chrome (no existing classification changes). */
-    uaTokens: [/Chrome\/([\d.]+)/, /Chromium\/([\d.]+)/],
+    /* P2 browser name: a plain `Chrome/<ver>` token belongs to Google Chrome (or
+     * to a higher-precedence fork), NEVER to Chromium. Listing `Chrome/` here made
+     * every "UA says Chrome" payload a latent Chromium match — the Google Chrome
+     * spec happens to mask it today, but any brand/version path that reaches this
+     * spec would mislabel a plain Chrome client. Only a genuine bare `Chromium/<ver>`
+     * token (or an explicit Chromium-only UA-CH brand claim, i.e. Chromium is the
+     * sole real brand) identifies unbranded Chromium. */
+    uaTokens: [/Chromium\/([\d.]+)/],
   },
   {
     name: 'Firefox',

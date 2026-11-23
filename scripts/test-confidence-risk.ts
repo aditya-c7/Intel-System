@@ -424,6 +424,76 @@ check('all evidence outputs are rounded to <= 4 decimals', () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* 1b. Continuity corroboration (P0-6)                                          */
+/* -------------------------------------------------------------------------- */
+
+section('1b. Continuity corroboration: 131 visits raises 0.60 -> 0.69');
+
+/** A 0.60-scoring profile: lsh_fuzzy 0.20 + match 0.20 + anchors 0.075
+ *  + single seed 0.10 + browser consensus 0.025 (no OS consensus). */
+const CONTINUITY_BASE = {
+  match_tier: 'lsh_fuzzy' as const,
+  match_score: 80,
+  structural_anchor_ratio: 0.5,
+  distinct_storage_seeds_count: 1,
+  browser_family_consensus: true,
+  os_family_consensus: false,
+};
+
+check('0-visit baseline scores 0.60 regardless of an explicit zero count', () => {
+  assert.equal(evidenceScore({ ...CONTINUITY_BASE }), 0.6);
+  assert.equal(evidenceScore({ ...CONTINUITY_BASE, visitContinuity: 0 }), 0.6);
+});
+
+check('131-visit corroborated input scores 0.69 (+0.09 capped) vs 0.60 baseline', () => {
+  const zero = evidenceScore({ ...CONTINUITY_BASE });
+  const oneThirtyOne = evidenceScore({
+    ...CONTINUITY_BASE,
+    storageHealed: true,
+    visitContinuity: 131,
+    profileAgeDays: 180,
+  });
+  assert.equal(zero, 0.6);
+  assert.equal(oneThirtyOne, 0.69);
+  assert.equal(Math.round((oneThirtyOne - zero) * 10000) / 10000, 0.09);
+});
+
+check('six components still sum exactly to the published corroborated score', () => {
+  const input: ScoredEvidence = {
+    ...CONTINUITY_BASE,
+    storageHealed: true,
+    visitContinuity: 131,
+    profileAgeDays: 180,
+  };
+  const components = scoreConfidenceBreakdown(input);
+  assert.equal(components.length, 6);
+  const summed = Math.round(components.reduce((total, item) => total + item.contribution, 0) * 10000) / 10000;
+  assert.equal(summed, 0.69);
+  assert.equal(summed, evidenceScore(input));
+  // The single seed (+0.10) and the full corroboration (+0.09) share one signed bucket.
+  const seeds = componentOf(components, 'distinct_storage_seeds');
+  assert.equal(seeds.weight, 0.1);
+  assert.equal(seeds.contribution, 0.19);
+  assert.match(seeds.detail, /continuity corroboration \+0\.09/);
+  assert.match(seeds.detail, /visitContinuity=131/);
+});
+
+check('corroboration is suppressed for an unmatched tier', () => {
+  const unmatched: ScoredEvidence = {
+    match_tier: 'new_enrollment',
+    match_score: 80,
+    structural_anchor_ratio: 0.5,
+    distinct_storage_seeds_count: 1,
+    storageHealed: true,
+    visitContinuity: 131,
+    profileAgeDays: 180,
+  };
+  const without = evidenceScore({ ...unmatched, storageHealed: undefined, visitContinuity: undefined, profileAgeDays: undefined });
+  assert.equal(evidenceScore(unmatched), without);
+  assert.equal(componentOf(scoreConfidenceBreakdown(unmatched), 'distinct_storage_seeds').detail.match(/continuity corroboration/) ?? null, null);
+});
+
+/* -------------------------------------------------------------------------- */
 /* 2. Honest publication of the number                                         */
 /* -------------------------------------------------------------------------- */
 
@@ -602,6 +672,42 @@ check('confidence_score mirrors agree across the scorer, honest publisher and ba
     assert.equal(confidenceBandForScore(honest.confidence_score ?? 0), c.band, `${c.stage}/${c.seeds}: band`);
     assert.equal(honest.confidence_tier, c.band, `${c.stage}/${c.seeds}: honest tier mirror`);
   }
+});
+
+check('continuity signals are forwarded and never force calibration', () => {
+  const base: Omit<CalibrationInput, 'matchStage'> = {
+    ...CALIBRATED_GATE,
+    matchScore: 80,
+    structuralAnchorRatio: 0.5,
+    distinctStorageSeedsCount: 1,
+    browserFamilyConsensus: true,
+    osFamilyConsensus: false,
+  };
+  const zero = computeHonestIdentityConfidence({ ...base, matchStage: 'lsh_fuzzy' });
+  const corroborated = computeHonestIdentityConfidence({
+    ...base,
+    matchStage: 'lsh_fuzzy',
+    storageHealed: true,
+    visitContinuity: 131,
+    profileAgeDays: 180,
+  });
+  assert.equal(zero.confidence_score, 0.6);
+  assert.equal(corroborated.confidence_score, 0.69);
+  // A dormant gate stays uncalibrated even though the evidence score rose by +0.09.
+  const dormantGate = computeHonestIdentityConfidence({
+    labeledPairs: 0,
+    heldOutEce: 1,
+    matchStage: 'lsh_fuzzy',
+    matchScore: 80,
+    structuralAnchorRatio: 0.5,
+    distinctStorageSeedsCount: 1,
+    browserFamilyConsensus: true,
+    storageHealed: true,
+    visitContinuity: 131,
+    profileAgeDays: 180,
+  });
+  assert.equal(dormantGate.confidence_score, 0.69);
+  assert.equal(dormantGate.calibration_status, 'uncalibrated');
 });
 
 /* -------------------------------------------------------------------------- */

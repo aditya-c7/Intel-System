@@ -36,12 +36,24 @@
  * Cross-scope "tampering lie" observations (`tamperingLies.ts`) are integrated as an
  * ADDITIVE shadow verdict only: `resolveTamperingLies` is called with caller-supplied
  * observations and the result is exposed as `tampering_lies`. It never feeds `tampering`,
- * `anti_detect_browser`, `tampering_ml_score`, or any risk score / verdict tier.
+ * `anti_detect_browser`, `tampering_rule_score`, or any risk score / verdict tier.
+ *
+ * P1-3 honesty notes:
+ *  - `tampering_rule_score` is the canonical score producer. It is a deterministic RULE
+ *    BASELINE CONSTANT (`tampering_score_source: 'baseline_constant'`), never a machine
+ *    learning model output; the legacy `tampering_ml_score` key is a deprecated alias kept
+ *    for one cycle and is synchronized with it.
+ *  - The collector's `entropyTelemetry` (worker triangulation, ActiveText, shader profile,
+ *    repeat-read) is projected into the shadow verdict as POINTS:0 reasons. Projection never
+ *    grants resolver weights, so no score, tier, threshold or canonical flag can move.
+ *  - silent-buffer, cyclic `__proto__` and `iframe.contentWindow === window` are shadow-only
+ *    STRONG indicators: they abstain unless explicitly observed, carry zero points, and are
+ *    gated from promotion until corroborated by actual scored evidence (or a caller gate).
  *
  * A rating layer enforces the false-positive rule on the SHADOW flag only: STRONG (rating 1)
  * contradictions — user-agent / platform / brand divergence between the page and a worker,
  * an iframe realm leak, automation stack frames, a cyclic __proto__ proxy trap, and a
- * 12-triple shader-backend mismatch — may set the additive `anti_detect_browser`. SOFT
+ * 12-triple shader-backend mismatch — may set the additive `anti_detect_browser`. Zero-point STRONG indicators (including the P1-3 ones and the entropy projection) stay gated until scored resolver evidence corroborates them or a caller opens the gate. SOFT
  * (rating 0.5) warnings — languages / hardwareConcurrency / deviceMemory drift, ActiveText
  * color (Windows claim + pure red), simple native getters and privacy-class audio noise —
  * keep their score and reason but can NEVER set that flag. Privacy hardening still removes
@@ -92,11 +104,22 @@ export interface TamperingDetails {
   canvas_noise?: boolean;
 }
 
+/** Provenance of the published tampering score. It is always rule-derived, never ML. */
+export type TamperingScoreSource = 'baseline_constant';
+
 export interface TamperingAssessment {
   tampering: boolean;
   /** Docked DevTools window detected from the outer/inner viewport delta. */
   developerTools: boolean;
   tampering_confidence: TamperingConfidence;
+  /** Canonical score producer. A deterministic rule baseline constant raised by the rules
+   * below — NOT a machine-learning model output. */
+  tampering_rule_score: number;
+  /** Machine-readable provenance of `tampering_rule_score`. Always 'baseline_constant'. */
+  tampering_score_source: TamperingScoreSource;
+  /** @deprecated Misnamed legacy alias for `tampering_rule_score`. It has always been a rule
+   * baseline constant, never an ML score. Kept for one deprecation cycle as a synchronized
+   * accessor so existing consumers (including ones that mutate it) keep working. */
   tampering_ml_score: number;
   tampering_details: TamperingDetails;
   /** Additive, shadow-only cross-scope lie verdict. Carries the resolver's score and reasons
@@ -125,6 +148,34 @@ export interface TamperingLieRating {
 }
 
 /**
+ * Additive entropy telemetry mirrored by the collector (`entropyTelemetry`). It is already
+ * collected for informational purposes; the detector only projects POINTS:0 reasons from it
+ * into the shadow lie verdict. No field grants score weight or changes a threshold.
+ */
+export interface EntropyTelemetryLies {
+  /** Blob-worker triangulation: only `brands` is a strong contradiction; the other drift
+   * fields are soft warnings in the collector and are projected as such here. */
+  workerTriangulation?: {
+    available?: boolean | null;
+    strong?: boolean | null;
+    soft?: boolean | null;
+    strong_fields?: string[] | null;
+    soft_fields?: string[] | null;
+  } | null;
+  /** `ActiveText` system-color hint. Only the explicit `warning_soft` contradiction is
+   * projected, and only outside privacy hardening (noise-only lies are suppressed there). */
+  activeText?: {
+    color?: string | null;
+    windows_blue?: boolean | null;
+    warning_soft?: number | null;
+  } | null;
+  shaderPrecisionProfile?: string | null;
+  claimedGpuOs?: string | null;
+  audioSilentBufferNonZero?: boolean | null;
+  audioRepeatReadDiverged?: boolean | null;
+}
+
+/**
  * Extra shadow signals the standalone resolver cannot represent in `WorkerScopeObservations`.
  * All are precomputed by the collector's worker/prototype/shader/audio probes; none is read
  * from a platform API here and none can change the canonical verdict.
@@ -146,6 +197,16 @@ export interface TamperingLieExtras {
    * 12 is the full OS-backend check; an explicit value below 12 downgrades the shader
    * contradiction to a 0.5 warning. Absent counts keep the resolver's strong default. */
   shaderPrecisionTripleCount?: number | null;
+  /** SHADOW STRONG (points:0): a deliberately silent audio buffer rendered non-zero samples
+   * outside privacy hardening. Abstains when null/false or privacy-hardened. */
+  silentBufferAnomaly?: boolean | null;
+  /** SHADOW STRONG (points:0): a "clean" iframe reported `contentWindow === window`, i.e. the
+   * probe never entered a separate realm. Abstains when null/false. */
+  iframeContentWindowEqualsWindow?: boolean | null;
+  /** Optional caller gate. When true, zero-point STRONG indicators may promote the SHADOW
+   * anti_detect flag even without scored resolver evidence. Never affects the canonical
+   * verdict, risk score, tier or canonical anti_detect_browser. */
+  shadowStrongGate?: boolean | null;
 }
 
 export interface TamperingInput {
@@ -160,6 +221,10 @@ export interface TamperingInput {
    * Additive only: the rated verdict is emitted as `tampering_lies` and cannot change this
    * function's canonical verdict, score, or anti_detect_browser flag. */
   tamperingLies?: (WorkerScopeObservations & TamperingLieExtras) | null;
+  /** ADDITIVE (P1-3): the collector's `entropyTelemetry` mirror. Every observation is
+   * projected into the shadow verdict as a POINTS:0 reason; it cannot change score, tier,
+   * threshold, canonical anti_detect_browser, or any risk field. */
+  entropyTelemetry?: EntropyTelemetryLies | null;
   /** ADDITIVE (T9/T11): per-read canvas pixel noise (farbling) observed by the collector.
    * `canvasNoiseDetected` and `canvas.noise` are accepted aliases. */
   canvasNoise?: boolean | null;
@@ -415,13 +480,15 @@ function observesAutomationArtifacts(hardEvidence: string[]): boolean {
   return false;
 }
 
-/** STRONG (rating 1) lie evidence: a physical identity contradiction or an injected realm. */
+/** STRONG (rating 1) lie evidence: a physical identity contradiction or an injected realm.
+ * The three P1-3 shadow-only indicators are rated STRONG for telemetry but carry zero points
+ * and are gated from promotion (see `promotionGateOpen` in `detectBrowserTampering`). */
 const STRONG_LIE_REASON =
-  /navigator\.(?:userAgent|platform) divergence|brands divergence|shader precision profile|iframe realm leak|automation stack frame|cyclic __proto__/i;
+  /navigator\.(?:userAgent|platform) divergence|brands divergence|shader precision profile|iframe realm leak|automation stack frame|cyclic __proto__|silent buffer rendered non-zero|iframe\.contentWindow\s*===\s*window/i;
 
 /** SOFT (rating 0.5) lie evidence: warnings legitimately produced by Chrome privacy tools. */
 const WEAK_LIE_REASON =
-  /navigator\.(?:languages|hardwareConcurrency|deviceMemory) divergence|ActiveText color|silent audio buffer|repeated audio reads diverged|proxy-wrapped|iframe stealth trap|gpu_answer_unreliable/i;
+  /navigator\.(?:languages|hardwareConcurrency|deviceMemory) divergence|ActiveText color|silent audio buffer|repeated audio reads diverged|soft worker-triangulation drift|proxy-wrapped|iframe stealth trap|gpu_answer_unreliable/i;
 
 /**
  * Rate the additive lie reasons. Only STRONG (rating 1) contradictions may set the shadow
@@ -484,6 +551,87 @@ function stripSoftLieFields(
     copy.claimedGpuOs = null;
   }
   return copy as WorkerScopeObservations & TamperingLieExtras;
+}
+
+/**
+ * P1-3: project the collector's additive `entropyTelemetry` into the shadow lie verdict as
+ * POINTS:0 reasons. The resolver's weights are deliberately NOT granted here, so projected
+ * reasons can never move `anomaly_score`, a risk score, a tier, or any anti_detect threshold.
+ * Noise-class observations (activeText warning, audio silent-buffer / repeat-read, worker
+ * soft drift) abstain under privacy hardening; hard contradictions (worker `brands`, shader
+ * OS mismatch) survive but remain ungated zero-point reasons. Totality is preserved: hostile
+ * or malformed telemetry degrades to no reasons rather than throwing.
+ */
+function projectEntropyTelemetry(
+  telemetry: EntropyTelemetryLies | null | undefined,
+  privacyForLies: boolean
+): string[] {
+  const reasons: string[] = [];
+  if (!telemetry || typeof telemetry !== 'object') return reasons;
+  try {
+    const worker = telemetry.workerTriangulation;
+    if (worker && typeof worker === 'object') {
+      const strongFields = Array.isArray(worker.strong_fields)
+        ? worker.strong_fields.filter((field): field is string => typeof field === 'string')
+        : [];
+      if (worker.strong === true || strongFields.includes('brands')) {
+        reasons.push(
+          'brands divergence between window and worker (entropyTelemetry worker triangulation, points:0)'
+        );
+      }
+      if (!privacyForLies) {
+        const softFields = Array.isArray(worker.soft_fields)
+          ? worker.soft_fields.filter((field): field is string => typeof field === 'string')
+          : [];
+        for (const field of softFields) {
+          if (/languages|hardwareConcurrency|deviceMemory/i.test(field)) {
+            reasons.push(
+              `navigator.${field} divergence (soft worker-triangulation drift, entropyTelemetry, points:0)`
+            );
+          } else {
+            reasons.push(
+              `soft worker-triangulation drift in navigator.${field} (entropyTelemetry, points:0)`
+            );
+          }
+        }
+      }
+    }
+
+    const activeText = telemetry.activeText;
+    if (
+      !privacyForLies &&
+      activeText &&
+      typeof activeText === 'object' &&
+      activeText.warning_soft === 0.5
+    ) {
+      reasons.push(
+        'ActiveText color contradicts the claimed OS (entropyTelemetry, points:0)'
+      );
+    }
+
+    if (telemetry.shaderPrecisionProfile && telemetry.claimedGpuOs) {
+      // Reuse the resolver's own contradiction detection instead of duplicating its OS
+      // classifier. Only the deterministic reason text is projected; its weight is discarded.
+      const shaderProbe = resolveTamperingLies({
+        shaderPrecisionProfile: telemetry.shaderPrecisionProfile,
+        claimedGpuOs: telemetry.claimedGpuOs,
+        privacyHardened: true,
+      });
+      for (const reason of shaderProbe.reasons) {
+        reasons.push(`${reason} (entropyTelemetry, points:0)`);
+      }
+    }
+
+    if (!privacyForLies && telemetry.audioRepeatReadDiverged === true) {
+      reasons.push('repeated audio reads diverged (entropyTelemetry, points:0)');
+    }
+    if (!privacyForLies && telemetry.audioSilentBufferNonZero === true) {
+      reasons.push('silent audio buffer returned non-zero samples (entropyTelemetry, points:0)');
+    }
+  } catch {
+    // Hostile telemetry abstains; it never throws into the canonical pipeline.
+  }
+  return reasons;
 }
 
 function detectEngine(): { evalLen: number; isV8: boolean; hasChrome: boolean; isWebKit: boolean } {
@@ -801,7 +949,7 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     : devtoolsEmulation || antiDetect || canvasNoise || anomalyPoints >= 40;
 
   // ADDITIVE shadow path. Every canonical value above is already final; nothing below can
-  // change `tampering`, `anti_detect_browser`, `tampering_ml_score`, or any risk/verdict tier.
+  // change `tampering`, `anti_detect_browser`, `tampering_rule_score`, or any risk/verdict tier.
   // The resolver suppresses noise-only lies under privacy hardening; the rating layer here
   // additionally guarantees that a lone 0.5 warning can NEVER set the shadow anti-detect
   // flag. cdc_* / webdriver / CDP traces are marked artifact-only, so they cannot set it
@@ -817,6 +965,9 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     const source =
       input.tamperingLies && typeof input.tamperingLies === 'object' ? input.tamperingLies : null;
     const privacyForLies = privacyHardened || source?.privacyHardened === true;
+    // P1-3: the collector's entropy telemetry is projected as POINTS:0 reasons only. No
+    // resolver weight is granted, so the shadow score and every threshold stay untouched.
+    const entropyReasons = projectEntropyTelemetry(input.entropyTelemetry, privacyForLies);
     // cdc_* / webdriver / CDP artifacts (stack frames included) are ALWAYS artifact-only:
     // they report a score/reason but can never switch anti_detect_browser on.
     const automationArtifactOnly =
@@ -854,11 +1005,30 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
       reasons.push('cyclic __proto__ trap succeeded (Proxy-wrapped native)');
     }
 
+    // P1-3 shadow-only STRONG indicators. They abstain unless explicitly true (the silent
+    // buffer additionally abstains under privacy hardening, where noise is an expected
+    // defence), carry ZERO points, and are gated from promotion below. They are telemetry,
+    // never canonical automation/bot evidence and never an anti_detect threshold change.
+    const silentBufferStrong = source?.silentBufferAnomaly === true && !privacyForLies;
+    const cyclicTrapStrong = source?.prototypeCyclicTrap === true;
+    const iframeSelfStrong = source?.iframeContentWindowEqualsWindow === true;
+    const newStrongReasons: string[] = [];
+    if (silentBufferStrong) {
+      newStrongReasons.push('silent buffer rendered non-zero samples (shadow STRONG, points:0)');
+    }
+    if (iframeSelfStrong) {
+      newStrongReasons.push('iframe.contentWindow === window (shadow STRONG, points:0)');
+    }
+    reasons.push(...newStrongReasons);
+
     // T9/T11: a masked renderer / stealth GPU template / farbled canvas is reported as an
     // informational 0.5 warning. It never contributes shadow score or anti_detect_browser.
     if (gpuUnreliable && !reasons.includes(GPU_UNRELIABLE_REASON)) {
       reasons.push(GPU_UNRELIABLE_REASON);
     }
+    // Append the entropy-telemetry projection last. It is deliberately outside the score
+    // path, so these reasons are visible for telemetry but add no points whatsoever.
+    reasons.push(...entropyReasons);
 
     tampering_lies_rating = rateLieReasons(reasons, source?.shaderPrecisionTripleCount);
     // Privacy hardening removes the score contribution of every 0.5 warning; only the four
@@ -870,13 +1040,28 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
           automationArtifactOnly,
         })
       : resolved;
+    // P1-3 gate: zero-point STRONG indicators (the three new shadow indicators plus any
+    // STRONG entropy-telemetry projection) are rated STRONG for telemetry but cannot promote
+    // the shadow anti_detect flag until real scored resolver evidence corroborates them —
+    // or the caller explicitly opens the gate. They never add score points in either case.
+    const hasZeroPointStrong =
+      silentBufferStrong ||
+      cyclicTrapStrong ||
+      iframeSelfStrong ||
+      entropyReasons.some((reason) => STRONG_LIE_REASON.test(reason));
+    const hasScoredEvidence = scoreSource.anomaly_score > 0;
+    const promotionGateOpen =
+      !hasZeroPointStrong || hasScoredEvidence || source?.shadowStrongGate === true;
+
     tampering_lies = {
       anomaly_score: Math.max(
         0,
         Number((scoreSource.anomaly_score - droppedAudio * 0.15).toFixed(4))
       ),
-      // Only STRONG (rating 1) evidence can set the flag, and automation artifacts never can.
-      anti_detect_browser: tampering_lies_rating.rating === 1 && !automationArtifactOnly,
+      // Only STRONG (rating 1) evidence can set the flag, automation artifacts never can,
+      // and zero-point indicators stay gated until the gate above opens.
+      anti_detect_browser:
+        tampering_lies_rating.rating === 1 && !automationArtifactOnly && promotionGateOpen,
       tampering_confidence: tampering_lies_rating.rating === 1 ? 'high' : 'low',
       reasons,
     };
@@ -884,11 +1069,14 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     // Keep the safe zero verdict and empty rating; never throw into the canonical pipeline.
   }
 
-  return {
+  const ruleScore = isTampered ? Math.max(0.842, clampedScore) : 0.0024;
+  const assessment: TamperingAssessment = {
     tampering: isTampered,
     developerTools,
     tampering_confidence: isTampered ? (anomalyPoints >= 70 ? 'high' : 'medium') : 'high',
-    tampering_ml_score: isTampered ? Math.max(0.842, clampedScore) : 0.0024,
+    tampering_rule_score: ruleScore,
+    tampering_score_source: 'baseline_constant',
+    tampering_ml_score: ruleScore,
     tampering_details: {
       anomaly_score: privacyHardened && !isTampered ? 0 : Number((Math.min(100, anomalyPoints) / 100).toFixed(2)),
       anti_detect_browser: privacyHardened ? false : antiDetect,
@@ -904,4 +1092,17 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     tampering_lies_rating,
     gpu_answer_unreliable: gpuUnreliable,
   };
+  // P1-3: the deprecated `tampering_ml_score` name is kept for one cycle as a SYNCHRONIZED
+  // alias of the canonical rule score. A consumer that still writes the old key (the collector
+  // does today) cannot desynchronize it from `tampering_rule_score`, while the honest name and
+  // provenance are available to new consumers. The score remains a rule baseline constant.
+  Object.defineProperty(assessment, 'tampering_ml_score', {
+    enumerable: true,
+    configurable: true,
+    get: () => assessment.tampering_rule_score,
+    set: (value: number) => {
+      assessment.tampering_rule_score = value;
+    },
+  });
+  return assessment;
 }

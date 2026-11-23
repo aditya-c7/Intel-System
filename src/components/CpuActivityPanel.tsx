@@ -231,6 +231,9 @@ export function CpuActivityPanel() {
   );
   const userEnabledRef = useRef<boolean>(true);
   const sampleCounterRef = useRef<number>(0);
+  // Native Compute Pressure can callback far more than once per second; keep diagnostic logs
+  // bounded to at most one line per second instead of flooding the console.
+  const lastPressureLogRef = useRef<number>(0);
   const chartWrapperRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
 
@@ -374,7 +377,11 @@ export function CpuActivityPanel() {
 
       try {
         const observer = new g.PressureObserver((records: NativePressureRecord[]) => {
-          console.log('[CPU Pressure] Callback invoked. Received records:', records?.length ?? 0);
+          const nowForLog = Date.now();
+          if (nowForLog - lastPressureLogRef.current >= 1000) {
+            lastPressureLogRef.current = nowForLog;
+            console.log('[CPU Pressure] Callback invoked. Received records:', records?.length ?? 0);
+          }
 
           if (!Array.isArray(records) || records.length === 0) return;
 
@@ -390,9 +397,6 @@ export function CpuActivityPanel() {
           const newSamples: PressureObservationSample[] = validCpuRecords.map((rec) => {
             const epochMs = convertRecordTimeToEpochMs(rec.time);
             const displayLevel = PRESSURE_MAP[rec.state];
-            console.log(
-              `[CPU Pressure] Record: source=${rec.source}, state=${rec.state} · ${displayLevel}, rawTime=${rec.time}, timestamp=${new Date(epochMs).toISOString()}`
-            );
             return {
               id: ++sampleCounterRef.current,
               timestampMs: epochMs,
@@ -772,7 +776,7 @@ export function CpuActivityPanel() {
       return 'Initializing...';
     }
     if (status === 'Monitoring' && !latestSample) {
-      return 'Awaiting sample';
+      return 'Awaiting first change';
     }
     if ((status === 'Live' || status === 'Paused' || status === 'Monitoring') && latestSample) {
       return `${latestSample.displayLevel} · ${PRESSURE_QUALIFIER[latestSample.rawState]}`;
@@ -935,7 +939,7 @@ export function CpuActivityPanel() {
               {status === 'Live'
                 ? 'Live 5m'
                 : status === 'Monitoring'
-                ? 'Awaiting sample'
+                ? 'Awaiting first change'
                 : status}
             </span>
           </div>
@@ -1112,7 +1116,11 @@ export function CpuActivityPanel() {
         title={httpPolicyHeader ? `Permissions-Policy: ${httpPolicyHeader}` : undefined}
       >
         <span>Scale: Normal · Moderate · High · Heavy</span>
-        <span className="font-mono tabular-nums shrink-0">W3C Compute Pressure (1s)</span>
+        <span className="font-mono tabular-nums shrink-0">
+          {fallbackActive
+            ? 'Event-loop estimate (1s) — native API unavailable'
+            : 'W3C Compute Pressure (1s)'}
+        </span>
       </div>
     </div>
   );

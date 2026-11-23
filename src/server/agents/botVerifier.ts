@@ -76,6 +76,15 @@ export interface BotVerifierWebBotAuth {
   invalidReason?: string | null;
   /** Agent category from the registry (`ai_assistant` / `ai_agent` / `assistant` / `agent`). */
   category?: string | null;
+  /** Verified trust-anchor agent id (WbaVerification field, additive). */
+  agentId?: string | null;
+  /* --- additive proof fields published by `src/lib/wbaVerifier.ts` --- */
+  /** Proof reason: `signed-agent` on a verified signature, otherwise a tri-state reason. */
+  reason?: string | null;
+  /** Proof method: `rfc9421` / `signed_agent` / `page_attestation` / `none`. */
+  verification_method?: string | null;
+  /** Helper tri-state outcome: `VALID` / `INVALID` / `NEUTRAL`. */
+  outcome?: string | null;
 }
 
 export interface BotVerifierDirectory {
@@ -244,7 +253,10 @@ export const HARD_AGENT_REASON_IDS = [
   'stealth.playwright-source-url',
   'bot.cdp-tampered',
   'bot.playwright-binding',
-  'cdc.global.binding',
+  // RS-E: cdc_* binding globals are UNATTRIBUTED runtime artifacts (CDP bridge / injected
+  // client) — a different evidentiary class from deterministic automation proof. They are
+  // recorded in the weight-0 developer_tools tier below and can never disqualify a signed
+  // good agent. Only corroborated hard automation can reach `bad`, after every crypto rung.
   CORROBORATED_CDP_REASON_ID,
   CORROBORATED_CHROMIUM_CDP_REASON_ID,
 ] as const;
@@ -254,6 +266,9 @@ const DEVELOPER_TOOLS_REASON_IDS: ReadonlySet<string> = new Set([
   'cdp.runtime.enable.empty_source',
   'cdp.network.enable.pre_load_message',
   'bot.cdp-runtime-leak',
+  // RS-E: cdc_* / bare CDP are unattributed runtime artifacts — telemetry-only evidence.
+  // Automation is expected for verified agents and cannot disqualify signed good.
+  'cdc.global.binding',
   // A second external CDP client driving Runtime / Page: active inspection, weight 0.
   // Exact entry wins over the generic weak `bot.` prefix rule — never a hard path.
   ACTIVE_CDP_INSPECTION_REASON_ID,
@@ -310,8 +325,10 @@ const WEAK_REASON_IDS: ReadonlySet<string> = new Set([
 /** Prefix rules evaluated after the exact sets (first match wins). */
 const PREFIX_RULES: ReadonlyArray<{ prefix: string; weight: ReasonWeight }> = [
   { prefix: 'cdp.', weight: 'developer_tools' }, // bare CDP is weight 0
+  // RS-E: cdc_* binding globals are unattributed runtime artifacts (weight 0), not proof
+  // of a driven runtime. Exact entries win, so `cdc.global.binding` stays developer_tools.
+  { prefix: 'cdc.', weight: 'developer_tools' },
   { prefix: 'playwright.', weight: 'hard' },
-  { prefix: 'cdc.', weight: 'hard' },
   { prefix: 'ua.headless', weight: 'hard' },
   { prefix: 'selenium.', weight: 'hard' },
   { prefix: 'webdriver.', weight: 'hard' },
@@ -557,16 +574,41 @@ function hasSignedIdentity(values: unknown[]): boolean {
   return values.some((value) => normalizeIdentity(value) === 'signed');
 }
 
+/** Normalized additive proof string. */
+function proofString(value: unknown): string {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+/**
+ * RS-E: a verified RFC 9421 signature is itself a signed-identity proof. The published proof
+ * fields (`reason`, `identity`, `verification_method`) let a verified agent win BEFORE the
+ * hard-automation rung even when no legacy `identity:'signed'` flag was supplied — automation
+ * is expected for verified agents and cannot disqualify signed good.
+ */
+function hasSignedProof(wba: BotVerifierWebBotAuth): boolean {
+  const reason = proofString(wba.reason);
+  const method = proofString(wba.verification_method);
+  return (
+    normalizeIdentity(wba.identity) === 'signed' ||
+    reason === 'signed-agent' ||
+    method === 'rfc9421' ||
+    method === 'signed_agent'
+  );
+}
+
 /**
  * RFC 9421 tri-state gate. Only a VALID signature grants the good paths; INVALID and
  * NEUTRAL never do. NEUTRAL simply falls through to the IP / UA inconclusive paths.
  * An explicit `result`/`status` overrides the looser `verified` compatibility boolean.
  */
 function isWbaValid(wba: BotVerifierWebBotAuth): boolean {
-  const result = typeof wba.result === 'string' ? wba.result.trim().toLowerCase() : '';
+  const outcome = proofString(wba.outcome);
+  if (outcome === 'invalid' || outcome === 'neutral') return false;
+  if (outcome === 'valid') return true;
+  const result = proofString(wba.result);
   if (result === 'invalid' || result === 'neutral') return false;
   if (result === 'valid') return true;
-  const status = typeof wba.status === 'string' ? wba.status.trim().toLowerCase() : '';
+  const status = proofString(wba.status);
   if (status === 'invalid' || status === 'neutral') return false;
   return wba.verified === true;
 }
@@ -649,9 +691,17 @@ export function composeBotVerdict(input: BotVerdictInput): BotVerdict {
     inspection_state: inspectionState,
     automation_protocol_inspection_state: inspectionState,
     // A spoofed-impersonation core result is authoritative: an input-level 'unknown'
-    // or 'verified' claim must never downgrade identity='spoofed'. All other reasons
-    // keep the existing explicit-claim-then-reason precedence.
-    identity: reasonIdentity === 'spoofed' ? 'spoofed' : explicitIdentity ?? reasonIdentity,
+    // or 'verified' claim must never downgrade identity='spoofed'. A signed-good core result
+    // is equally authoritative for its own reason: identity MUST be 'signed' even when an
+    // upstream claim says 'verified' or 'unknown' (RS-E signed-good precedence / parity).
+    identity:
+      reasonIdentity === 'spoofed'
+        ? 'spoofed'
+        : core.reason === 'signed-agent'
+          ? 'signed'
+          : core.reason === 'verified-agent'
+            ? 'verified'
+            : explicitIdentity ?? reasonIdentity,
     confidence: confidenceForReason(core.reason),
   };
 }
@@ -702,23 +752,33 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
   const allProbeReasons = [...probeReasons, ...stealthReasons, ...activeInspectionReasons];
   const effectiveProbeVerdict = probeVerdict === 'agent' || stealthDetected ? 'agent' : probeVerdict;
 
-  /* 0 — Signed good agent: WBA cryptographic proof + signed identity + an
-   *     assistant/agent category. This outranks every bad path (including a
-   *     spoofed directory claim and a hard client probe). */
+  /* 0 — Signed good agent. RS-E decision order: a VALID WBA signature plus signed identity
+   *     (or its published proof fields) plus an assistant/agent category wins BEFORE every
+   *     bad rung — including a spoofed directory claim and corroborated hard automation.
+   *     Automation is expected for verified agents and cannot disqualify signed good; the
+   *     published reason_ids are exactly ['signed-agent'] so ZERO stealth automation reasons
+   *     escape this rung. Only a crypto/anchor failure can fall through to the probe ladder. */
+  const signedProof = hasSignedProof(webBotAuth);
   const signedWba =
     isWbaValid(webBotAuth) &&
-    (hasSignedIdentity([webBotAuth.identity, webBotAuth.status]) ||
+    (signedProof ||
+      hasSignedIdentity([webBotAuth.identity, webBotAuth.status]) ||
       hasSignedIdentity([directory.identity, directory.status, directory.signed === true ? 'signed' : null]));
   if (
     signedWba &&
-    isAssistantOrAgentCategory([webBotAuth.category, directory.category, input.category])
+    (signedProof || isAssistantOrAgentCategory([webBotAuth.category, directory.category, input.category]))
   ) {
     return {
       verdict: 'good',
       reason: 'signed-agent',
-      reason_ids: ['signed-agent', ...allProbeReasons],
+      reason_ids: ['signed-agent'],
       agent_verdict:
-        webBotAuth.bot_id || webBotAuth.operator || directory.bot_id || directory.operator || null,
+        webBotAuth.bot_id ||
+        webBotAuth.agentId ||
+        webBotAuth.operator ||
+        directory.bot_id ||
+        directory.operator ||
+        null,
       verified: true,
       severity: 'none',
     };

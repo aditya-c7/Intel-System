@@ -144,6 +144,14 @@ export interface CalibrationInput {
   distinctStorageSeedsCount?: number;
   browserFamilyConsensus?: boolean;
   osFamilyConsensus?: boolean;
+
+  /* Continuity corroboration, forwarded verbatim to the evidence scorer (P0-6).
+   * Each present, valid signal adds a small fixed, capped bonus (+0.03 each, +0.09
+   * aggregate); absent evidence contributes zero and is never inferred. These are
+   * camelCase so they cannot collide with the legacy `storage_healed` telemetry field. */
+  storageHealed?: boolean | number | string | null;
+  visitContinuity?: number | string | null;
+  profileAgeDays?: number | string | null;
 }
 
 /** Display band derived from the numeric confidence score. */
@@ -250,6 +258,9 @@ export function computeHonestIdentityConfidence(input: CalibrationInput): Honest
     distinct_storage_seeds_count: source.distinctStorageSeedsCount,
     browser_family_consensus: source.browserFamilyConsensus,
     os_family_consensus: source.osFamilyConsensus,
+    storageHealed: source.storageHealed,
+    visitContinuity: source.visitContinuity,
+    profileAgeDays: source.profileAgeDays,
   });
 
   return {

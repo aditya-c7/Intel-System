@@ -96,7 +96,10 @@ const HARD_REASONS: ReadonlySet<string> = new Set([
   // hard evidence here.
   'bot.cdp-tampered',
   'bot.playwright-binding',
-  'cdc.global.binding',
+  // `cdc.*` binding globals are UNATTRIBUTED runtime artifacts (CDP bridge / injected client),
+  // a different evidentiary class from deterministic automation proof. They live in the
+  // developer_tools tier (weight 0) below — see RS-E. Tag/binding presence alone cannot confer
+  // an automation verdict or disqualify a cryptographically signed good agent.
   // Corroborated CDP escalation: a runtime bridge with NO trusted human input after the
   // dwell window. Exact ids win over the generic weak `bot.` prefix rule below.
   CORROBORATED_CDP_REASON_ID,
@@ -112,6 +115,10 @@ const DEVELOPER_TOOLS_REASONS: ReadonlySet<string> = new Set([
   'cdp.runtime.enable.empty_source',
   'cdp.network.enable.pre_load_message',
   'bot.cdp-runtime-leak',
+  // RS-E: cdc_* and bare CDP are unattributed runtime artifacts — a different evidentiary
+  // class, recorded for telemetry only. Automation is expected for verified agents; these
+  // can never disqualify a signed good verdict (enforced by the signed-good rung upstream).
+  'cdc.global.binding',
   // A second external CDP client driving Runtime / Page: active inspection, weight 0.
   // Exact entry wins over the generic weak `bot.` prefix rule — never a hard path.
   ACTIVE_CDP_INSPECTION_REASON_ID,
@@ -180,10 +187,13 @@ const WEAK_REASONS: ReadonlySet<string> = new Set([
 /** Prefix rules evaluated after the exact sets (first match wins). */
 const PREFIX_RULES: ReadonlyArray<{ prefix: string; weight: ReasonWeight }> = [
   { prefix: 'cdp.', weight: 'developer_tools' },
-  // Playwright / CDC bindings are hard automation evidence. Exact-set entries are
+  // RS-E: cdc_* binding globals are unattributed runtime artifacts (weight 0), NOT proof
+  // of a driven runtime. Exact-set entries are checked first, so `cdc.global.binding` lands
+  // here too; only corroborated protocol-level hard evidence can ever reach `bad`.
+  { prefix: 'cdc.', weight: 'developer_tools' },
+  // Playwright bindings are hard automation evidence. Exact-set entries are
   // checked first, so the weak `playwright.mcp.pressure` quirk keeps its soft weight.
   { prefix: 'playwright.', weight: 'hard' },
-  { prefix: 'cdc.', weight: 'hard' },
   { prefix: 'ua.headless', weight: 'hard' },
   { prefix: 'selenium.', weight: 'hard' },
   { prefix: 'webdriver.', weight: 'hard' },

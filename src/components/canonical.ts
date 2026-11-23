@@ -62,6 +62,44 @@ function clampScore(value: number): number {
   return Math.max(0, Math.min(100, Math.round(value)));
 }
 
+/**
+ * Transports that may carry the newest server blocks. The resolved canonical envelope is
+ * authoritative; the response root, a dedicated `server` / `server_truth` block, the hardware
+ * / environment axes and the legacy `securitySignals` mirror are transport fallbacks only.
+ * Every value read through here is an `as unknown as` pass-through: a field the server omitted
+ * stays undefined and a field it supplied as null stays null.
+ */
+function serverTransportBlocks(
+  base: Record<string, unknown> | null,
+  env: Record<string, unknown> | null,
+  truthEnv: Record<string, unknown> | null,
+  signalExtras: Record<string, unknown>,
+  axes: Array<Record<string, unknown> | null>
+): Record<string, unknown>[] {
+  return [
+    truthEnv,
+    env,
+    asRecord(env?.server),
+    asRecord(truthEnv?.server),
+    base,
+    asRecord(base?.server),
+    asRecord(base?.server_truth),
+    ...axes,
+    signalExtras,
+  ].filter((block): block is Record<string, unknown> => block != null);
+}
+
+/** First *present* value (undefined means absent; an explicit null is a supplied value). */
+function pickServerValue(blocks: Record<string, unknown>[], keys: string[]): unknown {
+  for (const block of blocks) {
+    for (const key of keys) {
+      const value = block[key];
+      if (value !== undefined) return value;
+    }
+  }
+  return undefined;
+}
+
 export interface CanonicalView {
   /** True when the backend supplied canonical axes at all. */
   present: boolean;
@@ -99,11 +137,32 @@ export interface CanonicalView {
   inspectorState?: InspectorStateTristate | InspectorState | null;
   /** Server-resolved developer-tools verdict from the automation axis (verbatim). */
   developerTools?: boolean;
-  /** Canonical GPU observation bucket from the envelope axis (verbatim). */
+  /** Canonical GPU observation bucket from the envelope axis (verbatim pass-through). */
   gpuObservation?: GpuObservation | null;
   /** Server timezone-mismatch verdict from the network axis (verbatim). */
   timezoneMismatchCanonical?: boolean;
+  /** Raw `os_truth` block from the server envelope / new server transport, verbatim. */
   osTruth?: Record<string, unknown>;
+  os_truth?: Record<string, unknown> | null;
+
+  /* Newer server provenance / honesty mirrors — ALL OPTIONAL and read-only. As with every
+     other additive field here, the value is an `as unknown as` pass-through from the one
+     canonical envelope (or its response transports). A field the server did not supply stays
+     undefined exactly as the server left it; no Boolean()/Number() coercion, no default and
+     no client-side derivation is ever applied. Both snake_case and camelCase spellings are
+     exposed so every consumer reads the exact same mirrored value/reference. */
+  /** True only when the server says the renderer string came from spoofable WebGL reporting. */
+  renderer_reported_unverified?: boolean | null;
+  rendererReportedUnverified?: boolean | null;
+  /** Source-control revision of the build that emitted the response. */
+  build_sha?: string | null;
+  buildSha?: string | null;
+  /** Version of the worker / edge that emitted the response. */
+  worker_version?: string | null;
+  workerVersion?: string | null;
+  /** Server's human-facing, uncalibrated confidence copy (`Match evidence N%` / null). */
+  confidence_label?: string | null;
+  confidenceLabel?: string | null;
   /** Additive incognito probe diagnostics mirrored verbatim from the canonical envelope/data. */
   diagnostics?: IncognitoDiagnostics;
 
@@ -326,6 +385,49 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
   const privacyRaw = asRecord(privacy_settings);
   const privacySignalRaw = asRecord(signalExtras.privacySettings);
 
+  // Newer server blocks (os_truth, renderer provenance, build/version, confidence copy).
+  // These arrive in the canonical envelope or a dedicated `server` / `server_truth` block —
+  // NOT only on the automation axis. Everything below is a verbatim pass-through: no Boolean /
+  // Number coercion, no re-derivation and no fabricated default. The automation-derived OS
+  // object remains a fallback so older payloads keep every existing mirror.
+  const serverBlocks = serverTransportBlocks(
+    base,
+    env,
+    truthEnv,
+    signalExtras,
+    [hardwareRaw, environmentRaw, automationRaw]
+  );
+  const rawOsTruth = pickServerValue(serverBlocks, ['os_truth', 'osTruth', 'server_os_truth']);
+  const gpuObservationRaw = pickServerValue(serverBlocks, [
+    'gpuObservation',
+    'gpu_observation',
+  ]);
+  const rendererReportedUnverified = pickServerValue(serverBlocks, [
+    'renderer_reported_unverified',
+    'rendererReportedUnverified',
+  ]) as unknown as boolean | null | undefined;
+  const buildSha = pickServerValue(serverBlocks, [
+    'build_sha',
+    'buildSha',
+  ]) as unknown as string | null | undefined;
+  const workerVersion = pickServerValue(serverBlocks, [
+    'worker_version',
+    'workerVersion',
+  ]) as unknown as string | null | undefined;
+  // The confidence copy is authored by the identity resolver, so its nested identity block is
+  // preferred; the flat envelope / response transports remain fallbacks.
+  const identificationRaw = asRecord(base?.identification);
+  const confidenceBlocks = [
+    identityRaw,
+    identificationRaw,
+    asRecord(identificationRaw?.confidence),
+    ...serverBlocks,
+  ].filter((block): block is Record<string, unknown> => block != null);
+  const confidenceLabel = pickServerValue(confidenceBlocks, [
+    'confidence_label',
+    'confidenceLabel',
+  ]) as unknown as string | null | undefined;
+
   const gpu_truth_state = (truthEnv?.gpu_truth_state ??
     truthEnv?.gpuTruthState ??
     base?.gpu_truth_state ??
@@ -528,9 +630,19 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
       | InspectorState
       | null,
     developerTools: automationRaw?.developer_tools as unknown as boolean | undefined,
-    gpuObservation: (env?.gpuObservation ?? null) as unknown as GpuObservation | null,
+    // Verbatim server observation bucket. The old envelope-only read is kept as the last
+    // fallback, but the new server transports above win so a bucket emitted outside the
+    // automation axis is no longer silently dropped.
+    gpuObservation: (gpuObservationRaw !== undefined
+      ? gpuObservationRaw
+      : env?.gpuObservation ?? null) as unknown as GpuObservation | null,
     timezoneMismatchCanonical: networkRaw?.timezone_mismatch as unknown as boolean | undefined,
-    osTruth: automation
+    // The server's `os_truth` block is authoritative when supplied (as-unknown-as pass-through).
+    // The previous automation-axis projection is retained as a fallback so legacy payloads keep
+    // every existing mirror and no client-side derivation is introduced.
+    osTruth: (rawOsTruth !== undefined
+      ? rawOsTruth
+      : automation
       ? {
           serverVerifiedOs: automation.serverVerifiedOs,
           serverVerifiedBrowser: automation.serverVerifiedBrowser,
@@ -542,7 +654,17 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
           headerMismatch: automation.headerMismatch,
           engine: automation.engine,
         }
-      : {},
+      : {}) as unknown as Record<string, unknown>,
+    os_truth: rawOsTruth as unknown as Record<string, unknown> | null | undefined,
+    // Newer server mirrors — verbatim, both spellings share the exact same value/reference.
+    renderer_reported_unverified: rendererReportedUnverified,
+    rendererReportedUnverified,
+    build_sha: buildSha,
+    buildSha,
+    worker_version: workerVersion,
+    workerVersion,
+    confidence_label: confidenceLabel,
+    confidenceLabel,
     diagnostics,
     // Additive mirrors: same value/reference on both spellings, no recomputation. The risk
     // headline above (riskScore10 / riskTier / evidenceLedger) stays an independent pure

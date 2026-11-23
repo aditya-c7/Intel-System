@@ -19,7 +19,13 @@ import {
 import type { GpuObservation, GrantedGeolocation } from './telemetryContract';
 import { resolveGpuObservation } from './specInvariants';
 import { timezoneMismatchContext } from './timezone';
-import { resolveIdbDurabilityTruth, shouldApplyMarkerVeto } from './idbDurabilityTruth';
+import {
+  IDB_NORMAL_RATIO_MIN,
+  IDB_PRIVATE_RATIO_MAX,
+  STRONG_RAM_RATIO_MAX,
+  resolveIdbDurabilityTruth,
+  shouldApplyMarkerVeto,
+} from './idbDurabilityTruth';
 import { probeEngineLength, resolveHardwareTruth } from './hardwareTruth';
 import { detectBotD19Signals } from './aiBotDirectory';
 import { resolvePrivacySignatures, type PrivacySignalsInput } from './privacySignatures';
@@ -844,6 +850,265 @@ function inspectWebGlGpu(): WebGlGpuProbe {
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/* P0-3 — per-surface WebGL audit (RS-C).                                      */
+/*                                                                            */
+/* WEBGL_debug_renderer_info is OPTIONAL PER CONTEXT. WebGL1 and WebGL2 expose  */
+/* getParameter on different prototypes, and a worker / OffscreenCanvas is a   */
+/* separate realm that main-thread patches cannot reach. A disagreement is     */
+/* EVIDENCE OF DIVERGENCE — never a reason to pick one winning string. Every   */
+/* surface is recorded with a literal state; only `reported` carries a value.  */
+/* -------------------------------------------------------------------------- */
+
+type WebGlValueState =
+  | 'not_requested'
+  | 'context_unavailable'
+  | 'extension_unavailable'
+  | 'parameter_missing'
+  | 'reported'
+  | 'no_value';
+
+/** Classification of a *string*, never of an adapter. Every value is spoofable. */
+type GpuStringClass = 'SOFTWARE_SIG' | 'MASKED_GENERIC' | 'HARDWARE_CLAIMING';
+
+/** Minimal shape used from WEBGL_debug_renderer_info; cast explicitly through unknown. */
+interface WebGlDebugRendererInfoExtension {
+  readonly UNMASKED_VENDOR_WEBGL: number;
+  readonly UNMASKED_RENDERER_WEBGL: number;
+}
+
+interface WebGlSurfaceValue {
+  state: WebGlValueState;
+  value: string | null;
+  classification: GpuStringClass | null;
+}
+
+interface WebGlSurfaceRecord {
+  surface: 'webgl1' | 'webgl2' | 'worker_offscreen' | 'webgpu';
+  maskedVendor: WebGlSurfaceValue;
+  maskedRenderer: WebGlSurfaceValue;
+  unmaskedVendor: WebGlSurfaceValue;
+  unmaskedRenderer: WebGlSurfaceValue;
+  /** True when UNMASKED_* enums answered BEFORE extension enablement (a JS-hook tell). */
+  rawEnumTell: boolean | null;
+}
+
+interface WebGlSurfaceAudit {
+  surfaces: WebGlSurfaceRecord[];
+  /** True only when two surfaces both reported a value and the values differ. */
+  divergence: boolean;
+  conflict: string | null;
+  honestyLabels: string[];
+}
+
+/** Software signatures name a library (SwiftShader/llvmpipe/WARP), not a physical GPU. */
+const GPU_SOFTWARE_SIGNATURE_PATTERN =
+  /swiftshader|subzero|0x0000c0de|llvmpipe|softpipe|mesa offscreen|software rasterizer|software renderer|microsoft basic render|basic render driver|apple software renderer|virgl|goldfish|ranchu/i;
+/** Brave / WebKit / Apple generic placeholders are masks, never hardware evidence. */
+const GPU_MASKED_GENERIC_PATTERN =
+  /^(?:webkit|mozilla|webgl|standard webgl|generic|unavailable)|webkit webgl|\bapple\s+gpu\b|intel\s*(?:\(r\))?\s*(?:iris\s+)?opengl\s+engine/i;
+
+function classifyGpuStringValue(value: string | null): GpuStringClass | null {
+  if (!value) return null;
+  const text = value.trim();
+  if (!text || /^(unavailable|n\/?a|none|null|undefined|unknown|err|error)$/i.test(text)) return null;
+  if (GPU_SOFTWARE_SIGNATURE_PATTERN.test(text)) return 'SOFTWARE_SIG';
+  if (GPU_MASKED_GENERIC_PATTERN.test(text)) return 'MASKED_GENERIC';
+  return 'HARDWARE_CLAIMING';
+}
+
+function gpuSurfaceValue(state: WebGlValueState, value: string | null = null): WebGlSurfaceValue {
+  return { state, value, classification: value ? classifyGpuStringValue(value) : null };
+}
+
+function makeUnobservedSurface(
+  surface: WebGlSurfaceRecord['surface'],
+  state: WebGlValueState
+): WebGlSurfaceRecord {
+  return {
+    surface,
+    maskedVendor: gpuSurfaceValue(state),
+    maskedRenderer: gpuSurfaceValue(state),
+    unmaskedVendor: gpuSurfaceValue(state),
+    unmaskedRenderer: gpuSurfaceValue(state),
+    rawEnumTell: null,
+  };
+}
+
+function readGpuSurfaceParameter(gl: WebGLRenderingContext, enumValue: number): WebGlSurfaceValue {
+  try {
+    const raw = gl.getParameter(enumValue);
+    const text = typeof raw === 'string' && raw.trim() ? raw.trim() : null;
+    return text ? gpuSurfaceValue('reported', text) : gpuSurfaceValue('parameter_missing');
+  } catch {
+    return gpuSurfaceValue('parameter_missing');
+  }
+}
+
+/**
+ * Before WEBGL_debug_renderer_info is enabled on THIS context, 0x9245/0x9246 are invalid:
+ * an honest driver returns null and raises INVALID_ENUM (1280). A non-null value, a different
+ * error, or no error at all means a JS hook is answering — recorded, never trusted. Never
+ * throws; an unreadable enum is inconclusive (null), not a positive tell.
+ */
+function probeRawUnmaskedEnumTell(gl: WebGLRenderingContext): boolean {
+  try {
+    const beforeRenderer = gl.getParameter(0x9246);
+    const rendererError = gl.getError();
+    const beforeVendor = gl.getParameter(0x9245);
+    const vendorError = gl.getError();
+    return !(
+      beforeRenderer === null &&
+      rendererError === 1280 &&
+      beforeVendor === null &&
+      vendorError === 1280
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Records each WebGL surface independently. WebGL2 and WebGL1 get their own contexts because
+ * their getParameter lives on different prototypes; a worker/OffscreenCanvas realm and WebGPU
+ * are recorded as `not_requested` when this path does not probe them (absence is never Agreement).
+ */
+function auditWebGlSurfaces(): WebGlSurfaceAudit {
+  const surfaces: WebGlSurfaceRecord[] = [];
+  if (typeof document !== 'undefined') {
+    for (const surface of ['webgl1', 'webgl2'] as const) {
+      let gl: WebGLRenderingContext | null = null;
+      try {
+        const canvas = document.createElement('canvas');
+        gl = (surface === 'webgl2'
+          ? canvas.getContext('webgl2')
+          : canvas.getContext('webgl') || canvas.getContext('experimental-webgl')) as WebGLRenderingContext | null;
+      } catch {
+        gl = null;
+      }
+      if (!gl) {
+        surfaces.push(makeUnobservedSurface(surface, 'context_unavailable'));
+        continue;
+      }
+      const rawEnumTell = probeRawUnmaskedEnumTell(gl);
+      const maskedVendor = readGpuSurfaceParameter(gl, gl.VENDOR);
+      const maskedRenderer = readGpuSurfaceParameter(gl, gl.RENDERER);
+      let debugExt: WebGlDebugRendererInfoExtension | null = null;
+      try {
+        debugExt = gl.getExtension('WEBGL_debug_renderer_info') as unknown as WebGlDebugRendererInfoExtension | null;
+      } catch {
+        debugExt = null;
+      }
+      surfaces.push({
+        surface,
+        maskedVendor,
+        maskedRenderer,
+        unmaskedVendor: debugExt
+          ? readGpuSurfaceParameter(gl, debugExt.UNMASKED_VENDOR_WEBGL)
+          : gpuSurfaceValue('extension_unavailable'),
+        unmaskedRenderer: debugExt
+          ? readGpuSurfaceParameter(gl, debugExt.UNMASKED_RENDERER_WEBGL)
+          : gpuSurfaceValue('extension_unavailable'),
+        rawEnumTell,
+      });
+      try {
+        const lose = gl.getExtension('WEBGL_lose_context');
+        if (lose && typeof lose.loseContext === 'function') lose.loseContext();
+      } catch {
+        // Ignore: context release is best-effort.
+      }
+    }
+  } else {
+    surfaces.push(makeUnobservedSurface('webgl1', 'context_unavailable'));
+    surfaces.push(makeUnobservedSurface('webgl2', 'context_unavailable'));
+  }
+  surfaces.push(makeUnobservedSurface('worker_offscreen', 'not_requested'));
+  surfaces.push(makeUnobservedSurface('webgpu', 'not_requested'));
+
+  const valueKeys = ['maskedVendor', 'maskedRenderer', 'unmaskedVendor', 'unmaskedRenderer'] as const;
+  const conflicts: string[] = [];
+  for (const key of valueKeys) {
+    const reported = surfaces.filter((s) => s[key].state === 'reported');
+    if (reported.length >= 2) {
+      const anchor = reported[0][key].value;
+      if (reported.some((s) => s[key].value !== anchor)) {
+        conflicts.push(`${key} differs across WebGL surfaces`);
+      }
+    }
+  }
+  const unmaskedStates = surfaces
+    .filter((s) => s.surface === 'webgl1' || s.surface === 'webgl2')
+    .map((s) =>
+      s.unmaskedVendor.state === 'reported' || s.unmaskedRenderer.state === 'reported'
+        ? 'reported'
+        : 'unavailable'
+    );
+  if (unmaskedStates.includes('reported') && unmaskedStates.includes('unavailable')) {
+    conflicts.push('WEBGL_debug_renderer_info availability differs across WebGL surfaces');
+  }
+
+  const honesty = new Set<string>();
+  for (const surface of surfaces) {
+    for (const key of valueKeys) {
+      const classification = surface[key].classification;
+      if (classification === 'SOFTWARE_SIG') honesty.add('software_renderer_signature');
+      else if (classification === 'MASKED_GENERIC') honesty.add('masked_generic_value');
+      else if (classification === 'HARDWARE_CLAIMING') honesty.add('hardware_claiming_string_unverified');
+    }
+  }
+  const divergence = conflicts.length > 0;
+  if (divergence) honesty.add('surface_divergence');
+  return {
+    surfaces,
+    divergence,
+    conflict: divergence ? 'multi-surface disagreement — true adapter unresolved' : null,
+    honestyLabels: Array.from(honesty),
+  };
+}
+
+/**
+ * A `hardware` truth verdict is admissible ONLY when every observed surface agrees and no raw
+ * UNMASKED_* enum tell or masked-generic "unmasked" value is present. Disagreement is reported,
+ * never resolved by choosing the most flattering string. Software verdicts are untouched —
+ * SwiftShader stays `software_renderer`, never VM proof.
+ */
+function applyGpuSurfaceHonestyGuard(
+  verdict: ReturnType<typeof resolveGpuTruthState>,
+  audit: WebGlSurfaceAudit
+): ReturnType<typeof resolveGpuTruthState> {
+  if (verdict.state !== 'hardware') return verdict;
+  const unmaskedClasses = audit.surfaces.flatMap((s) => [
+    s.unmaskedVendor.classification,
+    s.unmaskedRenderer.classification,
+  ]);
+  const rawTell = audit.surfaces.some((s) => s.rawEnumTell === true);
+  const maskedGenericUnmasked = unmaskedClasses.includes('MASKED_GENERIC');
+  if (!audit.divergence && !rawTell && !maskedGenericUnmasked) return verdict;
+  const reasons = [...verdict.reasons];
+  if (audit.divergence) reasons.push(audit.conflict || 'multi-surface disagreement — true adapter unresolved');
+  if (rawTell) reasons.push('raw UNMASKED_* enum readable before extension enablement (hook tell)');
+  if (maskedGenericUnmasked) reasons.push('masked-generic unmasked string cannot anchor physical hardware');
+  return { state: 'masked', answerUnreliable: true, reasons: Array.from(new Set(reasons)) };
+}
+
+/**
+ * SINGLE shared WebGL verdict, carried by the device gate, the hardware-id seed and every GPU
+ * truth/observation field. The per-surface audit is attached here so a disagreement between
+ * WebGL1 / WebGL2 (or a raw-enum hook tell) is REPORTED instead of being hidden by picking one
+ * string. The primary context is created once per page. Never throws.
+ */
+type SharedWebGlProbe = WebGlGpuProbe & { surfaceAudit: WebGlSurfaceAudit };
+let sharedWebGlGpuProbeCache: SharedWebGlProbe | null = null;
+function getSharedWebGlProbe(): SharedWebGlProbe {
+  if (!sharedWebGlGpuProbeCache) {
+    sharedWebGlGpuProbeCache = {
+      ...inspectWebGlGpu(),
+      surfaceAudit: auditWebGlSurfaces(),
+    };
+  }
+  return sharedWebGlGpuProbeCache;
+}
+
 /** Canvas probe result: the stable SHA-256 signature plus structural/noise metadata. */
 interface CanvasSignatureResult {
   signature: string;
@@ -1554,7 +1819,7 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & Cl
     typeof window !== 'undefined' && 'ontouchstart' in window;
   const viewportWidth =
     typeof window !== 'undefined' ? Number(window.innerWidth) || 0 : 0;
-  const gpuProbe = inspectWebGlGpu();
+  const gpuProbe = getSharedWebGlProbe();
   const pcLock = getPcLock();
 
   const deviceGate: DeviceGateResult = classifyGenuineDevice({
@@ -1927,7 +2192,15 @@ function stableStructuralAnchors(): { fontMetric: string; mathAnchor: string } {
  */
 export async function collectHardwareSignals(
   browserDevice: BrowserDeviceInfo
-): Promise<HardwareSignals & { gpuClass: string; gpuObservation: GpuObservation }> {
+): Promise<
+  HardwareSignals & {
+    gpuClass: string;
+    gpuObservation: GpuObservation;
+    shaderPrecisionProfile: string;
+    renderer_reported_unverified?: string | null;
+    gpuSurfaceAudit?: WebGlSurfaceAudit;
+  }
+> {
   const [
     {
       gpuVendor,
@@ -1941,12 +2214,13 @@ export async function collectHardwareSignals(
       unmaskedVendor,
       unmaskedRenderer,
       shaderPrecisionProfile,
+      surfaceAudit,
     },
     canvas,
     audio,
   ] =
     await Promise.all([
-      Promise.resolve(inspectWebGlGpu()),
+      Promise.resolve(getSharedWebGlProbe()),
       computeCanvas2dSignature(),
       computeWebAudioSignature(),
     ]);
@@ -2076,17 +2350,15 @@ export async function collectHardwareSignals(
     // Ignore storage block
   }
 
-  // Four-state GPU observation from explicit identifiers only (canonical resolver in
-  // specInvariants.ts). A masked/unavailable extension is NEVER promoted to VM/software proof,
-  // and SwiftShader maps to `software_or_virtual` without setting any VM verdict.
-  const gpuObservation = resolveGpuObservation(gpuVendor, gpuRenderer, gpuClass);
   // The GPU truth resolver is the ONLY place allowed to say "hardware". It requires an
-  // actual unmasked manufacturer identifier and rejects stealth templates / masking.
+  // actual unmasked manufacturer identifier and rejects stealth templates / masking. The
+  // per-surface honesty guard additionally refuses a hardware verdict when surfaces disagree,
+  // a raw UNMASKED_* enum answered before enablement, or the "unmasked" value is a generic mask.
   const uaForGpuTruth =
     typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string'
       ? navigator.userAgent
       : '';
-  const gpuTruth = resolveGpuTruthState({
+  const gpuTruthEvaluated = resolveGpuTruthState({
     vendor: maskedVendor,
     renderer: maskedRenderer,
     unmaskedVendor,
@@ -2095,6 +2367,36 @@ export async function collectHardwareSignals(
     shaderPrecisionProfile,
     privacyHardened: isPrivacyHardenedRuntime(uaForGpuTruth, false),
   });
+  const gpuTruth = applyGpuSurfaceHonestyGuard(gpuTruthEvaluated, surfaceAudit);
+
+  // Four-state GPU observation from explicit identifiers only (canonical resolver in
+  // specInvariants.ts). A masked/unavailable extension is NEVER promoted to VM/software proof,
+  // and SwiftShader maps to `software_or_virtual` without setting any VM verdict. If the truth
+  // verdict is unreliable, a `hardware_visible` string claim is demoted so observation and truth
+  // can never contradict each other — the shared probe guarantees both read the same surfaces.
+  const observedGpu = resolveGpuObservation(gpuVendor, gpuRenderer, gpuClass);
+  const gpuObservation: GpuObservation =
+    observedGpu === 'hardware_visible' && gpuTruth.answerUnreliable
+      ? gpuClass && gpuClass !== 'na'
+        ? 'masked_by_privacy'
+        : 'observation_unavailable'
+      : observedGpu;
+
+  // P0-3/1-2: when no surface yielded a verified, unmasked hardware identity, the only renderer
+  // we have is a spoofable WebGL getParameter string. Expose it under an explicitly UNVERIFIED
+  // name so no consumer can mistake it for a physical-GPU claim. Telemetry only: this field is
+  // never a hardware-id seed input and never touches a digest or the 0-10 headline.
+  const verifiedUnmaskedIdentity =
+    debugExtensionAvailable &&
+    !surfaceAudit.divergence &&
+    !surfaceAudit.surfaces.some((s) => s.rawEnumTell === true) &&
+    [unmaskedVendor, unmaskedRenderer].some(
+      (value) => classifyGpuStringValue(value ?? null) === 'HARDWARE_CLAIMING'
+    );
+  const rendererReportedUnverified =
+    !verifiedUnmaskedIdentity && typeof gpuRenderer === 'string' && gpuRenderer.trim()
+      ? gpuRenderer.trim()
+      : null;
 
   return {
     hardwareId,
@@ -2104,6 +2406,13 @@ export async function collectHardwareSignals(
     gpuClass,
     gpuObservation,
     gpuTruth,
+    // Capability-derived profile (additive) — forwarded to the shadow tampering-lies resolver.
+    shaderPrecisionProfile,
+    // Additive per-surface audit: literal states, string classes and any divergence.
+    gpuSurfaceAudit: surfaceAudit,
+    ...(rendererReportedUnverified
+      ? { renderer_reported_unverified: rendererReportedUnverified }
+      : {}),
     debugExtensionAvailable,
     maskedVendor: maskedVendor ?? undefined,
     maskedRenderer: maskedRenderer ?? undefined,
@@ -2244,8 +2553,130 @@ const METHOD_INCONCLUSIVE = 'storage-check-inconclusive';
  * READ-ONLY mirror of values the probe already computes — it never feeds the verdict,
  * the risk score or any downstream decision.
  */
+/**
+ * Additive, read-only raw evidence captured per incognito evaluation (RS-J). Every field is
+ * optional: an unavailable probe is OMITTED, never filled with a fabricated value. This record
+ * is solely for drift monitoring — no field (and no detector verdict) is ever used to derive a
+ * ground-truth label, a threshold, the incognito verdict, the score or the 0-10 headline.
+ */
+export interface IncognitoEvidence {
+  /** Raw `(-1).toFixed(-1)` RangeError length. */
+  engineId?: number;
+  quota?: number | null;
+  headroom?: number | null;
+  /** Observed quota shape, derived only from quota + usage when both are known. */
+  reportedQuotaPattern?: string;
+  opfs?: {
+    status?: string;
+    /** Verbatim error.name / error.message — exact strings, never normalised into a verdict. */
+    errorName?: string;
+    errorMessage?: string;
+    workerAvailable?: boolean;
+    cspBlocked?: boolean;
+  };
+  idb?: Partial<IdbDurabilityProbe> & {
+    threshold?: string;
+    margin?: number;
+    idbError?: string | null;
+  };
+  confounders?: {
+    webviewTokens?: boolean;
+    uaChMismatch?: boolean;
+    guestConditionalMediationAvailable?: boolean;
+  };
+  verdict?: { isPrivate: boolean; confidence: IncognitoConfidence; method: string };
+  abstainReason?: string;
+  thresholds?: Readonly<Record<string, number | string>>;
+  configHash?: string;
+}
+
+/** Frozen evidence thresholds (mirrors the shared resolver constants; no decision reads these). */
+const INCOGNITO_THRESHOLD_CONFIG = Object.freeze({
+  idbPrivateRatioMax: IDB_PRIVATE_RATIO_MAX,
+  idbNormalRatioMin: IDB_NORMAL_RATIO_MIN,
+  strongRamRatioMax: STRONG_RAM_RATIO_MAX,
+  collectorDeadbandHigh: 1.55,
+  configVersion: 'incognito-evidence-v1',
+});
+const INCOGNITO_THRESHOLD_HASH = hash128(JSON.stringify(INCOGNITO_THRESHOLD_CONFIG));
+const IDB_EVIDENCE_THRESHOLD_LABEL = `private<=${IDB_PRIVATE_RATIO_MAX},normal>${IDB_NORMAL_RATIO_MIN},strong_ram<=${STRONG_RAM_RATIO_MAX}`;
+
+/** Verbatim error identity for evidence only; never matched into a verdict here. */
+function errorIdentity(error: unknown): { name?: string; message?: string } {
+  if (!error) return {};
+  if (typeof error === 'string') return error ? { message: error } : {};
+  if (typeof error !== 'object') return {};
+  const record = error as Record<string, unknown>;
+  return {
+    ...(typeof record.name === 'string' && record.name ? { name: record.name } : {}),
+    ...(typeof record.message === 'string' && record.message ? { message: record.message } : {}),
+  };
+}
+
+/** Set only by an explicit CSP-related worker failure; null means "not observed". */
+let lastOpfsWorkerBlockedByCsp: boolean | null = null;
+
+function captureOpfsEvidence(
+  result: Awaited<ReturnType<typeof probeOpfsDirectory>>
+): NonNullable<IncognitoEvidence['opfs']> {
+  const captured: NonNullable<IncognitoEvidence['opfs']> = { status: result.status };
+  if (result.status === 'rejected') {
+    const identity = errorIdentity(result.error);
+    if (identity.name) captured.errorName = identity.name;
+    if (identity.message) captured.errorMessage = identity.message;
+  }
+  try {
+    captured.workerAvailable = typeof Worker !== 'undefined';
+  } catch {
+    // Omit when the scope is hostile.
+  }
+  if (lastOpfsWorkerBlockedByCsp !== null) captured.cspBlocked = lastOpfsWorkerBlockedByCsp;
+  return captured;
+}
+
+function captureIdbEvidence(probe: IdbDurabilityProbe): NonNullable<IncognitoEvidence['idb']> {
+  const captured: NonNullable<IncognitoEvidence['idb']> = { ...probe, threshold: IDB_EVIDENCE_THRESHOLD_LABEL };
+  if (typeof probe.ratio === 'number' && Number.isFinite(probe.ratio)) {
+    captured.margin = Math.min(
+      Math.abs(probe.ratio - IDB_PRIVATE_RATIO_MAX),
+      Math.abs(probe.ratio - STRONG_RAM_RATIO_MAX),
+      Math.abs(probe.ratio - IDB_NORMAL_RATIO_MIN)
+    );
+  }
+  return captured;
+}
+
+function captureIncognitoConfounders(ua: string): NonNullable<IncognitoEvidence['confounders']> {
+  const captured: NonNullable<IncognitoEvidence['confounders']> = {};
+  try {
+    captured.webviewTokens = EMBEDDED_SHELL_PATTERN.test(ua);
+  } catch {
+    // Omit when unavailable.
+  }
+  try {
+    captured.uaChMismatch = getUaChContradiction().detected;
+  } catch {
+    // Omit when unavailable.
+  }
+  try {
+    const credentialCtor = (
+      globalThis as unknown as {
+        PublicKeyCredential?: { isConditionalMediationAvailable?: unknown };
+      }
+    ).PublicKeyCredential;
+    if (credentialCtor && typeof credentialCtor.isConditionalMediationAvailable === 'function') {
+      captured.guestConditionalMediationAvailable = true;
+    }
+  } catch {
+    // Omit when unavailable.
+  }
+  return captured;
+}
+
 export interface IncognitoDiagnostics {
   enabled: boolean;
+  /** Raw per-evaluation evidence (RS-J). Never a verdict or ground-truth source. */
+  evidence?: IncognitoEvidence;
   engine: string | null;
   method: string | null;
   confidence: IncognitoConfidence | null;
@@ -2798,6 +3229,8 @@ export interface InspectorProbes {
   activeCdpInspection: boolean;
   crossRealmGetterSourceMismatch: boolean;
   crossRealmNativeDescriptor: boolean;
+  /** Additive shadow observation: a "clean" iframe returned contentWindow === window. */
+  iframeContentWindowEqualsWindow?: boolean;
   inspectorProbeError: string;
 }
 export const inspectorProbes: InspectorProbes = {
@@ -2807,6 +3240,7 @@ export const inspectorProbes: InspectorProbes = {
   activeCdpInspection: false,
   crossRealmGetterSourceMismatch: false,
   crossRealmNativeDescriptor: false,
+  iframeContentWindowEqualsWindow: false,
   inspectorProbeError: '',
 };
 
@@ -3423,6 +3857,8 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
             return undefined;
           }
         };
+        // Additive shadow observation only — never a bot verdict or score input.
+        inspectorProbes.iframeContentWindowEqualsWindow = childWindow === window;
         const childNavProto = childWindow.navigator
           ? Object.getPrototypeOf(childWindow.navigator)
           : undefined;
@@ -4022,6 +4458,17 @@ interface IdbDurabilityProbe {
   ratio: number | null;
   /** True when the trimmed spread is too wide (or too few rounds) to trust. */
   highVariance: boolean;
+  /* --- RS-J additive raw evidence. Recorded only; never read by a decision path. ------- */
+  durabilityHintHonored?: boolean;
+  payloadBytes?: number;
+  writesPerBlock?: number;
+  roundsExecuted?: number;
+  elapsedMs?: number;
+  relaxedMs?: number[];
+  strictMs?: number[];
+  ratios?: number[];
+  medianRatio?: number | null;
+  idbError?: string | null;
 }
 
 /** Shared inconclusive sentinel — never treated as incognito evidence. */
@@ -4039,6 +4486,28 @@ async function probeChromiumIdbDurability(): Promise<IdbDurabilityProbe> {
 
   return new Promise<IdbDurabilityProbe>((resolve) => {
     let settled = false;
+    // RS-J raw evidence accumulators — observation only, never a decision input.
+    let honored = false;
+    let roundsExecuted = 0;
+    let elapsedMs = 0;
+    let idbError: string | null = null;
+    const relaxedMs: number[] = [];
+    const strictMs: number[] = [];
+    const roundRatios: number[] = [];
+    const makeProbe = (ratio: number | null, highVariance: boolean): IdbDurabilityProbe => ({
+      ratio,
+      highVariance,
+      durabilityHintHonored: honored,
+      payloadBytes: PAYLOAD,
+      writesPerBlock: WRITES,
+      roundsExecuted,
+      elapsedMs,
+      relaxedMs: [...relaxedMs],
+      strictMs: [...strictMs],
+      ratios: [...roundRatios],
+      medianRatio: ratio,
+      idbError,
+    });
     const finish = (val: IdbDurabilityProbe, db?: IDBDatabase) => {
       if (settled) return;
       settled = true;
@@ -4050,32 +4519,44 @@ async function probeChromiumIdbDurability(): Promise<IdbDurabilityProbe> {
     try {
       const req = indexedDB.open(dbName, 1);
       req.onupgradeneeded = () => { req.result.createObjectStore('s'); };
-      req.onerror = () => { clearTimeout(safetyTimer); finish(IDB_INCONCLUSIVE); };
+      req.onerror = () => {
+        idbError = errorIdentity(req.error).message ?? errorIdentity(req.error).name ?? 'IDB open failed';
+        clearTimeout(safetyTimer);
+        finish(makeProbe(null, true));
+      };
       req.onsuccess = () => {
         const db = req.result;
-        let honored = false;
         try {
           const t = (db as unknown as {
             transaction: (store: string, mode: string, opts: { durability: string }) => IDBTransaction & { durability?: string };
           }).transaction('s', 'readwrite', { durability: 'strict' });
           honored = t.durability === 'strict';
           t.abort();
-        } catch { honored = false; }
-        if (!honored) { clearTimeout(safetyTimer); finish(IDB_INCONCLUSIVE, db); return; }
+        } catch (error) { honored = false; idbError = errorIdentity(error).message ?? errorIdentity(error).name ?? null; }
+        if (!honored) { clearTimeout(safetyTimer); finish(makeProbe(null, true), db); return; }
 
         const block = (durability: 'strict' | 'relaxed'): Promise<number> =>
           new Promise((res, rej) => {
             const t0 = performance.now();
             let i = 0;
             const step = (): void => {
-              if (i === WRITES) { res(performance.now() - t0); return; }
+              if (i === WRITES) {
+                const ms = performance.now() - t0;
+                (durability === 'relaxed' ? relaxedMs : strictMs).push(ms);
+                res(ms);
+                return;
+              }
               const tx = (db as unknown as {
                 transaction: (store: string, mode: string, opts: { durability: string }) => IDBTransaction;
               }).transaction('s', 'readwrite', { durability });
               tx.objectStore('s').put(payload, i);
               i++;
               tx.oncomplete = step;
-              tx.onerror = tx.onabort = () => rej(tx.error);
+              tx.onerror = tx.onabort = () => {
+                const identity = errorIdentity(tx.error);
+                idbError = identity.message ?? identity.name ?? null;
+                rej(tx.error);
+              };
             };
             step();
           });
@@ -4084,7 +4565,6 @@ async function probeChromiumIdbDurability(): Promise<IdbDurabilityProbe> {
           const start = performance.now();
           await block('relaxed');
           await block('strict'); // warm-up discarded
-          const ratios: number[] = [];
           // Interleave the measurement order so a monotonic IO/clock drift cannot bias
           // the ratio: even rounds relax→strict, odd rounds strict→relax.
           for (let r = 0; r < ROUNDS; r++) {
@@ -4097,13 +4577,15 @@ async function probeChromiumIdbDurability(): Promise<IdbDurabilityProbe> {
               str = await block('strict');
               rel = await block('relaxed');
             }
-            ratios.push(rel > 0 ? str / rel : Infinity);
-            if (ratios.length >= MIN_ROUNDS && performance.now() - start >= CAP_MS) break;
+            roundRatios.push(rel > 0 ? str / rel : Infinity);
+            if (roundRatios.length >= MIN_ROUNDS && performance.now() - start >= CAP_MS) break;
           }
+          roundsExecuted = roundRatios.length;
+          elapsedMs = performance.now() - start;
           // Trimmed median: drop one fastest and one slowest round before taking the
           // median, so a single scheduler hiccup cannot move the verdict across the
           // deadband. This is the interleaved trimmed-median gate used on Chromium 51.
-          const finite = ratios.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+          const finite = roundRatios.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
           const trimmed = finite.length >= 5 ? finite.slice(1, -1) : finite;
           const median = trimmed.length > 0 ? trimmed[trimmed.length >> 1] : null;
           // High variance = optimistic majority (below the trimmed median) or a wide
@@ -4120,14 +4602,19 @@ async function probeChromiumIdbDurability(): Promise<IdbDurabilityProbe> {
           if (median === null || !Number.isFinite(median) || highVariance) {
             finish(
               median !== null && Number.isFinite(median)
-                ? { ratio: Number(median.toFixed(3)), highVariance: true }
-                : IDB_INCONCLUSIVE,
+                ? makeProbe(Number(median.toFixed(3)), true)
+                : makeProbe(null, true),
               db
             );
           } else {
-            finish({ ratio: Number(median.toFixed(3)), highVariance: false }, db);
+            finish(makeProbe(Number(median.toFixed(3)), false), db);
           }
-        })().catch(() => { clearTimeout(safetyTimer); finish(IDB_INCONCLUSIVE, db); });
+        })().catch((error) => {
+          const identity = errorIdentity(error);
+          idbError = identity.message ?? identity.name ?? null;
+          clearTimeout(safetyTimer);
+          finish(makeProbe(null, true), db);
+        });
       };
     } catch { clearTimeout(safetyTimer); finish(IDB_INCONCLUSIVE); }
   });
@@ -4251,7 +4738,17 @@ async function probeChromiumOpfsWorkerFlush(): Promise<OpfsFlushProbeResult | nu
           finish(null);
         }
       };
-      worker.onerror = () => finish(null);
+      worker.onerror = (event: ErrorEvent) => {
+        // RS-J observation only: an explicit CSP denial is recorded verbatim as a confounder.
+        const message =
+          event && typeof event.message === 'string'
+            ? event.message
+            : '';
+        if (/content security policy|\bcsp\b/i.test(message)) {
+          lastOpfsWorkerBlockedByCsp = true;
+        }
+        finish(null);
+      };
       worker.postMessage('run');
     } catch {
       finish(null);
@@ -4948,6 +5445,27 @@ function finalizeIncognitoVerdict(result: IncognitoDetectionResult): IncognitoDe
 }
 
 /**
+ * Deterministic JS-engine label for the incognito probe, shared by the fresh probe and the
+ * cached-lock diagnostic mirror so the two paths cannot drift. The `(-1).toFixed(-1)`
+ * RangeError length is authoritative (51 V8 / 25 SpiderMonkey / 43-44 JavaScriptCore); UA
+ * tokens are fallback only. Pure and read-only.
+ */
+type IncognitoEngine = 'chromium' | 'firefox' | 'safari';
+function resolveIncognitoEngine(engineErrorLength: number, ua: string): IncognitoEngine {
+  const isSpiderMonkey = engineErrorLength === 25 || /Firefox/i.test(ua);
+  const isJSC =
+    engineErrorLength === 44 ||
+    engineErrorLength === 43 ||
+    (/Safari/i.test(ua) && !/Chrome|Chromium|Edg|OPR/i.test(ua));
+  if (engineErrorLength === 25) return 'firefox';
+  if (engineErrorLength === 43 || engineErrorLength === 44) return 'safari';
+  if (engineErrorLength === 51) return 'chromium';
+  if (isSpiderMonkey) return 'firefox';
+  if (isJSC) return 'safari';
+  return 'chromium';
+}
+
+/**
  * Multi-engine private-browsing detection (3 layers, no quota veto).
  *
  * The JS engine is fingerprinted through the `toFixed` RangeError length and
@@ -5000,6 +5518,53 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
   if (locked && (locked.isPrivate || !(await cachedNormalIsStale()))) {
     noteDiag('sessionLockHit', true);
     if (diag) {
+      // Additive, read-only reconstruction of the four fields the fresh path records. No probe
+      // is re-run for a decision: persisted-storage and isolation checks are read-only, and the
+      // IDB rule is reconstructed from the CACHED ratio/variance (OPFS corroboration is not
+      // re-probed). Verdict, threshold and the 65 s envelope are untouched.
+      let lockUa = '';
+      try {
+        lockUa = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+      } catch {
+        lockUa = '';
+      }
+      noteDiag('engine', resolveIncognitoEngine(getEngineErrorLength(), lockUa));
+      const lockGrant = await hasPersistedStorageGrant();
+      const lockIsolated = isIsolatedStorageContext();
+      noteDiag('persistedStorageGrant', lockGrant);
+      noteDiag('isolatedContextVeto', lockIsolated);
+      noteDiag(
+        'idbTruthRule',
+        resolveIdbDurabilityTruth({
+          ratio: locked.idbDurabilityRatio,
+          highVariance: locked.idbHighVariance,
+          persistedGrant: lockGrant,
+          isolatedContext: lockIsolated,
+          opfsCorroboration: false,
+        }).rule
+      );
+      // Read-only evidence from the cached verdict + fresh engine oracle. No probe is re-run.
+      const lockEvidence: IncognitoEvidence = {
+        engineId: getEngineErrorLength(),
+        quota: locked.quotaBytes,
+        headroom: locked.headroomGiB,
+        verdict: {
+          isPrivate: locked.isPrivate,
+          confidence: locked.confidence,
+          method: locked.method,
+        },
+        thresholds: { ...INCOGNITO_THRESHOLD_CONFIG },
+        configHash: INCOGNITO_THRESHOLD_HASH,
+      };
+      if (locked.idbDurabilityRatio !== null) {
+        lockEvidence.idb = {
+          ratio: locked.idbDurabilityRatio,
+          medianRatio: locked.idbDurabilityRatio,
+          highVariance: locked.idbHighVariance ?? false,
+          threshold: IDB_EVIDENCE_THRESHOLD_LABEL,
+        };
+      }
+      noteDiag('evidence', lockEvidence);
       noteDiag('method', locked.method);
       noteDiag('confidence', locked.confidence);
       noteDiag('isPrivate', locked.isPrivate);
@@ -5019,6 +5584,10 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
   }
   noteDiag('sessionLockHit', false);
 
+  // RS-J: raw evidence is accumulated by the probe below and mirrored into diagnostics only
+  // when the flag is on. It is never read by any verdict, threshold or scoring path.
+  let evidence: IncognitoEvidence = {};
+
   cachedIncognitoPromise = (async (): Promise<IncognitoDetectionResult> => {
     const nav = typeof navigator !== 'undefined' ? navigator : undefined;
     let ua = '';
@@ -5028,30 +5597,11 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       ua = '';
     }
     const feid = getEngineErrorLength();
-
-    const isSpiderMonkey = feid === 25 || /Firefox/i.test(ua);
-    const isJSC =
-      feid === 44 || feid === 43 || (/Safari/i.test(ua) && !/Chrome|Chromium|Edg|OPR/i.test(ua));
-
-    // The `(-1).toFixed(-1)` RangeError length is the deterministic engine oracle:
-    // Firefox 25, WebKit 43/44 and Chromium 51 are authoritative when the probe works.
-    // UA strings are only a fallback for engines that hide/change the message length.
-    let engine: 'chromium' | 'firefox' | 'safari';
-    if (feid === 25) {
-      engine = 'firefox';
-    } else if (feid === 43 || feid === 44) {
-      engine = 'safari';
-    } else if (feid === 51) {
-      engine = 'chromium';
-    } else if (isSpiderMonkey) {
-      engine = 'firefox';
-    } else if (isJSC) {
-      engine = 'safari';
-    } else {
-      // Unknown engine length and no UA hint: default to the Chromium physics path,
-      // which fails open rather than abstaining on the strict OPFS/IDB probes.
-      engine = 'chromium';
-    }
+    evidence.engineId = feid;
+    evidence.confounders = captureIncognitoConfounders(ua);
+    // The `(-1).toFixed(-1)` RangeError length is the deterministic engine oracle; UA strings
+    // are only a fallback. Unknown length + no UA hint defaults to the fail-open Chromium path.
+    const engine = resolveIncognitoEngine(feid, ua);
 
     noteDiag('engine', engine);
     const browserName = resolveBrowserName(engine, ua, nav);
@@ -5083,6 +5633,15 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
     const headroomBytes = quotaBytes !== null ? quotaBytes - usageBytes : null;
     const headroomGiB =
       headroomBytes !== null ? Number((Math.max(0, headroomBytes) / GIB_BYTES).toFixed(2)) : null;
+    evidence.quota = quotaBytes;
+    evidence.headroom = headroomGiB;
+    if (quotaBytes !== null && usageBytes > 0 && headroomBytes !== null) {
+      evidence.reportedQuotaPattern = Math.abs(headroomBytes - 10 * GIB_BYTES) < 0.05 * GIB_BYTES
+        ? 'usage+10GiB'
+        : Math.abs(headroomBytes - 9 * GIB_BYTES) < 0.05 * GIB_BYTES
+        ? 'usage+9GiB'
+        : 'other';
+    }
     noteDiag('quotaBytes', quotaBytes);
     noteDiag('headroomGiB', headroomGiB);
     // Weak Chromium-only context hints, reported for telemetry but never used as
@@ -5092,6 +5651,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
     try {
       if (engine === 'firefox') {
         const opfs = await probeOpfsDirectory();
+        evidence.opfs = captureOpfsEvidence(opfs);
         if (opfs.status === 'resolved') {
           return {
             isPrivate: false,
@@ -5143,6 +5703,7 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
 
       if (engine === 'safari') {
         const opfs = await probeOpfsDirectory();
+        evidence.opfs = captureOpfsEvidence(opfs);
         if (opfs.status === 'resolved') {
           return {
             isPrivate: false,
@@ -5206,12 +5767,14 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       // Noisy vectors (c, d) still corroborate each other via the original AND gate, so
       // the deadband / high-variance case remains inconclusive rather than a false positive.
       const opfsDir = await probeOpfsDirectory();
+      evidence.opfs = captureOpfsEvidence(opfsDir);
       const opfsDirClass = classifyPrivateError(
         opfsDir.status === 'rejected' ? opfsDir.error : null
       );
       const opfsDirDecisive = opfsRejectionIsDecisive(opfsDir);
 
       const idbProbe = await probeChromiumIdbDurability();
+      evidence.idb = captureIdbEvidence(idbProbe);
       const idbRatio = idbProbe.ratio;
       const idbHighVariance = idbProbe.highVariance;
       noteDiag('idbDurabilityRatio', idbRatio);
@@ -5343,6 +5906,18 @@ export async function detectIncognitoMode(): Promise<IncognitoDetectionResult> {
       const lowVeto = finalized.confidence === 'low';
       noteDiag('lowConfidenceVeto', lowVeto);
       noteDiag('serverWouldVeto', lowVeto);
+      // RS-J: evidence is captured FIRST and frozen with the threshold config; no ground-truth
+      // label is derived from the detector's own output. Abstain reasons name the observed veto.
+      evidence.verdict = {
+        isPrivate: finalized.isPrivate,
+        confidence: finalized.confidence,
+        method: finalized.method,
+      };
+      if (finalized.confidence === 'low') evidence.abstainReason = 'low-confidence-fail-open';
+      else if (evidence.opfs?.cspBlocked === true) evidence.abstainReason = 'opfs-worker-csp-blocked';
+      evidence.thresholds = { ...INCOGNITO_THRESHOLD_CONFIG };
+      evidence.configHash = INCOGNITO_THRESHOLD_HASH;
+      noteDiag('evidence', evidence);
       return { ...finalized, diagnostics: diag };
     }
     return finalized;
@@ -5518,6 +6093,10 @@ export interface ClientProvenanceSignals extends ClientRuntimeSignals {
   /* Additive normalized truth/stability mirrors — never verdict or score inputs. */
   gpu_truth_state?: ReturnType<typeof resolveGpuTruthState>['state'];
   gpu_answer_unreliable?: boolean;
+  /** Honesty labels from the per-surface GPU audit (RS-C). Telemetry only, never scored. */
+  gpu_honesty_labels?: string[];
+  /** True when two GPU surfaces both reported a value and disagreed. Never a VM/bot verdict. */
+  gpu_surface_divergence?: boolean;
   headless_mode?: 'shell' | 'new' | null;
   audio_stability_class?: 'stable' | 'noisy' | 'unavailable' | null;
   active_cdp_inspection?: boolean;
@@ -5533,6 +6112,9 @@ type CollectedHardwareSignals = HardwareSignals & {
   gpuClass?: string;
   gpuObservation?: GpuObservation;
   gpuTruth?: ReturnType<typeof resolveGpuTruthState>;
+  shaderPrecisionProfile?: string;
+  gpuSurfaceAudit?: WebGlSurfaceAudit;
+  renderer_reported_unverified?: string | null;
   debugExtensionAvailable?: boolean;
   maskedVendor?: string;
   maskedRenderer?: string;
@@ -5878,13 +6460,36 @@ export async function evaluateSecuritySignals(
     )
   );
   const clientRuntime = detectClientRuntime(uaSnapshot);
+  // Resolve GPU truth BEFORE the observation so both fields read the same shared surfaces. The
+  // per-surface guard is applied again here for legacy callers that supply no precomputed truth.
+  const gpuTruth =
+    hardwareSignals.gpuTruth ??
+    (() => {
+      const evaluated = resolveGpuTruthState({
+        vendor: hardwareSignals.maskedVendor ?? hardwareSignals.gpuVendor,
+        renderer: hardwareSignals.maskedRenderer ?? hardwareSignals.gpuRenderer,
+        unmaskedVendor: hardwareSignals.unmaskedVendor ?? null,
+        unmaskedRenderer: hardwareSignals.unmaskedRenderer ?? null,
+        debugExtensionAvailable: hardwareSignals.debugExtensionAvailable ?? false,
+      });
+      return hardwareSignals.gpuSurfaceAudit
+        ? applyGpuSurfaceHonestyGuard(evaluated, hardwareSignals.gpuSurfaceAudit)
+        : evaluated;
+    })();
   const gpuObservation: GpuObservation =
     hardwareSignals.gpuObservation ??
-    resolveGpuObservation(
-      hardwareSignals.gpuVendor,
-      hardwareSignals.gpuRenderer,
-      hardwareSignals.gpuClass ?? ''
-    );
+    (() => {
+      const observed = resolveGpuObservation(
+        hardwareSignals.gpuVendor,
+        hardwareSignals.gpuRenderer,
+        hardwareSignals.gpuClass ?? ''
+      );
+      return observed === 'hardware_visible' && gpuTruth.answerUnreliable
+        ? hardwareSignals.gpuClass && hardwareSignals.gpuClass !== 'na'
+          ? 'masked_by_privacy'
+          : 'observation_unavailable'
+        : observed;
+    })();
 
   // 2. VPN / Proxy & Network Classification (Task 1 classifier)
   const browserTimezone = browserDevice.timezone || 'Unavailable';
@@ -5922,18 +6527,9 @@ export async function evaluateSecuritySignals(
 
   const datacenterAsn = isDatacenterOrHosting;
 
-  // GPU truth: raw getParameter strings are NEVER an unmasked physical-GPU claim. The
-  // resolver enforces a stealth-template denylist, rejects constant strings, and treats a
-  // masked WEBGL_debug_renderer_info extension as an unreliable answer.
-  const gpuTruth =
-    hardwareSignals.gpuTruth ??
-    resolveGpuTruthState({
-      vendor: hardwareSignals.maskedVendor ?? hardwareSignals.gpuVendor,
-      renderer: hardwareSignals.maskedRenderer ?? hardwareSignals.gpuRenderer,
-      unmaskedVendor: hardwareSignals.unmaskedVendor ?? null,
-      unmaskedRenderer: hardwareSignals.unmaskedRenderer ?? null,
-      debugExtensionAvailable: hardwareSignals.debugExtensionAvailable ?? false,
-    });
+  // GPU truth was resolved above from the single shared surface audit. Raw getParameter
+  // strings are NEVER an unmasked physical-GPU claim: a masked or divergent answer stays
+  // unreliable and cannot promote a SwiftShader/software renderer to VM proof.
   const debugRendererMasked =
     gpuTruth.state === 'masked' || hardwareSignals.debugExtensionAvailable === false;
   const maskedGpu =
@@ -6066,10 +6662,42 @@ export async function evaluateSecuritySignals(
     torBrowserClient.confirmed,
     browserDevice.browser
   );
+  // Forward only observations that were actually collected on this path. Worker/shared/service
+  // scopes, silent-buffer and cyclic-__proto__ traps are NOT probed here, so they stay absent
+  // rather than being fabricated as false. Every forwarded field is POINTS:0 shadow telemetry.
+  let windowLanguages: string | null = null;
+  try {
+    const langs = typeof navigator !== 'undefined' ? navigator.languages : undefined;
+    if (Array.isArray(langs) && langs.length > 0) windowLanguages = langs.join(',');
+  } catch {
+    // Omit when the scope is hostile.
+  }
   const tampering = detectBrowserTampering({
     webglVendor: hardwareSignals.gpuVendor,
     webglRenderer: hardwareSignals.gpuRenderer,
     privacyHardened,
+    entropyTelemetry: {
+      shaderPrecisionProfile: hardwareSignals.shaderPrecisionProfile ?? null,
+      audioRepeatReadDiverged: hardwareSignals.audioNoise ?? null,
+    },
+    tamperingLies: {
+      window: {
+        ua: typeof navigator !== 'undefined' ? navigator.userAgent || '' : null,
+        platform: browserDevice.platform || null,
+        cores: hardwareSignals.cpuCores ?? null,
+        memory: hardwareSignals.deviceMemoryGb ?? null,
+        languages: windowLanguages,
+      },
+      shaderPrecisionProfile: hardwareSignals.shaderPrecisionProfile ?? null,
+      audioRepeatReadDiverged: hardwareSignals.audioNoise ?? null,
+      audioPrivacyNoise: privacyHardened && Boolean(hardwareSignals.audioNoise),
+      iframeContentWindowEqualsWindow: inspectorProbes.iframeContentWindowEqualsWindow,
+    },
+    canvasNoiseDetected,
+    gpuAnswerUnreliable: gpuTruth.answerUnreliable,
+    debugExtensionAvailable: hardwareSignals.debugExtensionAvailable ?? false,
+    gpuTruthState: gpuTruth.state,
+    gpuCapabilityClass: hardwareSignals.gpuClass ?? null,
   });
 
   // Forged UA-CH majors are stripped from every published version field. Route the claim
@@ -6420,6 +7048,10 @@ export async function evaluateSecuritySignals(
     /* Additive normalized truth mirrors — copied verbatim, never re-derived into a verdict. */
     gpu_truth_state: gpuTruth.state,
     gpu_answer_unreliable: gpuTruth.answerUnreliable,
+    // Per-surface honesty labels (RS-C). A hardware-claiming or generic string stays labelled
+    // unverified; a disagreement is reported rather than resolved by picking one string.
+    gpu_honesty_labels: hardwareSignals.gpuSurfaceAudit?.honestyLabels ?? [],
+    gpu_surface_divergence: hardwareSignals.gpuSurfaceAudit?.divergence ?? false,
     headless_mode: /headless[_-]?shell|chrome[_-]?headless[_-]?shell/i.test(uaSnapshot)
       ? 'shell'
       : /HeadlessChrome/i.test(uaSnapshot)
@@ -6471,7 +7103,13 @@ export async function evaluateSecuritySignals(
     /* VM / OS integrity verdict */
     isVirtualMachine: vmStatus.isVirtualMachine,
     isOsTampered: vmStatus.isOsTampered,
-    vmReason: vmStatus.vmReason,
+    // Never publish "Physical GPU & Consistent OS Identity" when the GPU answer was masked,
+    // spoofed or noisy — a hardware claim needs a verified unmasked identity, not an absence
+    // of VM strings. SwiftShader/software renderers are unaffected (never VM proof).
+    vmReason:
+      gpuAnswerInvalid && !vmStatus.isVirtualMachine && !vmStatus.isOsTampered
+        ? 'GPU identity unavailable or masked; VM verdict rests on OS/UA evidence only'
+        : vmStatus.vmReason,
     /* Phase 3 — mobile emulator / cloud container verdict */
     emulatorDetected,
     emulatorReason,
@@ -8081,6 +8719,8 @@ export async function identifyCurrentVisitor(options?: {
         gpuObservation: securitySignals.gpuObservation,
         gpu_truth_state: securitySignals.gpu_truth_state,
         gpu_answer_unreliable: securitySignals.gpu_answer_unreliable,
+        gpu_honesty_labels: securitySignals.gpu_honesty_labels,
+        gpu_surface_divergence: securitySignals.gpu_surface_divergence,
         audio_stability_class: securitySignals.audio_stability_class,
         media_preferences: securitySignals.media_preferences,
         active_cdp_inspection: securitySignals.active_cdp_inspection,

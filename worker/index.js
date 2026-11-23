@@ -138,6 +138,9 @@ function versionInfo(env) {
       cfString(bag.BUILD_SHA) ||
       cfString(bag.GIT_COMMIT_SHA) ||
       cfString(bag.CF_BUILD_SHA) ||
+      // WORKERS_CI_COMMIT_SHA is Cloudflare Workers CI's own default var. It is only read when
+      // actually bound; an absent/empty value falls through to the honest 'unknown' default.
+      cfString(bag.WORKERS_CI_COMMIT_SHA) ||
       DEFAULT_BUILD_SHA,
     workerVersion: cfString(bag.INTEL_WORKER_VERSION) || DEFAULT_WORKER_VERSION,
   };
@@ -168,6 +171,23 @@ function lightDistanceKm(rttMs) {
 function buildEdgeGeoHeader(request) {
   const cf = request.cf || {};
   const botManagement = cf.botManagement;
+  const httpProtocol = cfString(cf.httpProtocol);
+  // HTTP/3 is QUIC — there is no TCP round trip on that path. `edgeL4` is a secondary QUIC
+  // signal for deployments where `httpProtocol` is not populated on request.cf.
+  const isQuic = /HTTP\/3|QUIC/i.test(httpProtocol) || /^quic$/i.test(cfString(cf.edgeL4));
+  const observedTcpRtt =
+    typeof cf.clientTcpRtt === 'number' && Number.isFinite(cf.clientTcpRtt) ? cf.clientTcpRtt : null;
+  const observedQuicRtt =
+    typeof cf.clientQuicRtt === 'number' && Number.isFinite(cf.clientQuicRtt) ? cf.clientQuicRtt : null;
+  // Truth rule: a 0 ms TCP RTT on QUIC is "not measured", not a measurement. Null it before
+  // anything downstream can turn it into a fabricated 0 km light-distance estimate.
+  const tcpRttUnavailableOnQuic = isQuic && observedTcpRtt === 0;
+  const clientTcpRtt = tcpRttUnavailableOnQuic ? null : observedTcpRtt;
+  // Prefer the real QUIC RTT when present and positive; it is the only meaningful client RTT
+  // on HTTP/3. Absent or 0 stays unavailable — no invented number, never a JA3/JA4 claim.
+  const quicRttAvailable = observedQuicRtt !== null && observedQuicRtt > 0;
+  const effectiveRtt = quicRttAvailable ? observedQuicRtt : clientTcpRtt;
+  const effectiveRttSource = quicRttAvailable ? 'clientQuicRtt' : 'clientTcpRtt';
   const payload = {
     v: 1,
     country: cfString(cf.country),
@@ -186,11 +206,11 @@ function buildEdgeGeoHeader(request) {
     // Bot-Management-only and deliberately omitted — the server reports them as "Unavailable".
     tlsVersion: cfString(cf.tlsVersion),
     tlsCipher: cfString(cf.tlsCipher),
-    clientTcpRtt:
-      typeof cf.clientTcpRtt === 'number' && Number.isFinite(cf.clientTcpRtt)
-        ? cf.clientTcpRtt
-        : null,
-    httpProtocol: cfString(cf.httpProtocol),
+    clientTcpRtt,
+    clientTcpRttLabel: tcpRttUnavailableOnQuic
+      ? 'not applicable on QUIC/HTTP/3 (0 is a placeholder, not a measurement)'
+      : 'edge-observed TCP round-trip time',
+    httpProtocol,
     // Bot-Management-only hash fields (Enterprise plans). Null-guarded and isolated in a
     // distinctly named field so the free-plan TLS-lite components below are NEVER reported
     // as JA3 / JA4. Absent on free plans: "out of list" means unavailable, not malicious.
@@ -199,12 +219,18 @@ function buildEdgeGeoHeader(request) {
       ja3Hash: typeof botManagement?.ja3Hash === 'string' ? botManagement.ja3Hash : null,
       ja4: typeof botManagement?.ja4 === 'string' ? botManagement.ja4 : null,
     },
-    // RTT-derived distance estimate, explicitly NOT JA4L.
+    // RTT-derived distance estimate, explicitly NOT JA4L. The JA4H-style header stays
+    // independent and truthful: httpVersionCode() still reads the real HTTP/3 protocol code.
     rttLightDistance: {
       label: 'RTT-based light-distance estimate (approximation)',
       propagationFactor: LIGHT_DISTANCE_PROPAGATION_FACTOR,
-      tcp: lightDistanceKm(cf.clientTcpRtt),
-      quic: lightDistanceKm(cf.clientQuicRtt),
+      // Per-transport fields kept for compatibility. Both use normalized RTTs, so a QUIC 0
+      // placeholder can never become a fabricated 0 km "measurement".
+      tcp: lightDistanceKm(clientTcpRtt),
+      quic: lightDistanceKm(quicRttAvailable ? observedQuicRtt : null),
+      // Selected estimate: clientQuicRtt when present, otherwise clientTcpRtt.
+      selected: lightDistanceKm(effectiveRtt),
+      selectedSource: effectiveRttSource,
     },
     // Eight FREE request.cf TLS/network fields available on every plan. These are raw
     // edge-derived TLS components — NOT JA3/JA4 or any Bot-Management-only fingerprint — and

@@ -28,6 +28,8 @@ export interface SmartSignalRowData {
   /** Muted/amber state for informational verdicts that are not threats of their own. */
   tone?: 'clean' | 'trigger' | 'neutral';
   detail?: string;
+  /** Neutral informational badge (e.g. a signed/verified good-bot identity). Never a verdict. */
+  badge?: string;
   /** Row links to the raw event JSON inspector. */
   jsonAnchor?: boolean;
 }
@@ -306,7 +308,7 @@ export function resolveVmVerdict(
     (gpuTruth.length > 0 && !truthSaysPhysical) || observationRestricted || gpuUnreliable || unavailable;
 
   const gpuVendor = data.hardwareSignals?.gpuVendor ?? '';
-  const gpuRenderer = data.hardwareSignals?.gpuRenderer ?? '';
+  const gpuRenderer = (data.hardwareSignals?.gpuRenderer ?? '').trim();
   const realUnmaskedGpu =
     !webglSoftware &&
     !softwareRenderer &&
@@ -315,6 +317,15 @@ export function resolveVmVerdict(
     gpuVendor !== 'Unavailable' &&
     Boolean(gpuRenderer) &&
     gpuRenderer !== 'Unavailable';
+
+  // A raw WebGL renderer string is spoofable JS output, never hardware proof. It is trusted as
+  // a hardware anchor ONLY when the server's own GPU truth / observation independently says so.
+  // The new `renderer_reported_unverified` server flag is authoritative when present.
+  const serverVerifiedHardware =
+    truthSaysPhysical || observation === 'hardware_visible';
+  const rendererOnlyWebgl =
+    gpuRenderer.length > 0 &&
+    (canonicalView.renderer_reported_unverified === true || !serverVerifiedHardware);
 
   let state: VmVerdictState;
   if (isVmFlag === true || signalState === 'vm' || labelState === 'vm') {
@@ -339,6 +350,9 @@ export function resolveVmVerdict(
   if (isVmFlag === false && (state === 'vm' || state === 'physical')) state = 'unknown';
   if (unavailable && (state === 'vm' || state === 'physical')) state = 'unknown';
   if (state === 'physical' && truthBlocksPhysical) state = 'unknown';
+  // "Physical Hardware" requires the server's own hardware anchor. A WebGL-reported renderer
+  // string alone is spoofable output and can never promote the tile to a physical claim.
+  if (state === 'physical' && (!serverVerifiedHardware || rendererOnlyWebgl)) state = 'unknown';
 
   // The restricted-GPU label replaces "Not determinable" only when a physical claim was
   // actually blocked: explicitly masked / spoofed answers read "Masked / Unverified", while an
@@ -348,8 +362,19 @@ export function resolveVmVerdict(
     : truthBlocksPhysical
     ? 'Unavailable / Browser-Restricted'
     : null;
+  const hardwareUnverifiable =
+    state === 'unknown' &&
+    (restrictedGpuStatus !== null ||
+      unavailable ||
+      observationRestricted ||
+      gpuUnreliable ||
+      rendererOnlyWebgl);
+  const reportedRendererStatus =
+    gpuRenderer.length > 0 ? `Reported renderer (unverified): ${gpuRenderer}` : null;
   const status =
-    state === 'unknown' && restrictedGpuStatus
+    state === 'unknown' && hardwareUnverifiable && reportedRendererStatus
+      ? reportedRendererStatus
+      : state === 'unknown' && restrictedGpuStatus
       ? restrictedGpuStatus
       : state === 'vm'
       ? signalState === 'vm'
@@ -369,7 +394,12 @@ export function resolveVmVerdict(
     // An unavailable environment has no positive detail to print: the server's raw VM
     // detail can still claim an unmasked physical GPU after its own consistency pass
     // rewrote the status to "GPU Masked / Unavailable", which would contradict the JSON.
-    detail: state === 'vm' || state === 'software' ? signalDetail || undefined : undefined,
+    detail:
+      state === 'vm' || state === 'software'
+        ? signalDetail || undefined
+        : hardwareUnverifiable && rendererOnlyWebgl
+        ? 'Hardware verification unavailable (renderer reported by WebGL)'
+        : undefined,
     score: state === 'vm' ? 6 : state === 'software' ? 3 : 0,
   };
 }
@@ -547,6 +577,13 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   ]
     .filter((part): part is string => part != null)
     .join(' · ');
+  // A signed / verified good-bot identity is INFORMATIONAL: it never changes the server's
+  // bot status, trigger or score. Read the identity verbatim from the canonical bot_info mirror
+  // (or its response fallback) and surface it as a neutral badge only when the server said so.
+  const botInfoMirror = asRecord(canonicalView.bot_info) ?? asRecord(data.bot_info);
+  const botIdentity =
+    typeof botInfoMirror?.identity === 'string' ? botInfoMirror.identity.trim().toLowerCase() : '';
+  const signedGoodBot = botIdentity === 'signed' || botIdentity === 'verified';
   rows.push({
     key: 'bot',
     label: 'Bot',
@@ -554,6 +591,7 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     status: bot.status,
     triggered: bot.triggered,
     detail: [bot.detail, botEvidenceDetail].filter(Boolean).join(' · ') || undefined,
+    badge: signedGoodBot ? 'Signed good bot' : undefined,
   });
 
   // The server's structured `vpn_methods` mirror is the single source of truth. Timezone
@@ -819,8 +857,15 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     canonicalTier === 'Critical'
       ? canonicalTier
       : resolveRiskTier(suspectScore);
-  // Calibration evidence is displayed verbatim as detail only. The 0-10 headline and the
-  // "uncalibrated" honesty posture are untouched — this record never promotes a score.
+  // Confidence copy is bound to the server's own `confidence_label`, never recomputed from a
+  // score. A null / absent label means the evidence is unavailable — it is NOT rendered as 0%
+  // (a fabricated zero would imply a measured but empty match). Calibration evidence stays an
+  // appended detail only; the 0-10 headline and "uncalibrated" posture are untouched.
+  const serverConfidenceLabel =
+    typeof canonicalView.confidenceLabel === 'string' && canonicalView.confidenceLabel.trim()
+      ? canonicalView.confidenceLabel.trim()
+      : null;
+  const confidenceCopy = serverConfidenceLabel ?? 'Match evidence unavailable';
   const calibrationMirror = canonicalView.calibration_evidence;
   const calibrationDetail =
     calibrationMirror != null
@@ -846,7 +891,7 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
       : riskTier === 'Elevated'
       ? 'neutral'
       : 'clean',
-    detail: calibrationDetail || undefined,
+    detail: [confidenceCopy, calibrationDetail].filter(Boolean).join(' · '),
   });
   rows.push({
     key: 'riskTier',
@@ -948,7 +993,17 @@ export function SmartSignalsGrid({ data }: { data: IntelVisitorResponse }) {
         const content = (
           <>
             <div className="min-w-0">
-              <span className="block text-[11px] font-medium text-slate-500">{row.label}</span>
+              <span className="block text-[11px] font-medium text-slate-500">
+                {row.label}
+                {row.badge && (
+                  <span
+                    className="ml-1.5 inline-flex items-center rounded-full border border-slate-200 bg-slate-50 px-1.5 py-0.5 align-middle text-[9px] font-medium text-slate-600"
+                    title="Informational only — signed / verified identity from bot_info"
+                  >
+                    {row.badge}
+                  </span>
+                )}
+              </span>
               {row.detail && (
                 <span className="block text-[10px] text-slate-400 truncate" title={row.detail}>
                   {row.detail}

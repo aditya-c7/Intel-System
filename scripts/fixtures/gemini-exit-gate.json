@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "frozen": true,
+  "description": "Frozen exit gate for the Gemini integration wave. These seven constraints are the locked product contract verified by scripts/test-benchmark15.ts; they may change only through an explicit, reviewed amendment to this fixture, never as a side effect of implementation work.",
+  "gate": {
+    "score": 0,
+    "calibration_status": "uncalibrated",
+    "confidence_label_prefix": "Match evidence",
+    "new_panel_count": 0,
+    "third_party_sdk_count": 0,
+    "do_alarm_count": 0,
+    "auto_deploy": false
+  }
+}
