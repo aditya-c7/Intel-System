@@ -1805,6 +1805,28 @@ export default function App() {
       // whenever it is present. Deliberately NOT gated on `intel_diag` / sessionStorage and not
       // a client-side session flag — nothing here is fabricated from the flag-gated hook.
       ...(canonical.diagnostics != null ? { diagnostics: canonical.diagnostics } : {}),
+      // Additive research / calibration / verification mirrors — published verbatim and
+      // only when the canonical envelope actually supplied them. No coercion, no default
+      // and no client-side re-derivation; a WBA 'valid' is never inferred from presence.
+      ...(canonical.calibration_evidence != null
+        ? { calibration_evidence: canonical.calibration_evidence }
+        : {}),
+      ...(canonical.high_activity_threshold_mode != null
+        ? { high_activity_threshold_mode: canonical.high_activity_threshold_mode }
+        : {}),
+      ...(canonical.high_activity_threshold != null
+        ? { high_activity_threshold: canonical.high_activity_threshold }
+        : {}),
+      ...(canonical.wba_status != null ? { wba_status: canonical.wba_status } : {}),
+      ...(canonical.official_bot_feed_match != null
+        ? { official_bot_feed_match: canonical.official_bot_feed_match }
+        : {}),
+      ...(canonical.webgpu_research_disclosure != null
+        ? { webgpu_research_disclosure: canonical.webgpu_research_disclosure }
+        : {}),
+      ...(canonical.benchmark_policy != null
+        ? { benchmark_policy: canonical.benchmark_policy }
+        : {}),
     };
   }, [
     data,

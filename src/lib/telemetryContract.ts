@@ -373,6 +373,37 @@ export interface TamperingDetailsMirror {
   hardAutomationEvidence?: string[];
 }
 
+/* -------------------------------------------------------------------------- */
+/* Additive research / calibration / verification mirrors (all OPTIONAL)       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Verbatim calibration-evidence mirror. Every member is transport-only and may be absent;
+ * no consumer may turn it into a gate, score or verdict.
+ */
+export interface CalibrationEvidenceMirror {
+  eligible?: boolean | null;
+  labeledPairs?: number | null;
+  ece?: number | null;
+  brier?: number | null;
+  reason?: string | null;
+}
+
+/** High-activity regime vocabulary shared by the threshold helpers. */
+export type HighActivityThresholdMode = 'fixed_small_corpus' | 'adaptive_p98';
+
+/**
+ * Web Bot Auth status mirror. Only a server-side verified signature may emit `valid`; a
+ * presence / neutral signal is never upgraded to it on the client.
+ */
+export type WbaStatusMirror = 'absent' | 'present' | 'neutral' | 'valid' | 'invalid' | null;
+
+/** Benchmark evidence policy mirror: matched-coverage guard plus the resulting claim. */
+export interface BenchmarkPolicyMirror {
+  notEvaluableRate?: number | null;
+  claim?: string | null;
+}
+
 /** The single response envelope consumed by the dashboard and the Event JSON. */
 export interface CanonicalTelemetryEnvelope {
   event_id: string;
@@ -484,6 +515,26 @@ export interface CanonicalTelemetryEnvelope {
   audio_stability_class?: AudioStabilityClass;
   /** Domain-separated stability key used by confidence matching; null when unavailable. */
   confidence_stability_key?: string | null;
+
+  /* ------------------------------------------------------------------------ */
+  /* Additive research / calibration / verification mirrors (ALL OPTIONAL).     */
+  /* Every value is copied verbatim from the producer; the envelope never        */
+  /* derives, coerces or fabricates any of them, and an absent value stays absent. */
+  /* ------------------------------------------------------------------------ */
+  /** Calibration-evidence record from the calibration / benchmark helpers. */
+  calibration_evidence?: CalibrationEvidenceMirror | null;
+  /** High-activity threshold regime selected by the threshold helper. */
+  high_activity_threshold_mode?: HighActivityThresholdMode | null;
+  /** Numeric high-activity threshold selected by the helper, null when unavailable. */
+  high_activity_threshold?: number | null;
+  /** Web Bot Auth verification status; never upgraded on the client. */
+  wba_status?: WbaStatusMirror;
+  /** Operators whose official IP feed matched this request, verbatim. */
+  official_bot_feed_match?: string[] | null;
+  /** WebGPU research-only disclosure text; no probe is run by this envelope. */
+  webgpu_research_disclosure?: string | null;
+  /** Benchmark evidence policy (not-evaluable rate + claim), verbatim. */
+  benchmark_policy?: BenchmarkPolicyMirror | null;
 }
 
 /* -------------------------------------------------------------------------- */

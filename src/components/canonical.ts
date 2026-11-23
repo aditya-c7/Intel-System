@@ -12,9 +12,11 @@
 
 import type {
   AutomationAxes,
-  CanonicalTelemetryEnvelope,
+  BenchmarkPolicyMirror,
+  CalibrationEvidenceMirror,
   EnvironmentAxes,
   GpuObservation,
+  HighActivityThresholdMode,
   IdentityAxes,
   IncognitoDiagnostics,
   InspectorState,
@@ -29,6 +31,7 @@ import type {
   TamperingDetailsMirror,
   VerdictTier,
   VpnMethodsMirror,
+  WbaStatusMirror,
 } from '../lib/telemetryContract';
 import type { IntelVisitorResponse } from '../types/visitor';
 
@@ -159,6 +162,16 @@ export interface CanonicalView {
   networkLayerHash?: string | null;
   /** Shadow-only IDB resolver rule id, mirrored verbatim — never a verdict input. */
   idbTruthRule?: string | null;
+
+  /* Additive research / calibration / verification mirrors — verbatim pass-through only.
+     The client never derives, coerces or fabricates any of them; absent stays undefined. */
+  calibration_evidence?: CalibrationEvidenceMirror | null;
+  high_activity_threshold_mode?: HighActivityThresholdMode | null;
+  high_activity_threshold?: number | null;
+  wba_status?: WbaStatusMirror;
+  official_bot_feed_match?: string[] | null;
+  webgpu_research_disclosure?: string | null;
+  benchmark_policy?: BenchmarkPolicyMirror | null;
 }
 
 /** Resolve the one canonical envelope from every supported response shape. */
@@ -274,6 +287,34 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     diagnostics?.idbTruthRule ??
     data?.diagnostics?.idbTruthRule ??
     data?.securitySignals?.diagnostics?.idbTruthRule) as unknown as string | null | undefined;
+
+  // Additive research / calibration / verification mirrors — verbatim `as unknown as`
+  // pass-through from the one canonical envelope (response transports are fallbacks only).
+  // No Boolean()/Number() coercion, no re-derivation and no fabricated default: a field the
+  // server did not supply stays undefined, and a `wba_status` of 'valid' is never inferred.
+  const calibration_evidence = (env?.calibration_evidence ??
+    base?.calibration_evidence ??
+    signalExtras.calibration_evidence) as unknown as CalibrationEvidenceMirror | null | undefined;
+  const high_activity_threshold_mode = (env?.high_activity_threshold_mode ??
+    env?.highActivityThresholdMode ??
+    base?.high_activity_threshold_mode ??
+    base?.highActivityThresholdMode ??
+    signalExtras.high_activity_threshold_mode) as unknown as HighActivityThresholdMode | null | undefined;
+  const high_activity_threshold = (env?.high_activity_threshold ??
+    base?.high_activity_threshold ??
+    signalExtras.high_activity_threshold) as unknown as number | null | undefined;
+  const wba_status = (env?.wba_status ??
+    base?.wba_status ??
+    signalExtras.wba_status) as unknown as WbaStatusMirror | undefined;
+  const official_bot_feed_match = (env?.official_bot_feed_match ??
+    base?.official_bot_feed_match ??
+    signalExtras.official_bot_feed_match) as unknown as string[] | null | undefined;
+  const webgpu_research_disclosure = (env?.webgpu_research_disclosure ??
+    base?.webgpu_research_disclosure ??
+    signalExtras.webgpu_research_disclosure) as unknown as string | null | undefined;
+  const benchmark_policy = (env?.benchmark_policy ??
+    base?.benchmark_policy ??
+    signalExtras.benchmark_policy) as unknown as BenchmarkPolicyMirror | null | undefined;
 
   // Remaining additive truth / observation mirrors — every value below is a verbatim
   // `as unknown as` pass-through from the one canonical envelope or its response transports.
@@ -535,6 +576,14 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     context_isolated,
     audio_stability_class,
     confidence_stability_key,
+    // Additive research / calibration / verification mirrors — verbatim, no recomputation.
+    calibration_evidence,
+    high_activity_threshold_mode,
+    high_activity_threshold,
+    wba_status,
+    official_bot_feed_match,
+    webgpu_research_disclosure,
+    benchmark_policy,
   };
 }
 

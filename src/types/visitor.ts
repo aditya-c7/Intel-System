@@ -1,6 +1,9 @@
 import type {
   AudioStabilityClass,
+  BenchmarkPolicyMirror,
+  CalibrationEvidenceMirror,
   GpuObservation,
+  HighActivityThresholdMode,
   GpuTruthState,
   GrantedGeolocation,
   HeadlessMode,
@@ -13,6 +16,7 @@ import type {
   StealthSignalsMirror,
   TamperingDetailsMirror,
   VpnMethodsMirror,
+  WbaStatusMirror,
 } from '../lib/telemetryContract';
 import type { ClientType, RuntimeKind } from '../shared/normalization/uaNormalizer';
 
@@ -914,4 +918,24 @@ export interface IntelVisitorResponse {
   audio_stability_class?: AudioStabilityClass;
   /** Domain-separated stability key used by confidence matching; null when unavailable. */
   confidence_stability_key?: string | null;
+
+  /* ------------------------------------------------------------------------ */
+  /* Additive research / calibration / verification mirrors — ALL OPTIONAL.     */
+  /* Verbatim transports from the canonical envelope; nothing here is re-derived */
+  /* or fed back into a verdict, and an absent value stays absent.              */
+  /* ------------------------------------------------------------------------ */
+  /** Calibration-evidence record from the calibration / benchmark helpers. */
+  calibration_evidence?: CalibrationEvidenceMirror | null;
+  /** High-activity threshold regime selected by the threshold helper. */
+  high_activity_threshold_mode?: HighActivityThresholdMode | null;
+  /** Numeric high-activity threshold selected by the helper, null when unavailable. */
+  high_activity_threshold?: number | null;
+  /** Web Bot Auth verification status; only the server may emit `valid`. */
+  wba_status?: WbaStatusMirror;
+  /** Operators whose official IP feed matched this request, verbatim. */
+  official_bot_feed_match?: string[] | null;
+  /** WebGPU research-only disclosure text (research gate, no probe). */
+  webgpu_research_disclosure?: string | null;
+  /** Benchmark evidence policy (not-evaluable rate + claim), verbatim. */
+  benchmark_policy?: BenchmarkPolicyMirror | null;
 }

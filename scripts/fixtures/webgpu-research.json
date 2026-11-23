@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "frozen": true,
+  "offline": true,
+  "generated_on": "2026-11-23",
+  "note": "SHADOW research fixture for src/lib/webgpuResearchGate.ts. These cases pin a gate contract only: they are NOT a fingerprint probe, NOT a production identity source and NOT a decision input. The single passing case is an explicitly hypothetical evidence bundle; the three failing cases mirror published real-world measurements.",
+  "description": "RS3 WebGPU research gate: GO requires per-device >=95% exact stability over >=30 days and >=2 browser updates, an open-world pool >=10000 devices, capture <=200ms, timer-free capture and documented consent. None of the published real-world studies meet all criteria.",
+  "researchFindings": [
+    {
+      "source": "LockedApart poster",
+      "observed": "6 PCs + 4 phones; no time-lapse test; ~52ms/trace",
+      "gateImpact": "small pool, no >=30d observation, no >=2-update coverage"
+    },
+    {
+      "source": "AtomicIncrement",
+      "observed": "7 devices / 21 days; per-device exact-stability means 0.63-1.00 with minima 0.00; ~1.2s capture",
+      "gateImpact": "stability, window, pool and capture budget all fail"
+    },
+    {
+      "source": "WGPULens",
+      "observed": "1095/1095 unique but repeat stability 57/80 active and 45/80 combined; timer/clamp sensitive; high-res AUROC 0.718 -> 0.512 coarse and 32ms clamp 0.637 -> 0.500",
+      "gateImpact": "repeat stability, open-world pool and timer-free criteria fail"
+    },
+    {
+      "source": "Tranco top-10k",
+      "observed": "zero observed page-load GPU activity",
+      "gateImpact": "no open-world coverage evidence"
+    }
+  ],
+  "cases": [
+    {
+      "id": "hypothetical-pass",
+      "name": "Hypothetical full-GO evidence bundle (NOT observed in any cited study)",
+      "input": {
+        "exactStability30d": 0.98,
+        "minPerDeviceStabilityMs": 2678400000,
+        "candidatePool": 12000,
+        "captureMs": 52,
+        "timerFree": true,
+        "consentDocumented": true,
+        "browserUpdatesCovered": 3
+      },
+      "expected": {
+        "deployable": true,
+        "researchOnly": false,
+        "failingCriteria": []
+      }
+    },
+    {
+      "id": "lockedapart-no-timelapse",
+      "name": "LockedApart poster: 6 PCs + 4 phones, no time-lapse test, ~52ms/trace",
+      "input": {
+        "exactStability30d": null,
+        "minPerDeviceStabilityMs": 0,
+        "candidatePool": 10,
+        "captureMs": 52,
+        "timerFree": false,
+        "consentDocumented": false,
+        "browserUpdatesCovered": 1
+      },
+      "expected": {
+        "deployable": false,
+        "researchOnly": true,
+        "failingCriteria": [
+          "per-device-exact-stability-below-95-percent",
+          "per-device-observation-window-below-30-days",
+          "fewer-than-2-browser-updates-covered",
+          "open-world-candidate-pool-below-10000",
+          "timer-based-capture-is-not-timer-free",
+          "consent-not-documented"
+        ]
+      }
+    },
+    {
+      "id": "atomic-increment-realworld",
+      "name": "AtomicIncrement: 7 devices / 21 days, means 0.63-1.00, minima 0.00, ~1.2s capture",
+      "input": {
+        "exactStability30d": 0.63,
+        "minPerDeviceStabilityMs": 1814400000,
+        "candidatePool": 7,
+        "captureMs": 1200,
+        "timerFree": false,
+        "consentDocumented": false,
+        "browserUpdatesCovered": 1
+      },
+      "expected": {
+        "deployable": false,
+        "researchOnly": true,
+        "failingCriteria": [
+          "per-device-exact-stability-below-95-percent",
+          "per-device-observation-window-below-30-days",
+          "fewer-than-2-browser-updates-covered",
+          "open-world-candidate-pool-below-10000",
+          "capture-exceeds-200ms-budget",
+          "timer-based-capture-is-not-timer-free",
+          "consent-not-documented"
+        ]
+      }
+    },
+    {
+      "id": "wgpulens-realworld",
+      "name": "WGPULens: 1095/1095 unique but 57/80 active and 45/80 combined repeat stability; clamp-sensitive",
+      "input": {
+        "exactStability30d": 0.5625,
+        "minPerDeviceStabilityMs": 1209600000,
+        "candidatePool": 1095,
+        "captureMs": 32,
+        "timerFree": false,
+        "consentDocumented": false,
+        "browserUpdatesCovered": 1
+      },
+      "expected": {
+        "deployable": false,
+        "researchOnly": true,
+        "failingCriteria": [
+          "per-device-exact-stability-below-95-percent",
+          "per-device-observation-window-below-30-days",
+          "fewer-than-2-browser-updates-covered",
+          "open-world-candidate-pool-below-10000",
+          "timer-based-capture-is-not-timer-free",
+          "consent-not-documented"
+        ]
+      }
+    }
+  ]
+}

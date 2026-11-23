@@ -154,6 +154,11 @@ import { resolveGpuTruthState, type GpuTruthState as SharedGpuTruthState } from 
 import { resolveActiveCdp } from './src/lib/activeCdp';
 import { resolveIdentityScope } from './src/lib/identityScope';
 import { buildExtraEvidenceLines } from './src/lib/riskEvidenceExtra';
+// Additive, pure/SDK-free diagnostic helpers. Their outputs are published ONLY as mirrors;
+// none is read into the 0-10 headline, 0-100 ledger, verdict tier, isBot, auth or cal status.
+import { resolveHighActivityThreshold, DEFAULT_FLOOR } from './src/lib/rollingPercentile';
+import { rarityDecision as computeRarityDecision } from './src/lib/rarityColdStart';
+import { buildCalibrationCorpus } from './src/lib/calibrationCorpus';
 
 /* -------------------------------------------------------------------------- */
 /* Shared agent registry adapter                                                */
@@ -4732,6 +4737,8 @@ interface VelocityReport {
   distinctDailyHardware: number;
   /** 98th percentile of per-visitor daily event counts (large-corpus threshold). */
   p98Events24h: number;
+  /** Real rolling per-visitor daily event observations (additive mirror input only). */
+  eventObservations: readonly number[];
 }
 
 const EMPTY_WINDOW: VelocityWindowCounts = { '5_minutes': 0, '1_hour': 0, '24_hours': 0 };
@@ -4926,6 +4933,7 @@ function computeVelocitySignals(
       distinctSubnets24h,
       distinctDailyHardware,
       p98Events24h,
+      eventObservations: eventValues,
     };
   } catch {
     return {
@@ -4936,6 +4944,7 @@ function computeVelocitySignals(
       distinctSubnets24h: 0,
       distinctDailyHardware: 0,
       p98Events24h: 0,
+      eventObservations: [],
     };
   }
 }
@@ -9710,6 +9719,32 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
           velocityReport.distinctSubnets24h >= FIXED_HIGH_ACTIVITY_DISTINCT_SUBNETS
         : velocityReport.events24h >= highActivityThreshold;
 
+    /* ---- Additive pure-helper diagnostic mirrors (RS6 / RS7 / RS1) --------------------
+     * READ-ONLY: these call already-verified pure functions with the real rolling
+     * observations gathered above. No result below is read into the score, tier, verdict,
+     * bot/isBot gate, calibration_status, auth, alarms, timers or history writes.
+     */
+    const highActivityMirror = resolveHighActivityThreshold({
+      observations: velocityReport.eventObservations,
+      floor: DEFAULT_FLOOR,
+    });
+    const rarityColdStartDecision = computeRarityDecision({
+      hits: rarityReport.matching,
+      total: rarityReport.sampleSize,
+    });
+    // No independently-labeled calibration corpus is collected in this request path. The
+    // builder is still invoked so the published evidence is its honest, fail-closed result;
+    // with zero labeled pairs the reason is the explicit 'no_labeled_corpus' token.
+    const calibrationCorpusResult = buildCalibrationCorpus([]);
+    const calibrationEvidence = {
+      labeledPairs: calibrationCorpusResult.labeledPairs,
+      eligible: calibrationCorpusResult.eligible,
+      reason:
+        calibrationCorpusResult.labeledPairs === 0
+          ? 'no_labeled_corpus'
+          : calibrationCorpusResult.reason,
+    };
+
     // A timezone mismatch is a network axis, never tampering evidence. If the client filed its
     // timezone note under tamperingDetails.reasons, strip those reason strings and do not let a
     // timezone-only tampering boolean reach the tampering / spoofing verdicts.
@@ -11178,6 +11213,17 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         percentile: rarityDecision.percentile,
         status: rarityDecision.status,
       },
+      /* Additive diagnostic mirrors — pure-helper outputs, never scored or enforced. */
+      high_activity_threshold_mode: highActivityMirror.mode,
+      high_activity_threshold: highActivityMirror.threshold,
+      rarity_cold_start: {
+        bucket: rarityColdStartDecision.bucket,
+        rare: rarityColdStartDecision.rare,
+        p_upper: rarityColdStartDecision.p_upper,
+        adjusted_alpha: rarityColdStartDecision.adjustedAlpha,
+        reasons: rarityColdStartDecision.reasons,
+      },
+      calibration_evidence: calibrationEvidence,
       velocity: velocityReport.velocity,
       risk: riskLedger,
       verdict_tier: effectiveVerdictTier,
@@ -11275,6 +11321,20 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       highActivityDevice,
       highActivityThresholdMode,
       highActivityThreshold,
+      // Additive diagnostic mirrors (RS6/RS7/RS1) — same keys as the envelope fields.
+      // Cast rather than editing types owned by other modules; no scoring/enforcement reads these.
+      ...({
+        high_activity_threshold_mode: highActivityMirror.mode,
+        high_activity_threshold: highActivityMirror.threshold,
+        rarity_cold_start: {
+          bucket: rarityColdStartDecision.bucket,
+          rare: rarityColdStartDecision.rare,
+          p_upper: rarityColdStartDecision.p_upper,
+          adjusted_alpha: rarityColdStartDecision.adjustedAlpha,
+          reasons: rarityColdStartDecision.reasons,
+        },
+        calibration_evidence: calibrationEvidence,
+      } as unknown as Record<string, unknown>),
       // Single-source-of-truth bot flag + inspector axes mirrored from the canonical envelope.
       isBot: canonicalIsBot,
       cdp_attached: inspectorFlags.cdp_attached,

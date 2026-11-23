@@ -4,6 +4,10 @@ import { DurableObject } from 'cloudflare:workers';
 import app, { initializeDatabaseSchema, withDatabase } from '../server.ts';
 import { findAgentByUa, displayFor, PILLS, AGENT_BY_ID } from '../src/lib/agentRegistry.ts';
 import { verifyWebBotAuth, WBA_TRUSTED_SIGNERS } from '../src/lib/wbaVerifier.ts';
+// Additive, flag-gated diagnostics ONLY. These two imports are pure helpers: the signature
+// parser never fetches a key and the feed helper is a UA prefilter, never a verdict.
+import { parseSignatureHeaders } from '../src/lib/webBotAuth.ts';
+import { uaPrefilter } from '../src/lib/officialBotFeeds.ts';
 
 // Workers' node:http adapter uses this as a routing key, not a public TCP port.
 const API_PORT = 3000;
@@ -247,6 +251,160 @@ function applyDiagHeader(headers, request) {
   else headers.delete(DIAG_HEADER);
 }
 
+/* -------------------------------------------------------------------------- */
+/* OPTIONAL, flag-gated Web Bot Auth + official-bot-feed attribution           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Diagnostics are enabled ONLY by the exact query flag `intelWbaDiag=1`. When enabled, the
+ * pure parse helper from src/lib/webBotAuth.ts and the UA prefilter from
+ * src/lib/officialBotFeeds.ts derive NEUTRAL attributes. No signing key is fetched and no
+ * signature is cryptographically verified in this path: the diagnostic NEVER claims
+ * `verified` / `valid` / `good`. Its only status values are `absent`, `present` and
+ * `neutral` (inconclusive).
+ *
+ * When the flag is absent, every client-supplied `x-intel-wba-*` header is stripped and
+ * nothing else happens — so no extra work and no new network calls by default. Existing
+ * JA4H / bot-verdict / version headers are left byte-for-byte untouched.
+ */
+const WBA_DIAG_FLAG = 'intelWbaDiag';
+const WBA_STATUS_HEADER = 'x-intel-wba-status';
+const BOT_FEED_MATCH_HEADER = 'x-intel-bot-feed-match';
+
+function hasWbaDiagFlag(request) {
+  try {
+    return new URL(request.url).searchParams.get(WBA_DIAG_FLAG) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/** UA-based official-feed PREFILTER — explicitly not a verdict, never proof of identity. */
+function botFeedPrefilter(request) {
+  try {
+    const ids = uaPrefilter(request.headers.get('user-agent') || '');
+    return Array.isArray(ids) && ids.length ? ids.join(',') : 'none';
+  } catch {
+    return 'none';
+  }
+}
+
+/** Per-request memo so request-side and response-side diagnostics share one pure parse. */
+const wbaDiagByRequest = new WeakMap();
+
+/**
+ * Pure, non-throwing snapshot. Returns `{ enabled: false }` without the exact flag. With the
+ * flag but no full Signature / Signature-Input / Signature-Agent triple it reports `absent`.
+ * Otherwise the headers are parsed (no fetch, no crypto) into observational attributes only.
+ */
+function computeWbaDiagnostics(request) {
+  try {
+    if (!hasWbaDiagFlag(request)) return { enabled: false };
+    const rawSignature = request.headers.get('signature');
+    const rawInput = request.headers.get('signature-input');
+    const rawAgent = request.headers.get('signature-agent');
+    const feedMatch = botFeedPrefilter(request);
+    if (!rawSignature || !rawInput || !rawAgent) {
+      return {
+        enabled: true,
+        absent: true,
+        status: 'absent',
+        present: '0',
+        label: '',
+        agentUrl: '',
+        agentForm: '',
+        covered: '',
+        keyid: '',
+        error: '',
+        feedMatch,
+      };
+    }
+    let parsed = null;
+    try {
+      parsed = parseSignatureHeaders(rawSignature, rawInput, rawAgent);
+    } catch {
+      parsed = null;
+    }
+    const present = Boolean(parsed && parsed.present);
+    const error = firstString(parsed || {}, 'error');
+    // Observational only: `present` = well-formed material, `neutral` = inconclusive.
+    // Never `verified` / `valid` — no cryptographic verification happens in this path.
+    const status = present && !error ? 'present' : 'neutral';
+    const params = parsed && parsed.params ? parsed.params : {};
+    return {
+      enabled: true,
+      absent: false,
+      status,
+      present: present ? '1' : '0',
+      label: firstString(parsed || {}, 'label'),
+      agentUrl: firstString(parsed || {}, 'agentUrl'),
+      agentForm: firstString(parsed || {}, 'agentForm'),
+      covered: Array.isArray(parsed?.covered) ? parsed.covered.join(',') : '',
+      keyid: firstString(params, 'keyid'),
+      error,
+      feedMatch,
+    };
+  } catch {
+    return { enabled: false };
+  }
+}
+
+function wbaDiagnostics(request) {
+  let snap = wbaDiagByRequest.get(request);
+  if (!snap) {
+    snap = computeWbaDiagnostics(request);
+    wbaDiagByRequest.set(request, snap);
+  }
+  return snap;
+}
+
+/**
+ * Strip every client-supplied diagnostic header so it can never be spoofed upstream. The
+ * pre-existing `x-intel-wba-attestation` is deliberately preserved — it belongs to the
+ * existing verifier path and must keep its current behaviour (NON-DISRUPTION).
+ */
+function stripWbaDiagRequestHeaders(headers) {
+  const names = [];
+  headers.forEach((_value, name) => {
+    const lower = name.toLowerCase();
+    if (
+      (lower.startsWith('x-intel-wba-') && lower !== 'x-intel-wba-attestation') ||
+      lower === BOT_FEED_MATCH_HEADER
+    ) {
+      names.push(name);
+    }
+  });
+  for (const name of names) headers.delete(name);
+}
+
+/**
+ * Forward NEUTRAL diagnostic attributes as `x-intel-wba-*` request headers. With the flag
+ * absent this only strips client-supplied copies and does nothing else.
+ */
+function applyWbaDiagRequestHeaders(headers, request) {
+  stripWbaDiagRequestHeaders(headers);
+  const snap = wbaDiagnostics(request);
+  if (!snap.enabled) return;
+  headers.set('x-intel-wba-diag-status', snap.status);
+  headers.set('x-intel-wba-diag-present', snap.present);
+  headers.set('x-intel-wba-diag-feed-match', snap.feedMatch);
+  if (snap.label) headers.set('x-intel-wba-diag-label', snap.label);
+  if (snap.agentUrl) headers.set('x-intel-wba-diag-agent-url', snap.agentUrl);
+  if (snap.agentForm) headers.set('x-intel-wba-diag-agent-form', snap.agentForm);
+  if (snap.covered) headers.set('x-intel-wba-diag-covered', snap.covered);
+  if (snap.keyid) headers.set('x-intel-wba-diag-keyid', snap.keyid);
+  if (snap.error) headers.set('x-intel-wba-diag-error', snap.error);
+}
+
+/** Additive response headers, emitted ONLY with the exact flag, strictly observational. */
+function applyWbaDiagResponseHeaders(response, request) {
+  const snap = wbaDiagnostics(request);
+  if (!snap.enabled) return response;
+  response.headers.set(WBA_STATUS_HEADER, snap.status);
+  response.headers.set(BOT_FEED_MATCH_HEADER, snap.feedMatch);
+  return response;
+}
+
 /**
  * JA4H-style HTTP header fingerprint — APPROXIMATE, never an exact JA4H hash. Cloudflare and
  * the Workers runtime may strip, normalise or reorder headers, and the hash is over the
@@ -363,6 +521,11 @@ async function forwardApiRequest(request) {
   // over any client-supplied copy (which was stripped above via UNTRUSTED_FORWARD_HEADERS).
   headers.set(JA4H_HEADER, await buildJa4hHeader(request));
 
+  // Additive, flag-gated Web Bot Auth + official-bot-feed diagnostics (neutral attributes
+  // only; no key fetch, no crypto verify). With the flag absent this only strips spoofed
+  // client-supplied x-intel-wba-* headers and leaves everything else untouched.
+  applyWbaDiagRequestHeaders(headers, request);
+
   return new Request(request, { headers });
 }
 
@@ -400,6 +563,11 @@ function applyClientHintHeaders(response, env, request) {
       /* malformed request URL: omit CORS rather than emit a wildcard */
     }
   }
+
+  // Additive, flag-gated diagnostics: x-intel-wba-status / x-intel-bot-feed-match are emitted
+  // ONLY when intelWbaDiag=1 is present, and are strictly observational (never verified/good).
+  // All existing JA4H / bot / version / hardening headers above remain intact.
+  applyWbaDiagResponseHeaders(result, request);
   return result;
 }
 

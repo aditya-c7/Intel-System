@@ -535,13 +535,25 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   });
 
   const bot = resolveBotVerdict(data);
+  // Additive WBA / official-feed mirrors are surfaced as DETAIL only. The tile's status,
+  // trigger and score stay exactly as the server computed them; a status/feed token is
+  // printed verbatim and never upgraded into a stronger bot verdict on the client.
+  const botEvidenceDetail = [
+    canonicalView.wba_status != null ? `WBA ${canonicalView.wba_status}` : null,
+    canonicalView.official_bot_feed_match != null &&
+    canonicalView.official_bot_feed_match.length > 0
+      ? `Official feed match: ${canonicalView.official_bot_feed_match.join(', ')}`
+      : null,
+  ]
+    .filter((part): part is string => part != null)
+    .join(' · ');
   rows.push({
     key: 'bot',
     label: 'Bot',
     // Verbatim server status — exact agent names are preserved, never recomputed.
     status: bot.status,
     triggered: bot.triggered,
-    detail: bot.detail,
+    detail: [bot.detail, botEvidenceDetail].filter(Boolean).join(' · ') || undefined,
   });
 
   // The server's structured `vpn_methods` mirror is the single source of truth. Timezone
@@ -725,14 +737,28 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   });
 
   const highActivity = Boolean(data.highActivityDevice ?? signals.highActivityDevice);
+  // The server's threshold regime/value is appended verbatim as context only — it never
+  // changes the high-activity verdict or its tile status.
+  const thresholdDetail =
+    canonicalView.high_activity_threshold_mode != null
+      ? `Threshold ${canonicalView.high_activity_threshold_mode}${
+          canonicalView.high_activity_threshold != null
+            ? ` (${canonicalView.high_activity_threshold})`
+            : ''
+        }`
+      : undefined;
   rows.push({
     key: 'highActivityDevice',
     label: 'High-Activity Device',
     status: highActivity ? 'Yes' : 'Not detected',
     triggered: highActivity,
-    detail: data.velocity
-      ? `${data.velocity.events['24_hours']} events in 24 hours`
-      : undefined,
+    detail:
+      [
+        data.velocity ? `${data.velocity.events['24_hours']} events in 24 hours` : undefined,
+        thresholdDetail,
+      ]
+        .filter((part): part is string => part != null)
+        .join(' · ') || undefined,
   });
 
   const rare = Boolean(data.rareDevice ?? signals.rareDevice);
@@ -793,6 +819,23 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     canonicalTier === 'Critical'
       ? canonicalTier
       : resolveRiskTier(suspectScore);
+  // Calibration evidence is displayed verbatim as detail only. The 0-10 headline and the
+  // "uncalibrated" honesty posture are untouched — this record never promotes a score.
+  const calibrationMirror = canonicalView.calibration_evidence;
+  const calibrationDetail =
+    calibrationMirror != null
+      ? [
+          calibrationMirror.eligible != null ? `eligible ${calibrationMirror.eligible}` : null,
+          calibrationMirror.labeledPairs != null
+            ? `labeled pairs ${calibrationMirror.labeledPairs}`
+            : null,
+          calibrationMirror.ece != null ? `ECE ${calibrationMirror.ece}` : null,
+          calibrationMirror.brier != null ? `Brier ${calibrationMirror.brier}` : null,
+          calibrationMirror.reason != null ? calibrationMirror.reason : null,
+        ]
+          .filter((part): part is string => part != null)
+          .join(' · ')
+      : undefined;
   rows.push({
     key: 'suspectScore',
     label: 'Suspect Score',
@@ -803,6 +846,7 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
       : riskTier === 'Elevated'
       ? 'neutral'
       : 'clean',
+    detail: calibrationDetail || undefined,
   });
   rows.push({
     key: 'riskTier',
@@ -864,12 +908,31 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     tone: proximityGranted ? 'clean' : 'neutral',
   });
 
+  // Research-only WebGPU disclosure and benchmark policy are appended verbatim as context
+  // on this existing evidence-link row (no new panel). They are not verdicts and no probe
+  // or claim derivation happens on the client.
+  const benchmarkPolicy = canonicalView.benchmark_policy;
+  const benchmarkDetail =
+    benchmarkPolicy != null
+      ? [
+          benchmarkPolicy.notEvaluableRate != null
+            ? `not-evaluable ${benchmarkPolicy.notEvaluableRate}`
+            : null,
+          benchmarkPolicy.claim != null ? `claim ${benchmarkPolicy.claim}` : null,
+        ]
+          .filter((part): part is string => part != null)
+          .join(' · ')
+      : undefined;
   rows.push({
     key: 'rawDeviceAttributes',
     label: 'Raw Device Attributes',
     status: 'See the JSON below',
     triggered: false,
     tone: 'neutral',
+    detail:
+      [canonicalView.webgpu_research_disclosure ?? undefined, benchmarkDetail || undefined]
+        .filter((part): part is string => part != null)
+        .join(' · ') || undefined,
     jsonAnchor: true,
   });
 

@@ -1,0 +1,553 @@
+{
+  "schema_version": 1,
+  "title": "RS10 browser automation matrix — controlled-config ground truth (shadow-only)",
+  "generated_on": "2026-11-23",
+  "frozen": true,
+  "offline": true,
+  "helper_modules": {
+    "browserAutomationMatrix": "../src/lib/browserAutomationMatrix.ts"
+  },
+  "rules": {
+    "ground_truth": "controlled launch config, never vendor verdict",
+    "automated": "known automation stack (allowlist)",
+    "human": "stock browser operated by human, or verified paid traffic",
+    "unknown": "unknown stack or insufficient controlled config",
+    "cdp": "client attached is weight 0; never claim abuse from CDP alone",
+    "axes": "automation tells separate from machine tells (GPU/fonts/audio/screen/codecs)",
+    "deployment": "log mode before enforce; fail run if human baseline flags"
+  },
+  "research": {
+    "openWaf": {
+      "browser": "Chrome 156",
+      "automatedRuns": 110,
+      "playwright": "12/12 flagged",
+      "patchrightDefault": "47/47 flagged",
+      "patchrightRecommendedHumanized": "0/3 pass",
+      "puppeteerStealth": "12/12 flagged",
+      "zendriver": "18/18 flagged",
+      "camoufox": "1/12 flagged",
+      "humans": "0/31 flagged"
+    },
+    "botstopV12": { "min": 83, "max": 100, "verdict": "automated" },
+    "causality": {
+      "runtimeEnable": "error stack / prepareStackTrace leaks",
+      "networkEnable": "iframe postMessage before load",
+      "ipcFlooding": "201st replaceState accepted",
+      "componentExtensions": "missing Google speech voices",
+      "headlessShell": "S1-S7",
+      "newHeadless": "H2-H4",
+      "setUserAgent": "empty brands"
+    },
+    "stealth": {
+      "jsPatches": "do not remove C1-C3",
+      "patchright": "removes some flags/Runtime; F1/F3/V1/C3 remain",
+      "nodriver": "no webdriver but still CDP",
+      "camoufox": "engine-level"
+    }
+  },
+  "stacks": [
+    "playwright",
+    "playwright_stealth",
+    "patchright",
+    "puppeteer",
+    "puppeteer_stealth",
+    "selenium",
+    "selenium_uc",
+    "nodriver",
+    "zendriver",
+    "camoufox",
+    "chrome_human"
+  ],
+  "classifyCases": [
+    {
+      "id": "AUT-PW",
+      "name": "Playwright: headless shell + IPC flag + domains + machine flag",
+      "input": {
+        "stack": "playwright",
+        "headlessMode": "headless-shell",
+        "flags": ["--disable-ipc-flooding-protection", "--disable-component-extensions"],
+        "cdpClients": 2,
+        "humanOperated": false,
+        "source": "controlled_launch_config",
+        "cdpDomains": ["Runtime.enable", "Network.enable"]
+      },
+      "expect": {
+        "expected": "automated",
+        "axis": "both",
+        "confidence": "high",
+        "tellsInclude": [
+          "automation:stack-playwright",
+          "automation:headless-shell-S1-S7",
+          "automation:ipc-flooding-replaceState-201",
+          "automation:runtime-enable-error-stack-leak",
+          "automation:network-enable-iframe-postmessage-before-load",
+          "machine:audio-missing-google-speech-voices"
+        ],
+        "reasonsInclude": ["controlled-launch-config", "known-automation-stack:playwright", "cdp-client-weight-0"]
+      }
+    },
+    {
+      "id": "AUT-PWS",
+      "name": "playwright-stealth: new headless, JS patches keep C1-C3",
+      "input": {
+        "stack": "playwright_stealth",
+        "headlessMode": "new-headless",
+        "flags": ["--enable-automation"],
+        "cdpClients": 1,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "automated",
+        "axis": "automation",
+        "confidence": "high",
+        "tellsInclude": [
+          "automation:stack-playwright_stealth",
+          "automation:stealth-js-patches-C1-C3",
+          "automation:new-headless-H2-H4",
+          "automation:enable-automation-flag"
+        ],
+        "reasonsInclude": ["known-automation-stack:playwright_stealth"]
+      }
+    },
+    {
+      "id": "AUT-PR",
+      "name": "Patchright: residual F1/F3/V1/C3 + stealth flag + GPU machine tell",
+      "input": {
+        "stack": "patchright",
+        "headlessMode": "headful",
+        "flags": ["--disable-blink-features=AutomationControlled", "--disable-gpu"],
+        "cdpClients": 0,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "automated",
+        "axis": "both",
+        "confidence": "high",
+        "tellsInclude": [
+          "automation:stack-patchright",
+          "automation:patchright-residual-F1-F3-V1-C3",
+          "automation:stealth-flag-automation-controlled",
+          "machine:gpu-software-renderer"
+        ],
+        "reasonsInclude": ["known-automation-stack:patchright"]
+      }
+    },
+    {
+      "id": "AUT-PP",
+      "name": "Puppeteer: default controlled launch",
+      "input": {
+        "stack": "puppeteer",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 0,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "automated",
+        "axis": "automation",
+        "confidence": "high",
+        "tellsInclude": ["automation:stack-puppeteer"],
+        "reasonsInclude": ["known-automation-stack:puppeteer"]
+      }
+    },
+    {
+      "id": "AUT-PPS",
+      "name": "puppeteer-stealth: JS patches do not remove IPC tell",
+      "input": {
+        "stack": "puppeteer_stealth",
+        "headlessMode": "headful",
+        "flags": ["--disable-ipc-flooding-protection"],
+        "cdpClients": 0,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "automated",
+        "axis": "automation",
+        "confidence": "high",
+        "tellsInclude": [
+          "automation:stack-puppeteer_stealth",
+          "automation:stealth-js-patches-C1-C3",
+          "automation:ipc-flooding-replaceState-201"
+        ],
+        "reasonsInclude": ["known-automation-stack:puppeteer_stealth"]
+      }
+    },
+    {
+      "id": "AUT-SEL",
+      "name": "Selenium: webdriver tell",
+      "input": {
+        "stack": "selenium",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 0,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "automated",
+        "axis": "automation",
+        "confidence": "high",
+        "tellsInclude": ["automation:stack-selenium", "automation:selenium-webdriver"],
+        "reasonsInclude": ["known-automation-stack:selenium"]
+      }
+    },
+    {
+      "id": "AUT-SELU",
+      "name": "selenium-uc: stealth patches still automated",
+      "input": {
+        "stack": "selenium_uc",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 0,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "automated",
+        "axis": "automation",
+        "confidence": "high",
+        "tellsInclude": ["automation:stack-selenium_uc", "automation:selenium-webdriver"],
+        "reasonsInclude": ["known-automation-stack:selenium_uc"]
+      }
+    },
+    {
+      "id": "AUT-ND",
+      "name": "Nodriver: no webdriver but still CDP",
+      "input": {
+        "stack": "nodriver",
+        "headlessMode": "headful",
+        "flags": ["--remote-debugging-port=9222"],
+        "cdpClients": 1,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "automated",
+        "axis": "automation",
+        "confidence": "high",
+        "tellsInclude": [
+          "automation:stack-nodriver",
+          "automation:nodriver-no-webdriver-cdp",
+          "automation:cdp-debugging-port"
+        ],
+        "reasonsInclude": ["known-automation-stack:nodriver"]
+      }
+    },
+    {
+      "id": "AUT-ZD",
+      "name": "Zendriver: CDP-driven stack",
+      "input": {
+        "stack": "zendriver",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 1,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "automated",
+        "axis": "automation",
+        "confidence": "high",
+        "tellsInclude": ["automation:stack-zendriver", "automation:zendriver-cdp"],
+        "reasonsInclude": ["known-automation-stack:zendriver"]
+      }
+    },
+    {
+      "id": "AUT-CAM",
+      "name": "Camoufox: engine-level anti-detect is still automated ground truth",
+      "input": {
+        "stack": "camoufox",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 0,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "automated",
+        "axis": "automation",
+        "confidence": "high",
+        "tellsInclude": ["automation:stack-camoufox", "automation:camoufox-engine-level"],
+        "reasonsInclude": ["known-automation-stack:camoufox"]
+      }
+    },
+    {
+      "id": "HUM-CTRL",
+      "name": "Human control: stock browser operated by a human",
+      "input": {
+        "stack": "chrome_human",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 0,
+        "humanOperated": true,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "human",
+        "axis": "automation",
+        "confidence": "high",
+        "tellsInclude": [],
+        "reasonsInclude": ["stock-browser-stack", "human-operated-flag", "human-operated-stock-browser"]
+      }
+    },
+    {
+      "id": "HUM-PAID",
+      "name": "Human control: verified paid traffic",
+      "input": {
+        "stack": "chrome_human",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 0,
+        "humanOperated": false,
+        "source": "verified_paid_traffic"
+      },
+      "expect": {
+        "expected": "human",
+        "axis": "automation",
+        "confidence": "high",
+        "tellsInclude": [],
+        "reasonsInclude": ["verified-paid-traffic", "verified-paid-traffic-human"]
+      }
+    },
+    {
+      "id": "HUM-NOOP",
+      "name": "Stock browser without human operation is not automatically human",
+      "input": {
+        "stack": "chrome_human",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 0,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "unknown",
+        "axis": "automation",
+        "confidence": "low",
+        "tellsInclude": [],
+        "reasonsInclude": ["stock-browser-stack", "insufficient-controlled-config"]
+      }
+    },
+    {
+      "id": "HUM-VENDOR",
+      "name": "Vendor verdict cannot manufacture a human label",
+      "input": {
+        "stack": "chrome_human",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 0,
+        "humanOperated": true,
+        "source": "vendor_verdict",
+        "vendorVerdict": "human"
+      },
+      "expect": {
+        "expected": "unknown",
+        "axis": "automation",
+        "confidence": "low",
+        "tellsInclude": [],
+        "reasonsInclude": ["vendor-verdict-ignored", "no-label-from-vendor-verdict"]
+      }
+    },
+    {
+      "id": "UNK-STACK",
+      "name": "Unknown stack yields unknown",
+      "input": {
+        "stack": "mystery_bot",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 0,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "unknown",
+        "axis": "automation",
+        "confidence": "low",
+        "tellsInclude": [],
+        "reasonsInclude": ["unknown-stack", "insufficient-controlled-config"]
+      }
+    },
+    {
+      "id": "VENDOR-CLAIM-HUMAN",
+      "name": "Vendor claims human but known stack wins; verdict string ignored",
+      "input": {
+        "stack": "playwright",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 0,
+        "humanOperated": false,
+        "source": "vendor_verdict",
+        "vendorVerdict": "human"
+      },
+      "expect": {
+        "expected": "automated",
+        "axis": "automation",
+        "confidence": "medium",
+        "tellsInclude": ["automation:stack-playwright"],
+        "reasonsInclude": ["vendor-verdict-ignored", "known-automation-stack:playwright"]
+      }
+    },
+    {
+      "id": "VENDOR-UNKNOWN",
+      "name": "Vendor claims automated for unknown stack; label stays unknown",
+      "input": {
+        "stack": "mystery_bot",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 0,
+        "humanOperated": false,
+        "source": "vendor_verdict",
+        "vendorVerdict": "automated"
+      },
+      "expect": {
+        "expected": "unknown",
+        "axis": "automation",
+        "confidence": "low",
+        "tellsInclude": [],
+        "reasonsInclude": ["vendor-verdict-ignored", "unknown-stack", "no-label-from-vendor-verdict"]
+      }
+    },
+    {
+      "id": "CDP-ONLY",
+      "name": "CDP client attached is weight 0 and never labels alone",
+      "input": {
+        "stack": "unknown_stack",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 3,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "unknown",
+        "axis": "automation",
+        "confidence": "low",
+        "tellsInclude": ["automation:cdp-client-attached"],
+        "reasonsInclude": ["cdp-client-weight-0", "insufficient-controlled-config"]
+      }
+    },
+    {
+      "id": "UA-SPOOF",
+      "name": "page.setUserAgent empty brands overrides nominal human stack",
+      "input": {
+        "stack": "chrome_human",
+        "headlessMode": "headful",
+        "flags": [],
+        "cdpClients": 0,
+        "humanOperated": true,
+        "source": "controlled_launch_config",
+        "userAgentSpoofed": true
+      },
+      "expect": {
+        "expected": "automated",
+        "axis": "automation",
+        "confidence": "medium",
+        "tellsInclude": ["automation:setUserAgent-empty-brands"],
+        "reasonsInclude": ["causality:setUserAgent-empty-brands", "automation-config-overrides-human-stack"]
+      }
+    },
+    {
+      "id": "MACHINE-ONLY",
+      "name": "Machine-axis flags only (GPU/screen/font/codec)",
+      "input": {
+        "stack": "unknown_stack",
+        "headlessMode": "headful",
+        "flags": ["--disable-gpu", "--window-size=1280,720", "--disable-font-subpixel-positioning", "--disable-accelerated-video-decode"],
+        "cdpClients": 0,
+        "humanOperated": false,
+        "source": "controlled_launch_config"
+      },
+      "expect": {
+        "expected": "unknown",
+        "axis": "machine",
+        "confidence": "low",
+        "tellsInclude": [
+          "machine:gpu-software-renderer",
+          "machine:screen-override",
+          "machine:font-override",
+          "machine:codec-override"
+        ],
+        "reasonsInclude": ["machine:gpu", "machine:screen", "machine:font", "machine:codec"]
+      }
+    },
+    {
+      "id": "HOSTILE-NULL",
+      "name": "Null input is contained",
+      "input": null,
+      "expect": {
+        "expected": "unknown",
+        "axis": "automation",
+        "confidence": "low",
+        "tellsInclude": [],
+        "reasonsInclude": ["unknown-stack", "insufficient-controlled-config"]
+      }
+    },
+    {
+      "id": "HOSTILE-ARRAY",
+      "name": "Array input is contained",
+      "input": [],
+      "expect": {
+        "expected": "unknown",
+        "axis": "automation",
+        "confidence": "low",
+        "tellsInclude": [],
+        "reasonsInclude": ["unknown-stack"]
+      }
+    },
+    {
+      "id": "HOSTILE-STRING",
+      "name": "String input is not treated as a stack name",
+      "input": "playwright",
+      "expect": {
+        "expected": "unknown",
+        "axis": "automation",
+        "confidence": "low",
+        "tellsInclude": [],
+        "reasonsInclude": ["unknown-stack"]
+      }
+    },
+    {
+      "id": "HOSTILE-NUMBER",
+      "name": "Numeric input is contained",
+      "input": 42,
+      "expect": {
+        "expected": "unknown",
+        "axis": "automation",
+        "confidence": "low",
+        "tellsInclude": [],
+        "reasonsInclude": ["unknown-stack"]
+      }
+    }
+  ],
+  "baselineCases": [
+    {
+      "id": "BASE-CLEAN",
+      "input": { "humanCases": 31, "flaggedCases": 0 },
+      "expect": { "valid": true, "falsePositiveRate": 0, "reasonIncludes": "HUMAN_BASELINE_VALID", "logBeforeEnforce": true }
+    },
+    {
+      "id": "BASE-FP-ONE",
+      "input": { "humanCases": 31, "flaggedCases": 1 },
+      "expect": { "valid": false, "falsePositiveRate": 0.032258, "reasonIncludes": "Fail run", "logBeforeEnforce": false }
+    },
+    {
+      "id": "BASE-FP-FIFTEEN",
+      "input": { "humanCases": 100, "flaggedCases": 15 },
+      "expect": { "valid": false, "falsePositiveRate": 0.15, "reasonIncludes": "HUMAN_BASELINE_INVALID", "logBeforeEnforce": false }
+    },
+    {
+      "id": "BASE-MISSING",
+      "input": { "humanCases": 0, "flaggedCases": 0 },
+      "expect": { "valid": false, "falsePositiveRate": 0, "reasonIncludes": "HUMAN_BASELINE_MISSING", "logBeforeEnforce": false }
+    },
+    {
+      "id": "BASE-EXCESS",
+      "input": { "humanCases": 2, "flaggedCases": 3 },
+      "expect": { "valid": false, "falsePositiveRate": 1.5, "reasonIncludes": "exceeds humanCases", "logBeforeEnforce": false }
+    }
+  ]
+}

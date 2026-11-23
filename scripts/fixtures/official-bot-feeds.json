@@ -1,0 +1,122 @@
+{
+  "$comment": "Synthetic representative fixture for officialBotFeeds tests. Prefixes follow the exact {creationTime, prefixes:[{ipv4Prefix|ipv6Prefix}]} shape of the official operator feeds. The claude/perplexitybot overlap on 18.97.9.96/32 is deliberate: it models the shared-cloud-range ambiguity that makes UA + FCrDNS necessary. Non-matching IPs use RFC 5737 (IPv4) and RFC 3849 (IPv6) documentation ranges.",
+  "nowMs": 1795392000000,
+  "feeds": {
+    "google-common": {
+      "creationTime": "2026-11-22T08:00:00.000000",
+      "prefixes": [
+        { "ipv4Prefix": "66.249.66.0/27" },
+        { "ipv6Prefix": "2001:4860:4801:10::/64" }
+      ]
+    },
+    "google-special": {
+      "creationTime": "2026-11-22T08:00:00.000000",
+      "prefixes": [
+        { "ipv4Prefix": "66.249.90.0/24" }
+      ]
+    },
+    "user-triggered-fetchers": {
+      "creationTime": "2026-11-22T08:00:00.000000",
+      "prefixes": [
+        { "ipv6Prefix": "2001:4860:4801:20::/64" }
+      ]
+    },
+    "gptbot": {
+      "creationTime": "2026-09-22T02:00:07.000000",
+      "prefixes": [
+        { "ipv4Prefix": "20.125.66.80/28" }
+      ]
+    },
+    "chatgpt-user": {
+      "creationTime": "2026-11-06T18:12:14.689393",
+      "prefixes": [
+        { "ipv4Prefix": "20.125.112.224/28" },
+        { "ipv4Prefix": "20.125.66.80/28" }
+      ]
+    },
+    "perplexitybot": {
+      "creationTime": "2026-11-18T16:30:18.000000",
+      "prefixes": [
+        { "ipv4Prefix": "18.97.9.96/32" },
+        { "ipv4Prefix": "3.41.218.160/32" }
+      ]
+    },
+    "perplexity-user": {
+      "creationTime": "2026-10-28T16:48:51.000000",
+      "prefixes": [
+        { "ipv4Prefix": "18.97.43.80/32" }
+      ]
+    },
+    "claude": {
+      "creationTime": "2026-10-20T00:00:00Z",
+      "prefixes": [
+        { "ipv4Prefix": "18.97.9.96/32" },
+        { "ipv4Prefix": "3.222.232.239/32" }
+      ]
+    },
+    "bingbot": {
+      "creationTime": "2026-11-20T10:00:00Z",
+      "prefixes": [
+        { "ipv4Prefix": "40.77.167.0/24" }
+      ]
+    },
+    "applebot": {
+      "creationTime": "2026-11-20T09:00:00Z",
+      "prefixes": [
+        { "ipv4Prefix": "17.166.20.0/24" }
+      ]
+    },
+    "empty-feed": {
+      "creationTime": null,
+      "prefixes": []
+    }
+  },
+  "hostileFeeds": {
+    "malformed": {
+      "creationTime": "not-a-date",
+      "prefixes": [
+        { "ipv4Prefix": "18.97.9.96/24" },
+        { "ipv6Prefix": "2001:4860:4801:10::1/120" },
+        { "ipv4Prefix": "999.1.1.1/24" },
+        { "ipv6Prefix": "gggg::1/64" },
+        { "ipv4Prefix": "1.2.3.4/33" },
+        { "ipv6Prefix": "2001:db8::/129" },
+        { "ipv4Prefix": 12345 },
+        "not an object",
+        {},
+        { "ipv4Prefix": "192.0.2.0/24" }
+      ]
+    }
+  },
+  "hosts": {
+    "googleValid": "crawl-66-249-66-1.googlebot.com",
+    "googleValidAlt": "crawl-1.google.com",
+    "bingValid": "msnbot-40-77-167-1.search.msn.com",
+    "appleValid": "applebot-17-166-20-1.applebot.apple.com",
+    "spoofed": "crawl-66-249-66-1.evil-googlebot.com.attacker.net",
+    "labelBoundary": "notgooglebot.com",
+    "suffixNotAtEnd": "crawl-66-249-66-1.googlebot.com.attacker.net"
+  },
+  "cases": [
+    { "name": "google-v4-first-in-27", "ip": "66.249.66.0", "operators": ["Google"], "feedIds": ["common-crawlers"] },
+    { "name": "google-v4-last-in-27", "ip": "66.249.66.31", "operators": ["Google"], "feedIds": ["common-crawlers"] },
+    { "name": "google-v4-first-outside-27", "ip": "66.249.66.32", "operators": [], "feedIds": [] },
+    { "name": "google-v6-in-64", "ip": "2001:4860:4801:10::1", "operators": ["Google"], "feedIds": ["common-crawlers"] },
+    { "name": "google-v6-neighbor-64", "ip": "2001:4860:4801:11::1", "operators": [], "feedIds": [] },
+    { "name": "google-special", "ip": "66.249.90.5", "operators": ["Google"], "feedIds": ["special-crawlers"] },
+    { "name": "google-user-triggered-v6", "ip": "2001:4860:4801:20::5", "operators": ["Google"], "feedIds": ["user-triggered-fetchers"] },
+    { "name": "openai-shared-cloud-range", "ip": "20.125.66.81", "operators": ["OpenAI"], "feedIds": ["gptbot", "chatgpt-user"] },
+    { "name": "openai-chatgpt-user-only", "ip": "20.125.112.225", "operators": ["OpenAI"], "feedIds": ["chatgpt-user"] },
+    { "name": "shared-cloud-ambiguity", "ip": "18.97.9.96", "operators": ["Perplexity", "Anthropic"], "feedIds": ["perplexitybot", "claude"] },
+    { "name": "perplexity-32-neighbor", "ip": "18.97.9.97", "operators": [], "feedIds": [] },
+    { "name": "perplexity-no-asn-widening", "ip": "3.41.218.161", "operators": [], "feedIds": [] },
+    { "name": "perplexity-user-exact", "ip": "18.97.43.80", "operators": ["Perplexity"], "feedIds": ["perplexity-user"] },
+    { "name": "bing-exact", "ip": "40.77.167.9", "operators": ["Microsoft"], "feedIds": ["bingbot"] },
+    { "name": "apple-exact", "ip": "17.166.20.9", "operators": ["Apple"], "feedIds": ["applebot"] },
+    { "name": "rfc5737-192", "ip": "192.0.2.1", "operators": [], "feedIds": [] },
+    { "name": "rfc5737-198", "ip": "198.51.100.7", "operators": [], "feedIds": [] },
+    { "name": "rfc5737-203", "ip": "203.0.113.7", "operators": [], "feedIds": [] },
+    { "name": "rfc3849-v6", "ip": "2001:db8::1", "operators": [], "feedIds": [] },
+    { "name": "ipv4-mapped-v6-never-matches-v4", "ip": "::ffff:66.249.66.1", "operators": [], "feedIds": [] }
+  ]
+}

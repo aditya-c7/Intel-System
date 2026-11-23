@@ -1,0 +1,121 @@
+{
+  "vector": {
+    "name": "RFC 8037 Appendix A.1 (Ed25519)",
+    "kty": "OKP",
+    "crv": "Ed25519",
+    "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+    "d": "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A",
+    "keyid": "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k"
+  },
+  "context": {
+    "authority": "service.example",
+    "nowMs": 1618884500000,
+    "created": 1618884480,
+    "expires": 1618884600,
+    "agentUrl": "https://agent.example",
+    "directoryUrl": "https://agent.example/.well-known/http-message-signatures-directory",
+    "agentLegacy": "\"https://agent.example\"",
+    "agentDictionary": "agent=\"https://agent.example\""
+  },
+  "validInput": "sig1=(\"@authority\" \"signature-agent\");created=1618884480;expires=1618884600;keyid=\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\";alg=\"ed25519\";tag=\"web-bot-auth\"",
+  "cases": [
+    {
+      "id": "neutral-no-signature",
+      "expect": "NEUTRAL",
+      "reason": "no_signature",
+      "rawSignature": "",
+      "rawInput": "",
+      "rawAgent": ""
+    },
+    {
+      "id": "invalid-unsupported-alg",
+      "expect": "INVALID",
+      "reason": "unsupported_alg",
+      "input": "sig1=(\"@authority\" \"signature-agent\");created=1618884480;expires=1618884600;keyid=\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\";alg=\"rsa\";tag=\"web-bot-auth\""
+    },
+    {
+      "id": "invalid-wrong-tag",
+      "expect": "INVALID",
+      "reason": "invalid_tag",
+      "input": "sig1=(\"@authority\" \"signature-agent\");created=1618884480;expires=1618884600;keyid=\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\";alg=\"ed25519\";tag=\"http-message-signatures\""
+    },
+    {
+      "id": "invalid-missing-keyid",
+      "expect": "INVALID",
+      "reason": "missing_required_param",
+      "input": "sig1=(\"@authority\" \"signature-agent\");created=1618884480;expires=1618884600;alg=\"ed25519\";tag=\"web-bot-auth\""
+    },
+    {
+      "id": "invalid-expired",
+      "expect": "INVALID",
+      "reason": "outside_validity_window",
+      "input": "sig1=(\"@authority\" \"signature-agent\");created=1618884480;expires=1618884490;keyid=\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\";alg=\"ed25519\";tag=\"web-bot-auth\""
+    },
+    {
+      "id": "invalid-expires-before-created",
+      "expect": "INVALID",
+      "reason": "expires_before_created",
+      "input": "sig1=(\"@authority\" \"signature-agent\");created=1618884580;expires=1618884400;keyid=\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\";alg=\"ed25519\";tag=\"web-bot-auth\""
+    },
+    {
+      "id": "invalid-missing-authority-coverage",
+      "expect": "INVALID",
+      "reason": "missing_covered_component",
+      "input": "sig1=(\"signature-agent\");created=1618884480;expires=1618884600;keyid=\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\";alg=\"ed25519\";tag=\"web-bot-auth\""
+    },
+    {
+      "id": "invalid-duplicate-component",
+      "expect": "INVALID",
+      "reason": "duplicate_covered_component",
+      "input": "sig1=(\"@authority\" \"@authority\" \"signature-agent\");created=1618884480;expires=1618884600;keyid=\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\";alg=\"ed25519\";tag=\"web-bot-auth\""
+    },
+    {
+      "id": "invalid-unknown-param",
+      "expect": "INVALID",
+      "reason": "unknown_signature_param:foo",
+      "input": "sig1=(\"@authority\" \"signature-agent\");created=1618884480;expires=1618884600;keyid=\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\";alg=\"ed25519\";tag=\"web-bot-auth\";foo=\"bar\""
+    },
+    {
+      "id": "invalid-label-mismatch",
+      "expect": "INVALID",
+      "reason": "signature_label_mismatch",
+      "signatureLabel": "sig2"
+    },
+    {
+      "id": "invalid-duplicate-label",
+      "expect": "INVALID",
+      "reason": "duplicate_signature_label",
+      "input": "sig1=(\"@authority\" \"signature-agent\");created=1618884480;expires=1618884600;keyid=\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k\";alg=\"ed25519\";tag=\"web-bot-auth\",sig1=(\"@authority\" \"signature-agent\")"
+    },
+    {
+      "id": "invalid-non-https-agent",
+      "expect": "INVALID",
+      "reason": "invalid_signature_agent_url",
+      "rawAgent": "\"http://agent.example\""
+    },
+    {
+      "id": "invalid-agent-credentials",
+      "expect": "INVALID",
+      "reason": "invalid_signature_agent_url",
+      "rawAgent": "\"https://user:pass@agent.example\""
+    },
+    {
+      "id": "invalid-agent-fragment",
+      "expect": "INVALID",
+      "reason": "invalid_signature_agent_url",
+      "rawAgent": "\"https://agent.example/dir#section\""
+    },
+    {
+      "id": "invalid-non-ascii-keyid",
+      "expect": "INVALID",
+      "reason": "invalid_keyid",
+      "input": "sig1=(\"@authority\" \"signature-agent\");created=1618884480;expires=1618884600;keyid=\"kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4€\";alg=\"ed25519\";tag=\"web-bot-auth\""
+    },
+    {
+      "id": "neutral-directory-unavailable",
+      "expect": "NEUTRAL",
+      "reason": "directory_fetch_failed",
+      "fetchFails": true
+    }
+  ]
+}
