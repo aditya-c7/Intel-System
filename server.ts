@@ -48,6 +48,7 @@ import {
 } from './src/lib/timezone';
 import { buildProximityInfo } from './src/lib/geohash';
 import { detectAiBotFromServerSignals } from './src/lib/aiBotDirectory';
+import { composeBotVerdict } from './src/server/agents/botVerifier';
 import { clientHintsMiddleware, type ParsedClientHints } from './src/server/middleware/clientHints';
 import {
   normalizeUserAgent,
@@ -78,9 +79,10 @@ import {
 import {
   evaluateSpecInvariants,
   enforceTamperingInvariant,
-  classifyInspectorState,
-  inspectorFlagsForState,
+  canonicalInspectorFlags,
+  checkInspectorInvariants,
   resolvePrivacyHardened,
+  type InspectorState as CanonicalInspectorState,
 } from './src/lib/specInvariants';
 import {
   buildGradedRiskLedger,
@@ -6588,7 +6590,7 @@ interface CorroboratedCdpAssessment {
 function assessCorroboratedCdp(args: {
   cdpBridge: boolean;
   strongCdpProof: boolean;
-  inspectorState: InspectorState;
+  inspectorState: ServerInspectorState;
   dockedWithHumanInteraction: boolean;
   stealthArtifact: boolean;
   trustedHumanCorroboration: number;
@@ -6620,9 +6622,12 @@ function isTimezoneMismatchReason(reason: string): boolean {
   return /\btime[\s_-]?zone\b/i.test(reason);
 }
 
+/** Both the canonical 3-state and the legacy 4-state inspector vocabularies are accepted. */
+type ServerInspectorState = InspectorState | CanonicalInspectorState;
+
 /** One authoritative inspector verdict shared by the escalation gate, envelope and top level. */
 interface ResolvedInspectorState {
-  inspector_state: InspectorState;
+  inspector_state: ServerInspectorState;
   cdp_attached: boolean;
   developer_tools: boolean;
   detail: string;
@@ -6631,10 +6636,15 @@ interface ResolvedInspectorState {
 /**
  * Single source of truth for `cdp_attached`, `developer_tools` and `inspector_state`.
  *
- * `cdp_attached` requires STRONG protocol-level proof (a real CDP/WebDriver binding). A weak
- * `cdpRuntimeLeak` / Error-preview read is only developer-tools telemetry: it can set
- * `developer_tools` (any DevTools / IDE / docked attach) but NEVER `cdp_attached`, and its
- * human-readable detail must never say "CDP attached".
+ * `canonicalInspectorFlags()` is the one-call resolver for all three axes. Its mapping is
+ * deliberately asymmetric: bare / automation-protocol CDP -> cdp_attached:true with
+ * developer_tools:false; docked or canary-verified DevTools -> developer_tools:true with
+ * cdp_attached:false; a corroborated CDP+UI pair -> both true. Feeding its own state and flags
+ * back into `checkInspectorInvariants()` is therefore always consistent.
+ *
+ * A weak `cdpRuntimeLeak` / Error-preview read is telemetry only — it is NOT forwarded as CDP or
+ * DevTools proof (matching `developerToolsAttached` below), so a clean browser can never acquire
+ * an inspector flag from it.
  */
 function resolveInspectorState(signals: {
   strongCdpProof?: boolean;
@@ -6644,34 +6654,36 @@ function resolveInspectorState(signals: {
   devtoolsActiveVerified?: boolean;
   viewportContractionNormalized?: boolean;
 }): ResolvedInspectorState {
-  const inspector_state = classifyInspectorState({
-    cdpAttached: Boolean(signals.strongCdpProof),
+  const canonical = canonicalInspectorFlags({
+    strongCdpProof: Boolean(signals.strongCdpProof),
     devtoolsActiveVerified: Boolean(signals.devtoolsActiveVerified),
     viewportContractionNormalized: Boolean(signals.viewportContractionNormalized),
+    developerTools: Boolean(signals.developerTools),
+    automationEnvironment: signals.automationEnvironment,
+    // `cdpRuntimeLeak` is deliberately NOT forwarded: a bare runtime leak is a weak,
+    // engine-dependent artifact and is not evidence of either a CDP binding or a DevTools UI.
   });
-  const cdp_attached = inspector_state === 'automation_protocol_attached';
-  // Any DevTools / IDE-webview / docked attach is developer-tools evidence — including a weak
-  // runtime leak. The CDP protocol state carries developer_tools:false by contract (the binding
-  // is reported on the cdp_attached axis instead).
-  const developer_tools =
-    !cdp_attached &&
-    Boolean(
-      signals.developerTools ||
-        signals.cdpRuntimeLeak ||
-        signals.automationEnvironment === 'electron' ||
-        signals.automationEnvironment === 'ide_webview' ||
-        signals.devtoolsActiveVerified ||
-        signals.viewportContractionNormalized
-    );
-  const detail = cdp_attached
-    ? 'CDP protocol attached; no docked DevTools UI'
-    : inspector_state === 'devtools_active_verified'
-    ? 'Docked DevTools frontend verified active'
-    : inspector_state === 'devtools_docked_suspected'
-    ? 'Docked DevTools frontend suspected'
-    : developer_tools
-    ? 'Developer tools / inspector probe observed (no CDP protocol proof)'
-    : 'No inspector / DevTools attachment detected';
+  // The public envelope keeps the legacy `automation_protocol_attached` spelling for a bare CDP
+  // binding. The canonical 3-state alias `yes-unattributed` carries the exact same asymmetric
+  // flags, so restoring the legacy spelling never changes cdp_attached / developer_tools and
+  // stays consistent under checkInspectorInvariants().
+  const inspector_state: ServerInspectorState =
+    canonical.inspector_state === 'yes-unattributed' && canonical.cdp_attached
+      ? 'automation_protocol_attached'
+      : canonical.inspector_state;
+  const { cdp_attached, developer_tools } = canonical;
+  const detail =
+    inspector_state === 'yes-corroborated'
+      ? 'CDP protocol binding and DevTools frontend both observed'
+      : cdp_attached
+      ? 'CDP protocol attached; no docked DevTools UI'
+      : inspector_state === 'devtools_active_verified'
+      ? 'Docked DevTools frontend verified active'
+      : inspector_state === 'devtools_docked_suspected'
+      ? 'Docked DevTools frontend suspected'
+      : developer_tools
+      ? 'Developer tools / inspector probe observed (no CDP protocol proof)'
+      : 'No inspector / DevTools attachment detected';
   return { inspector_state, cdp_attached, developer_tools, detail };
 }
 
@@ -6845,12 +6857,13 @@ function sanitizeAndReinforceSecuritySignals(
       ? raw.tamperingMlScore
       : 0;
   const mlTampering = rfpExempt ? false : tamperingMlScore >= 0.5;
-  // Developer-tools evidence is its own axis (Fingerprint Pro parity). A CDP Runtime leak
-  // means DevTools, an Electron shell or an IDE webview is attached — not that the session
-  // is automated. It is reported as `developer_tools` and never escalates the bot verdict.
+  // Developer-tools evidence is its own axis (Fingerprint Pro parity). Only a genuine docked
+  // DevTools / IDE / Electron attach belongs here. A raw `cdpRuntimeLeak` is a weak engine
+  // artifact, NOT DevTools proof: on the CDP axis it is either the strong protocol binding that
+  // resolves to `cdp_attached` or telemetry that carries no inspector flag at all. Including it
+  // here used to make `securitySignals.developerTools` disagree with the canonical flags.
   const developerToolsAttached = Boolean(
     raw?.developerTools ||
-      raw?.cdpRuntimeLeak ||
       raw?.automationEnvironment === 'electron' ||
       raw?.automationEnvironment === 'ide_webview'
   );
@@ -8140,8 +8153,37 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     // back to the high-entropy values the client resolved from `navigator.userAgentData`
     // and finally to the User-Agent string. `os` is always the family and the version
     // always lands in `os_version` — never the inverse.
+    //
+    // Resolve the COMPLETE request UA once, before any UA consumer. The Workers→Node adapter
+    // truncates comma-bearing User-Agent headers at the first comma (`… (KHTML, like Gecko …`),
+    // which strips the HeadlessChrome / Chromium / Safari 26 tokens and makes the normalizer
+    // fall back to Unknown / Google Chrome. Prefer the Worker's encoded original, then a bot
+    // signature in that header, then the signed envelope, then the plain header. Bot attribution
+    // below reuses this exact value so every browser / OS surface agrees.
+    const earlyRequestHeaders = req.headers as RawHeaderBag;
+    const encodedOriginalUa = readRequestHeader(earlyRequestHeaders, 'x-intel-original-ua');
+    let headerRequestUserAgent = readRequestHeader(earlyRequestHeaders, 'user-agent');
+    if (encodedOriginalUa) {
+      try {
+        headerRequestUserAgent = decodeURIComponent(encodedOriginalUa) || headerRequestUserAgent;
+      } catch {
+        // Malformed encoding: keep the plain header.
+      }
+    }
+    const envelopeRequestUserAgent =
+      typeof requestBody.securityEnvelope?.userAgent === 'string'
+        ? requestBody.securityEnvelope.userAgent.trim()
+        : '';
+    const headerCarriesBotSignature =
+      Boolean(headerRequestUserAgent) &&
+      (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) ||
+        GOOD_BOT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)) ||
+        AI_AGENT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)));
+    const fullRequestUserAgent = headerCarriesBotSignature
+      ? headerRequestUserAgent
+      : envelopeRequestUserAgent || headerRequestUserAgent;
     const uaIdentity = normalizeUserAgent({
-      userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '',
+      userAgent: fullRequestUserAgent,
       platform: typeof rawBrowserDevice?.platform === 'string' ? rawBrowserDevice.platform : '',
       maxTouchPoints: hardwareSignals.maxTouchPoints,
       clientHints: mergeRequestClientHints(
@@ -8149,10 +8191,16 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         requestBody.clientHints
       ),
     });
-    if (uaIdentity.os !== 'Unknown' && /^unknown|^$/i.test(browserDevice.os || '')) {
+    // One authoritative browser / OS identity across EVERY surface. The request's own UA and
+    // Sec-CH-UA hints are browser-generated, so they outrank a client payload that may lie:
+    //   - a `HeadlessChrome` UA must never be reported as `Google Chrome`,
+    //   - a bare `Chromium/…` build must never degrade to `Unknown`,
+    //   - Safari 26 (with ATPF) is `Mac OS X`, not `Unknown` / `iOS`.
+    // The client payload is kept only as a fallback when the server cannot resolve a family.
+    if (uaIdentity.os && uaIdentity.os !== 'Unknown') {
       browserDevice.os = uaIdentity.os;
     }
-    if (uaIdentity.browserName !== 'Unknown' && /^unknown|^$/i.test(browserDevice.browser || '')) {
+    if (uaIdentity.browserName && uaIdentity.browserName !== 'Unknown') {
       browserDevice.browser = uaIdentity.browserName;
     }
 
@@ -9121,34 +9169,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         earlyInspectorState === 'devtools_active_verified'
     ) &&
       (trustedHumanCorroboration >= 0.5 || hasTrustedInteractionEvidence);
-    // Phase 1 — bot identity is resolved from the raw headers plus the server network identity.
-    // Edge proxies truncate long User-Agent headers, so the signed envelope carries the full UA;
-    // fall back to the raw header for older clients. A crawler/automation signature in the raw
-    // header always wins so a spoofed envelope cannot mask a bot.
-    // The Workers→Node adapter truncates comma-containing UA strings at the first comma.
-    // The Worker forwards the complete value encoded in `x-intel-original-ua`; prefer it so
-    // `…(KHTML, like Gecko; compatible; GPTBot…)` survives intact on the API path too.
-    const encodedOriginalUa = readRequestHeader(rawRequestHeaders, 'x-intel-original-ua');
-    let headerRequestUserAgent = readRequestHeader(rawRequestHeaders, 'user-agent');
-    if (encodedOriginalUa) {
-      try {
-        headerRequestUserAgent = decodeURIComponent(encodedOriginalUa) || headerRequestUserAgent;
-      } catch {
-        // Malformed encoding: keep the plain header.
-      }
-    }
-    const envelopeRequestUserAgent =
-      typeof requestBody.securityEnvelope?.userAgent === 'string'
-        ? requestBody.securityEnvelope.userAgent.trim()
-        : '';
-    const headerCarriesBotSignature =
-      Boolean(headerRequestUserAgent) &&
-      (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) ||
-        GOOD_BOT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)) ||
-        AI_AGENT_UA_RULES.some((rule) => rule.pattern.test(headerRequestUserAgent)));
-    const fullRequestUserAgent = headerCarriesBotSignature
-      ? headerRequestUserAgent
-      : envelopeRequestUserAgent || headerRequestUserAgent;
+    // Phase 1 — bot identity uses `fullRequestUserAgent`, resolved once above from the Worker's
+    // encoded original UA / signed envelope so a truncated header cannot mask a named crawler.
     // Hard automation artifacts reach BOTH this first classification (which drives the final
     // bot_info / bot_type / history verdict) and the sanitizer's per-tile escalation. Omitting
     // them here used to leave the final classification as "Verified Human" even when the bot
@@ -9996,11 +10018,45 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     let botInfo: BotInfo | null = null;
     let botType: string | null = null;
     let botVerdict = 'not_detected';
-    // A "spoofed" identity needs a loaded feed / DNS answer that positively excludes the IP;
-    // unavailable verification sources alone must degrade to "unknown", never to a spoof.
-    const positiveSpoofExclusion = (aiAgent?.evidence || []).some((line) =>
-      /is not (on|inside)\b/i.test(line)
+    // A claimed verified-bot identity (Googlebot / GPTBot / ClaudeBot / …) is only trustworthy
+    // when first-party proof exists: a verified RFC 9421 Web Bot Auth signature, an exact
+    // official CIDR range or a forward-confirmed reverse DNS match. Without any of those the
+    // claim is a spoofed impostor — never "unknown" and never a low spoof likelihood. An
+    // unavailable feed / DNS answer is NOT an alibi: absence of proof is exactly the spoof.
+    const claimedVerifiedBotUa =
+      /\b(?:googlebot|googleother|gptbot|chatgpt-user|oai-searchbot|claudebot|claude-user|claude-searchbot|perplexitybot|perplexity-user|grokbot|xai-bot|meta-externalagent|meta-externalfetcher|facebookbot|muse|bingbot|duckduckbot|baiduspider|yandexbot)\b/i.test(
+        fullRequestUserAgent || ''
+      );
+    // Signed-good precedence: a cryptographically verified RFC 9421 agent keeps its real
+    // attribution even when its UA also names a crawler operator.
+    const signedGoodBot = Boolean(
+      aiAgent?.verified && /signed/i.test(String(aiAgent.executionMode || ''))
     );
+    // Consume the shared verifier verdict: a named crawler / AI-agent UA claim with no valid WBA
+    // signature and no official CIDR / FCrDNS proof is already classified there as
+    // bad / spoofed-impersonation with identity:'spoofed'. Mirroring that reason here keeps
+    // bot_info, spoof_likelihood and the risk evidence line in agreement with the verifier.
+    const botVerifierVerdict = composeBotVerdict({
+      userAgent: fullRequestUserAgent,
+      webBotAuth: effectiveWba,
+      ipInKnownBotCidr: Boolean(aiAgent?.verified),
+      uaLooksLikeBot: Boolean(aiAgent?.detected || registryAgent),
+      category: registryAgent?.category,
+      directory: aiAgent
+        ? {
+            detected: aiAgent.detected,
+            bot_id: aiAgent.agentId,
+            operator: aiAgent.operator,
+            category: registryAgent?.category,
+            identity: aiAgent.verified ? 'verified' : 'unknown',
+          }
+        : null,
+    });
+    const verifierSpoofed =
+      botVerifierVerdict.reason === 'spoofed-impersonation' ||
+      botVerifierVerdict.identity === 'spoofed';
+    const spoofedVerifiedBotClaim =
+      (claimedVerifiedBotUa && !signedGoodBot && !aiAgent?.verified) || verifierSpoofed;
 
     if (hardAutomationSignals) {
       // A stealth / anti-detect runtime is always an automation verdict — never let a crawler
@@ -10055,9 +10111,7 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         provider: aiAgent.operator || 'Unknown',
         name: aiAgent.agentName,
         identity: isImpostor
-          ? positiveSpoofExclusion
-            ? 'spoofed'
-            : 'unknown'
+          ? 'spoofed'
           : aiAgent.verified
           ? aiAgent.executionMode === 'RFC 9421 Signed Agent'
             ? 'signed'
@@ -10111,6 +10165,38 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       botVerdict = 'bad';
     }
 
+    if (spoofedVerifiedBotClaim) {
+      // Last-word identity authority: an unverified "verified bot" claim is a spoof even when a
+      // generic classifier labelled it a good crawler or an automation branch reported "unknown".
+      // Signed-good agents are excluded above, so only unproven claims reach this override. The
+      // evidence line is mirrored onto every surface (tampering reasons, risk ledger, aiAgent).
+      const spoofEvidence =
+        `Spoofed verified-bot identity claim: ${String(fullRequestUserAgent || '').slice(0, 120)}` +
+        ' — no RFC 9421 signature or official CIDR / FCrDNS proof';
+      botInfo = {
+        category: 'browser_automation',
+        provider: aiAgent?.operator || effectiveBotClassification.provider || 'Unverified',
+        name: aiAgent?.agentName || effectiveBotClassification.label || 'Spoofed Verified Bot',
+        identity: 'spoofed',
+      };
+      botType = 'ai_agent';
+      botVerdict = 'bad';
+      securitySignals.botSubtype = 'bad_bot';
+      tamperingFactorReasons.push(spoofEvidence);
+      riskLedger.evidence_ledger.push({
+        family: 'automation',
+        component: 'spoofed_verified_bot_claim',
+        points: 0,
+        reason: spoofEvidence,
+      });
+      if (securitySignals.aiAgent) {
+        securitySignals.aiAgent = {
+          ...securitySignals.aiAgent,
+          evidence: Array.from(new Set([...securitySignals.aiAgent.evidence, spoofEvidence])),
+        };
+      }
+    }
+
     // Final label authority: if any attribution engine / directory still produced a Gemini or
     // generic "Cloud Agent" label on a session the automation verdict owns, replace it with a
     // neutral stealth / headless automation identity everywhere it is serialized. A verified
@@ -10123,6 +10209,7 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     if (
       lingeringCloudAgentLabel &&
       !signedAgentIdentity &&
+      !spoofedVerifiedBotClaim &&
       (hardAutomationSignals ||
         botVerdict === 'bad' ||
         /stealth|headless|chromium/i.test(String(botType || '')))
@@ -10322,8 +10409,20 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       developer_tools: earlyInspector.developer_tools,
     };
     const inspectorDetail = earlyInspector.detail;
-    if (inspectorFlags.cdp_attached !== (inspectorState === 'automation_protocol_attached')) {
-      console.error('[invariant] inspector CDP parity violation', { inspectorState, inspectorFlags });
+    // Zero-contradiction guard: the flags and the state come from the same canonical resolver.
+    // Check both legacy (`automation_protocol_attached`) and canonical (`yes-unattributed`)
+    // spellings so a bare CDP binding can never trip a false parity alarm.
+    const inspectorInvariant = checkInspectorInvariants({
+      inspector_state: inspectorState,
+      cdp_attached: inspectorFlags.cdp_attached,
+      developer_tools: inspectorFlags.developer_tools,
+    });
+    if (!inspectorInvariant.consistent) {
+      console.error('[invariant] inspector CDP parity violation', {
+        inspectorState,
+        inspectorFlags,
+        contradictions: inspectorInvariant.contradictions,
+      });
     }
     const automationVerdict =
       securitySignals.isBot || botVerdict === 'bad' || hardAutomationSignals
@@ -10633,8 +10732,16 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       ? 'possible hardware match'
       : 'returning device';
 
+    // A positively classified residential ISP (e.g. Jio AS55836) is NEVER a hosting network,
+    // even if a geo provider's stale `is_vpn_or_hosting` flag leaked into `hostingDatacenter`.
+    // This keeps canonical.network.hosting_asn null for consumer broadband lines.
+    const residentialIsp =
+      classification.isConsumerBroadband &&
+      /broadband|residential|consumer/i.test(networkTypeLabel);
     const networkOwnership: 'residential_isp' | 'mobile_carrier' | 'hosting_datacenter' | 'enterprise' | 'unknown' =
-      hostingDatacenter
+      residentialIsp
+        ? 'residential_isp'
+        : hostingDatacenter
         ? 'hosting_datacenter'
         : /cellular|mobile|5g|carrier/i.test(networkTypeLabel)
         ? 'mobile_carrier'
@@ -10809,7 +10916,7 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       isBot: boolean;
       /** Inspector axes mirrored from the envelope so the identify response is self-contained. */
       cdp_attached: boolean;
-      inspector_state: InspectorState;
+      inspector_state: ServerInspectorState;
       inspector_detail: string;
       /** Which high-activity rule produced `highActivityDevice`. */
       highActivityThresholdMode: 'fixed_small_corpus' | 'p98';
@@ -11101,7 +11208,10 @@ app.get('/api/visitor/history/:visitorId', (req, res) => {
  * presented there is nothing to revalidate, so the response is `204`.
  */
 app.get('/api/intel/identity-ping', (req, res) => {
-  res.setHeader('Cache-Control', 'private, max-age=0, must-revalidate');
+  // Never let the HTTP disk cache replay an identity label after the cookie was cleared. The
+  // recognition source is derived from the cookie/token actually presented on THIS request; a
+  // stale 304 would otherwise serve a label from a previous, now-wiped storage state.
+  res.setHeader('Cache-Control', 'private, no-store, no-cache, must-revalidate, max-age=0');
   // Merge, never replace: clientHintsMiddleware already added `Vary: Sec-CH-UA*`, and dropping
   // it would let a shared cache serve one client's UA-CH-negotiated identity to another.
   const existingVary = res.getHeader('Vary');
@@ -11113,30 +11223,52 @@ app.get('/api/intel/identity-ping', (req, res) => {
     if (!varyValues.some((item) => item.toLowerCase() === value.toLowerCase())) varyValues.push(value);
   }
   res.setHeader('Vary', varyValues.join(', '));
-  const presented = typeof req.headers['if-none-match'] === 'string' ? req.headers['if-none-match'] : '';
-  if (presented) {
-    res.setHeader('ETag', presented);
-    res.status(304).end();
-    return;
-  }
   const cookies = (req.cookies ?? {}) as Record<string, unknown>;
   const cookieVisitor =
     (typeof cookies['_intel_vid_client'] === 'string' && cookies['_intel_vid_client'].trim()) ||
     (typeof cookies['intel_http_vid'] === 'string' && cookies['intel_http_vid'].trim()) ||
     '';
+  const cookieToken =
+    (typeof cookies['intel_http_token'] === 'string' && cookies['intel_http_token'].trim()) ||
+    '';
+  // A cleared cookie can never revalidate a cached body: answer 204 before any ETag check.
   if (!cookieVisitor) {
+    res.setHeader('ETag', '"identity-none"');
     res.status(204).end();
     return;
   }
-  const etag = `"${crypto.createHash('sha256').update(cookieVisitor).digest('base64url')}"`;
+  // Per-load nonce: including the nonce the client sent for this page load resets the ETag on a
+  // fresh load, so an ETag captured before a cookie clear can never produce a stale 304.
+  const loadNonce =
+    typeof req.headers['x-intel-load-nonce'] === 'string'
+      ? req.headers['x-intel-load-nonce'].slice(0, 120)
+      : '';
+  const etag = `"${crypto
+    .createHash('sha256')
+    .update(`${cookieVisitor}|${cookieToken}|${loadNonce}`)
+    .digest('base64url')}"`;
   res.setHeader('ETag', etag);
+  const presented = typeof req.headers['if-none-match'] === 'string' ? req.headers['if-none-match'] : '';
+  // Blindly echoing the presented ETag used to answer 304 for ANY conditional request, so a
+  // cached label could survive a cookie wipe. Only an exact match against the current cookie /
+  // token / nonce is revalidated.
+  if (presented && presented === etag) {
+    res.status(304).end();
+    return;
+  }
   res.json({
     identity: {
       visitor_id: cookieVisitor,
       hardware_fingerprint: '',
       browser_fingerprint: '',
       created_at: new Date().toISOString(),
+      // Derived from the incoming cookie + HMAC token, never from a cached response.
+      recognition_source: verifyVisitorToken(cookieVisitor, cookieToken)
+        ? 'First-Party Cookie'
+        : 'Unverified Cookie',
     },
+    // Handed back so the next conditional request can carry the same per-load nonce.
+    load_nonce: loadNonce,
   });
 });
 

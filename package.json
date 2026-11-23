@@ -46,7 +46,8 @@
     "test:proximity": "npx tsx scripts/test-proximity-adapter.ts",
     "test:vm": "npx tsx scripts/test-vm-integrity.ts",
     "test:benchmark": "npx tsx scripts/test-benchmark15.ts",
-    "test:shadow": "npm run test:proxy && npm run test:vpn && npm run test:diag && npm run test:idb && npm run test:privacy && npm run test:stealth && npm run test:tamper && npm run test:hex && npm run test:zero && npm run test:velocity && npm run test:entropy && npm run test:identity && npm run test:calibration && npm run test:network && npm run test:proximity && npm run test:vm && npm run test:benchmark",
+    "test:p0": "npx tsx scripts/test-p0-regressions.ts",
+    "test:shadow": "npm run test:proxy && npm run test:vpn && npm run test:diag && npm run test:idb && npm run test:privacy && npm run test:stealth && npm run test:tamper && npm run test:hex && npm run test:zero && npm run test:velocity && npm run test:entropy && npm run test:identity && npm run test:calibration && npm run test:network && npm run test:proximity && npm run test:vm && npm run test:benchmark && npm run test:p0",
     "rollback:last": "node scripts/rollback.mjs",
     "phones:generate": "node scripts/generate-phone-models.mjs"
   },

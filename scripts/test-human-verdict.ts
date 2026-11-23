@@ -395,17 +395,17 @@ section('I. Inspector tri-state flags');
 const unattributedInspector = resolveInspectorState({ cdpAttached: true });
 check('unattributed CDP resolves to yes-unattributed', unattributedInspector === 'yes-unattributed');
 check(
-  'unattributed CDP -> cdp_attached false, developer_tools true',
+  'unattributed CDP -> cdp_attached true, developer_tools false',
   (() => {
     const flags = inspectorFlagsForState(unattributedInspector);
-    return flags.cdp_attached === false && flags.developer_tools === true;
+    return flags.cdp_attached === true && flags.developer_tools === false;
   })(),
 );
 check(
   'legacy automation_protocol_attached normalizes to the unattributed flags',
   (() => {
     const flags = inspectorFlagsForState('automation_protocol_attached');
-    return flags.cdp_attached === false && flags.developer_tools === true;
+    return flags.cdp_attached === true && flags.developer_tools === false;
   })(),
 );
 
@@ -432,14 +432,23 @@ check(
 );
 
 check(
-  'inspector invariants reject a bare CDP claim of attachment',
+  'inspector invariants accept bare CDP attach but reject a docked DevTools claim',
   (() => {
-    const result = checkInspectorInvariants({
+    const bareAttach = checkInspectorInvariants({
       inspector_state: unattributedInspector,
       cdp_attached: true,
       developer_tools: false,
     });
-    return result.consistent === false && result.contradictions.length === 2;
+    const dockedClaim = checkInspectorInvariants({
+      inspector_state: unattributedInspector,
+      cdp_attached: false,
+      developer_tools: true,
+    });
+    return (
+      bareAttach.consistent === true &&
+      dockedClaim.consistent === false &&
+      dockedClaim.contradictions.length === 2
+    );
   })(),
 );
 check(

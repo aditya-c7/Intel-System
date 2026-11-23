@@ -9,6 +9,10 @@
  *   1. RFC 9421 Web Bot Auth signature verified      → good / verified-agent.
  *   2. Directory identity explicitly 'spoofed'       → bad / spoofed-impersonation.
  *   3. Directory detected (verified or signed)       → good / agent identity.
+ *   3.5 Explicit named crawler / AI-agent UA claim with NO valid signature AND an
+ *       out-of-list IP (no official CIDR / FCrDNS proof) → bad / spoofed-impersonation.
+ *       A UA-only claim cannot mint a verified identity; NEUTRAL + out-of-list is only
+ *       an inconclusive "unverified" result for non-crawler UAs. Signed-good still wins.
  *   4. Client probe 'agent' + corroborated automation → bad / automated-runtime.
  *      A bare `cdp.*` bridge is `developer_tools` (weight 0) and CANNOT escalate.
  *   5. Client probe 'agent' with weak reasons only   → not_detected / suspected-automation.
@@ -124,6 +128,13 @@ export interface BotVerdictInput {
   ipInKnownBotCidr?: boolean;
   /** User-agent matches a known bot / crawler pattern. */
   uaLooksLikeBot?: boolean;
+  /**
+   * Raw User-Agent string, when the caller has it. Used only to recognise an EXPLICIT
+   * named crawler / AI-agent claim (Googlebot, GPTBot, ClaudeBot, PerplexityBot, …).
+   */
+  userAgent?: string | null;
+  /** Alias for `userAgent`. */
+  ua?: string | null;
   /** Agent category when only the caller has it (mirrors the registry category). */
   category?: string | null;
 }
@@ -521,6 +532,56 @@ function isWbaValid(wba: BotVerifierWebBotAuth): boolean {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Explicit verified-bot claim detection                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Brands whose identity is routinely impersonated by a bare User-Agent token. These are
+ * the only claims that can be "spoofed": a generic automation UA (HeadlessChrome,
+ * Playwright, …) never claims a verification-backed identity and stays inconclusive.
+ * Static registry knowledge mirrored here so this facade remains import-free.
+ */
+const CLAIMED_OFFICIAL_BOT_PATTERN =
+  /googlebot|googleother|google-inspectiontool|gptbot|chatgpt-user|oai-searchbot|claudebot|claude-user|claude-searchbot|perplexitybot|perplexity-user|ccbot|bingbot|applebot|meta-externalagent|grokbot|bedrockagentcore|mistralai[_-]?user|manus-user/i;
+
+/** Categories whose *name* is itself a claim to a verification-backed crawler/agent. */
+const CLAIMED_BOT_CATEGORIES: ReadonlySet<string> = new Set([
+  'ai_crawler',
+  'search_crawler',
+  'link_preview',
+  'crawler',
+]);
+
+/**
+ * True when the request explicitly claims a named, verification-backed crawler /
+ * AI-agent identity — via the caller's `uaLooksLikeBot` flag, a raw UA string, a
+ * directory claimed bot id/operator, or a crawler category. A plain human UA is false.
+ */
+function claimsOfficialBotIdentity(input: BotVerdictInput): boolean {
+  if (input.uaLooksLikeBot === true) return true;
+
+  const pieces: string[] = [];
+  for (const value of [
+    input.userAgent,
+    input.ua,
+    input.webBotAuth?.bot_id,
+    input.webBotAuth?.operator,
+    input.directory?.bot_id,
+    input.directory?.operator,
+  ]) {
+    if (typeof value === 'string' && value.length > 0) pieces.push(value);
+  }
+  const claimedText = pieces.join(' ');
+  if (claimedText && CLAIMED_OFFICIAL_BOT_PATTERN.test(claimedText)) return true;
+
+  return [
+    input.category,
+    input.webBotAuth?.category,
+    input.directory?.category,
+  ].some((value) => CLAIMED_BOT_CATEGORIES.has(normalizedCategory(value)));
+}
+
+/* -------------------------------------------------------------------------- */
 /* Composition                                                                 */
 /* -------------------------------------------------------------------------- */
 
@@ -537,11 +598,15 @@ export function composeBotVerdict(input: BotVerdictInput): BotVerdict {
       input.directory?.identity ??
       input.directory?.status
   );
+  const reasonIdentity = identityForReason(core.reason);
   return {
     ...core,
     bot,
     isBot: bot !== 'not_detected',
-    identity: explicitIdentity ?? identityForReason(core.reason),
+    // A spoofed-impersonation core result is authoritative: an input-level 'unknown'
+    // or 'verified' claim must never downgrade identity='spoofed'. All other reasons
+    // keep the existing explicit-claim-then-reason precedence.
+    identity: reasonIdentity === 'spoofed' ? 'spoofed' : explicitIdentity ?? reasonIdentity,
     confidence: confidenceForReason(core.reason),
   };
 }
@@ -643,6 +708,27 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
       agent_verdict: directory.bot_id || directory.operator || null,
       verified: directoryStatus === 'verified',
       severity: 'none',
+    };
+  }
+
+  /* 3.5 — Spoofed verified-bot identity. An explicit named crawler / AI-agent claim
+   *       with NO valid signature (INVALID or NEUTRAL) AND an out-of-list IP (no official
+   *       CIDR / FCrDNS proof) is an impersonation, not an inconclusive claim. Signed-good
+   *       (steps 0/1) and a genuine directory verification (step 3) still win. NEUTRAL +
+   *       out-of-list stays "unverified" only when there is no crawler claim at all. */
+  if (
+    !isWbaValid(webBotAuth) &&
+    input.ipInKnownBotCidr !== true &&
+    claimsOfficialBotIdentity(input)
+  ) {
+    return {
+      verdict: 'bad',
+      reason: 'spoofed-impersonation',
+      reason_ids: ['spoofed-impersonation', ...allProbeReasons],
+      agent_verdict:
+        webBotAuth.bot_id || webBotAuth.operator || directory.bot_id || directory.operator || null,
+      verified: false,
+      severity: 'high',
     };
   }
 

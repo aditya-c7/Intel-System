@@ -1118,9 +1118,49 @@ async function collectClientGeoHint(): Promise<ClientGeoHint | null> {
   return null;
 }
 
+/**
+ * Touch-capability coherence. A host with no `touchstart` event and no coarse/hover-less
+ * pointer cannot honestly report a 10-point multi-touch digitizer: that combination is the
+ * signature of an injected `navigator.maxTouchPoints` override or a DevTools device-emulation
+ * preset. Genuine touch hosts (including Windows touch laptops, which expose `ontouchstart`
+ * even with a fine pointer) keep their reported value. Only multi-touch claims (>= 5) are
+ * corrected, so a real single-touch device is never rewritten. Hostile scopes keep the raw
+ * value — absence of corroboration is not evidence of a spoof. Never throws.
+ */
+function coherentMaxTouchPoints(raw: number | null | undefined): number {
+  const value = typeof raw === 'number' && Number.isFinite(raw) ? Math.max(0, Math.floor(raw)) : 0;
+  if (value === 0 || value < 5) return value;
+  try {
+    if (typeof window !== 'undefined') {
+      const hasTouchEvent = 'ontouchstart' in window;
+      const coarsePointer =
+        typeof window.matchMedia === 'function'
+          ? window.matchMedia('(pointer: coarse)').matches
+          : false;
+      const hoverNone =
+        typeof window.matchMedia === 'function'
+          ? window.matchMedia('(hover: none)').matches
+          : false;
+      if (!hasTouchEvent && !coarsePointer && !hoverNone) return 0;
+    }
+  } catch {
+    // Hostile window proxy: keep the reported value rather than invent evidence.
+  }
+  return value;
+}
+
 export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & ClientRuntimeSignals> {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
   const runtimeFacts = detectRuntimeFacts(ua);
+  // The `(-1).toFixed(-1)` RangeError length is the deterministic engine oracle (51 = V8).
+  // A Safari label on a V8 runtime is a spoofed UA claim, never a real Safari browser.
+  let jsEngineLength = 0;
+  try {
+    jsEngineLength = getEngineErrorLength();
+  } catch {
+    jsEngineLength = 0;
+  }
+  const v8EnginePresent = jsEngineLength === 51;
   const uaData =
     typeof navigator !== 'undefined'
       ? ((navigator as unknown as { userAgentData?: NavigatorUAData }).userAgentData ?? null)
@@ -1158,7 +1198,11 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & Cl
   }
 
   let browser = 'Unknown';
-  const versionList = highEntropy?.fullVersionList || uaData?.brands || [];
+  // The same forged-major filter used for the published UA-CH mirror runs here, so an
+  // implausible brand version can never become the human-readable browser label either.
+  const versionList =
+    sanitizeUaChBrands(highEntropy?.fullVersionList || uaData?.brands || [], ua, 'browserDevice') ||
+    [];
 
   let isBrave = false;
   try {
@@ -1217,7 +1261,9 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & Cl
   } else if (chromeBrand || chromeUa) {
     const ver = chromeUa ? chromeUa[1] : chromeBrand?.version || '';
     browser = ver ? `Chrome ${ver}` : 'Chrome';
-  } else if (safariUa && !/Chrome|Chromium|Edg|OPR/i.test(ua)) {
+  } else if (safariUa && !/Chrome|Chromium|Edg|OPR/i.test(ua) && !v8EnginePresent) {
+    // A Safari/Version UA token on a V8 runtime is a spoofed claim, not a Safari browser.
+    // The engine oracle (toFixed RangeError length) is independent of the forgeable UA.
     browser = `Safari ${safariUa[1]}`;
   }
 
@@ -1244,7 +1290,11 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & Cl
       .sort((a, b) => b.major - a.major || b.parts.length - a.parts.length)
       .map((entry) => entry.value.replace(/\.$/, ''))[0];
   };
-  const maxTouchPoints = typeof navigator !== 'undefined' ? Number(navigator.maxTouchPoints ?? 0) : 0;
+  // Coherence: a no-touch host cannot honestly report a 10-point digitizer. This prevents a
+  // forged multi-touch claim from manufacturing an iPadOS label or a fake device-gate input.
+  const maxTouchPoints = coherentMaxTouchPoints(
+    typeof navigator !== 'undefined' ? Number(navigator.maxTouchPoints ?? 0) : 0
+  );
   const hintPlatform = highEntropy?.platform || uaData?.platform || '';
   const hintPlatformVersion = highEntropy?.platformVersion || '';
 
@@ -1297,8 +1347,9 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & Cl
     typeof navigator !== 'undefined' && typeof navigator.platform === 'string'
       ? navigator.platform
       : '';
-  const gateTouchPoints =
-    typeof navigator !== 'undefined' ? Number(navigator.maxTouchPoints ?? 0) : 0;
+  const gateTouchPoints = coherentMaxTouchPoints(
+    typeof navigator !== 'undefined' ? Number(navigator.maxTouchPoints ?? 0) : 0
+  );
   const pointerCoarse =
     typeof window !== 'undefined' && typeof window.matchMedia === 'function'
       ? window.matchMedia('(pointer: coarse)').matches
@@ -1411,7 +1462,20 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & Cl
 
   const sw = typeof window !== 'undefined' && window.screen ? Number(window.screen.width) : 0;
   const sh = typeof window !== 'undefined' && window.screen ? Number(window.screen.height) : 0;
-  const screenResolution = sw > 0 && sh > 0 ? `${sw} x ${sh}` : 'Unavailable';
+  const viewportHeight = typeof window !== 'undefined' ? Number(window.innerHeight) || 0 : 0;
+  // Mobile emulation presets sometimes expose the screen axes in device-height order while the
+  // viewport is unambiguously portrait. Normalize ONLY that disagreement to width x height;
+  // a genuine landscape or portrait screen is published verbatim.
+  const mobileAxesSwapped =
+    deviceGate.kind === 'mobile' &&
+    sw > sh &&
+    viewportWidth > 0 &&
+    viewportHeight > 0 &&
+    viewportWidth < viewportHeight;
+  const screenResolution =
+    sw > 0 && sh > 0
+      ? `${mobileAxesSwapped ? sh : sw} x ${mobileAxesSwapped ? sw : sh}`
+      : 'Unavailable';
 
   const dpr = typeof window !== 'undefined' ? Number(window.devicePixelRatio) : NaN;
   const pixelRatio = !Number.isNaN(dpr) && dpr > 0 ? `${Number(dpr.toFixed(2))}x` : 'Unavailable';
@@ -1493,11 +1557,21 @@ async function collectClientHintsUncached(): Promise<ClientHintsPayload | null> 
   if (typeof navigator === 'undefined') return null;
   const uaData = (navigator as unknown as { userAgentData?: NavigatorUAData }).userAgentData;
   if (!uaData) return null;
+  let jsUa = '';
+  try {
+    jsUa = navigator.userAgent || '';
+  } catch {
+    jsUa = '';
+  }
 
   const lowEntropy: ClientHintsPayload = {
-    brands: Array.isArray(uaData.brands)
-      ? uaData.brands.map((entry) => ({ brand: entry.brand, version: entry.version }))
-      : undefined,
+    brands: sanitizeUaChBrands(
+      Array.isArray(uaData.brands)
+        ? uaData.brands.map((entry) => ({ brand: entry.brand, version: entry.version }))
+        : undefined,
+      jsUa,
+      'brands'
+    ),
     mobile: typeof uaData.mobile === 'boolean' ? uaData.mobile : undefined,
     platform: typeof uaData.platform === 'string' ? uaData.platform : undefined,
   };
@@ -1520,12 +1594,19 @@ async function collectClientHintsUncached(): Promise<ClientHintsPayload | null> 
     if (!highEntropy) return lowEntropy;
     return {
       ...lowEntropy,
-      fullVersionList: Array.isArray(highEntropy.fullVersionList)
-        ? highEntropy.fullVersionList.map((entry) => ({
-            brand: entry.brand,
-            version: entry.version,
-          }))
-        : undefined,
+      // A forged major (e.g. Chrome/999.0.0.0) is dropped here so the server can never
+      // publish it as a trusted browser version. The claim is recorded as contradiction
+      // evidence by `sanitizeUaChBrands` and surfaced through the tampering state.
+      fullVersionList: sanitizeUaChBrands(
+        Array.isArray(highEntropy.fullVersionList)
+          ? highEntropy.fullVersionList.map((entry) => ({
+              brand: entry.brand,
+              version: entry.version,
+            }))
+          : undefined,
+        jsUa,
+        'fullVersionList'
+      ),
       platform: highEntropy.platform || lowEntropy.platform,
       platformVersion: highEntropy.platformVersion || undefined,
       architecture: highEntropy.architecture || undefined,
@@ -1546,6 +1627,71 @@ export function collectClientHints(): Promise<ClientHintsPayload | null> {
     clientHintsInFlight = collectClientHintsUncached().catch(() => null);
   }
   return clientHintsInFlight;
+}
+
+/* -------------------------------------------------------------------------- */
+/* UA-CH claim sanity — a forged brand major is contradiction evidence, never   */
+/* a trusted browser version.                                                   */
+/* -------------------------------------------------------------------------- */
+
+/** Chrome's major advances a handful of times per year: 999 can never be genuine. */
+const MAX_PLAUSIBLE_BROWSER_MAJOR = 300;
+/** Even a fast-forwarded UA is never twenty majors behind its own JS navigator. */
+const UA_MAJOR_TOLERANCE = 20;
+
+/** Browser major declared by the page's own `navigator.userAgent` (the JS side of the pair). */
+function jsBrowserMajor(ua: string): number | null {
+  const match = ua.match(
+    /\b(?:Chrome|CriOS|Chromium|Edg(?:e|A|iOS)?|OPR|Firefox|FxiOS|Version)\/([\d]+)/i
+  );
+  if (!match) return null;
+  const major = Number.parseInt(match[1], 10);
+  return Number.isFinite(major) && major > 0 ? major : null;
+}
+
+function uaChBrandIsForged(brand: string, version: string, ua: string): boolean {
+  const major = Number.parseInt(String(version).split('.')[0], 10);
+  if (!Number.isFinite(major) || major <= 0) return false;
+  if (major > MAX_PLAUSIBLE_BROWSER_MAJOR) return true;
+  const uaMajor = jsBrowserMajor(ua);
+  return uaMajor !== null && major > uaMajor + UA_MAJOR_TOLERANCE;
+}
+
+/** Contradiction state remembered when a forged UA-CH brand is observed. */
+const uaChContradictionState: { detected: boolean; reasons: string[] } = {
+  detected: false,
+  reasons: [],
+};
+
+export function getUaChContradiction(): { detected: boolean; reasons: string[] } {
+  return { detected: uaChContradictionState.detected, reasons: [...uaChContradictionState.reasons] };
+}
+
+/**
+ * Drops implausible UA-CH brand entries before they can be published as a trusted
+ * `browser_details` version. The dropped claim is recorded as an existing tampering /
+ * contradiction reason instead. Never throws; an empty list becomes `undefined`.
+ */
+function sanitizeUaChBrands<T extends { brand: string; version: string }>(
+  list: T[] | undefined | null,
+  ua: string,
+  source: string
+): T[] | undefined {
+  if (!Array.isArray(list)) return undefined;
+  const kept: T[] = [];
+  for (const entry of list) {
+    if (!entry || typeof entry.brand !== 'string' || typeof entry.version !== 'string') continue;
+    if (uaChBrandIsForged(entry.brand, entry.version, ua)) {
+      const reason = `UA-CH ${entry.brand}/${entry.version} contradicts the JS User-Agent (${source})`;
+      if (!uaChContradictionState.reasons.includes(reason)) {
+        uaChContradictionState.reasons.push(reason);
+      }
+      uaChContradictionState.detected = true;
+      continue;
+    }
+    kept.push(entry);
+  }
+  return kept.length > 0 ? kept : undefined;
 }
 
 /**
@@ -1614,8 +1760,9 @@ export async function collectHardwareSignals(
       ? window.screen.colorDepth
       : 24;
 
-  const maxTouchPoints =
-    nav && typeof nav.maxTouchPoints === 'number' ? Math.max(0, nav.maxTouchPoints) : 0;
+  const maxTouchPoints = coherentMaxTouchPoints(
+    nav && typeof nav.maxTouchPoints === 'number' ? nav.maxTouchPoints : 0
+  );
 
   let hdrSupported = false;
   let colorGamut: HardwareSignals['colorGamut'] = 'sRGB';
@@ -2076,6 +2223,16 @@ export function detectEmulatorEvidence(input: EmulatorEvidenceInput = {}): Emula
     return {
       detected: true,
       reason: 'Android user-agent reporting zero touch points (emulated input layer)',
+    };
+  }
+
+  // 2b — A mobile UA reporting EXACTLY one touch point is the named signature of DevTools
+  // device emulation / an injected capability override: real multi-touch handsets and
+  // tablets expose 5+. Naming it here keeps the emulator reason honest and attributable.
+  if ((claimsAndroid || claimsIos) && maxTouchPoints === 1) {
+    return {
+      detected: true,
+      reason: 'maxTouchPoints=1 on a mobile user-agent (device-emulation signature)',
     };
   }
 
@@ -3151,6 +3308,13 @@ export function detectBotAndAutomation(
     human?: HumanCorroborationResult;
     /** True when the identify path waited out the corroboration window with no input. */
     dwellAwaited?: boolean;
+    /**
+     * Authoritative identify path: a bare `navigator.webdriver` flag is ambiguous on
+     * headful, CDP-driven browsers (the automation launch flag sets it), so it is
+     * downgraded to telemetry and only corroborated evidence may escalate. Left unset,
+     * the low-level detector keeps its legacy hard-flag contract for direct callers.
+     */
+    bareWebdriverIsSoft?: boolean;
   }
 ): BotAutomationSignals {
   const nav = typeof navigator !== 'undefined' ? navigator : undefined;
@@ -3189,6 +3353,15 @@ export function detectBotAndAutomation(
   // Stealth plugins hide every classic flag, so their own patching side effects become the
   // evidence: CDP Runtime serialization, forged native getters, iframe identity leaks.
   const stealth = options?.stealth ?? detectStealthArtifacts(gpuRenderer);
+
+  // A bare `navigator.webdriver` flag is ambiguous on a headful, CDP-driven Chrome: the
+  // automation launch flag sets it even when a person drives the session. The authoritative
+  // identify path therefore demotes it to telemetry; only the corroborated rules below
+  // (real automation bindings, two-probe CDP proof, stealth-plugin artifacts, hard
+  // anti-detect signals) may escalate. The low-level detector keeps the legacy hard-flag
+  // behavior for direct callers that supply no corroboration context.
+  const bareWebdriverAmbiguous = webdriver && options?.bareWebdriverIsSoft === true;
+  const effectiveWebdriver = webdriver && !bareWebdriverAmbiguous;
 
   // Weighted evidence gate. A real person must never be branded as a bot from ambiguous
   // environment quirks: SwiftShader appears whenever hardware acceleration is off (battery
@@ -3282,7 +3455,7 @@ export function detectBotAndAutomation(
     'Stealth automation: corroborated CDP runtime bridge with no trusted human input after dwell';
 
   const isBot =
-    webdriver ||
+    effectiveWebdriver ||
     cdpDetected ||
     headlessUa ||
     d19Hard ||
@@ -3295,7 +3468,7 @@ export function detectBotAndAutomation(
   let botReason = 'Verified human runtime & native DOM prototypes';
   const allBotReasons: string[] = [];
 
-  if (webdriver) {
+  if (effectiveWebdriver) {
     botReason = 'navigator.webdriver flag is enabled (WebDriver controlled session)';
   } else if (cdpDetected) {
     botReason = 'Chrome DevTools Protocol binding exposed on window/document';
@@ -3357,7 +3530,9 @@ export function detectBotAndAutomation(
     isHeadless:
       isHeadless || botD19.signals.window_size || botD19.signals.user_agent,
     botReason,
-    webdriver,
+    // A bare webdriver flag explained by a CDP bridge is telemetry, not a published
+    // automation input (the server must not read it as a hard WebDriver handshake).
+    webdriver: effectiveWebdriver,
     cdpDetected: cdpDetected || botD19.signals.distinctive_properties || corroboratedCdpBot,
     botSignals: allBotReasons,
     botSuspicion,
@@ -3404,11 +3579,13 @@ export function detectTorBrowserClient(
   try {
     geckoRuntime = getEngineErrorLength() === 25; // SpiderMonkey (V8 = 51)
     const scope = window as unknown as { chrome?: unknown };
+    // A bare navigator.webdriver flag is NOT a Chromium artifact: CDP-driven headful Chrome
+    // and privacy tooling both set it. Only concrete Chromium surfaces may reject the Gecko
+    // engine here, so genuine Tor / RFP sessions keep their exemption.
     chromiumArtifact =
       /Chrome\/|Chromium\/|Edg\/|OPR\//i.test(navigator.userAgent || '') ||
       Boolean((navigator as unknown as { userAgentData?: unknown }).userAgentData) ||
-      Boolean(scope.chrome) ||
-      navigator.webdriver === true;
+      Boolean(scope.chrome);
   } catch {
     // Hostile proxy: abstain from confirmation rather than trust the spoofable UA.
   }
@@ -4362,8 +4539,11 @@ function resolveBrowserName(
  * that must invalidate verdicts cached by an earlier version of the app. All loads of
  * the same tab in the same app version read this cache FIRST and return it verbatim.
  */
-const INCOGNITO_SESSION_LOCK_KEY = 'intel_fp_incognito_lock_v5';
-const INCOGNITO_LOCK_VERSION = 5;
+// v6: verdicts cached by v5 could be pinned as a high-confidence "normal" by the
+// first-party cookie marker veto. A cleared cookie inside a genuine incognito
+// window then re-read that stale lock instead of the fresh storage physics.
+const INCOGNITO_SESSION_LOCK_KEY = 'intel_fp_incognito_lock_v6';
+const INCOGNITO_LOCK_VERSION = 6;
 
 /**
  * Reads the authoritative per-tab verdict.
@@ -4441,24 +4621,20 @@ function writeIncognitoSessionLock(result: IncognitoDetectionResult): void {
 }
 
 /**
- * Hard veto: a readable first-party persistent marker proves a durable profile, so
- * incognito MUST be false regardless of any noisy physics probe. Checks the client
- * visitor cookie and the durable localStorage visitor/identity tokens. Every access is
- * try/catch-guarded and read-only — no storage is created or written. This veto is
- * applied to freshly computed verdicts (the cached lock is returned verbatim, but the
- * first load's verdict already folds the veto in, keeping the tab answer stable).
+ * Durable-profile marker used ONLY as a NEGATIVE corroborator for a private verdict.
+ *
+ * The incognito verdict itself is produced exclusively by fresh storage physics
+ * (IndexedDB commit durability, OPFS, quota / persisted-storage grant). The visitor
+ * cookie and any server "recognitionSource" are deliberately NOT read here: a cookie is
+ * attacker-clearable and `context.clearCookies()` inside a genuine private window must
+ * never be able to change the verdict. Only long-lived localStorage identity tokens are
+ * considered, and even those are ignored when the fresh physics confirms a RAM-backed
+ * private store via `shouldApplyMarkerVeto` / the physics-confirmed guard below.
+ * Every access is try/catch-guarded and read-only — no storage is created or written.
  */
 function hasFirstPartyPersistentMarker(): boolean {
-  try {
-    if (
-      typeof document !== 'undefined' &&
-      /(?:^|;\s*)intel_client_vid=/.test(document.cookie || '')
-    ) {
-      return true;
-    }
-  } catch {
-    // Cookie access blocked.
-  }
+  // NOTE: document.cookie and recognitionSource are intentionally absent. They are
+  // recognition state, not storage physics, and a cleared cookie must not flip the verdict.
   try {
     if (
       typeof localStorage !== 'undefined' &&
@@ -4475,10 +4651,11 @@ function hasFirstPartyPersistentMarker(): boolean {
 }
 
 /**
- * Apply the first-party persistent-marker veto to a freshly computed verdict. Returns a
- * new, normalized result whose `isPrivate` is false with a durable-profile method note
- * whenever a persistent marker is readable. Confidence is preserved (the marker only
- * makes a verdict more certainly negative), and the low-confidence invariant holds.
+ * Apply the (physics-gated) durable-marker veto to a freshly computed verdict. The marker
+ * alone can never decide incognito: it is consulted only for a verdict that is already
+ * private, and the strong-RAM exception in `shouldApplyMarkerVeto` plus the decisive-physics
+ * guard below keep a genuine incognito window private even when it inherited a marker from
+ * an earlier page of the same private session. A cleared cookie is not an input here.
  */
 function applyPersistentMarkerVeto(result: IncognitoDetectionResult): IncognitoDetectionResult {
   if (!result.isPrivate || !hasFirstPartyPersistentMarker()) return result;
@@ -4497,6 +4674,11 @@ function applyPersistentMarkerVeto(result: IncognitoDetectionResult): IncognitoD
   ) {
     return result;
   }
+  // Fresh, decisive storage physics outranks any recoverable identity token. This is the
+  // case a cookie-cleared incognito session used to lose after a stale cached "normal" lock.
+  if (result.confidence === 'high' && result.method === METHOD_PRIVATE_STORAGE) {
+    return result;
+  }
   return {
     ...result,
     isPrivate: false,
@@ -4506,9 +4688,9 @@ function applyPersistentMarkerVeto(result: IncognitoDetectionResult): IncognitoD
 
 /**
  * Final normalization applied to every freshly computed verdict before it is cached.
- * A readable first-party persistent marker is a hard veto (incognito = false), and a
- * low-confidence verdict can never be incognito. Touch / geometry / language are not
- * inputs here — this function only looks at the persistent-marker veto and confidence.
+ * A durable localStorage token (never a cookie / recognitionSource) can veto only a
+ * non-decisive private verdict, and a low-confidence verdict can never be incognito.
+ * Touch / geometry / language are not inputs here.
  */
 function finalizeIncognitoVerdict(result: IncognitoDetectionResult): IncognitoDetectionResult {
   const vetoed = applyPersistentMarkerVeto(result);
@@ -5008,19 +5190,9 @@ async function assessPrivateBrowsing(
     reasons.push('Existing first-party identity present');
   }
 
-  let cookieIdentityPresent = false;
-  try {
-    cookieIdentityPresent =
-      typeof document !== 'undefined'
-        ? /(?:^|;\s*)intel_client_vid=/.test(document.cookie || '')
-        : false;
-  } catch {
-    cookieIdentityPresent = false;
-  }
-  if (cookieIdentityPresent) {
-    logit -= 0.5;
-    reasons.push('First-party identity cookie present');
-  }
+  // A first-party identity cookie / recognition source is NOT an incognito input. It is
+  // clearable by the page driver and carries no storage-physics information, so it is
+  // deliberately not consulted here.
 
   const confidence = Number(
     Math.max(0.01, Math.min(0.99, 1 / (1 + Math.exp(-logit)))).toFixed(3)
@@ -5405,6 +5577,9 @@ export async function evaluateSecuritySignals(
     stealth: stealthSnapshot,
     human: humanSnapshot,
     dwellAwaited,
+    // Bare webdriver / bare CDP Runtime leaks are developer-tools telemetry on CDP-driven
+    // headful Chrome. Only corroborated bridge / stealth / anti-detect evidence may escalate.
+    bareWebdriverIsSoft: true,
   });
   const botSignals: string[] = botAssessment.isBot
     ? (botAssessment.botSignals && botAssessment.botSignals.length > 0
@@ -5415,11 +5590,18 @@ export async function evaluateSecuritySignals(
   // Map the collector's human-readable probe names onto canonical server reason ids. Weak
   // engine-dependent artifacts (notably the Error.prototype.name preview) map to null and can
   // never become a "CDP attached" claim; only the two-probe proof yields a CDP reason id.
+  // A bare CDP Runtime.enable leak and a bare navigator.webdriver flag are developer-tools /
+  // recognition telemetry, NOT escalation evidence, so their ids are dropped here as well.
   const cdpReasonIds = Array.from(
     new Set(
       [...stealthSnapshot.stealthReasons, ...bridgeSnapshot, ...botSignals]
         .map(mapCollectorProbeToReasonId)
-        .filter((id): id is string => Boolean(id))
+        .filter(
+          (id): id is string =>
+            Boolean(id) &&
+            id !== COLLECTOR_CDP_REASON_IDS.runtimeLeak &&
+            id !== COLLECTOR_CDP_REASON_IDS.webdriverFlag
+        )
     )
   );
   const clientRuntime = detectClientRuntime(uaSnapshot);
@@ -5587,6 +5769,20 @@ export async function evaluateSecuritySignals(
     privacyHardened,
   });
 
+  // Forged UA-CH majors are stripped from every published version field. Route the claim
+  // through the existing tampering / contradiction state instead of silently trusting it:
+  // the reason is exposed on both the tamper list and the tampering details, but does not
+  // become a second bot verdict or change the 0-10 score on its own.
+  const uaChContradiction = getUaChContradiction();
+  if (uaChContradiction.detected) {
+    for (const reason of uaChContradiction.reasons) {
+      if (!tamperReasons.includes(reason)) tamperReasons.push(reason);
+      if (!tampering.tampering_details.reasons.includes(reason)) {
+        tampering.tampering_details.reasons.push(reason);
+      }
+    }
+  }
+
   // The genuine-device gate adds hard evidence the generic detector cannot see:
   // a mobile UA over x86/desktop-GPU silicon. Escalate to a tampering verdict so
   // the Browser Tampering tile and Event JSON both reflect the emulation.
@@ -5680,6 +5876,13 @@ export async function evaluateSecuritySignals(
   const cdpEscalationReasonIds = botAssessment.corroboratedCdpEscalation
     ? [CORROBORATED_CDP_REASON_ID, CORROBORATED_CHROMIUM_CDP_REASON_ID]
     : [];
+  // A bare webdriver flag is suppressed from the published CDP ids when a CDP bridge explains
+  // it (developer-tools axis). When the *effective* flag is itself the bot evidence — a plain
+  // WebDriver/Playwright session with no CDP explanation — the parity gate still needs its
+  // canonical hard id; otherwise a correct isBot=true would fail its own evidence assertion.
+  const effectiveWebdriverBotIds = botAssessment.webdriver
+    ? [COLLECTOR_CDP_REASON_IDS.webdriverFlag]
+    : [];
   const botVerdict = deriveBotVerdict({
     isBot: authoritativeIsBot,
     // A hard CDP id on an exempt Electron/IDE/DevTools host must NOT make the gate disagree
@@ -5689,6 +5892,7 @@ export async function evaluateSecuritySignals(
       ? [
           // Canonical ids from strong collector probes. Weak preview artifacts never reach here.
           ...cdpReasonIds,
+          ...effectiveWebdriverBotIds,
           ...botSignals,
           ...hardAutomationEvidence.map((reason) => `cdc.${reason}`),
           ...cdpEscalationReasonIds,
@@ -6642,7 +6846,9 @@ export async function collectRawDeviceAttributes(): Promise<RawDeviceAttributes 
       // constructor only means the engine implements the API, which desktop Chrome always does.
       touch_event: 'ontouchstart' in window,
       touch_start: 'ontouchstart' in window,
-      max_touch_points: navigator.maxTouchPoints ?? 0,
+      // A 10-point claim on a host with no touchstart event / no coarse pointer is an
+      // injected emulation value, not hardware truth (preserves touch_start semantics).
+      max_touch_points: coherentMaxTouchPoints(navigator.maxTouchPoints ?? 0),
     },
     oscpu: (navigator as unknown as { oscpu?: string }).oscpu || '',
     architecture: Number((navigator as unknown as { architecture?: number }).architecture ?? 255),

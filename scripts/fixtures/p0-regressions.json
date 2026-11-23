@@ -1,0 +1,440 @@
+{
+  "schema_version": 1,
+  "title": "P0 benchmark defect regression corpus",
+  "note": "Frozen, declarative regression corpus for scripts/test-p0-regressions.ts. Each case is a frozen input snapshot plus golden expectations pinned to pure, already-in-repo helpers. No live requests, no browser, no deploy, no writes, no timers, no randomness. Expectations are golden: never edit an expected value to make a failing case green - fix the implementation instead. A missing helper is reported as SKIP with an explicit reason, not silently ignored.",
+  "generated_on": "2026-11-23",
+  "frozen": true,
+  "offline": true,
+  "helper_modules": {
+    "idbDurabilityTruth": "src/lib/idbDurabilityTruth.ts",
+    "botVerifier": "src/server/agents/botVerifier.ts",
+    "verdict": "src/lib/verdict.ts",
+    "uaNormalizer": "src/shared/normalization/uaNormalizer.ts",
+    "specInvariants": "src/lib/specInvariants.ts",
+    "confidenceScorer": "src/server/identity/confidenceScorer.ts"
+  },
+  "cases": [
+    {
+      "id": "P01",
+      "name": "Incognito survives cookie clear on a decisive RAM-backed IDB ratio",
+      "scenario": "incognito_cookie_clear",
+      "input": {
+        "diagnostics": {
+          "enabled": true,
+          "isPrivate": true,
+          "confidence": "high",
+          "idbDurabilityRatio": 0.531,
+          "idbHighVariance": false,
+          "idbTruthRule": "strong_ram_signature",
+          "persistedStorageGrant": false,
+          "isolatedContextVeto": false,
+          "sessionLockHit": true,
+          "serverWouldVeto": false
+        },
+        "markerPresent": true,
+        "clearedMarker": false,
+        "diskBacked": { "ratio": 2.701, "highVariance": true }
+      },
+      "expected": [
+        {
+          "id": "P01-ram-truth",
+          "helper": "idbDurabilityTruth",
+          "fn": "resolveIdbDurabilityTruth",
+          "args": [
+            {
+              "ratio": { "$input": "diagnostics.idbDurabilityRatio" },
+              "highVariance": { "$input": "diagnostics.idbHighVariance" }
+            }
+          ],
+          "fields": [
+            { "path": "incognito", "op": "true" },
+            { "path": "confidence", "op": "eq", "value": "high" },
+            { "path": "rule", "op": "eq", "value": "strong_ram_signature" }
+          ]
+        },
+        {
+          "id": "P01-cookie-clear-no-veto",
+          "helper": "idbDurabilityTruth",
+          "fn": "shouldApplyMarkerVeto",
+          "args": [
+            { "$input": "clearedMarker" },
+            { "$result": "P01-ram-truth" },
+            { "$input": "diagnostics.idbDurabilityRatio" }
+          ],
+          "fields": [{ "path": "", "op": "false" }]
+        },
+        {
+          "id": "P01-private-marker-no-veto",
+          "helper": "idbDurabilityTruth",
+          "fn": "shouldApplyMarkerVeto",
+          "args": [
+            { "$input": "markerPresent" },
+            { "$result": "P01-ram-truth" },
+            { "$input": "diagnostics.idbDurabilityRatio" }
+          ],
+          "fields": [{ "path": "", "op": "false" }]
+        },
+        {
+          "id": "P01-disk-truth",
+          "helper": "idbDurabilityTruth",
+          "fn": "resolveIdbDurabilityTruth",
+          "args": [{ "$input": "diskBacked" }],
+          "fields": [
+            { "path": "incognito", "op": "false" },
+            { "path": "confidence", "op": "eq", "value": "high" },
+            { "path": "rule", "op": "eq", "value": "disk_backed" }
+          ]
+        },
+        {
+          "id": "P01-disk-marker-veto",
+          "helper": "idbDurabilityTruth",
+          "fn": "shouldApplyMarkerVeto",
+          "args": [true, { "$result": "P01-disk-truth" }, 2.701],
+          "fields": [{ "path": "", "op": "true" }]
+        }
+      ]
+    },
+    {
+      "id": "P02",
+      "name": "Headful CDP Chrome with webdriver=true and no stealth plugin is not bot=bad",
+      "scenario": "headful_cdp_webdriver",
+      "input": {
+        "bareCdpReasons": ["cdp.runtime.enable", "cdp.console.debug", "cdp.network.order"],
+        "webdriverReasons": ["navigator.webdriver", "cdp.runtime.enable"],
+        "bareCdpProbe": {
+          "verdict": "human",
+          "reasons": ["cdp.runtime.enable", "cdp.console.debug", "cdp.network.order"]
+        },
+        "headfulHumanProbe": {
+          "verdict": "human",
+          "reasons": ["navigator.webdriver", "cdp.runtime.enable"]
+        },
+        "corroboratedAgentProbe": {
+          "verdict": "agent",
+          "reasons": ["navigator.webdriver", "cdp.runtime.enable"]
+        }
+      },
+      "expected": [
+        {
+          "id": "P02-cdp-is-developer-tools",
+          "helper": "botVerifier",
+          "fn": "classifyReasonId",
+          "args": ["cdp.runtime.enable"],
+          "fields": [{ "path": "", "op": "eq", "value": "developer_tools" }]
+        },
+        {
+          "id": "P02-cdp-gate",
+          "helper": "botVerifier",
+          "fn": "gateAgentReasons",
+          "args": [{ "$input": "bareCdpReasons" }],
+          "fields": [
+            { "path": "verdict", "op": "eq", "value": "human" },
+            { "path": "hardReasons", "op": "lengthEq", "value": 0 },
+            { "path": "developerToolsReasons", "op": "lengthEq", "value": 3 }
+          ]
+        },
+        {
+          "id": "P02-verdict-gate-parity",
+          "helper": "verdict",
+          "fn": "gateAutomationEvidence",
+          "args": [{ "$input": "bareCdpReasons" }],
+          "fields": [
+            { "path": "verdict", "op": "eq", "value": "human" },
+            { "path": "hardReasons", "op": "lengthEq", "value": 0 },
+            { "path": "developerToolsReasons", "op": "lengthEq", "value": 3 }
+          ]
+        },
+        {
+          "id": "P02-composed-bare-cdp",
+          "helper": "botVerifier",
+          "fn": "composeBotVerdict",
+          "args": [{ "clientProbe": { "$input": "bareCdpProbe" } }],
+          "fields": [
+            { "path": "bot", "op": "eq", "value": "not_detected" },
+            { "path": "bot", "op": "neq", "value": "bad" },
+            { "path": "isBot", "op": "false" },
+            { "path": "reason_ids", "op": "includes", "value": "cdp.runtime.enable" }
+          ]
+        },
+        {
+          "id": "P02-composed-headful-webdriver",
+          "helper": "botVerifier",
+          "fn": "composeBotVerdict",
+          "args": [{ "clientProbe": { "$input": "headfulHumanProbe" } }],
+          "fields": [
+            { "path": "bot", "op": "neq", "value": "bad" },
+            { "path": "bot", "op": "eq", "value": "not_detected" },
+            { "path": "isBot", "op": "false" },
+            { "path": "verdict", "op": "eq", "value": "human-or-unverified" },
+            { "path": "reason_ids", "op": "includes", "value": "navigator.webdriver" }
+          ]
+        },
+        {
+          "id": "P02-corroborated-agent-control",
+          "helper": "botVerifier",
+          "fn": "composeBotVerdict",
+          "args": [{ "clientProbe": { "$input": "corroboratedAgentProbe" } }],
+          "fields": [
+            { "path": "bot", "op": "eq", "value": "bad" },
+            { "path": "reason", "op": "eq", "value": "automated-runtime" },
+            { "path": "isBot", "op": "true" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "P03",
+      "name": "Forged UA-CH major is not accepted as a verified browser identity",
+      "scenario": "forged_uach_major",
+      "input": {
+        "realUa": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        "forged999": {
+          "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+          "clientHints": {
+            "fullVersionList": [
+              { "brand": "Not.A/Brand", "version": "99.0.0.0" },
+              { "brand": "Chromium", "version": "999.0.0.0" },
+              { "brand": "Google Chrome", "version": "999.0.0.0" }
+            ],
+            "brands": [
+              { "brand": "Not.A/Brand", "version": "99.0.0.0" },
+              { "brand": "Chromium", "version": "999.0.0.0" },
+              { "brand": "Google Chrome", "version": "999.0.0.0" }
+            ],
+            "platform": "Windows",
+            "platformVersion": "15.0.0"
+          }
+        },
+        "forged9999": {
+          "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+          "clientHints": {
+            "fullVersionList": [
+              { "brand": "Chromium", "version": "9999.0.0.0" },
+              { "brand": "Google Chrome", "version": "9999.0.0.0" }
+            ],
+            "platform": "Windows",
+            "platformVersion": "15.0.0"
+          }
+        }
+      },
+      "expected": [
+        {
+          "id": "P03-forged-999-normalized",
+          "helper": "uaNormalizer",
+          "fn": "normalizeUserAgent",
+          "args": [{ "$input": "forged999" }],
+          "fields": [
+            { "path": "browserName", "op": "eq", "value": "Google Chrome" },
+            { "path": "browserMajorVersion", "op": "eq", "value": "153" },
+            { "path": "browserMajorVersion", "op": "neq", "value": "999" },
+            { "path": "browserFullVersion", "op": "eq", "value": "153.0.0.0" },
+            { "path": "os", "op": "eq", "value": "Windows" },
+            { "path": "osVersion", "op": "eq", "value": "11" }
+          ]
+        },
+        {
+          "id": "P03-forged-999-invariants",
+          "helper": "uaNormalizer",
+          "fn": "validateUserAgentNormalization",
+          "args": [{ "$result": "P03-forged-999-normalized" }],
+          "fields": [{ "path": "", "op": "lengthEq", "value": 0 }]
+        },
+        {
+          "id": "P03-forged-9999-normalized",
+          "helper": "uaNormalizer",
+          "fn": "normalizeUserAgent",
+          "args": [{ "$input": "forged9999" }],
+          "fields": [
+            { "path": "browserName", "op": "eq", "value": "Google Chrome" },
+            { "path": "browserMajorVersion", "op": "eq", "value": "153" },
+            { "path": "browserMajorVersion", "op": "neq", "value": "9999" },
+            { "path": "browserFullVersion", "op": "eq", "value": "153.0.0.0" }
+          ]
+        },
+        {
+          "id": "P03-forged-9999-invariants",
+          "helper": "uaNormalizer",
+          "fn": "validateUserAgentNormalization",
+          "args": [{ "$result": "P03-forged-9999-normalized" }],
+          "fields": [{ "path": "", "op": "lengthEq", "value": 0 }]
+        }
+      ]
+    },
+    {
+      "id": "P04",
+      "name": "CDP attachment and docked DevTools keep asymmetric inspector flags",
+      "scenario": "cdp_devtools_flag_asymmetry",
+      "input": {
+        "cdpProbe": { "cdpAttached": true, "devtoolsActiveVerified": false },
+        "dockedProbe": { "viewportContractionNormalized": true },
+        "corroboratedProbe": { "cdpAttached": true, "devtoolsActiveVerified": true }
+      },
+      "expected": [
+        {
+          "id": "P04-cdp-flags",
+          "helper": "specInvariants",
+          "fn": "canonicalInspectorFlags",
+          "args": [{ "$input": "cdpProbe" }],
+          "fields": [
+            { "path": "cdp_attached", "op": "true" },
+            { "path": "developer_tools", "op": "false" },
+            { "path": "inspector_state", "op": "eq", "value": "yes-unattributed" }
+          ]
+        },
+        {
+          "id": "P04-docked-flags",
+          "helper": "specInvariants",
+          "fn": "canonicalInspectorFlags",
+          "args": [{ "$input": "dockedProbe" }],
+          "fields": [
+            { "path": "cdp_attached", "op": "false" },
+            { "path": "developer_tools", "op": "true" },
+            { "path": "inspector_state", "op": "eq", "value": "devtools_docked_suspected" }
+          ]
+        },
+        {
+          "id": "P04-legacy-cdp-flags",
+          "helper": "specInvariants",
+          "fn": "inspectorFlagsForState",
+          "args": ["automation_protocol_attached"],
+          "fields": [
+            { "path": "cdp_attached", "op": "true" },
+            { "path": "developer_tools", "op": "false" }
+          ]
+        },
+        {
+          "id": "P04-legacy-docked-flags",
+          "helper": "specInvariants",
+          "fn": "inspectorFlagsForState",
+          "args": ["devtools_docked_suspected"],
+          "fields": [
+            { "path": "cdp_attached", "op": "false" },
+            { "path": "developer_tools", "op": "true" }
+          ]
+        },
+        {
+          "id": "P04-cdp-invariant",
+          "helper": "specInvariants",
+          "fn": "checkInspectorInvariants",
+          "args": [
+            {
+              "inspector_state": { "$result": "P04-cdp-flags", "path": "inspector_state" },
+              "cdp_attached": { "$result": "P04-cdp-flags", "path": "cdp_attached" },
+              "developer_tools": { "$result": "P04-cdp-flags", "path": "developer_tools" }
+            }
+          ],
+          "fields": [
+            { "path": "consistent", "op": "true" },
+            { "path": "contradictions", "op": "lengthEq", "value": 0 }
+          ]
+        },
+        {
+          "id": "P04-docked-invariant",
+          "helper": "specInvariants",
+          "fn": "checkInspectorInvariants",
+          "args": [
+            {
+              "inspector_state": { "$result": "P04-docked-flags", "path": "inspector_state" },
+              "cdp_attached": { "$result": "P04-docked-flags", "path": "cdp_attached" },
+              "developer_tools": { "$result": "P04-docked-flags", "path": "developer_tools" }
+            }
+          ],
+          "fields": [
+            { "path": "consistent", "op": "true" },
+            { "path": "contradictions", "op": "lengthEq", "value": 0 }
+          ]
+        },
+        {
+          "id": "P04-corroborated-control",
+          "helper": "specInvariants",
+          "fn": "canonicalInspectorFlags",
+          "args": [{ "$input": "corroboratedProbe" }],
+          "fields": [
+            { "path": "cdp_attached", "op": "true" },
+            { "path": "developer_tools", "op": "true" },
+            { "path": "inspector_state", "op": "eq", "value": "yes-corroborated" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "P05",
+      "name": "Spoofed crawler UA without signature or CIDR is spoofed with high likelihood",
+      "scenario": "spoofed_crawler_identity",
+      "input": {
+        "crawlerUa": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        "noSignature": { "result": "neutral" },
+        "forgedVerifiedClaim": { "result": "neutral", "identity": "verified", "bot_id": "googlebot" },
+        "spoofInput": {
+          "userAgent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+          "webBotAuth": { "result": "neutral" },
+          "ipInKnownBotCidr": false
+        },
+        "forgedClaimInput": {
+          "userAgent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+          "webBotAuth": { "result": "neutral", "identity": "verified", "bot_id": "googlebot" },
+          "ipInKnownBotCidr": false
+        },
+        "cidrProofInput": {
+          "userAgent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+          "webBotAuth": { "result": "neutral" },
+          "ipInKnownBotCidr": true
+        },
+        "spoofConfidenceInput": {
+          "genuineSpoof": true,
+          "consistencyFlags": ["ua-ch-major-forged", "crawler-ua-without-signature-or-cidr"]
+        }
+      },
+      "expected": [
+        {
+          "id": "P05-spoofed-verdict",
+          "helper": "botVerifier",
+          "fn": "composeBotVerdict",
+          "args": [{ "$input": "spoofInput" }],
+          "fields": [
+            { "path": "verdict", "op": "eq", "value": "bad" },
+            { "path": "reason", "op": "eq", "value": "spoofed-impersonation" },
+            { "path": "identity", "op": "eq", "value": "spoofed" },
+            { "path": "verified", "op": "false" },
+            { "path": "confidence", "op": "eq", "value": "high" },
+            { "path": "bot", "op": "eq", "value": "bad" },
+            { "path": "severity", "op": "eq", "value": "high" }
+          ]
+        },
+        {
+          "id": "P05-forged-claim-stays-spoofed",
+          "helper": "botVerifier",
+          "fn": "composeBotVerdict",
+          "args": [{ "$input": "forgedClaimInput" }],
+          "fields": [
+            { "path": "identity", "op": "eq", "value": "spoofed" },
+            { "path": "reason", "op": "eq", "value": "spoofed-impersonation" },
+            { "path": "verified", "op": "false" }
+          ]
+        },
+        {
+          "id": "P05-spoof-likelihood",
+          "helper": "confidenceScorer",
+          "fn": "scoreConfidence",
+          "args": [{ "$input": "spoofConfidenceInput" }],
+          "fields": [
+            { "path": "spoof_likelihood", "op": "eq", "value": "high" },
+            { "path": "tampering", "op": "true" },
+            { "path": "tampering_ml_score", "op": "eq", "value": 0.9 }
+          ]
+        },
+        {
+          "id": "P05-cidr-proof-control",
+          "helper": "botVerifier",
+          "fn": "composeBotVerdict",
+          "args": [{ "$input": "cidrProofInput" }],
+          "fields": [
+            { "path": "verdict", "op": "eq", "value": "known-operator-network" },
+            { "path": "reason", "op": "eq", "value": "known-operator-network" },
+            { "path": "identity", "op": "eq", "value": "unknown" }
+          ]
+        }
+      ]
+    }
+  ]
+}

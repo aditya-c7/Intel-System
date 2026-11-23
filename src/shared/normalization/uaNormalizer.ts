@@ -154,6 +154,15 @@ export const GREASE_RE = /not.?a.?brand/i;
 
 const CHROMIUM_PLACEHOLDER = 'chromium';
 
+/**
+ * Explicit headless-Chromium tokens. Besides the legacy `HeadlessChrome` UA
+ * token/brand, `chrome-headless-shell` also advertises itself as
+ * `headless_shell`. Both are concrete browser identities, not generic Chrome.
+ */
+const HEADLESS_UA_RE = /HeadlessChrome|headless[_-]?shell|chrome[_-]?headless[_-]?shell/i;
+const HEADLESS_BRAND_RE = /^(?:headlesschrome|headless[_-]?shell|chrome[_-]?headless[_-]?shell)$/i;
+const HEADLESS_VERSION_RE = /(?:HeadlessChrome|headless[_-]?shell|chrome[_-]?headless[_-]?shell)\/([\d.]+)/i;
+
 /** Splits an RFC 9651 list on commas that are OUTSIDE quoted strings. */
 function splitStructuredList(raw: string): string[] {
   const parts: string[] = [];
@@ -305,7 +314,7 @@ export function parseBrandList(raw: string): BrandEntry[] {
     const brand = parsed.value.trim();
     if (!brand) continue;
     const entry: BrandEntry = { brand, version: (parsed.params.get('v') ?? '').trim() };
-    if (brand.toLowerCase() === 'headlesschrome') entry.is_headless_brand = true;
+    if (HEADLESS_BRAND_RE.test(brand)) entry.is_headless_brand = true;
     out.push(entry);
   }
   return out;
@@ -319,14 +328,19 @@ function filterBrands(brands: BrandEntry[]): BrandEntry[] {
 }
 
 /**
- * Reduced UA-CH sends `0.0.0.0` (and sometimes other all-zero) versions as a
- * redacted placeholder. Treating it as a real full version produced labels like
- * `Chromium 0.0.0.0`. Those values must be rejected so resolution falls back to
- * the UA token / GREASE-filtered real brands.
+ * Redacted and forged versions are not evidence of a verified browser release:
+ *   - reduced UA-CH sends `0.0.0.0` (and other all-zero) placeholders;
+ *   - spoofed brand lists use sentinel majors such as `999.0.0.0` / `9999`.
+ * Treating either as real would publish `Chrome 999.0.0.0` with a bogus
+ * verified major. Rejecting them lets resolution fall back to the UA token and
+ * to the GREASE-filtered, genuinely versioned brands.
  */
 function isPlaceholderVersion(version: string): boolean {
   if (typeof version !== 'string' || !version.trim()) return false;
-  return /^0+(?:\.0+)*$/.test(version.trim());
+  const v = version.trim();
+  if (/^0+(?:\.0+)*$/.test(v)) return true;
+  const major = v.split('.')[0];
+  return /^\d+$/.test(major) && Number(major) >= 999;
 }
 
 /** True when a brand list contains at least one non-GREASE, non-placeholder brand. */
@@ -478,8 +492,8 @@ const BROWSER_SPECS: BrowserSpec[] = [
   },
   {
     name: 'Headless Chrome',
-    brands: ['headlesschrome'],
-    uaTokens: [/HeadlessChrome\/([\d.]+)/],
+    brands: ['headlesschrome', 'headless_shell', 'chrome-headless-shell'],
+    uaTokens: [HEADLESS_VERSION_RE],
   },
   {
     // Chromium fork: UA ends with `… Chrome/<ver> Safari/<ver> Arc/<ver>`.
@@ -686,6 +700,40 @@ function resolveBrowser(
   }
 
   const rawUadBrands = (uad?.fullVersionList ?? []).filter((b) => !!b);
+  const allBrands = [...rawUadBrands, ...secCh.brands];
+
+  /* An explicit headless token (UA or UA-CH brand) outranks the generic
+   * Chromium / Google Chrome brands the very same binary also advertises.
+   * Letting the brand ladder run first relabelled headless sessions as
+   * 'Google Chrome'. Electron is still handled above, so its precedence is
+   * unchanged. */
+  if (HEADLESS_UA_RE.test(ua) || allBrands.some((b) => HEADLESS_BRAND_RE.test(b.brand))) {
+    const headlessBrand = allBrands.find((b) => HEADLESS_BRAND_RE.test(b.brand));
+    let version = firstMatch(HEADLESS_VERSION_RE, ua) ?? '';
+    if (isPlaceholderVersion(version)) version = '';
+    if (!version && headlessBrand && !isPlaceholderVersion(headlessBrand.version)) {
+      version = headlessBrand.version;
+    }
+    if (!version) {
+      /* Only non-placeholder evidence may fill the version of a headless UA
+       * whose token carries none. */
+      const versionedBrand = allBrands.find(
+        (b) => !GREASE_RE.test(b.brand) && !!b.version && !isPlaceholderVersion(b.version),
+      );
+      version =
+        versionedBrand?.version ??
+        firstMatch(/CriOS\/([\d.]+)|Chrome\/([\d.]+)/i, ua) ??
+        '';
+    }
+    if (isPlaceholderVersion(version)) version = '';
+    return {
+      name: 'Headless Chrome',
+      full: version,
+      major: majorOf(version),
+      is_headless_brand: true,
+    };
+  }
+
   const uadBrands = filterBrands(rawUadBrands);
   const candidates: Array<{ brands: BrandEntry[]; source: 'uad' | 'secch' }> = [];
   /* A GREASE-only (or all-placeholder) list is NOT evidence of any browser —
@@ -860,7 +908,9 @@ function macVersionFromSafariUa(ua: string): string | null {
   if (safari === null) return null;
   const safariMajor = parseIntSafe(safari[1] ?? '');
   if (safariMajor === null) return null;
-  const macMajor = safariMajor - 3;
+  /* Safari 26 shipped alongside macOS 26 — Apple aligned the version numbers,
+   * so the historical `Safari - 3` heuristic would wrongly report macOS 23. */
+  const macMajor = safariMajor >= 26 ? safariMajor : safariMajor - 3;
   if (macMajor <= 10) return '10.15';
   return `${macMajor}.0`;
 }
@@ -893,8 +943,25 @@ function resolveOs(
   const uaIpad = /iPad/.test(ua);
   /* iPadOS 13+ masquerades as desktop Safari: `Macintosh` UA, `MacIntel` platform and a
    * multi-touch screen. Chrome's UA-CH platform for the same device is `macOS`, so the
-   * touch count alone (with a Macintosh UA) is also accepted. */
-  const macTouch = touch >= IPAD_TOUCH_THRESHOLD && (/macintel/i.test(platformStr) || /macintosh/i.test(ua));
+   * touch count alone (with a Macintosh UA) is also accepted — unless there is explicit
+   * counter-evidence that this is really a Mac: a macOS platform hint with no tablet
+   * form factor / model, or a Safari 26+ Version token (Safari 26 runs on macOS 26).
+   * Without such evidence (e.g. a bare UA + touch, as in the frozen iPadOS fixture)
+   * the iPadOS classification is unchanged. */
+  const safariVersionMatch = /(?:^|[\s;])Version\/(\d+)(?:\.[\d.]+)?.*Safari/.exec(ua);
+  const safariMajorNumber = safariVersionMatch === null ? null : parseIntSafe(safariVersionMatch[1] ?? '');
+  const noTabletFormFactor = !/\btablet\b/i.test(formFactors.join(' '));
+  const explicitMacHint =
+    (uadPlatform.toLowerCase() === 'macos' || secCh.platform.toLowerCase() === 'macos') &&
+    noTabletFormFactor &&
+    !(uad?.model ?? '').trim() &&
+    !secCh.model;
+  const safari26Mac = safariMajorNumber !== null && safariMajorNumber >= 26 && noTabletFormFactor;
+  const macTouch =
+    touch >= IPAD_TOUCH_THRESHOLD &&
+    (/macintel/i.test(platformStr) || /macintosh/i.test(ua)) &&
+    !explicitMacHint &&
+    !safari26Mac;
   const macTabletFormFactor =
     touch >= IPAD_TOUCH_THRESHOLD &&
     uadPlatform.toLowerCase() === 'macos' &&

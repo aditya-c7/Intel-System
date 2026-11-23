@@ -72,10 +72,10 @@
       "expected": {
         "rawSignals": { "cdpAttached": true, "devtoolsActiveVerified": false, "viewportContractionNormalized": false },
         "inspectorState": "yes-unattributed",
-        "cdpAttached": false,
-        "developerTools": true,
+        "cdpAttached": true,
+        "developerTools": false,
         "permitsHumanVerdict": false,
-        "rule": "a bare CDP probe is honest DevTools telemetry: state yes-unattributed, cdp_attached=false, developer_tools=true; cdp_attached=true requires a corroborated CDP+DevTools pair (yes-corroborated). The note and the flags must never disagree."
+        "rule": "a bare CDP probe is honest CDP telemetry: state yes-unattributed, cdp_attached=true, developer_tools=false; developer_tools=true requires a corroborated CDP+DevTools pair (yes-corroborated) or verified docked DevTools UI (devtools_active_verified / devtools_docked_suspected, cdp_attached=false). The note and the flags must never disagree."
       },
       "helpers": ["src/lib/specInvariants: resolveInspectorState, toInspectorState, inspectorFlagsForState, checkInspectorInvariants, permitsHumanVerdict"],
       "helper_module": "src/lib/specInvariants"

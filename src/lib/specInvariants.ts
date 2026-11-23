@@ -525,6 +525,15 @@ export interface InspectorSignals {
   devtoolsActiveVerified?: boolean;
   /** Mid-session viewport contraction that survives zoom normalization. */
   viewportContractionNormalized?: boolean;
+  /**
+   * Server-side aliases accepted so a caller can forward its raw security signals verbatim.
+   * `strongCdpProof` is the protocol-level CDP binding (maps to `cdpAttached`); the others are
+   * DevTools-UI evidence only and can never, on their own, claim `cdp_attached`.
+   */
+  strongCdpProof?: boolean | null;
+  developerTools?: boolean | null;
+  cdpRuntimeLeak?: boolean | null;
+  automationEnvironment?: string | null;
 }
 
 /**
@@ -548,32 +557,63 @@ export function toInspectorState(state: InspectorState | LegacyInspectorState): 
   }
 }
 
-/** Resolve the canonical state directly from the raw, passive inspector probes. */
-export function resolveInspectorState(signals: InspectorSignals = {}): InspectorState {
-  const cdp = Boolean(signals.cdpAttached);
-  const devtools = Boolean(signals.devtoolsActiveVerified);
-  if (cdp && devtools) return 'yes-corroborated';
-  if (cdp || devtools || Boolean(signals.viewportContractionNormalized)) return 'yes-unattributed';
+/**
+ * Resolve the inspector state directly from the raw, passive inspector probes.
+ *
+ * A corroborated CDP+UI pair is `yes-corroborated`. A bare / automation-protocol CDP binding is
+ * `yes-unattributed` — the canonical state whose flags are cdp_attached:true, developer_tools:false.
+ * Pure DevTools-UI evidence (a verified canary or a normalized docked-layout contraction) keeps its
+ * legacy `devtools_*` spelling so the asymmetric developer_tools:true / cdp_attached:false mapping
+ * is preserved end-to-end. No evidence resolves to `no`.
+ */
+export function resolveInspectorState(
+  signals: InspectorSignals = {}
+): InspectorState | LegacyInspectorState {
+  // Only a protocol-level binding (cdpAttached / strongCdpProof) is CDP proof. A runtime leak,
+  // an electron / IDE host or a docked layout is DevTools-UI evidence only and can never attach
+  // CDP on its own.
+  const cdp = Boolean(signals.cdpAttached) || Boolean(signals.strongCdpProof);
+  const verifiedUi = Boolean(signals.devtoolsActiveVerified);
+  if (cdp && verifiedUi) return 'yes-corroborated';
+  if (cdp) return 'yes-unattributed';
+  if (verifiedUi || Boolean(signals.developerTools)) return 'devtools_active_verified';
+  if (
+    Boolean(signals.cdpRuntimeLeak) ||
+    signals.automationEnvironment === 'electron' ||
+    signals.automationEnvironment === 'ide_webview' ||
+    Boolean(signals.viewportContractionNormalized)
+  ) {
+    return 'devtools_docked_suspected';
+  }
   return 'no';
 }
 
 /**
- * Canonical flag resolver.
- *  - no                 -> neither flag.
- *  - yes-unattributed   -> cdp_attached:false, developer_tools:true (an unattributed CDP signal
- *                          is honest DevTools telemetry, never a confirmed CDP attachment).
- *  - yes-corroborated   -> both flags true (CDP and DevTools agree).
- * Legacy 4-state inputs are normalised first, so both vocabularies agree exactly.
+ * Canonical flag resolver. The two axes are deliberately asymmetric so each observation stays on
+ * its own truth axis:
+ *  - yes-unattributed / automation_protocol_attached (bare or automation-protocol CDP binding)
+ *                          -> cdp_attached:true, developer_tools:false.
+ *  - devtools_docked_suspected / devtools_active_verified (docked DevTools / verified UI canary)
+ *                          -> cdp_attached:false, developer_tools:true.
+ *  - yes-corroborated   -> both flags true (CDP and DevTools UI canary agree).
+ *  - no / closed        -> neither flag.
+ * The raw spelling is inspected (not `toInspectorState`): the canonical 3-state vocabulary folds
+ * both asymmetric cases into `yes-unattributed`, so normalising first would lose the distinction.
  */
 export function inspectorFlagsForState(
   state: InspectorState | LegacyInspectorState
 ): { cdp_attached: boolean; developer_tools: boolean } {
-  switch (toInspectorState(state)) {
+  switch (state) {
     case 'yes-corroborated':
       return { cdp_attached: true, developer_tools: true };
     case 'yes-unattributed':
+    case 'automation_protocol_attached':
+      return { cdp_attached: true, developer_tools: false };
+    case 'devtools_docked_suspected':
+    case 'devtools_active_verified':
       return { cdp_attached: false, developer_tools: true };
     case 'no':
+    case 'closed':
     default:
       return { cdp_attached: false, developer_tools: false };
   }
@@ -618,7 +658,9 @@ export interface InspectorInvariantResult {
  */
 export function checkInspectorInvariants(input: InspectorInvariantInput): InspectorInvariantResult {
   const canonical_state = toInspectorState(input.inspector_state);
-  const expected_flags = inspectorFlagsForState(canonical_state);
+  // Check the raw spelling: the canonical 3-state value folds bare CDP and docked DevTools into
+  // the same bucket, so normalising first would erase the asymmetric flag mapping.
+  const expected_flags = inspectorFlagsForState(input.inspector_state);
   const contradictions: string[] = [];
 
   if (
@@ -658,6 +700,94 @@ export function checkInspectorInvariants(input: InspectorInvariantInput): Inspec
 /** Boolean convenience wrapper around `checkInspectorInvariants`. */
 export function hasInspectorContradictions(input: InspectorInvariantInput): boolean {
   return checkInspectorInvariants(input).contradictions.length > 0;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Canonical inspector flags — one-call resolver (additive)                     */
+/* -------------------------------------------------------------------------- */
+
+/** The one-call resolver's result: both canonical flags plus the inspector state string. */
+export interface CanonicalInspectorFlags {
+  cdp_attached: boolean;
+  developer_tools: boolean;
+  inspector_state: InspectorState | LegacyInspectorState;
+}
+
+/**
+ * Inputs accepted by the one-call resolver. An already-resolved `inspector_state` or a published
+ * flag pair is honoured; otherwise raw passive probes (including the server's signal aliases) are
+ * forwarded to `resolveInspectorState`. All reads are defensive so hostile getters cannot throw.
+ */
+export interface CanonicalInspectorFlagsInput extends InspectorSignals {
+  strongCdpProof?: boolean | null;
+  developerTools?: boolean | null;
+  cdpRuntimeLeak?: boolean | null;
+  automationEnvironment?: string | null;
+  inspector_state?: InspectorState | LegacyInspectorState | null;
+  cdp_attached?: boolean | null;
+  developer_tools?: boolean | null;
+  [key: string]: unknown;
+}
+
+const INSPECTOR_STATE_VALUES: ReadonlySet<string> = new Set<string>([
+  'no',
+  'yes-unattributed',
+  'yes-corroborated',
+  'closed',
+  'automation_protocol_attached',
+  'devtools_docked_suspected',
+  'devtools_active_verified',
+]);
+
+function isInspectorStateValue(value: unknown): value is InspectorState | LegacyInspectorState {
+  return typeof value === 'string' && INSPECTOR_STATE_VALUES.has(value);
+}
+
+/**
+ * Additive, total one-call resolver for `cdp_attached`, `developer_tools` and `inspector_state`.
+ *
+ * The returned flags are derived from the same state that is returned, so feeding the result back
+ * into `checkInspectorInvariants` is always consistent. Mapping:
+ *  - bare / automation-protocol CDP -> cdp_attached:true, developer_tools:false;
+ *  - docked / verified DevTools UI  -> cdp_attached:false, developer_tools:true;
+ *  - corroborated CDP + UI canary   -> both true;
+ *  - no evidence                    -> both false.
+ * Never throws: any failure resolves to the safe `no` verdict.
+ */
+export function canonicalInspectorFlags(
+  input: CanonicalInspectorFlagsInput = {}
+): CanonicalInspectorFlags {
+  try {
+    const source =
+      input && typeof input === 'object' ? (input as CanonicalInspectorFlagsInput) : ({} as CanonicalInspectorFlagsInput);
+
+    // 1. An explicitly resolved state is authoritative; its flags follow from that exact spelling.
+    const rawState = shadowField(source, 'inspector_state');
+    if (isInspectorStateValue(rawState)) {
+      return { ...inspectorFlagsForState(rawState), inspector_state: rawState };
+    }
+
+    // 2. Otherwise derive the state from published flags (when present, they win per axis) or
+    //    from the raw passive probes. Only a verified canary corroborates a CDP binding.
+    const publishedCdp = shadowBool(source, 'cdp_attached');
+    const publishedDevtools = shadowBool(source, 'developer_tools');
+    const environment = shadowField(source, 'automationEnvironment');
+    const state = resolveInspectorState({
+      cdpAttached:
+        publishedCdp ??
+        (shadowBool(source, 'cdpAttached') === true || shadowBool(source, 'strongCdpProof') === true),
+      devtoolsActiveVerified:
+        publishedDevtools ??
+        (shadowBool(source, 'devtoolsActiveVerified') === true ||
+          shadowBool(source, 'developerTools') === true),
+      viewportContractionNormalized: shadowBool(source, 'viewportContractionNormalized'),
+      cdpRuntimeLeak: shadowBool(source, 'cdpRuntimeLeak'),
+      automationEnvironment: typeof environment === 'string' ? environment : undefined,
+    });
+    return { ...inspectorFlagsForState(state), inspector_state: state };
+  } catch {
+    return { cdp_attached: false, developer_tools: false, inspector_state: 'no' };
+  }
 }
 
 /* -------------------------------------------------------------------------- */
