@@ -104,6 +104,37 @@ export interface CanonicalView {
   /** Additive incognito probe diagnostics mirrored verbatim from the canonical envelope/data. */
   diagnostics?: IncognitoDiagnostics;
 
+  /* Additive truth / observation transports — ALL OPTIONAL and read-only. Each value is an
+     `as unknown as` pass-through from the one canonical envelope (or its response mirrors).
+     The client never derives, rounds, coerces or fabricates any of them: a server field that
+     was not supplied stays undefined exactly as the server left it. */
+  /** Server GPU truth bucket (hardware | software_renderer | masked | spoofed_suspect | unknown). */
+  gpu_truth_state?: string | null;
+  /** True only when the server says the GPU answer is masked / spoofed / unobservable. */
+  gpu_answer_unreliable?: boolean | null;
+  /** Normalized headless variant ('shell' | 'new' | null) from identity resolution. */
+  headless_mode?: string | null;
+  /** Explicit browser geolocation permission state (granted / prompt / denied). */
+  geolocationPermission?: string | null;
+  /** Browser-granted fix only — never IP-derived coordinates. Verbatim server shape. */
+  grantedGeolocation?: Record<string, unknown> | null;
+  /** Accuracy in metres of the granted geolocation fix (when the server supplied one). */
+  accuracy_m?: number | null;
+  /** Flat mirror of the fired privacy-signature tokens. Informational only, never a verdict. */
+  privacy_signature_ids?: string[] | null;
+  /** Structured media-preference readout, verbatim. */
+  media_preferences?: Record<string, unknown> | null;
+  /** Server's active-CDP-inspection verdict, verbatim (distinct from cdpAttached). */
+  active_cdp_inspection?: boolean | null;
+  /** Identity-scope verdict, verbatim. */
+  id_scope?: string | null;
+  /** Isolated-context verdict, verbatim. */
+  context_isolated?: boolean | null;
+  /** Audio-stability classification, verbatim. */
+  audio_stability_class?: string | null;
+  /** Confidence-stability key, verbatim. */
+  confidence_stability_key?: string | null;
+
   /* Additive evidence mirrors — all OPTIONAL, verbatim `as unknown as` pass-through from the
      one canonical envelope or the response data. These are transports for server-supplied
      values only: the client never derives, rounds, tier-shifts or computes any of them, and an
@@ -166,18 +197,33 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
   const networkRaw = asRecord(env?.network);
   const environmentRaw = asRecord(env?.environment);
 
-  // Additive incognito diagnostics — verbatim `as unknown as` pass-through from the one
-  // canonical envelope (or its data mirrors). Present only when the server supplied it;
-  // otherwise undefined. Never re-derived or gated on the client.
-  const diagnosticsRaw = env?.diagnostics ?? base?.diagnostics ?? data?.securitySignals?.diagnostics;
-  const diagnostics = diagnosticsRaw ? (diagnosticsRaw as unknown as IncognitoDiagnostics) : undefined;
-
   // Additive evidence mirrors — verbatim pass-through, never derived. The resolved canonical
   // envelope is authoritative; root-level and `securitySignals` mirrors are transport fallbacks
   // only. `as unknown as` is used throughout because these fields are intentionally not part of
   // the typed legacy contract yet. No Boolean()/Number() coercion, rounding, tier mapping or
   // default fabrication: a missing field stays undefined exactly as the server left it.
   const signalExtras = (data?.securitySignals ?? {}) as unknown as Record<string, unknown>;
+  // Additive truth fields can arrive on the same canonical envelope before its risk / identity
+  // axes are populated. Read those transports from the envelope keys without changing the core
+  // `source` / `present` decision above (no canonical axis is invented on the client).
+  const truthEnv =
+    env ??
+    asRecord(base?.telemetry) ??
+    asRecord(base?.canonical) ??
+    asRecord(base?.envelope) ??
+    asRecord(base?.canonical_telemetry);
+
+  // Additive incognito diagnostics — verbatim `as unknown as` pass-through from the one
+  // canonical envelope (or its data mirrors). Present only when the server supplied it;
+  // otherwise undefined. Never re-derived, and never gated on a client-only session flag:
+  // this is a read-only server record, not a client-side incognito verdict.
+  const diagnosticsRaw =
+    truthEnv?.diagnostics ??
+    base?.diagnostics ??
+    data?.diagnostics ??
+    data?.securitySignals?.diagnostics ??
+    signalExtras.diagnostics;
+  const diagnostics = diagnosticsRaw ? (diagnosticsRaw as unknown as IncognitoDiagnostics) : undefined;
   const proxy_details = (env?.proxy_details ??
     base?.proxy_details ??
     base?.proxyDetails ??
@@ -228,6 +274,110 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     diagnostics?.idbTruthRule ??
     data?.diagnostics?.idbTruthRule ??
     data?.securitySignals?.diagnostics?.idbTruthRule) as unknown as string | null | undefined;
+
+  // Remaining additive truth / observation mirrors — every value below is a verbatim
+  // `as unknown as` pass-through from the one canonical envelope or its response transports.
+  // No Boolean()/Number() coercion, rounding, tier mapping or default fabrication is applied,
+  // so a field the server did not supply stays undefined (and is absent from the Event JSON).
+  const hardwareRaw = asRecord(data?.hardwareSignals);
+  const browserIdentityRaw = asRecord(data?.browser_details);
+  const proximityRaw = asRecord(truthEnv?.proximity ?? base?.proximity ?? data?.proximity);
+  const privacyRaw = asRecord(privacy_settings);
+  const privacySignalRaw = asRecord(signalExtras.privacySettings);
+
+  const gpu_truth_state = (truthEnv?.gpu_truth_state ??
+    truthEnv?.gpuTruthState ??
+    base?.gpu_truth_state ??
+    base?.gpuTruthState ??
+    automationRaw?.gpu_truth_state ??
+    environmentRaw?.gpu_truth_state ??
+    hardwareRaw?.gpu_truth_state ??
+    signalExtras.gpu_truth_state) as unknown as string | null | undefined;
+  const gpu_answer_unreliable = (truthEnv?.gpu_answer_unreliable ??
+    truthEnv?.gpuAnswerUnreliable ??
+    base?.gpu_answer_unreliable ??
+    base?.gpuAnswerUnreliable ??
+    environmentRaw?.gpu_answer_unreliable ??
+    hardwareRaw?.gpu_answer_unreliable ??
+    signalExtras.gpu_answer_unreliable) as unknown as boolean | null | undefined;
+  const headless_mode = (truthEnv?.headless_mode ??
+    truthEnv?.headlessMode ??
+    base?.headless_mode ??
+    base?.headlessMode ??
+    identityRaw?.headless_mode ??
+    browserIdentityRaw?.headless_mode ??
+    automationRaw?.headless_mode ??
+    signalExtras.headless_mode) as unknown as string | null | undefined;
+  const geolocationPermission = (proximityRaw?.permission ??
+    proximityRaw?.geolocationPermission ??
+    proximityRaw?.geolocation_permission ??
+    truthEnv?.geolocationPermission ??
+    truthEnv?.geolocation_permission ??
+    base?.geolocationPermission ??
+    base?.geolocation_permission ??
+    signalExtras.geolocationPermission ??
+    signalExtras.geolocation_permission) as unknown as string | null | undefined;
+  const grantedGeolocation = (proximityRaw?.coordinates ??
+    proximityRaw?.grantedGeolocation ??
+    proximityRaw?.granted_geolocation ??
+    truthEnv?.grantedGeolocation ??
+    truthEnv?.granted_geolocation ??
+    base?.grantedGeolocation ??
+    base?.granted_geolocation ??
+    signalExtras.grantedGeolocation ??
+    signalExtras.granted_geolocation) as unknown as Record<string, unknown> | null | undefined;
+  const grantedRaw = asRecord(grantedGeolocation);
+  const accuracy_m = (proximityRaw?.accuracy_m ??
+    truthEnv?.accuracy_m ??
+    truthEnv?.geolocationAccuracyM ??
+    base?.accuracy_m ??
+    base?.geolocationAccuracyM ??
+    grantedRaw?.accuracyM ??
+    grantedRaw?.accuracy_m ??
+    signalExtras.accuracy_m ??
+    signalExtras.geolocationAccuracyM) as unknown as number | null | undefined;
+  const privacy_signature_ids = (truthEnv?.privacy_signature_ids ??
+    base?.privacy_signature_ids ??
+    privacyRaw?.privacy_signature_ids ??
+    privacyRaw?.signatures ??
+    privacySignalRaw?.privacy_signature_ids ??
+    privacySignalRaw?.signatures ??
+    signalExtras.privacy_signature_ids) as unknown as string[] | null | undefined;
+  const media_preferences = (truthEnv?.media_preferences ??
+    truthEnv?.mediaPreferences ??
+    base?.media_preferences ??
+    base?.mediaPreferences ??
+    hardwareRaw?.media_preferences ??
+    hardwareRaw?.mediaPreferences ??
+    signalExtras.media_preferences ??
+    signalExtras.mediaPreferences) as unknown as Record<string, unknown> | null | undefined;
+  const active_cdp_inspection = (truthEnv?.active_cdp_inspection ??
+    truthEnv?.activeCdpInspection ??
+    base?.active_cdp_inspection ??
+    base?.activeCdpInspection ??
+    automationRaw?.active_cdp_inspection ??
+    automationRaw?.activeCdpInspection ??
+    signalExtras.active_cdp_inspection ??
+    signalExtras.activeCdpInspection) as unknown as boolean | null | undefined;
+  const id_scope = (truthEnv?.id_scope ??
+    base?.id_scope ??
+    identityRaw?.id_scope ??
+    browserIdentityRaw?.id_scope ??
+    signalExtras.id_scope) as unknown as string | null | undefined;
+  const context_isolated = (truthEnv?.context_isolated ??
+    base?.context_isolated ??
+    identityRaw?.context_isolated ??
+    browserIdentityRaw?.context_isolated ??
+    signalExtras.context_isolated) as unknown as boolean | null | undefined;
+  const audio_stability_class = (truthEnv?.audio_stability_class ??
+    base?.audio_stability_class ??
+    hardwareRaw?.audio_stability_class ??
+    signalExtras.audio_stability_class) as unknown as string | null | undefined;
+  const confidence_stability_key = (truthEnv?.confidence_stability_key ??
+    base?.confidence_stability_key ??
+    identityRaw?.confidence_stability_key ??
+    hardwareRaw?.confidence_stability_key ??
+    signalExtras.confidence_stability_key) as unknown as string | null | undefined;
 
   // The 0-100 ledger is canonical. Before it lands, the server's own
   // `suspectScore100` is the only acceptable server-provided fallback — never a
@@ -371,6 +521,20 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
     network_layer_hash,
     networkLayerHash: network_layer_hash,
     idbTruthRule,
+    // Remaining additive mirrors: verbatim, no recomputation and no fabricated defaults.
+    gpu_truth_state,
+    gpu_answer_unreliable,
+    headless_mode,
+    geolocationPermission,
+    grantedGeolocation,
+    accuracy_m,
+    privacy_signature_ids,
+    media_preferences,
+    active_cdp_inspection,
+    id_scope,
+    context_isolated,
+    audio_stability_class,
+    confidence_stability_key,
   };
 }
 

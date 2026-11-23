@@ -38,6 +38,14 @@ export type PlatformFamily = 'windows' | 'mac' | 'linux' | 'android' | 'ios' | '
 export type DeviceKind = 'Desktop' | 'Mobile' | 'Tablet' | 'Unknown';
 
 /**
+ * P2-17 — headless variant, additive and independent of browser classification.
+ *   - 'shell' : `chrome-headless-shell` / `headless_shell` (legacy headless shell binary)
+ *   - 'new'   : plain `HeadlessChrome` (modern --headless=new mode)
+ *   - null    : no headless signal was present
+ */
+export type HeadlessMode = 'shell' | 'new' | null;
+
+/**
  * The *runtime* that actually renders the page — distinct from the browser engine.
  * Electron / IDE shells / WebViews embed Chromium, so a UA-CH brand list alone would
  * mislabel them as generic Chromium. Ordered by detection precedence (see
@@ -95,6 +103,8 @@ export interface NormalizedIdentity {
   platformFamily: PlatformFamily;
   /** True when the selected browser came from the HeadlessChrome UA-CH brand. */
   is_headless_brand?: boolean;
+  /** Headless variant ('shell' | 'new' | null). Additive field (P2-17). */
+  headless_mode?: HeadlessMode;
   /** Host runtime that renders the page (engine-independent). Additive field. */
   runtime?: RuntimeKind;
   /** Host application name when the runtime is an Electron/IDE/WebView shell. */
@@ -162,6 +172,15 @@ const CHROMIUM_PLACEHOLDER = 'chromium';
 const HEADLESS_UA_RE = /HeadlessChrome|headless[_-]?shell|chrome[_-]?headless[_-]?shell/i;
 const HEADLESS_BRAND_RE = /^(?:headlesschrome|headless[_-]?shell|chrome[_-]?headless[_-]?shell)$/i;
 const HEADLESS_VERSION_RE = /(?:HeadlessChrome|headless[_-]?shell|chrome[_-]?headless[_-]?shell)\/([\d.]+)/i;
+
+/**
+ * P2-17 — the legacy headless *shell* binary is a distinct product from the
+ * modern `HeadlessChrome` (new headless) mode. It advertises itself as
+ * `chrome-headless-shell` (UA-CH brand) or `headless_shell` (UA token/brand).
+ * These regexes are detection-only and never affect browser resolution.
+ */
+const HEADLESS_SHELL_UA_RE = /headless[_-]?shell|chrome[_-]?headless[_-]?shell/i;
+const HEADLESS_SHELL_BRAND_RE = /^(?:headless[_-]?shell|chrome[_-]?headless[_-]?shell)$/i;
 
 /** Splits an RFC 9651 list on commas that are OUTSIDE quoted strings. */
 function splitStructuredList(raw: string): string[] {
@@ -420,6 +439,28 @@ function parseSecCh(secCh: Record<string, string> | undefined): SecChHints {
     formFactors: parseFormFactors(headerValue(secCh, 'sec-ch-ua-form-factors')),
     wow64: parseWow64(headerValue(secCh, 'sec-ch-ua-wow64')),
   };
+}
+
+/**
+ * P2-17 — derives the headless variant straight from the raw signals, so it is
+ * fully additive: it neither reads nor influences `resolveBrowser`. A shell
+ * token in the UA or in either brand list wins over a plain HeadlessChrome
+ * token; without any headless signal the result is `null`.
+ */
+function resolveHeadlessMode(
+  ua: string,
+  uad: UaDataHighEntropy | null,
+  secCh: SecChHints,
+): HeadlessMode {
+  const brands = [...(uad?.fullVersionList ?? []), ...secCh.brands];
+  const isShell =
+    HEADLESS_SHELL_UA_RE.test(ua) ||
+    brands.some((b) => !!b && HEADLESS_SHELL_BRAND_RE.test(b.brand));
+  if (isShell) return 'shell';
+  const isHeadless =
+    HEADLESS_UA_RE.test(ua) ||
+    brands.some((b) => !!b && HEADLESS_BRAND_RE.test(b.brand));
+  return isHeadless ? 'new' : null;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1339,6 +1380,7 @@ const BLANK_IDENTITY: NormalizedIdentity = {
   architecture: '',
   bitness: '',
   platformFamily: 'unknown',
+  headless_mode: null,
   runtime: 'unknown',
   host_app: '',
   client_type: 'unknown',
@@ -1366,6 +1408,7 @@ export function normalizeIdentity(input: NormalizeIdentityInput): NormalizedIden
     const touch = typeof rawTouch === 'number' && isFinite(rawTouch) ? rawTouch : 0;
     const uad = input?.uaData ?? null;
     const secCh = parseSecCh(input?.secCh);
+    const headlessMode = resolveHeadlessMode(ua, uad, secCh);
     const signals = runtimeSignalsFromInput(input ?? {});
     const runtime = resolveRuntime(ua, signals);
 
@@ -1411,6 +1454,7 @@ export function normalizeIdentity(input: NormalizeIdentityInput): NormalizedIden
       architecture: archRes.architecture,
       bitness: archRes.bitness,
       platformFamily: osRes.platformFamily,
+      headless_mode: headlessMode,
       runtime: runtime.runtime,
       host_app: runtime.host_app,
       client_type: runtime.client_type,
@@ -1495,6 +1539,8 @@ export interface NormalizedUserAgent {
   model: string;
   /** True when the resolved browser came from the HeadlessChrome UA-CH brand. */
   is_headless_brand?: boolean;
+  /** Headless variant ('shell' | 'new' | null). Additive field (P2-17). */
+  headless_mode?: HeadlessMode;
   /** Host runtime that renders the page (engine-independent). Additive field. */
   runtime?: RuntimeKind;
   /** Host application name when the runtime is an Electron/IDE/WebView shell. */
@@ -1517,6 +1563,7 @@ const BLANK_USER_AGENT: NormalizedUserAgent = {
   architecture: '',
   bitness: '',
   model: '',
+  headless_mode: null,
   runtime: 'unknown',
   host_app: '',
   client_type: 'unknown',
@@ -1674,6 +1721,7 @@ export function normalizeUserAgent(input: NormalizeUserAgentInput): NormalizedUs
       bitness: identity.bitness,
       model: identity.device_model,
       is_headless_brand: identity.is_headless_brand,
+      headless_mode: identity.headless_mode,
       runtime: identity.runtime,
       host_app: identity.host_app,
       client_type: identity.client_type,

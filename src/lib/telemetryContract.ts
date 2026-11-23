@@ -146,6 +146,36 @@ export type InspectorStateTristate = 'attached' | 'detached' | 'unknown';
 /** Lowercase alias matching the canonical envelope field name. */
 export type inspectorState = InspectorStateTristate;
 
+/* -------------------------------------------------------------------------- */
+/* Additive normalized truth / stability vocabularies (all transport-only)      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Normalized GPU truth state. This is deliberately distinct from the coarse `GpuObservation`
+ * labeling bucket: it records *why* a raw vendor/renderer answer cannot be trusted, so it can
+ * be compared across model and weight-config versions without re-deriving a verdict.
+ */
+export type GpuTruthState = 'hardware' | 'software_renderer' | 'masked' | 'spoofed_suspect' | 'unknown';
+
+/** Concrete headless-Chromium variant: legacy shell binary, modern new-headless, or none. */
+export type HeadlessMode = 'shell' | 'new' | null;
+
+/** Scope of the identity anchor that produced a visitor id: durable hardware or per-context. */
+export type IdScope = 'hardware' | 'context';
+
+/** Coarse, farbling-resistant audio probe stability class used by the hardware-id seed. */
+export type AudioStabilityClass = 'stable' | 'noisy' | 'unavailable';
+
+/**
+ * Browser-granted geolocation fix. Coordinates here are only ever supplied by the browser
+ * geolocation API — an IP-derived coordinate must never populate this shape.
+ */
+export interface GrantedGeolocation {
+  lat: number;
+  lon: number;
+  accuracyM: number | null;
+}
+
 export interface AutomationAxes {
   bot: 'not_detected' | 'suspected' | 'bad' | 'good' | 'ai_agent';
   bot_type: string | null;
@@ -420,6 +450,40 @@ export interface CanonicalTelemetryEnvelope {
   tampering_details?: TamperingDetailsMirror | null;
   /** Network-layer fingerprint hash, when the edge supplied one. */
   network_layer_hash?: string | null;
+
+  /* ------------------------------------------------------------------------ */
+  /* Additive normalized truth / stability mirrors (ALL OPTIONAL).              */
+  /* Each value is copied verbatim from the producer that observed it; the       */
+  /* envelope never re-derives any of them into a score, tier or verdict.        */
+  /* ------------------------------------------------------------------------ */
+  /** Normalized GPU truth state refined beyond the coarse `gpuObservation` bucket. */
+  gpu_truth_state?: GpuTruthState;
+  /** True when the raw client GPU answer is unreliable (masked / spoofed / unreadable). */
+  gpu_answer_unreliable?: boolean;
+  /** Concrete headless-Chromium variant, when a headless UA / brand was observed. */
+  headless_mode?: HeadlessMode;
+  /** Explicit browser geolocation permission state (`granted` / `denied` / ...). */
+  geolocationPermission?: string | null;
+  /** Browser-granted geolocation fix (never IP-derived), when permission was granted. */
+  grantedGeolocation?: GrantedGeolocation | null;
+  /** Horizontal accuracy of the granted geolocation fix, in metres. */
+  accuracy_m?: number | null;
+  /** Flat privacy-signature token ids mirrored from the privacy-signature resolver. */
+  privacy_signature_ids?: string[];
+  /** Confirmed privacy-hardening posture (mirror of the response's `privacy_hardened`). */
+  privacy_hardened?: boolean;
+  /** Coarse media-preference record (color scheme, reduced motion, forced colors, ...). */
+  media_preferences?: Record<string, unknown>;
+  /** True when an automation protocol (CDP) is actively inspecting this page. */
+  active_cdp_inspection?: boolean;
+  /** Scope of the identity anchor: durable hardware or per-context. */
+  id_scope?: IdScope;
+  /** True when the session ran in an isolated / non-persistent browser context. */
+  context_isolated?: boolean;
+  /** Farbling-resistant audio probe stability class used by the hardware-id seed. */
+  audio_stability_class?: AudioStabilityClass;
+  /** Domain-separated stability key used by confidence matching; null when unavailable. */
+  confidence_stability_key?: string | null;
 }
 
 /* -------------------------------------------------------------------------- */

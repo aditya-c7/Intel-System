@@ -1,5 +1,10 @@
 import type {
+  AudioStabilityClass,
   GpuObservation,
+  GpuTruthState,
+  GrantedGeolocation,
+  HeadlessMode,
+  IdScope,
   InspectorStateTristate,
   PrivacySettingsMirror,
   ProxyDetailsMirror,
@@ -80,6 +85,24 @@ export interface HardwareSignals {
   audioNoise?: boolean;
   /** 8x8 coarse-quantized canvas digest (structural, collision-resistant anchor). */
   canvasCoarseHash?: string | null;
+  /* --- Additive truth/telemetry (R-fix wave) --------------------------------- */
+  gpuClass?: string;
+  gpuObservation?: string;
+  gpuTruth?: {
+    state: 'hardware' | 'software_renderer' | 'masked' | 'spoofed_suspect' | 'unknown';
+    answerUnreliable: boolean;
+    reasons: string[];
+  };
+  debugExtensionAvailable?: boolean;
+  maskedVendor?: string;
+  maskedRenderer?: string;
+  unmaskedVendor?: string;
+  unmaskedRenderer?: string;
+  audioSum?: number | null;
+  audioStabilityClass?: 'stable' | 'noisy' | 'unavailable';
+  audioUsableForIdentity?: boolean;
+  audioNoiseReasons?: string[];
+  audioTamperingInconclusive?: boolean;
 }
 
 export type RiskLevel = 'Low' | 'Medium' | 'High';
@@ -527,6 +550,14 @@ export interface SecuritySignals {
   risk_tier?: RiskTier;
   /** Flat scored-line mirror of `risk.evidence_ledger`. */
   evidence_ledger?: RiskEvidenceLine[];
+
+  /* Additive normalized truth / instrumentation mirrors — ALL OPTIONAL. */
+  /** Concrete headless-Chromium variant; refines the boolean `isHeadless`. */
+  headless_mode?: HeadlessMode;
+  /** True when an automation protocol (CDP) is actively inspecting the page. */
+  active_cdp_inspection?: boolean;
+  /** Coarse media-preference record from `matchMedia` probes. */
+  media_preferences?: Record<string, unknown>;
 }
 
 export type LocationSource = 'edge' | 'provider' | 'consensus' | 'tor-relay' | 'none';
@@ -603,6 +634,14 @@ export interface LocationInfo {
   accuracy_radius?: number | null;
   /** Routed BGP prefix for the egress ASN (e.g. `73.136.0.0/13`). */
   asn_network?: string;
+
+  /* Additive browser-geolocation evidence — OPTIONAL. Never derived from IP coordinates. */
+  /** Explicit `navigator.permissions` / geolocation permission state. */
+  geolocationPermission?: string | null;
+  /** Browser-granted geolocation fix (lat/lon/accuracyM); IP-derived coordinates are invalid here. */
+  grantedGeolocation?: GrantedGeolocation | null;
+  /** Horizontal accuracy of the granted geolocation fix, in metres. */
+  accuracy_m?: number | null;
 }
 
 export interface VisitStatistics {
@@ -845,4 +884,34 @@ export interface IntelVisitorResponse {
   subdivision_iso?: string;
   accuracy_radius?: number | null;
   asn_network?: string;
+
+  /* ------------------------------------------------------------------------ */
+  /* Additive normalized truth / stability mirrors — ALL OPTIONAL. Every value */
+  /* below is mirrored verbatim from the canonical envelope; nothing here is    */
+  /* re-derived into a score, tier or verdict.                                  */
+  /* ------------------------------------------------------------------------ */
+  /** Normalized GPU truth state refined beyond the coarse `gpuObservation` bucket. */
+  gpu_truth_state?: GpuTruthState;
+  /** True when the raw client GPU answer is unreliable (masked / spoofed / unreadable). */
+  gpu_answer_unreliable?: boolean;
+  /** Concrete headless-Chromium variant, when a headless UA / brand was observed. */
+  headless_mode?: HeadlessMode;
+  /** Explicit browser geolocation permission state. */
+  geolocationPermission?: string | null;
+  /** Browser-granted geolocation fix (never IP-derived). */
+  grantedGeolocation?: GrantedGeolocation | null;
+  /** Horizontal accuracy of the granted geolocation fix, in metres. */
+  accuracy_m?: number | null;
+  /** Coarse media-preference record from `matchMedia` probes. */
+  media_preferences?: Record<string, unknown>;
+  /** True when an automation protocol (CDP) is actively inspecting the page. */
+  active_cdp_inspection?: boolean;
+  /** Scope of the identity anchor: durable hardware or per-context. */
+  id_scope?: IdScope;
+  /** True when the session ran in an isolated / non-persistent browser context. */
+  context_isolated?: boolean;
+  /** Farbling-resistant audio probe stability class used by the hardware-id seed. */
+  audio_stability_class?: AudioStabilityClass;
+  /** Domain-separated stability key used by confidence matching; null when unavailable. */
+  confidence_stability_key?: string | null;
 }

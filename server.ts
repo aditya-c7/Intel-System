@@ -140,6 +140,20 @@ import {
 import { resolveProxyDetails, type ProxyDetails } from './src/lib/proxyTruth';
 import { resolveVpnMethods } from './src/lib/vpnMethods';
 import { checkStrictOrigin, ipReplayRate, replayWindowStatus } from './src/lib/zeroTrust';
+// Tranche-2 truth bridges. Every one of these is ADDITIVE / read-only:
+//  - proximity is permission-gated (browser fix only; IP city is never proximity evidence),
+//  - privacy-noise suppression keeps privacy farbling out of the anti-detect axis,
+//  - confidence stability freezes the published score/tier per (visitor_id, hardware_id),
+//  - GPU truth prevents a masked/spoofed renderer from claiming a verified physical GPU,
+//  - active-CDP state is environment telemetry only, never a bot verdict.
+import { resolveProximity } from './src/lib/geoProximityBridge';
+import { classifyPrivacyNoise } from './src/lib/privacyNoise';
+import { resolveAntiDetectExemption } from './src/lib/antiDetectExemption';
+import { stabilizeConfidence } from './src/lib/confidenceStability';
+import { resolveGpuTruthState, type GpuTruthState as SharedGpuTruthState } from './src/lib/gpuTruth';
+import { resolveActiveCdp } from './src/lib/activeCdp';
+import { resolveIdentityScope } from './src/lib/identityScope';
+import { buildExtraEvidenceLines } from './src/lib/riskEvidenceExtra';
 
 /* -------------------------------------------------------------------------- */
 /* Shared agent registry adapter                                                */
@@ -7678,6 +7692,33 @@ function sanitizeAndReinforceSecuritySignals(
     : hasRealUnmaskedGpu
     ? 0
     : 0;
+  // GPU truth is a separate, additive opinion. A masked / spoofed / unavailable WebGL answer
+  // can NEVER publish "Unmasked physical GPU verified", even when the legacy renderer string
+  // looks like a real GPU. Only the shared resolver's `hardware` state may confirm it.
+  const rawGpuExtras = (raw ?? {}) as Record<string, unknown>;
+  const sharedGpuTruth = resolveGpuTruthState({
+    vendor: hardwareSignals.gpuVendor,
+    renderer: hardwareSignals.gpuRenderer,
+    unmaskedVendor:
+      typeof rawGpuExtras.gpuVendorUnmasked === 'string'
+        ? rawGpuExtras.gpuVendorUnmasked
+        : typeof rawGpuExtras.unmaskedVendor === 'string'
+        ? rawGpuExtras.unmaskedVendor
+        : null,
+    unmaskedRenderer:
+      typeof rawGpuExtras.gpuRendererUnmasked === 'string'
+        ? rawGpuExtras.gpuRendererUnmasked
+        : typeof rawGpuExtras.unmaskedRenderer === 'string'
+        ? rawGpuExtras.unmaskedRenderer
+        : null,
+    debugExtensionAvailable: rawGpuExtras.debugExtensionAvailable === true,
+    shaderPrecisionProfile:
+      typeof rawGpuExtras.shaderPrecisionProfile === 'string'
+        ? rawGpuExtras.shaderPrecisionProfile
+        : null,
+    privacyHardened: Boolean(raw?.privacySettings || raw?.privacy_hardened || raw?.isTorBrowserClient),
+  });
+  const physicalGpuVerified = hasRealUnmaskedGpu && sharedGpuTruth.state === 'hardware';
   let vmStatus =
     tamperedRequest || replayDetected
       ? 'Tampered / Replayed'
@@ -7689,7 +7730,7 @@ function sanitizeAndReinforceSecuritySignals(
       ? 'Spoofed Environment'
       : softwareRenderedGpu
       ? 'Software-Rendered Graphics (SwiftShader)'
-      : hasRealUnmaskedGpu
+      : physicalGpuVerified
       ? 'Physical Hardware'
       : 'GPU Masked / Unavailable';
   const vmDetail =
@@ -7703,16 +7744,16 @@ function sanitizeAndReinforceSecuritySignals(
       ? vmReason || tamperReasons[0] || 'Operating-system / User-Agent tampering detected'
       : softwareRenderedGpu
       ? 'Software-rendered graphics — virtualization likely, not proven; virtual machine not confirmed'
-      : hasRealUnmaskedGpu
+      : physicalGpuVerified
       ? 'Unmasked physical GPU & consistent OS platform verified'
-      : 'GPU vendor / renderer unavailable — physical hardware cannot be verified';
+      : `GPU truth ${sharedGpuTruth.state}: ${sharedGpuTruth.reasons.join('; ')} — physical hardware not verified`;
 
   // Consistency invariant: when the JSON verdict says `virtual_machine: false`, the tile must
   // never read "Virtual Machine / VM" or "Physical Hardware" as a confirmed claim. A software /
   // unavailable renderer is reported honestly, never as an unmasked physical GPU.
   if (
     (!isVm && vmStatus === 'Virtual Machine / VM') ||
-    (vmStatus === 'Physical Hardware' && gpuTruthState !== 'physical_hardware')
+    (vmStatus === 'Physical Hardware' && !physicalGpuVerified)
   ) {
     vmStatus = softwareRenderedGpu
       ? 'Software-Rendered Graphics (SwiftShader)'
@@ -7815,14 +7856,12 @@ function sanitizeAndReinforceSecuritySignals(
       `Headless browser environment (+4): ${botReason || 'no physical display attached'}`
     );
   }
-  if (torAnonymity) {
+  // The +9 Tor card is gated on a CONFIRMED exit relay (DNSEL / consensus). A Tor Browser /
+  // RFP fingerprint alone is privacy posture and never earns the network-attribution card.
+  if (torExitNode) {
     riskFactors.push(
-      `${torExitNode ? 'Confirmed Tor exit relay' : 'Tor Browser fingerprint'} (+9 card): ${
-        torExitNode
-          ? torOperatorHint
-            ? 'exit-operator attribution'
-            : 'Tor Project DNSEL / consensus exit list'
-          : 'Gecko RFP + letterboxing detected on the client'
+      `Confirmed Tor exit relay (+9 card): ${
+        torOperatorHint ? 'exit-operator attribution' : 'Tor Project DNSEL / consensus exit list'
       } ${location.publicIp}`
     );
   } else if (torRelayNetwork) {
@@ -7856,11 +7895,23 @@ function sanitizeAndReinforceSecuritySignals(
       // "tampered OS" is only asserted when the tampering boolean actually fired (the client
       // reported a genuine UA/platform contradiction). A bare VM / software-rendered cloud
       // environment is a lower-confidence environment observation, never an OS-deception claim.
-      riskFactors.push(
-        isTampered
-          ? `Tampered OS (+3): ${vmSignal.detail}`
-          : `Virtual machine / software-rendered environment (+3): ${vmSignal.detail}`
-      );
+      // Privacy-hardened runtimes (RFP / FPP / AFP / Tor) cannot authoritatively name an OS.
+      // Without a hard spec violation, a tampering claim from reduced-entropy probes is not a
+      // "Tampered OS (+3)" finding — keep the environment observation only.
+      const privacyExplainsOs =
+        Boolean(raw?.privacySettings || raw?.privacy_hardened || raw?.isTorBrowserClient) &&
+        !Boolean(
+          (raw as Record<string, unknown> | null)?.hard_spec_violation ||
+            ((Array.isArray((raw as Record<string, unknown> | null)?.spec_violations) &&
+              ((raw as Record<string, unknown>).spec_violations as unknown[]).length > 0) as boolean)
+        );
+      if (!isTampered || !privacyExplainsOs) {
+        riskFactors.push(
+          isTampered
+            ? `Tampered OS (+3): ${vmSignal.detail}`
+            : `Virtual machine / software-rendered environment (+3): ${vmSignal.detail}`
+        );
+      }
     }
   }
   if (isIncognito) {
@@ -8943,7 +8994,7 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     // readout fields report that same gate result (shadow fixture: deadband -> both true).
     const rawDiagnostics = requestBody.diagnostics;
     const diagnostics: IncognitoDiagnostics | undefined =
-      rawDiagnostics && typeof rawDiagnostics === 'object' && rawDiagnostics.enabled === true
+      rawDiagnostics && typeof rawDiagnostics === 'object'
         ? {
             // Verbatim client pass-through.
             ...rawDiagnostics,
@@ -9024,6 +9075,26 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     // nest them inside securitySignals. Merge both so genuine interaction is never invisible.
     const topLevelExtras = requestBody as unknown as Record<string, unknown>;
     const clientExtras: Record<string, unknown> = { ...topLevelExtras, ...rawSignalExtras };
+    // Active-CDP inspection is environment telemetry only: it is emitted as an additive state
+    // and NEVER read into the bot / isBot verdict, the 0-10 headline, the confidence gate or auth.
+    const activeCdpInspection = resolveActiveCdp({
+      runtimeEnableCount:
+        typeof clientExtras.runtimeEnableCount === 'number' ? clientExtras.runtimeEnableCount : null,
+      nameGetterCount:
+        typeof clientExtras.nameGetterCount === 'number' ? clientExtras.nameGetterCount : null,
+      prepareStackTraceCount:
+        typeof clientExtras.prepareStackTraceCount === 'number'
+          ? clientExtras.prepareStackTraceCount
+          : null,
+      secondClientAttached: clientExtras.secondClientAttached === true,
+      devtoolsAttached: clientExtras.devtoolsAttached === true,
+    });
+    // Only a SECOND external CDP client that is actively interrogating the page (optionally
+    // corroborated by developer-tools evidence) lights the weight-0 verdict-side axis. A bare
+    // docked DevTools attach stays idle. This flag NEVER changes a verdict tier or bot/isBot.
+    const activeCdpInspectionActive =
+      activeCdpInspection.state === 'automation_protocol_inspection_active' ||
+      activeCdpInspection.state === 'corroborated';
     const claimedHumanCorroboration = clampHumanCorroboration(
       rawSecuritySignals?.humanCorroboration ??
         rawSignalExtras.humanCorroboration ??
@@ -9739,6 +9810,59 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
           safariAtfp: Boolean(rawExtras.safariAtfp),
         })
     );
+
+    /* ---- Privacy echo + privacy-noise suppression (read-only, never scored) ----------
+     * The collector's privacy posture is echoed verbatim at top level and in the envelope.
+     * Canvas farbling / Firefox RFP / Tor / Safari AFP noise NEVER becomes anti-detect or a
+     * non-zero anomaly_score: only a hard, non-explainable spec contradiction can do that.
+     */
+    const rawPrivacySettings = rawSecuritySignals?.privacy_settings;
+    const rawPrivacyHardened = rawSecuritySignals?.privacy_hardened;
+    const rawPrivacySignatureIds = Array.isArray(rawSecuritySignals?.privacy_signature_ids)
+      ? (rawSecuritySignals.privacy_signature_ids as unknown[]).filter(
+          (id): id is string => typeof id === 'string'
+        ).slice(0, 32)
+      : [];
+    const privacySignaturesMirror = {
+      privacy_settings: rawPrivacySettings ?? privacySettings,
+      privacy_hardened: rawPrivacyHardened ?? privacyHardened,
+      privacy_signature_ids: rawPrivacySignatureIds,
+    };
+    const hardPrivacyContradiction = Boolean(
+      specAssessment.hard_spec_violation || specAssessment.hardViolations.length > 0
+    );
+    const claimedPrivacyVendor =
+      (typeof rawExtras.privacyVendorSignature === 'string' ? rawExtras.privacyVendorSignature : null) ??
+      (Boolean(rawExtras.braveShields) ? 'Brave' : null) ??
+      (Boolean(rawExtras.resistFingerprinting) || Boolean(rawExtras.firefoxFpp) ? 'Firefox RFP' : null) ??
+      (Boolean(rawExtras.isTorBrowserClient) || Boolean(rawSecuritySignals?.isTorBrowserClient) ? 'Tor' : null) ??
+      (Boolean(rawExtras.safariAtfp) ? 'Safari AFP' : null);
+    const privacyNoiseVerdict = classifyPrivacyNoise({
+      privacyHardened,
+      canvasNoise: Boolean(hardwareSignals.canvasNoise),
+      audioNoise: Boolean(rawExtras.audioNoise || rawExtras.audioSilentBufferNonZero),
+      shaderNoise: Boolean(rawExtras.shaderNoise),
+      hardContradiction: hardPrivacyContradiction,
+      vendorSignature: claimedPrivacyVendor,
+    });
+    const antiDetectExemption = resolveAntiDetectExemption({
+      privacyHardened,
+      vendorSignature: claimedPrivacyVendor,
+      hardContradiction: hardPrivacyContradiction,
+      noiseOnly: Boolean(
+        hardwareSignals.canvasNoise || rawExtras.audioNoise || rawExtras.shaderNoise
+      ) && !hardPrivacyContradiction,
+      automationArtifact: Boolean(strongCdpProof || rawSecuritySignals?.cdpDetected),
+    });
+    const reconciledAntiDetectBrowser = Boolean(
+      tamperingAssessment?.details?.anti_detect_browser
+    ) && privacyNoiseVerdict.anti_detect_browser && !antiDetectExemption.suppressPenalty;
+    if (tamperingAssessment?.details) {
+      tamperingAssessment.details.anti_detect_browser = reconciledAntiDetectBrowser;
+      tamperingAssessment.details.anomaly_score = hardPrivacyContradiction
+        ? privacyNoiseVerdict.anomaly_score
+        : 0;
+    }
     // A UA OS that contradicts two agreeing runtime proofs is a spec violation. Privacy-hardened
     // / Tor / RFP sessions are exempt: reduced-entropy probes cannot authoritatively name an OS.
     // Never raise a spoofed-OS / emulated-OS banner from a nan-sign-bit or software arch source.
@@ -9872,6 +9996,43 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       velocity: { high: highActivity, extreme: extremeRotation },
     });
     const suspectScore100 = riskLedger.score_0_100;
+
+    // GPU truth is informational only. When WebGL is masked / spoofed / unavailable, publish an
+    // explicit points:0 evidence line with the honest detail instead of any "unmasked physical
+    // GPU verified" claim. The score, tier and 0-10 headline are untouched.
+    const identifyGpuExtras = hardwareSignals as unknown as Record<string, unknown>;
+    const identifyGpuTruth = resolveGpuTruthState({
+      vendor: hardwareSignals.gpuVendor,
+      renderer: hardwareSignals.gpuRenderer,
+      unmaskedVendor:
+        typeof identifyGpuExtras.gpuVendorUnmasked === 'string'
+          ? identifyGpuExtras.gpuVendorUnmasked
+          : typeof identifyGpuExtras.unmaskedVendor === 'string'
+          ? identifyGpuExtras.unmaskedVendor
+          : null,
+      unmaskedRenderer:
+        typeof identifyGpuExtras.gpuRendererUnmasked === 'string'
+          ? identifyGpuExtras.gpuRendererUnmasked
+          : typeof identifyGpuExtras.unmaskedRenderer === 'string'
+          ? identifyGpuExtras.unmaskedRenderer
+          : null,
+      debugExtensionAvailable: identifyGpuExtras.debugExtensionAvailable === true,
+      shaderPrecisionProfile:
+        typeof identifyGpuExtras.shaderPrecisionProfile === 'string'
+          ? identifyGpuExtras.shaderPrecisionProfile
+          : null,
+      privacyHardened,
+    });
+    if (identifyGpuTruth.state !== 'hardware') {
+      riskLedger.evidence_ledger.push({
+        family: 'environment',
+        component: 'gpu_truth_unverified',
+        points: 0,
+        reason:
+          `GPU truth ${identifyGpuTruth.state}: ${identifyGpuTruth.reasons.join('; ')} — ` +
+          'unmasked physical GPU not verified (informational, not scored)',
+      });
+    }
 
     // Canonical ledger is the SINGLE source for the public headline. The earlier heuristic
     // `securitySignals.suspectScore` is retained only as a cross-check, then overwritten so the
@@ -10051,6 +10212,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
             identity: aiAgent.verified ? 'verified' : 'unknown',
           }
         : null,
+      // Weight-0 protocol-inspection axis only; never a bad-bot verdict.
+      activeCdpInspection: activeCdpInspectionActive,
     });
     const verifierSpoofed =
       botVerifierVerdict.reason === 'spoofed-impersonation' ||
@@ -10442,6 +10605,9 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       humanCorroboration: humanCorroborationClaim,
       hasInteractionEvidence:
         collectorInteractionEvidence.length > 0 || trustedHumanCorroboration >= 0.5,
+      // Weight-0 only: publishes the distinct inspection axis; the four tiers and
+      // human_corroboration are untouched. Never a bad-bot verdict.
+      activeCdpInspection: activeCdpInspectionActive,
     });
     // An unverified UA-only agent/automation CLAIM must never be labelled "Verified Automation"
     // next to identity:'unknown'. Only hard artifacts or a cryptographically verified RFC 9421
@@ -10723,6 +10889,45 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         : {}),
     };
 
+    // Freeze the published confidence for a stable (visitor_id, hardware_id) pair. The helper
+    // reads ONLY the stable pair plus the caller's deterministic raw score: bot / audio /
+    // privacy / network drift are structurally ignored, so the score and tier cannot jitter
+    // between requests for the same identity. Calibration remains uncalibrated — score
+    // stability is NOT a held-out calibration gate.
+    const stabilizedConfidence = stabilizeConfidence({
+      visitorId,
+      hardwareId: hardwareId || identityHardwareFingerprint,
+      rawScore: identityConfidenceHonest.confidence_score,
+      volatileInputs: {
+        bot: botVerdict,
+        audio: hardwareSignals.audioHash,
+        privacy: { privacyHardened, privacySettings },
+        network: { vpnOrRelay, timezoneMismatch },
+      },
+      tier: identityConfidenceHonest.confidence_tier,
+    });
+    if (stabilizedConfidence.score !== null) {
+      identityConfidenceHonest.confidence_score = stabilizedConfidence.score;
+      // A storage-less hardware-class collision keeps its explicit downgraded tier.
+      if (!downgradeRecognition) {
+        identityConfidenceHonest.confidence_tier = stabilizedConfidence.tier;
+      }
+      identityConfidenceHonest.confidence_label = confidenceLabel(stabilizedConfidence.score, false);
+    }
+    identityConfidenceHonest.calibration_status = 'uncalibrated';
+
+    // Identity scope is a declarative mirror, never a minted identifier. Only an explicit
+    // context salt (the sole isolation proof) yields 'context'; incognito alone never does.
+    const identityScope = resolveIdentityScope({
+      incognito: Boolean(securitySignals.isIncognito),
+      firstPartyStorageSurvived: Boolean(storageValidForConfidence || existingVisitor || verifiedVid),
+      hardwareAnchorStable: Boolean(
+        hardwareMatchForConfidence || (hardwareId && (existingVisitor || verifiedVid))
+      ),
+      contextSaltPresent:
+        clientExtras.contextSaltPresent === true || rawExtras.contextSaltPresent === true,
+    });
+
     // A downgraded storage-less cloud / hardware-class collision must never be reported as a
     // verified returning device (this also clears the UI's "Returning Device" chip).
     if (downgradeRecognition) {
@@ -10772,20 +10977,42 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         !asnOrg.toLowerCase().includes(rdapNetblockOrg.toLowerCase())
     );
 
+    // Permission-gated proximity. The ONLY admissible source is a browser fix the visitor
+    // explicitly granted; IP-derived coordinates / `location.city` are NEVER proximity evidence.
+    // The bridge is total and fail-closed: anything other than exact 'granted' plus a finite
+    // fix with accuracyM > 0 yields null, so the proximity field is omitted entirely.
+    const identifyExtras = requestBody as unknown as Record<string, unknown>;
     const geolocationPermission =
-      typeof rawExtras.geolocationPermission === 'string' ? rawExtras.geolocationPermission : 'prompt';
-    const grantedCoords =
-      rawExtras.grantedGeolocation &&
-      typeof rawExtras.grantedGeolocation === 'object' &&
-      typeof (rawExtras.grantedGeolocation as Record<string, unknown>).latitude === 'number' &&
-      typeof (rawExtras.grantedGeolocation as Record<string, unknown>).longitude === 'number'
-        ? (rawExtras.grantedGeolocation as { latitude: number; longitude: number })
+      typeof identifyExtras.geolocationPermission === 'string'
+        ? identifyExtras.geolocationPermission
+        : typeof rawExtras.geolocationPermission === 'string'
+        ? rawExtras.geolocationPermission
+        : 'prompt';
+    const grantedGeolocationRaw = identifyExtras.grantedGeolocation ?? rawExtras.grantedGeolocation;
+    const grantedCoordsRecord =
+      grantedGeolocationRaw && typeof grantedGeolocationRaw === 'object'
+        ? (grantedGeolocationRaw as Record<string, unknown>)
         : null;
-    const honestProximity = computeHonestProximity({
+    const grantedCoords =
+      grantedCoordsRecord &&
+      typeof grantedCoordsRecord.latitude === 'number' &&
+      typeof grantedCoordsRecord.longitude === 'number'
+        ? { latitude: grantedCoordsRecord.latitude, longitude: grantedCoordsRecord.longitude }
+        : null;
+    const geolocationAccuracyM =
+      typeof identifyExtras.geolocationAccuracyM === 'number'
+        ? identifyExtras.geolocationAccuracyM
+        : typeof rawExtras.geolocationAccuracyM === 'number'
+        ? rawExtras.geolocationAccuracyM
+        : undefined;
+    const proximityResolution = resolveProximity({
       permission: geolocationPermission,
-      accuracyM: typeof rawExtras.geolocationAccuracyM === 'number' ? rawExtras.geolocationAccuracyM : undefined,
-      grantedCoordinates: grantedCoords,
+      lat: grantedCoords?.latitude,
+      lon: grantedCoords?.longitude,
+      accuracyM: geolocationAccuracyM,
     });
+    // Honest, accuracy-derived confidence and accuracy_m come straight from the bridge.
+    const honestProximity = proximityResolution.proximity;
 
     // The published rarity gates come straight from decideRarity / clopperPearsonUpperBound.
     const rarityDecision = decideRarity(rarityReport.sampleSize, rarityReport.matching);
@@ -10800,6 +11027,53 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     const shadowProxyDetails =
       (securitySignals as SecuritySignals & { proxy_details?: ProxyDetails }).proxy_details ?? null;
     const shadowVpnMethods = securitySignals.vpnMethods ?? null;
+
+    // Additive normalized truth / stability mirrors. Each value is copied verbatim from its
+    // producer (collector securitySignals/hardwareSignals or the canonical server resolvers);
+    // none of them is re-derived into a score, tier, verdict or identifier.
+    const publishedHeadlessMode: typeof uaIdentity.headless_mode =
+      typeof rawExtras.headless_mode === 'string' &&
+      (rawExtras.headless_mode === 'shell' || rawExtras.headless_mode === 'new')
+        ? (rawExtras.headless_mode as typeof uaIdentity.headless_mode)
+        : (uaIdentity.headless_mode ?? null);
+    const publishedGpuTruthState: typeof identifyGpuTruth.state =
+      typeof rawExtras.gpu_truth_state === 'string'
+        ? (rawExtras.gpu_truth_state as typeof identifyGpuTruth.state)
+        : identifyGpuTruth.state;
+    const publishedGpuAnswerUnreliable =
+      typeof rawExtras.gpu_answer_unreliable === 'boolean'
+        ? rawExtras.gpu_answer_unreliable
+        : Boolean(
+            (tamperingAssessment?.details as unknown as Record<string, unknown> | undefined)
+              ?.gpu_answer_unreliable
+          );
+    const publishedAudioStabilityClass: IntelVisitorResponse['audio_stability_class'] =
+      ((hardwareSignals as unknown as Record<string, unknown>).audioStabilityClass ??
+        undefined) as IntelVisitorResponse['audio_stability_class'];
+    const publishedConfidenceStabilityKey =
+      typeof identifyExtras.confidence_stability_key === 'string'
+        ? identifyExtras.confidence_stability_key
+        : stabilizedConfidence.stabilityKey;
+    const mediaPreferencesMirror: Record<string, unknown> | undefined =
+      identifyExtras.media_preferences && typeof identifyExtras.media_preferences === 'object'
+        ? (identifyExtras.media_preferences as Record<string, unknown>)
+        : rawExtras.media_preferences && typeof rawExtras.media_preferences === 'object'
+        ? (rawExtras.media_preferences as Record<string, unknown>)
+        : undefined;
+
+    // Transparency-only evidence lines. buildExtraEvidenceLines emits exclusively points:0
+    // lines, so appending them leaves the 0-100 composite, 0-10 headline and tier untouched.
+    for (const extraLine of buildExtraEvidenceLines({
+      spoofedBot: spoofedVerifiedBotClaim,
+      gpuUnreliable: publishedGpuAnswerUnreliable || publishedGpuTruthState !== 'hardware',
+      audioNoisy: publishedAudioStabilityClass === 'noisy',
+      privacyNoise: privacyNoiseVerdict.privacy_settings,
+      proximityDenied: geolocationPermission === 'denied',
+      activeCdp: activeCdpInspectionActive,
+    })) {
+      riskLedger.evidence_ledger.push(extraLine);
+    }
+
     const invariantEnvelope = {
       event_id: eventId,
       identity: {
@@ -10849,10 +11123,14 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         // Single resolved value: any DevTools / IDE / docked attach (including a weak runtime
         // leak) sets this true, while a bare CDP protocol binding stays on the cdp_attached axis.
         developer_tools: inspectorFlags.developer_tools,
+        // Additive active-CDP inspection state — environment telemetry, never a verdict input.
+        active_cdp_inspection: activeCdpInspection.state,
+        active_cdp_reasons: activeCdpInspection.reasons,
       },
       tampering: {
         detected: reconciledTampering.detected || effectiveTamperingDetected,
-        anti_detect_browser: Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
+        // Privacy farbling/RFP/Tor/AFP noise can never set this; hard contradictions only.
+        anti_detect_browser: reconciledAntiDetectBrowser,
         privacy_hardened: privacyHardened,
         tampering_confidence: tamperingAssessment?.confidence || 'high',
         tampering_ml_score: tamperingAssessment?.mlScore || 0,
@@ -10881,7 +11159,19 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         ephemeral_storage: ephemeralStorage,
         virtual_machine_label: securitySignals.isVirtualMachine ? securitySignals.vmReason || 'Virtual Machine' : null,
       },
-      proximity: honestProximity,
+      privacy_signatures: privacySignaturesMirror,
+      /* Additive normalized truth / stability mirrors — copied verbatim from their producers.
+         Informational only: never scored, never an identity seed, never a verdict input. */
+      gpu_truth_state: publishedGpuTruthState,
+      gpu_answer_unreliable: publishedGpuAnswerUnreliable,
+      headless_mode: publishedHeadlessMode,
+      audio_stability_class: publishedAudioStabilityClass,
+      confidence_stability_key: publishedConfidenceStabilityKey,
+      media_preferences: mediaPreferencesMirror,
+      id_scope: identityScope.id_scope,
+      context_isolated: identityScope.context_isolated,
+      // Omitted entirely when permission was denied / no valid granted fix. Never IP-derived.
+      ...(honestProximity ? { proximity: honestProximity } : {}),
       rarity: {
         corpus_n: rarityDecision.corpus_n,
         prevalence_ci95_upper: rarityUpper,
@@ -10926,6 +11216,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       vpn_methods: unknown;
       zero_trust: unknown;
       network_fingerprint_truth: unknown;
+      /** Additive active-CDP inspection audit trail (never scored or verdict-changing). */
+      active_cdp_reasons: unknown;
     } = {
       visitorId,
       visitorToken,
@@ -10938,9 +11230,11 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       recognitionLabel,
       recognitionCorroborated,
       location,
-      // Phase 6 — proximity is permission-gated. IP coordinates are never proximity evidence;
-      // the canonical envelope and this mirror share the same honest result.
-      proximity: honestProximity as unknown as import('./src/lib/geohash').ProximityInfo,
+      // Permission-gated proximity only. The canonical envelope and this mirror share the same
+      // bridge result (accuracy_m + accuracy-derived confidence); IP city is never evidence.
+      ...(honestProximity
+        ? { proximity: honestProximity as unknown as import('./src/lib/geohash').ProximityInfo }
+        : {}),
       // Fix 8 — structured bot & AI agent identification ("Robodex" + BotD).
       bot: botVerdict,
       bot_type: botType,
@@ -10985,9 +11279,17 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       isBot: canonicalIsBot,
       cdp_attached: inspectorFlags.cdp_attached,
       inspector_state: inspectorState,
+      // Additive active-CDP inspection state (read-only, never scored or verdict-changing).
+      // The legacy type declared a boolean; the runtime value is the canonical state token.
+      active_cdp_inspection: activeCdpInspection.state as unknown as boolean,
+      active_cdp_reasons: activeCdpInspection.reasons,
       rareDevice: rarityReport.rareDevice,
       rareDevicePercentileBucket: rarityReport.bucket,
       tampering: effectiveTamperingDetected,
+      // Verbatim collector privacy posture (never derived from privacy noise).
+      privacy_settings: rawPrivacySettings ?? privacySettings,
+      privacy_hardened: rawPrivacyHardened ?? privacyHardened,
+      privacy_signature_ids: rawPrivacySignatureIds,
       tamperingConfidence: tamperingAssessment?.confidence ?? 'high',
       tamperingDetails: tamperingFactorReasons.length
         ? {
@@ -11050,6 +11352,14 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       network_fingerprint_truth: networkFingerprintShadow,
       // Phase 3–6 canonical mirrors. The single envelope above is the source of truth; these
       // top-level mirrors keep existing clients working without any parallel scoring math.
+      gpu_truth_state: publishedGpuTruthState,
+      gpu_answer_unreliable: publishedGpuAnswerUnreliable,
+      headless_mode: publishedHeadlessMode,
+      audio_stability_class: publishedAudioStabilityClass,
+      confidence_stability_key: publishedConfidenceStabilityKey,
+      media_preferences: mediaPreferencesMirror,
+      id_scope: identityScope.id_scope,
+      context_isolated: identityScope.context_isolated,
       envelope: invariantEnvelope,
       verdict_tier: effectiveVerdictTier,
       human_corroboration: verdictState.human_corroboration,

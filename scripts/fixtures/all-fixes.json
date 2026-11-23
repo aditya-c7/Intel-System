@@ -1,0 +1,713 @@
+{
+  "schema_version": 1,
+  "title": "Frozen offline regression fixture for all remaining benchmark defects",
+  "generated_on": "2026-11-23",
+  "frozen": true,
+  "offline": true,
+  "helper_modules": {
+    "audioTruth": "../src/lib/audioTruth.ts",
+    "gpuTruth": "../src/lib/gpuTruth.ts",
+    "geoProximityBridge": "../src/lib/geoProximityBridge.ts",
+    "privacyNoise": "../src/lib/privacyNoise.ts",
+    "confidenceStability": "../src/lib/confidenceStability.ts",
+    "activeCdp": "../src/lib/activeCdp.ts",
+    "riskEvidenceExtra": "../src/lib/riskEvidenceExtra.ts",
+    "mediaPreferences": "../src/lib/mediaPreferences.ts",
+    "identityScope": "../src/lib/identityScope.ts",
+    "antiDetectExemption": "../src/lib/antiDetectExemption.ts",
+    "uaNormalizer": "../src/shared/normalization/uaNormalizer.ts"
+  },
+  "cases": [
+    {
+      "id": "AF-AUDIO",
+      "name": "Audio identity stability: noise excludes the anchor, never rotates it",
+      "scenario": "audio_identity_stability",
+      "input": {
+        "audioClean": {
+          "renderSums": [124.04347745512496],
+          "getChannelDataWrapped": false,
+          "copyFromChannelMatches": true,
+          "silentBufferNonZero": false,
+          "privacyHardened": false
+        },
+        "audioNoise": {
+          "renderSums": [124.04347745512496],
+          "getChannelDataWrapped": true,
+          "copyFromChannelMatches": true,
+          "silentBufferNonZero": false,
+          "privacyHardened": false
+        }
+      },
+      "expected": [
+        {
+          "id": "audio.clean_stable",
+          "helper": "audioTruth",
+          "fn": "classifyAudioStability",
+          "args": [{ "$input": "audioClean" }],
+          "fields": [
+            { "path": "stability", "op": "eq", "value": "stable" },
+            { "path": "usableForIdentity", "op": "true" },
+            { "path": "noiseReasons", "op": "lengthEq", "value": 0 },
+            { "path": "tamperingInconclusive", "op": "false" }
+          ]
+        },
+        {
+          "id": "audio.noisy_wrapped",
+          "helper": "audioTruth",
+          "fn": "classifyAudioStability",
+          "args": [{ "$input": "audioNoise" }],
+          "fields": [
+            { "path": "stability", "op": "eq", "value": "noisy" },
+            { "path": "usableForIdentity", "op": "false" },
+            { "path": "noiseReasons", "op": "eq", "value": ["getChannelData is wrapped/instrumented"] },
+            { "path": "tamperingInconclusive", "op": "false" }
+          ]
+        },
+        {
+          "id": "audio.anchor_exact",
+          "helper": "audioTruth",
+          "fn": "audioAnchorValue",
+          "args": [124.04347745512496],
+          "fields": [
+            { "path": "", "op": "eq", "value": 124.04347745512496 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "AF-GPU",
+      "name": "GPU truth: stealth-template denylist, masked extension, software-not-VM",
+      "scenario": "gpu_truth_stealth_template_masked_extension",
+      "input": {
+        "stealthTemplate": {
+          "vendor": "Intel Inc.",
+          "renderer": "Intel Iris OpenGL Engine",
+          "unmaskedVendor": "Intel Inc.",
+          "unmaskedRenderer": "Intel Iris OpenGL Engine",
+          "debugExtensionAvailable": true
+        },
+        "maskedExtension": {
+          "vendor": "Intel Inc.",
+          "renderer": "Intel(R) HD Graphics 4600",
+          "debugExtensionAvailable": false
+        },
+        "softwareRenderer": {
+          "vendor": "Google Inc.",
+          "renderer": "Google SwiftShader",
+          "unmaskedVendor": "Google Inc. (Google)",
+          "unmaskedRenderer": "Google SwiftShader",
+          "debugExtensionAvailable": true,
+          "shaderPrecisionProfile": "8|8"
+        },
+        "unsupportedHighEnd": {
+          "vendor": "NVIDIA Corporation",
+          "renderer": "NVIDIA GeForce RTX 4090",
+          "debugExtensionAvailable": false
+        }
+      },
+      "expected": [
+        {
+          "id": "gpu.stealth_denylist",
+          "helper": "gpuTruth",
+          "fn": "resolveGpuTruthState",
+          "args": [{ "$input": "stealthTemplate" }],
+          "fields": [
+            { "path": "state", "op": "eq", "value": "spoofed_suspect" },
+            { "path": "answerUnreliable", "op": "true" },
+            { "path": "reasons", "op": "includes", "value": "stealth-template-denylist:intel-iris-opengl-engine" }
+          ]
+        },
+        {
+          "id": "gpu.masked_extension",
+          "helper": "gpuTruth",
+          "fn": "resolveGpuTruthState",
+          "args": [{ "$input": "maskedExtension" }],
+          "fields": [
+            { "path": "state", "op": "eq", "value": "masked" },
+            { "path": "answerUnreliable", "op": "true" },
+            { "path": "reasons", "op": "includes", "value": "webgl-debug-renderer-info-extension-unavailable" }
+          ]
+        },
+        {
+          "id": "gpu.software_not_vm",
+          "helper": "gpuTruth",
+          "fn": "resolveGpuTruthState",
+          "args": [{ "$input": "softwareRenderer" }],
+          "fields": [
+            { "path": "state", "op": "eq", "value": "software_renderer" },
+            { "path": "answerUnreliable", "op": "false" },
+            { "path": "reasons", "op": "includes", "value": "software-rasteriser-signature-detected" },
+            { "path": "reasons", "op": "includes", "value": "software-rendering-is-not-a-virtual-machine-verdict" }
+          ]
+        },
+        {
+          "id": "gpu.unsupported_high_end",
+          "helper": "gpuTruth",
+          "fn": "resolveGpuTruthState",
+          "args": [{ "$input": "unsupportedHighEnd" }],
+          "fields": [
+            { "path": "state", "op": "eq", "value": "spoofed_suspect" },
+            { "path": "reasons", "op": "includes", "value": "high-end-renderer-claim-without-unmasked-renderer" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "AF-GEO",
+      "name": "Geolocation: strict permission gate with no IP-city fallback",
+      "scenario": "geolocation_permission_gating_no_ip_fallback",
+      "input": {
+        "denied": { "permission": "denied", "lat": 52.37, "lon": 4.89, "accuracyM": 12, "ipCity": "Amsterdam" },
+        "prompt": { "permission": "prompt", "lat": 52.37, "lon": 4.89, "accuracyM": 12, "ipCity": "Amsterdam" },
+        "coerced": { "permission": "GRANTED", "lat": 52.37, "lon": 4.89, "accuracyM": 12, "ipCity": "Amsterdam" },
+        "invalidFix": { "permission": "granted", "lat": 52.37, "lon": 4.89, "accuracyM": 0, "ipCity": "Amsterdam" },
+        "grantedWithIp": { "permission": "granted", "lat": 52.37, "lon": 4.89, "accuracyM": 12, "ipCity": "Amsterdam" },
+        "grantedWithoutIp": { "permission": "granted", "lat": 52.37, "lon": 4.89, "accuracyM": 12 }
+      },
+      "expected": [
+        {
+          "id": "geo.denied",
+          "helper": "geoProximityBridge",
+          "fn": "resolveProximity",
+          "args": [{ "$input": "denied" }],
+          "fields": [
+            { "path": "reason", "op": "eq", "value": "permission_required" },
+            { "path": "proximity", "op": "null" }
+          ]
+        },
+        {
+          "id": "geo.prompt",
+          "helper": "geoProximityBridge",
+          "fn": "resolveProximity",
+          "args": [{ "$input": "prompt" }],
+          "fields": [
+            { "path": "reason", "op": "eq", "value": "permission_required" },
+            { "path": "proximity", "op": "null" }
+          ]
+        },
+        {
+          "id": "geo.coerced_permission",
+          "helper": "geoProximityBridge",
+          "fn": "resolveProximity",
+          "args": [{ "$input": "coerced" }],
+          "fields": [
+            { "path": "reason", "op": "eq", "value": "permission_required" },
+            { "path": "proximity", "op": "null" }
+          ]
+        },
+        {
+          "id": "geo.invalid_fix",
+          "helper": "geoProximityBridge",
+          "fn": "resolveProximity",
+          "args": [{ "$input": "invalidFix" }],
+          "fields": [
+            { "path": "reason", "op": "eq", "value": "invalid_fix" },
+            { "path": "proximity", "op": "null" }
+          ]
+        },
+        {
+          "id": "geo.granted_with_ip",
+          "helper": "geoProximityBridge",
+          "fn": "resolveProximity",
+          "args": [{ "$input": "grantedWithIp" }],
+          "fields": [
+            { "path": "reason", "op": "eq", "value": "ok" },
+            { "path": "proximity.accuracy_m", "op": "eq", "value": 12 },
+            { "path": "proximity.id", "op": "matches", "value": "^hex_[0-9a-f]{32}$" },
+            { "path": "proximity.id", "op": "notIncludes", "value": "52.37" },
+            { "path": "proximity.id", "op": "notIncludes", "value": "4.89" },
+            { "path": "proximity.id", "op": "notIncludes", "value": "Amsterdam" }
+          ]
+        },
+        {
+          "id": "geo.no_ip_fallback",
+          "helper": "geoProximityBridge",
+          "fn": "resolveProximity",
+          "args": [{ "$input": "grantedWithoutIp" }],
+          "fields": [
+            { "path": "reason", "op": "eq", "value": "ok" },
+            { "path": "proximity.accuracy_m", "op": "eq", "value": 12 },
+            { "path": "proximity.id", "op": "matches", "value": "^hex_[0-9a-f]{32}$" }
+          ]
+        },
+        {
+          "id": "geo.body_field",
+          "helper": "geoProximityBridge",
+          "fn": "proximityBodyField",
+          "args": [{ "$result": "geo.granted_with_ip" }],
+          "fields": [
+            { "path": "hex_proximity.accuracy_m", "op": "eq", "value": 12 },
+            { "path": "hex_proximity.id", "op": "matches", "value": "^hex_[0-9a-f]{32}$" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "AF-PRIVACY",
+      "name": "Privacy noise suppression: privacy settings vs hard contradiction",
+      "scenario": "privacy_noise_suppression",
+      "input": {
+        "hardenedNoise": { "privacyHardened": true, "canvasNoise": true },
+        "noiseOnly": { "canvasNoise": true, "audioNoise": true, "shaderNoise": true },
+        "hardContradiction": { "privacyHardened": true, "canvasNoise": true, "hardContradiction": true },
+        "locale": { "vendorSignature": "en-US" }
+      },
+      "expected": [
+        {
+          "id": "privacy.hardened_noise",
+          "helper": "privacyNoise",
+          "fn": "classifyPrivacyNoise",
+          "args": [{ "$input": "hardenedNoise" }],
+          "fields": [
+            { "path": "privacy_settings", "op": "true" },
+            { "path": "anti_detect_browser", "op": "false" },
+            { "path": "anomaly_score", "op": "eq", "value": 0 },
+            { "path": "reasons", "op": "includes", "value": "explains canvas noise" }
+          ]
+        },
+        {
+          "id": "privacy.noise_only",
+          "helper": "privacyNoise",
+          "fn": "classifyPrivacyNoise",
+          "args": [{ "$input": "noiseOnly" }],
+          "fields": [
+            { "path": "privacy_settings", "op": "false" },
+            { "path": "anti_detect_browser", "op": "false" },
+            { "path": "anomaly_score", "op": "eq", "value": 0 },
+            { "path": "reasons", "op": "includes", "value": "abstaining (noise may be an automation artifact)" }
+          ]
+        },
+        {
+          "id": "privacy.hard_contradiction",
+          "helper": "privacyNoise",
+          "fn": "classifyPrivacyNoise",
+          "args": [{ "$input": "hardContradiction" }],
+          "fields": [
+            { "path": "privacy_settings", "op": "true" },
+            { "path": "anti_detect_browser", "op": "true" },
+            { "path": "anomaly_score", "op": "gt", "value": 0 },
+            { "path": "anomaly_score", "op": "lte", "value": 1 },
+            { "path": "reasons", "op": "includes", "value": "cannot be explained away by privacy hardening" }
+          ]
+        },
+        {
+          "id": "privacy.locale_ignored",
+          "helper": "privacyNoise",
+          "fn": "classifyPrivacyNoise",
+          "args": [{ "$input": "locale" }],
+          "fields": [
+            { "path": "privacy_settings", "op": "false" },
+            { "path": "anti_detect_browser", "op": "false" },
+            { "path": "anomaly_score", "op": "eq", "value": 0 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "AF-CONFIDENCE",
+      "name": "Confidence stability: pair-keyed score, volatile channels inert",
+      "scenario": "confidence_stability",
+      "input": {
+        "stablePair": { "visitorId": "visitor-abc", "hardwareId": "hw-123", "rawScore": 0.87 },
+        "exactPair": { "visitorId": "visitor-abc", "hardwareId": "hw-123", "rawScore": 0.85 },
+        "noPair": { "rawScore": 0.9 },
+        "volatilePair": {
+          "visitorId": "visitor-abc",
+          "hardwareId": "hw-123",
+          "rawScore": 0.87,
+          "volatileInputs": {
+            "bot": true,
+            "audio": { "sum": 12345.678, "noise": "farbling" },
+            "privacy": { "hardened": true, "vpn": true },
+            "network": { "asn": "AS999", "rtt": 999 }
+          }
+        }
+      },
+      "expected": [
+        {
+          "id": "conf.stable_pair",
+          "helper": "confidenceStability",
+          "fn": "stabilizeConfidence",
+          "args": [{ "$input": "stablePair" }],
+          "fields": [
+            { "path": "score", "op": "eq", "value": 0.85 },
+            { "path": "tier", "op": "eq", "value": "High" },
+            { "path": "changed", "op": "true" },
+            { "path": "reason", "op": "eq", "value": "score_quantized_for_stability" },
+            { "path": "stabilityKey", "op": "matches", "value": "^stab:[0-9a-f]{16}$" }
+          ]
+        },
+        {
+          "id": "conf.exact_pair",
+          "helper": "confidenceStability",
+          "fn": "stabilizeConfidence",
+          "args": [{ "$input": "exactPair" }],
+          "fields": [
+            { "path": "score", "op": "eq", "value": 0.85 },
+            { "path": "tier", "op": "eq", "value": "High" },
+            { "path": "changed", "op": "false" },
+            { "path": "reason", "op": "eq", "value": "score_stable" }
+          ]
+        },
+        {
+          "id": "conf.no_pair",
+          "helper": "confidenceStability",
+          "fn": "stabilizeConfidence",
+          "args": [{ "$input": "noPair" }],
+          "fields": [
+            { "path": "score", "op": "null" },
+            { "path": "tier", "op": "eq", "value": "New/Unobserved" },
+            { "path": "stabilityKey", "op": "eq", "value": "stab:none" },
+            { "path": "reason", "op": "eq", "value": "no_stable_pair" },
+            { "path": "changed", "op": "false" }
+          ]
+        },
+        {
+          "id": "conf.volatile_inert",
+          "helper": "confidenceStability",
+          "fn": "stabilizeConfidence",
+          "args": [{ "$input": "volatilePair" }],
+          "fields": [
+            { "path": "score", "op": "eq", "value": 0.85 },
+            { "path": "tier", "op": "eq", "value": "High" },
+            { "path": "changed", "op": "true" },
+            { "path": "reason", "op": "eq", "value": "score_quantized_for_stability" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "AF-CDP",
+      "name": "Active CDP inspection: corroboration-gated states, never a bad-bot verdict",
+      "scenario": "active_cdp_inspection",
+      "input": {
+        "empty": {},
+        "runtimeOnly": { "runtimeEnableCount": 1 },
+        "inspection": { "runtimeEnableCount": 2, "nameGetterCount": 2, "secondClientAttached": true },
+        "docked": { "devtoolsAttached": true },
+        "corroborated": {
+          "runtimeEnableCount": 2,
+          "nameGetterCount": 2,
+          "secondClientAttached": true,
+          "devtoolsAttached": true
+        }
+      },
+      "expected": [
+        {
+          "id": "cdp.none",
+          "helper": "activeCdp",
+          "fn": "resolveActiveCdp",
+          "args": [{ "$input": "empty" }],
+          "fields": [
+            { "path": "state", "op": "eq", "value": "none" },
+            { "path": "cdp_attached", "op": "false" },
+            { "path": "developer_tools", "op": "false" },
+            { "path": "reasons", "op": "nonEmpty" }
+          ]
+        },
+        {
+          "id": "cdp.attached",
+          "helper": "activeCdp",
+          "fn": "resolveActiveCdp",
+          "args": [{ "$input": "runtimeOnly" }],
+          "fields": [
+            { "path": "state", "op": "eq", "value": "automation_protocol_attached" },
+            { "path": "cdp_attached", "op": "true" },
+            { "path": "developer_tools", "op": "false" },
+            { "path": "reasons", "op": "includes", "value": "runtime_domain_enabled" }
+          ]
+        },
+        {
+          "id": "cdp.inspection_active",
+          "helper": "activeCdp",
+          "fn": "resolveActiveCdp",
+          "args": [{ "$input": "inspection" }],
+          "fields": [
+            { "path": "state", "op": "eq", "value": "automation_protocol_inspection_active" },
+            { "path": "cdp_attached", "op": "true" },
+            { "path": "developer_tools", "op": "false" },
+            { "path": "reasons", "op": "includes", "value": "name_getter_elevated" }
+          ]
+        },
+        {
+          "id": "cdp.docked_devtools",
+          "helper": "activeCdp",
+          "fn": "resolveActiveCdp",
+          "args": [{ "$input": "docked" }],
+          "fields": [
+            { "path": "state", "op": "eq", "value": "docked_devtools" },
+            { "path": "cdp_attached", "op": "false" },
+            { "path": "developer_tools", "op": "true" },
+            { "path": "reasons", "op": "includes", "value": "devtools_attached" }
+          ]
+        },
+        {
+          "id": "cdp.corroborated",
+          "helper": "activeCdp",
+          "fn": "resolveActiveCdp",
+          "args": [{ "$input": "corroborated" }],
+          "fields": [
+            { "path": "state", "op": "eq", "value": "corroborated" },
+            { "path": "cdp_attached", "op": "true" },
+            { "path": "developer_tools", "op": "true" },
+            { "path": "reasons", "op": "includes", "value": "name_getter_elevated" },
+            { "path": "reasons", "op": "includes", "value": "devtools_attached" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "AF-EXTRA",
+      "name": "Extra evidence lines: informational shape with points exactly 0",
+      "scenario": "extra_evidence_lines_points_zero",
+      "input": {
+        "allTrue": {
+          "spoofedBot": true,
+          "gpuUnreliable": true,
+          "audioNoisy": true,
+          "privacyNoise": true,
+          "proximityDenied": true,
+          "activeCdp": true
+        },
+        "empty": {}
+      },
+      "expected": [
+        {
+          "id": "extra.all_true",
+          "helper": "riskEvidenceExtra",
+          "fn": "buildExtraEvidenceLines",
+          "args": [{ "$input": "allTrue" }],
+          "fields": [
+            { "path": "", "op": "lengthEq", "value": 6 },
+            { "path": "0.component", "op": "eq", "value": "extra.spoofed_bot" },
+            { "path": "1.component", "op": "eq", "value": "extra.gpu_unreliable" },
+            { "path": "2.component", "op": "eq", "value": "extra.audio_noisy" },
+            { "path": "3.component", "op": "eq", "value": "extra.privacy_noise" },
+            { "path": "4.component", "op": "eq", "value": "extra.proximity_denied" },
+            { "path": "5.component", "op": "eq", "value": "extra.active_cdp" },
+            { "path": "0.family", "op": "eq", "value": "automation" },
+            { "path": "1.family", "op": "eq", "value": "environment" },
+            { "path": "2.family", "op": "eq", "value": "environment" },
+            { "path": "3.family", "op": "eq", "value": "tampering" },
+            { "path": "4.family", "op": "eq", "value": "environment" },
+            { "path": "5.family", "op": "eq", "value": "automation" },
+            { "path": "0.points", "op": "eq", "value": 0 },
+            { "path": "1.points", "op": "eq", "value": 0 },
+            { "path": "2.points", "op": "eq", "value": 0 },
+            { "path": "3.points", "op": "eq", "value": 0 },
+            { "path": "4.points", "op": "eq", "value": 0 },
+            { "path": "5.points", "op": "eq", "value": 0 },
+            { "path": "0.reason", "op": "includes", "value": "Informational" },
+            { "path": "0.reason", "op": "includes", "value": "not scored" },
+            { "path": "0.label", "op": "nonEmpty" }
+          ]
+        },
+        {
+          "id": "extra.empty",
+          "helper": "riskEvidenceExtra",
+          "fn": "buildExtraEvidenceLines",
+          "args": [{ "$input": "empty" }],
+          "fields": [
+            { "path": "", "op": "lengthEq", "value": 0 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "AF-MEDIA",
+      "name": "Media preferences: additive informational-only record",
+      "scenario": "media_preferences_informational_only",
+      "input": {
+        "empty": {},
+        "populated": {
+          "forcedColors": false,
+          "reducedMotion": true,
+          "reducedTransparency": false,
+          "colorScheme": "dark",
+          "contrast": "more",
+          "locale": "en-GB",
+          "timezone": "Europe/London"
+        }
+      },
+      "expected": [
+        {
+          "id": "media.empty",
+          "helper": "mediaPreferences",
+          "fn": "resolveMediaPreferences",
+          "args": [{ "$input": "empty" }],
+          "fields": [
+            { "path": "color_scheme", "op": "null" },
+            { "path": "timezone", "op": "null" },
+            { "path": "notes", "op": "lengthEq", "value": 1 },
+            { "path": "notes.0", "op": "includes", "value": "Informational only" }
+          ]
+        },
+        {
+          "id": "media.normalization",
+          "helper": "mediaPreferences",
+          "fn": "resolveMediaPreferences",
+          "args": [{ "$input": "populated" }],
+          "fields": [
+            { "path": "forced_colors", "op": "false" },
+            { "path": "reduced_motion", "op": "true" },
+            { "path": "reduced_transparency", "op": "false" },
+            { "path": "color_scheme", "op": "eq", "value": "dark" },
+            { "path": "contrast", "op": "eq", "value": "more" },
+            { "path": "locale", "op": "eq", "value": "en-GB" },
+            { "path": "timezone", "op": "eq", "value": "Europe/London" },
+            { "path": "notes", "op": "lengthEq", "value": 1 }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "AF-SCOPE",
+      "name": "Identity scope metadata: explicit context salt is the only isolated scope",
+      "scenario": "identity_scope_metadata",
+      "input": {
+        "salt": { "contextSaltPresent": true },
+        "incognitoStable": { "incognito": true, "hardwareAnchorStable": true },
+        "empty": {}
+      },
+      "expected": [
+        {
+          "id": "scope.context_salt",
+          "helper": "identityScope",
+          "fn": "resolveIdentityScope",
+          "args": [{ "$input": "salt" }],
+          "fields": [
+            { "path": "id_scope", "op": "eq", "value": "context" },
+            { "path": "context_isolated", "op": "true" },
+            { "path": "reason", "op": "includes", "value": "context_salt_present" },
+            { "path": "reason", "op": "includes", "value": "no identifier was minted" }
+          ]
+        },
+        {
+          "id": "scope.incognito_hardware",
+          "helper": "identityScope",
+          "fn": "resolveIdentityScope",
+          "args": [{ "$input": "incognitoStable" }],
+          "fields": [
+            { "path": "id_scope", "op": "eq", "value": "hardware" },
+            { "path": "context_isolated", "op": "false" },
+            { "path": "reason", "op": "matches", "value": "never implies privacy isolation" },
+            { "path": "reason", "op": "includes", "value": "context isolation is NOT assumed" }
+          ]
+        },
+        {
+          "id": "scope.hardware_fallback",
+          "helper": "identityScope",
+          "fn": "resolveIdentityScope",
+          "args": [{ "$input": "empty" }],
+          "fields": [
+            { "path": "id_scope", "op": "eq", "value": "hardware" },
+            { "path": "context_isolated", "op": "false" },
+            { "path": "reason", "op": "includes", "value": "hardware scope fallback" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "AF-ANTIDETECT",
+      "name": "Anti-detect exemption: posture + noiseOnly only; hard contradiction wins",
+      "scenario": "anti_detect_exemption",
+      "input": {
+        "granted": { "privacyHardened": true, "noiseOnly": true },
+        "noiseOnly": { "noiseOnly": true },
+        "automationOnly": { "automationArtifact": true },
+        "hardContradiction": { "privacyHardened": true, "noiseOnly": true, "hardContradiction": true }
+      },
+      "expected": [
+        {
+          "id": "anti.granted",
+          "helper": "antiDetectExemption",
+          "fn": "resolveAntiDetectExemption",
+          "args": [{ "$input": "granted" }],
+          "fields": [
+            { "path": "suppressPenalty", "op": "true" },
+            { "path": "anti_detect_browser", "op": "false" },
+            { "path": "anomaly_score", "op": "eq", "value": 0 },
+            { "path": "reasons", "op": "includes", "value": "Exemption granted" }
+          ]
+        },
+        {
+          "id": "anti.noise_only",
+          "helper": "antiDetectExemption",
+          "fn": "resolveAntiDetectExemption",
+          "args": [{ "$input": "noiseOnly" }],
+          "fields": [
+            { "path": "suppressPenalty", "op": "false" },
+            { "path": "anti_detect_browser", "op": "false" },
+            { "path": "anomaly_score", "op": "eq", "value": 0 },
+            { "path": "reasons", "op": "includes", "value": "Noise alone does not earn the exemption" }
+          ]
+        },
+        {
+          "id": "anti.automation_only",
+          "helper": "antiDetectExemption",
+          "fn": "resolveAntiDetectExemption",
+          "args": [{ "$input": "automationOnly" }],
+          "fields": [
+            { "path": "suppressPenalty", "op": "false" },
+            { "path": "anti_detect_browser", "op": "false" },
+            { "path": "anomaly_score", "op": "eq", "value": 0 },
+            { "path": "reasons", "op": "includes", "value": "never sets anti_detect_browser" }
+          ]
+        },
+        {
+          "id": "anti.hard_contradiction",
+          "helper": "antiDetectExemption",
+          "fn": "resolveAntiDetectExemption",
+          "args": [{ "$input": "hardContradiction" }],
+          "fields": [
+            { "path": "suppressPenalty", "op": "false" },
+            { "path": "anti_detect_browser", "op": "true" },
+            { "path": "anomaly_score", "op": "gt", "value": 0 },
+            { "path": "anomaly_score", "op": "lte", "value": 1 },
+            { "path": "reasons", "op": "includes", "value": "cannot be explained away" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "AF-HEADLESS",
+      "name": "Headless granularity: shell binary vs new headless vs regular Chrome",
+      "scenario": "headless_shell_new_granularity",
+      "input": {
+        "shellUa": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) chrome-headless-shell/131.0.0.0 Safari/537.36",
+        "newUa": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/131.0.0.0 Safari/537.36",
+        "regularUa": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+        "noHints": {}
+      },
+      "expected": [
+        {
+          "id": "headless.shell_mode",
+          "helper": "uaNormalizer",
+          "fn": "normalizeUserAgent",
+          "args": [{ "userAgent": { "$input": "shellUa" }, "clientHints": { "$input": "noHints" } }],
+          "fields": [
+            { "path": "headless_mode", "op": "eq", "value": "shell" }
+          ]
+        },
+        {
+          "id": "headless.new_mode",
+          "helper": "uaNormalizer",
+          "fn": "normalizeUserAgent",
+          "args": [{ "userAgent": { "$input": "newUa" }, "clientHints": { "$input": "noHints" } }],
+          "fields": [
+            { "path": "headless_mode", "op": "eq", "value": "new" }
+          ]
+        },
+        {
+          "id": "headless.regular_mode",
+          "helper": "uaNormalizer",
+          "fn": "normalizeUserAgent",
+          "args": [{ "userAgent": { "$input": "regularUa" }, "clientHints": { "$input": "noHints" } }],
+          "fields": [
+            { "path": "headless_mode", "op": "null" }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -16,13 +16,18 @@ import {
   CORROBORATED_CHROMIUM_CDP_REASON_ID,
   deriveBotVerdict,
 } from './verdict';
-import type { GpuObservation } from './telemetryContract';
+import type { GpuObservation, GrantedGeolocation } from './telemetryContract';
 import { resolveGpuObservation } from './specInvariants';
 import { timezoneMismatchContext } from './timezone';
 import { resolveIdbDurabilityTruth, shouldApplyMarkerVeto } from './idbDurabilityTruth';
 import { probeEngineLength, resolveHardwareTruth } from './hardwareTruth';
 import { detectBotD19Signals } from './aiBotDirectory';
 import { resolvePrivacySignatures, type PrivacySignalsInput } from './privacySignatures';
+import { classifyAudioStability, audioAnchorValue } from './audioTruth';
+import { resolveGpuTruthState } from './gpuTruth';
+import { resolveProximity, proximityBodyField } from './geoProximityBridge';
+import { classifyPrivacyNoise } from './privacyNoise';
+import { resolveMediaPreferences } from './mediaPreferences';
 import {
   evaluateStealthSignals,
   type StealthObservation,
@@ -701,6 +706,16 @@ interface WebGlGpuProbe {
   gpuClass: string;
   /** True when strings or capabilities indicate a software / masked rasteriser. */
   softwareRenderer: boolean;
+  /** True ONLY when WEBGL_debug_renderer_info was actually obtained. */
+  debugExtensionAvailable: boolean;
+  /** Masked gl.VENDOR / gl.RENDERER strings (always telemetry, never a hardware claim). */
+  maskedVendor: string;
+  maskedRenderer: string;
+  /** UNMASKED_* strings, present only when the debug extension was available. */
+  unmaskedVendor: string | null;
+  unmaskedRenderer: string | null;
+  /** Capability-derived shader precision profile used by the GPU truth resolver. */
+  shaderPrecisionProfile: string;
 }
 
 const SOFTWARE_GPU_RENDERER_PATTERN =
@@ -721,6 +736,12 @@ function inspectWebGlGpu(): WebGlGpuProbe {
     maxTextureSize: 0,
     gpuClass: 'na',
     softwareRenderer: false,
+    debugExtensionAvailable: false,
+    maskedVendor: 'Unavailable',
+    maskedRenderer: 'Unavailable',
+    unmaskedVendor: null,
+    unmaskedRenderer: null,
+    shaderPrecisionProfile: 'unknown',
   };
   if (typeof document === 'undefined') {
     return unavailable;
@@ -737,20 +758,26 @@ function inspectWebGlGpu(): WebGlGpuProbe {
       return unavailable;
     }
 
+    // The masked strings are ALWAYS captured separately: a spoofable getParameter value must
+    // never be promoted into an "unmasked physical GPU" claim. The unmasked strings only exist
+    // when the debug extension itself was obtainable.
+    const readString = (value: unknown): string =>
+      typeof value === 'string' && value.trim() ? value.trim() : '';
+    const maskedVendor = readString(gl.getParameter(gl.VENDOR)) || 'Standard WebGL Vendor';
+    const maskedRenderer = readString(gl.getParameter(gl.RENDERER)) || 'Standard WebGL Renderer';
     const debugExt = gl.getExtension('WEBGL_debug_renderer_info');
-    const rawVendor = debugExt
-      ? gl.getParameter(debugExt.UNMASKED_VENDOR_WEBGL)
-      : gl.getParameter(gl.VENDOR);
-    const rawRenderer = debugExt
-      ? gl.getParameter(debugExt.UNMASKED_RENDERER_WEBGL)
-      : gl.getParameter(gl.RENDERER);
+    const debugExtensionAvailable = Boolean(debugExt);
+    const unmaskedVendor = debugExt
+      ? readString(gl.getParameter(debugExt.UNMASKED_VENDOR_WEBGL)) || null
+      : null;
+    const unmaskedRenderer = debugExt
+      ? readString(gl.getParameter(debugExt.UNMASKED_RENDERER_WEBGL)) || null
+      : null;
+    const rawVendor = unmaskedVendor ?? maskedVendor;
+    const rawRenderer = unmaskedRenderer ?? maskedRenderer;
     const rawMaxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-    const gpuVendor =
-      typeof rawVendor === 'string' && rawVendor.trim() ? rawVendor.trim() : 'Standard WebGL Vendor';
-    const gpuRenderer =
-      typeof rawRenderer === 'string' && rawRenderer.trim()
-        ? rawRenderer.trim()
-        : 'Standard WebGL Renderer';
+    const gpuVendor = rawVendor || 'Standard WebGL Vendor';
+    const gpuRenderer = rawRenderer || 'Standard WebGL Renderer';
     const maxTextureSize =
       typeof rawMaxTex === 'number' && Number.isFinite(rawMaxTex) ? rawMaxTex : 0;
 
@@ -792,8 +819,26 @@ function inspectWebGlGpu(): WebGlGpuProbe {
     const precisionBucket = fragmentPrecision > 0 && vertexPrecision > 0 ? 'h' : 'l';
     const extBucket = extensionCount >= 40 ? 'e3' : extensionCount >= 20 ? 'e2' : extensionCount >= 8 ? 'e1' : 'e0';
     const gpuClass = `${texBucket}|${precisionBucket}|${extBucket}`;
+    const shaderPrecisionProfile =
+      fragmentPrecision >= 20 && vertexPrecision >= 20
+        ? 'high'
+        : fragmentPrecision > 0 && vertexPrecision > 0
+        ? `${fragmentPrecision}|${vertexPrecision}`
+        : 'low';
 
-    return { gpuVendor, gpuRenderer, maxTextureSize, gpuClass, softwareRenderer };
+    return {
+      gpuVendor,
+      gpuRenderer,
+      maxTextureSize,
+      gpuClass,
+      softwareRenderer,
+      debugExtensionAvailable,
+      maskedVendor,
+      maskedRenderer,
+      unmaskedVendor,
+      unmaskedRenderer,
+      shaderPrecisionProfile,
+    };
   } catch {
     return unavailable;
   }
@@ -905,21 +950,29 @@ async function computeCanvas2dSignature(): Promise<CanvasSignatureResult> {
   }
 }
 
-/** Audio probe result: the stable SHA-256 signature plus a dual-render noise flag. */
+/** Audio probe result: stable SHA-256 signature plus evidence-based stability telemetry. */
 interface AudioSignatureResult {
   signature: string;
   noise: boolean;
+  /** Exact, unrounded render sum — `audioAnchorValue` pass-through (no toFixed requantization). */
+  sum: number | null;
+  renderSums: number[];
+  getChannelDataWrapped: boolean;
+  copyFromChannelMatches: boolean;
+  silentBufferNonZero: boolean;
+  stability: 'stable' | 'noisy' | 'unavailable';
+  usableForIdentity: boolean;
+  tamperingInconclusive: boolean;
+  noiseReasons: string[];
 }
 
 /**
- * Coarse, farbling-resistant audio stability class for the hardware-id seed. It is derived
- * ONLY from the dual-render comparison and the probe's availability state — never from the
- * raw rendered float or its hash, both of which drift under Brave/Safari/Tor farbling.
+ * Coarse, farbling-resistant audio stability class. Noise removes the audio identity anchor;
+ * it never rotates an id and never changes a confidence/risk tier. The exact rendered float is
+ * preserved via `audioAnchorValue` and is only mirrored while the probe is stable.
  */
 function audioStabilityClass(audio: AudioSignatureResult): 'stable' | 'noisy' | 'unavailable' {
-  if (audio.noise) return 'noisy';
-  if (/timeout|unsupported|unavailable|restricted/i.test(audio.signature)) return 'unavailable';
-  return 'stable';
+  return audio.stability;
 }
 
 /**
@@ -931,15 +984,47 @@ function audioStabilityClass(audio: AudioSignatureResult): 'stable' | 'noisy' | 
  * different noise into each render, recorded as `noise` instead of minting a new id.
  */
 async function computeWebAudioSignature(): Promise<AudioSignatureResult> {
-  if (typeof window === 'undefined') return { signature: 'unavailable', noise: false };
+  const empty = (signature: string): AudioSignatureResult => ({
+    signature,
+    noise: false,
+    sum: null,
+    renderSums: [],
+    getChannelDataWrapped: false,
+    copyFromChannelMatches: true,
+    silentBufferNonZero: false,
+    stability: 'unavailable',
+    usableForIdentity: false,
+    tamperingInconclusive: false,
+    noiseReasons: [],
+  });
+  if (typeof window === 'undefined') return empty('unavailable');
   try {
     const OfflineCtx =
       window.OfflineAudioContext ||
       (window as unknown as { webkitOfflineAudioContext?: typeof OfflineAudioContext })
         .webkitOfflineAudioContext;
-    if (!OfflineCtx) return { signature: 'unsupported', noise: false };
+    if (!OfflineCtx) return empty('unsupported');
 
-    const renderOnce = async (): Promise<string | null> => {
+    // Instrumented getChannelData is a noise signature on its own. A source-string check is
+    // engine-independent and never mutates the prototype.
+    let getChannelDataWrapped = false;
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(AudioBuffer.prototype, 'getChannelData');
+      const source =
+        descriptor && typeof descriptor.value === 'function'
+          ? Function.prototype.toString.call(descriptor.value)
+          : '';
+      getChannelDataWrapped = source.length > 0 && !/\[native code\]/.test(source);
+    } catch {
+      // Unreadable descriptor is inconclusive, not a noise claim.
+    }
+
+    interface RenderRead {
+      sum: number;
+      fingerprint: string;
+      copyMatches: boolean;
+    }
+    const renderOnce = async (): Promise<RenderRead | null> => {
       try {
         const context = new OfflineCtx(1, 4500, 44100);
         const oscillator = context.createOscillator();
@@ -964,27 +1049,134 @@ async function computeWebAudioSignature(): Promise<AudioSignatureResult> {
         if (!renderedBuffer) return null;
 
         const channelData = renderedBuffer.getChannelData(0);
-        let sampleSum = 0;
+        // Exact IEEE754 pass-through — never toFixed/quantize a stable anchor.
+        const sum = audioAnchorValue(
+          channelData.reduce((total, value, index) => (index >= 450 ? total + Math.abs(value) : total), 0)
+        );
+        if (!Number.isFinite(sum)) return null;
         const quantizedSamples: string[] = [];
         for (let i = 450; i < channelData.length; i += 50) {
-          const val = channelData[i];
-          sampleSum += Math.abs(val);
-          quantizedSamples.push(val.toFixed(6));
+          quantizedSamples.push(channelData[i].toFixed(6));
         }
-        return `${sampleSum.toFixed(8)}|${quantizedSamples.join(',')}`;
+
+        // Independent read path: copyFromChannel must agree with getChannelData.
+        let copyMatches = true;
+        try {
+          const copied = new Float32Array(Math.min(16, channelData.length));
+          renderedBuffer.copyFromChannel(copied, 0, Math.max(0, channelData.length - copied.length));
+          for (let i = 0; i < copied.length; i += 1) {
+            if (copied[i] !== channelData[channelData.length - copied.length + i]) {
+              copyMatches = false;
+              break;
+            }
+          }
+        } catch {
+          copyMatches = false;
+        }
+        return { sum, fingerprint: quantizedSamples.join(','), copyMatches };
       } catch {
         return null;
       }
     };
 
     const first = await renderOnce();
-    if (first === null) return { signature: 'timeout', noise: false };
+    if (first === null) return empty('timeout');
     const second = await renderOnce();
-    const noise = second !== null && second !== first;
-    const fullHex = await sha256Hex(first);
-    return { signature: fullHex.slice(0, 16), noise };
+    const renderSums = [first.sum, ...(second ? [second.sum] : [])];
+    const verdict = classifyAudioStability({
+      renderSums,
+      getChannelDataWrapped,
+      copyFromChannelMatches: first.copyMatches && (second ? second.copyMatches : true),
+      silentBufferNonZero: false,
+      privacyHardened: false,
+    });
+    const noise = verdict.stability === 'noisy';
+    const fullHex = await sha256Hex(`${String(first.sum)}|${first.fingerprint}`);
+    return {
+      signature: fullHex.slice(0, 16),
+      noise,
+      sum: first.sum,
+      renderSums,
+      getChannelDataWrapped,
+      copyFromChannelMatches: first.copyMatches && (second ? second.copyMatches : true),
+      silentBufferNonZero: false,
+      stability: verdict.stability,
+      usableForIdentity: verdict.usableForIdentity,
+      tamperingInconclusive: verdict.tamperingInconclusive,
+      noiseReasons: verdict.noiseReasons,
+    };
   } catch {
-    return { signature: 'restricted', noise: false };
+    return empty('restricted');
+  }
+}
+
+/**
+ * Permission-gated browser geolocation bridge. Reads `navigator.permissions.geolocation`
+ * and calls `getCurrentPosition` ONLY when the permission is exactly `granted`. The emitted
+ * fix is exclusively browser-derived — an IP/city coordinate is never substituted, and no
+ * IP-derived field is ever handed to the proximity resolver.
+ */
+export interface GrantedGeolocationResult {
+  geolocationPermission: string | null;
+  grantedGeolocation: GrantedGeolocation | null;
+  geolocationAccuracyM: number | null;
+  hexProximity: ReturnType<typeof resolveProximity>['proximity'];
+}
+
+async function collectGrantedGeolocation(): Promise<GrantedGeolocationResult> {
+  const empty: GrantedGeolocationResult = {
+    geolocationPermission: null,
+    grantedGeolocation: null,
+    geolocationAccuracyM: null,
+    hexProximity: null,
+  };
+  try {
+    const nav = typeof navigator !== 'undefined' ? navigator : undefined;
+    if (!nav) return empty;
+    const permissions = (nav as unknown as {
+      permissions?: {
+        query?: (descriptor: { name: string }) => Promise<{ state?: string }>;
+      };
+    }).permissions;
+    if (!permissions || typeof permissions.query !== 'function') return empty;
+    const status = await Promise.race([
+      permissions.query({ name: 'geolocation' }),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 800)),
+    ]);
+    const permission = typeof status?.state === 'string' ? status.state : null;
+    if (permission !== 'granted' || !nav.geolocation || typeof nav.geolocation.getCurrentPosition !== 'function') {
+      return { ...empty, geolocationPermission: permission };
+    }
+    const position = await Promise.race([
+      new Promise<GeolocationPosition>((resolve, reject) => {
+        nav.geolocation.getCurrentPosition(resolve, reject, {
+          enableHighAccuracy: false,
+          timeout: 2500,
+          maximumAge: 30000,
+        });
+      }),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+    ]);
+    if (!position) return { ...empty, geolocationPermission: permission };
+    const coords = position.coords;
+    const lat = typeof coords?.latitude === 'number' && Number.isFinite(coords.latitude) ? coords.latitude : null;
+    const lon = typeof coords?.longitude === 'number' && Number.isFinite(coords.longitude) ? coords.longitude : null;
+    const accuracyM =
+      typeof coords?.accuracy === 'number' && Number.isFinite(coords.accuracy) && coords.accuracy > 0
+        ? coords.accuracy
+        : null;
+    if (lat === null || lon === null) return { ...empty, geolocationPermission: permission };
+    const granted: GrantedGeolocation = { lat, lon, accuracyM };
+    // The bridge receives NO IP city: proximity can only come from this granted fix.
+    const resolved = resolveProximity({ permission, lat, lon, accuracyM });
+    return {
+      geolocationPermission: permission,
+      grantedGeolocation: granted,
+      geolocationAccuracyM: accuracyM,
+      hexProximity: resolved.proximity,
+    };
+  } catch {
+    return empty;
   }
 }
 
@@ -1736,7 +1928,23 @@ function stableStructuralAnchors(): { fontMetric: string; mathAnchor: string } {
 export async function collectHardwareSignals(
   browserDevice: BrowserDeviceInfo
 ): Promise<HardwareSignals & { gpuClass: string; gpuObservation: GpuObservation }> {
-  const [{ gpuVendor, gpuRenderer, maxTextureSize, gpuClass, softwareRenderer }, canvas, audio] =
+  const [
+    {
+      gpuVendor,
+      gpuRenderer,
+      maxTextureSize,
+      gpuClass,
+      softwareRenderer,
+      debugExtensionAvailable,
+      maskedVendor,
+      maskedRenderer,
+      unmaskedVendor,
+      unmaskedRenderer,
+      shaderPrecisionProfile,
+    },
+    canvas,
+    audio,
+  ] =
     await Promise.all([
       Promise.resolve(inspectWebGlGpu()),
       computeCanvas2dSignature(),
@@ -1828,14 +2036,14 @@ export async function collectHardwareSignals(
   //  - CPU cores, bucketed device memory, colour depth/gamut
   //  - 8x8 quantized canvas digest (farbling-tolerant), isolated font metrics and a fixed
   //    transcendental math anchor
-  //  - an explicit audio stability class from the dual-render comparison
-  // Deliberately EXCLUDED: raw canvas SHA-256, raw audio float/hash, raw GPU strings,
-  // the resolved architecture (a UA-CH/platform claim), screen size, DPR, UA and touch.
+  // Deliberately EXCLUDED: raw canvas SHA-256, ANY audio-derived value (float, hash or
+  // stability class — a per-render noise flip must never rotate the hardware id), raw GPU
+  // strings, the resolved architecture (a UA-CH/platform claim), screen size, DPR, UA and touch.
   const { fontMetric, mathAnchor } = stableStructuralAnchors();
   // Coarse digest is ALWAYS preferred over the exact canvas SHA-256 for the seed/matching;
   // this is the farbling-tolerant anchor used when canvasNoise/audioNoise flags are set.
   const coarseCanvas = canvas.coarseHash ?? 'na';
-  const audioClass = audioStabilityClass(audio);
+  const audioClass = audioStabilityClass(audio); // telemetry only — never a seed input
   const memoryBucket =
     deviceMemoryGb === null
       ? 'na'
@@ -1855,7 +2063,6 @@ export async function collectHardwareSignals(
     memoryBucket,
     colorGamut,
     coarseCanvas,
-    audioClass,
     fontMetric,
     mathAnchor,
   ].join('||');
@@ -1873,6 +2080,21 @@ export async function collectHardwareSignals(
   // specInvariants.ts). A masked/unavailable extension is NEVER promoted to VM/software proof,
   // and SwiftShader maps to `software_or_virtual` without setting any VM verdict.
   const gpuObservation = resolveGpuObservation(gpuVendor, gpuRenderer, gpuClass);
+  // The GPU truth resolver is the ONLY place allowed to say "hardware". It requires an
+  // actual unmasked manufacturer identifier and rejects stealth templates / masking.
+  const uaForGpuTruth =
+    typeof navigator !== 'undefined' && typeof navigator.userAgent === 'string'
+      ? navigator.userAgent
+      : '';
+  const gpuTruth = resolveGpuTruthState({
+    vendor: maskedVendor,
+    renderer: maskedRenderer,
+    unmaskedVendor,
+    unmaskedRenderer,
+    debugExtensionAvailable,
+    shaderPrecisionProfile,
+    privacyHardened: isPrivacyHardenedRuntime(uaForGpuTruth, false),
+  });
 
   return {
     hardwareId,
@@ -1881,6 +2103,12 @@ export async function collectHardwareSignals(
     maxTextureSize,
     gpuClass,
     gpuObservation,
+    gpuTruth,
+    debugExtensionAvailable,
+    maskedVendor: maskedVendor ?? undefined,
+    maskedRenderer: maskedRenderer ?? undefined,
+    unmaskedVendor: unmaskedVendor ?? undefined,
+    unmaskedRenderer: unmaskedRenderer ?? undefined,
     canvasHash,
     audioHash,
     cpuCores,
@@ -1901,6 +2129,11 @@ export async function collectHardwareSignals(
     canvasNoise: canvas.noise,
     audioNoise: audio.noise,
     canvasCoarseHash: canvas.coarseHash,
+    audioSum: audio.sum,
+    audioStabilityClass: audioClass,
+    audioUsableForIdentity: audio.usableForIdentity,
+    audioNoiseReasons: audio.noiseReasons,
+    audioTamperingInconclusive: audio.tamperingInconclusive,
   };
 }
 
@@ -2557,12 +2790,21 @@ let lastTouchStartAt = 0;
 /** Passive inspector probes. Results are reported for `inspector_state`, never bot proof. */
 export interface InspectorProbes {
   errorPrototypeNamePreviewReads: number;
+  /** Protocol-side Error.prototype.name getter reads (additive, weight-0 telemetry). */
+  nameGetterCount: number;
+  /** Protocol-side object-preview getter reads (additive, weight-0 telemetry). */
+  objectPreviewReads: number;
+  /** True when both protocol observables fired — additive inspection telemetry, never bot proof. */
+  activeCdpInspection: boolean;
   crossRealmGetterSourceMismatch: boolean;
   crossRealmNativeDescriptor: boolean;
   inspectorProbeError: string;
 }
 export const inspectorProbes: InspectorProbes = {
   errorPrototypeNamePreviewReads: 0,
+  nameGetterCount: 0,
+  objectPreviewReads: 0,
+  activeCdpInspection: false,
   crossRealmGetterSourceMismatch: false,
   crossRealmNativeDescriptor: false,
   inspectorProbeError: '',
@@ -3124,6 +3366,8 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
     }
 
     inspectorProbes.errorPrototypeNamePreviewReads = namePreviewReads;
+    inspectorProbes.nameGetterCount = namePreviewReads;
+    inspectorProbes.objectPreviewReads = objectPreviewReads;
     // (3) is WEAK and engine-dependent (it fires naturally on Android Chrome). It is
     // recorded in `inspectorProbes` for telemetry but is deliberately NOT pushed into
     // `reasons`, so it can never corroborate a stealth-plugin or CDP bot verdict.
@@ -3133,6 +3377,9 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
     // object-preview observable, and is the ONLY thing that may escalate a bot verdict.
     cdpRuntimeLeak = prepareInvoked || objectPreviewReads > 0;
     cdpRuntimeProof = prepareInvoked && objectPreviewReads > 0;
+    // Additive protocol-side observation only. It mirrors the STRONG proof but never
+    // becomes a second bot verdict, a score input or a DevTools claim.
+    inspectorProbes.activeCdpInspection = cdpRuntimeProof;
     if (cdpRuntimeProof) {
       reasons.push('CDP Runtime.enable serialization leak (Error.prepareStackTrace invoked on console.debug)');
     } else if (prepareInvoked) {
@@ -5268,9 +5515,35 @@ export interface ClientProvenanceSignals extends ClientRuntimeSignals {
   privacy_signature_ids?: string[];
   /** Additive, informational stealth evidence ids from `./stealthSignals` (never a verdict). */
   stealth_signal_ids?: string[];
+  /* Additive normalized truth/stability mirrors — never verdict or score inputs. */
+  gpu_truth_state?: ReturnType<typeof resolveGpuTruthState>['state'];
+  gpu_answer_unreliable?: boolean;
+  headless_mode?: 'shell' | 'new' | null;
+  audio_stability_class?: 'stable' | 'noisy' | 'unavailable' | null;
+  active_cdp_inspection?: boolean;
+  confidence_stability_key?: string | null;
+  /** Informational matchMedia/locale/timezone record — never scored or identity-bearing. */
+  media_preferences?: Record<string, unknown>;
 }
 
 export type SecuritySignalsWithProvenance = SecuritySignals & ClientProvenanceSignals;
+
+/** Hardware signals enriched with additive truth/stability probes (never score inputs). */
+type CollectedHardwareSignals = HardwareSignals & {
+  gpuClass?: string;
+  gpuObservation?: GpuObservation;
+  gpuTruth?: ReturnType<typeof resolveGpuTruthState>;
+  debugExtensionAvailable?: boolean;
+  maskedVendor?: string;
+  maskedRenderer?: string;
+  unmaskedVendor?: string | null;
+  unmaskedRenderer?: string | null;
+  audioSum?: number | null;
+  audioStabilityClass?: 'stable' | 'noisy' | 'unavailable';
+  audioUsableForIdentity?: boolean;
+  audioNoiseReasons?: string[];
+  audioTamperingInconclusive?: boolean;
+};
 
 /* ------------------------------------------------------------------------------------------------
  * Additive privacy / stealth telemetry helpers
@@ -5546,7 +5819,7 @@ function buildStealthObservations(evidence: LightweightStealthEvidence): Stealth
  */
 export async function evaluateSecuritySignals(
   browserDevice: BrowserDeviceInfo,
-  hardwareSignals: HardwareSignals & { gpuClass?: string; gpuObservation?: GpuObservation },
+  hardwareSignals: CollectedHardwareSignals,
   clientGeoHint: ClientGeoHint | null,
   hasStoredIdentity: boolean
 ): Promise<SecuritySignalsWithProvenance> {
@@ -5649,11 +5922,31 @@ export async function evaluateSecuritySignals(
 
   const datacenterAsn = isDatacenterOrHosting;
 
-  const maskedGpu = isMaskedOrUnavailableGpu(
-    hardwareSignals.gpuVendor,
-    hardwareSignals.gpuRenderer
-  );
-  const cloudOrMaskedGpu = datacenterAsn && maskedGpu;
+  // GPU truth: raw getParameter strings are NEVER an unmasked physical-GPU claim. The
+  // resolver enforces a stealth-template denylist, rejects constant strings, and treats a
+  // masked WEBGL_debug_renderer_info extension as an unreliable answer.
+  const gpuTruth =
+    hardwareSignals.gpuTruth ??
+    resolveGpuTruthState({
+      vendor: hardwareSignals.maskedVendor ?? hardwareSignals.gpuVendor,
+      renderer: hardwareSignals.maskedRenderer ?? hardwareSignals.gpuRenderer,
+      unmaskedVendor: hardwareSignals.unmaskedVendor ?? null,
+      unmaskedRenderer: hardwareSignals.unmaskedRenderer ?? null,
+      debugExtensionAvailable: hardwareSignals.debugExtensionAvailable ?? false,
+    });
+  const debugRendererMasked =
+    gpuTruth.state === 'masked' || hardwareSignals.debugExtensionAvailable === false;
+  const maskedGpu =
+    isMaskedOrUnavailableGpu(hardwareSignals.gpuVendor, hardwareSignals.gpuRenderer) ||
+    debugRendererMasked ||
+    gpuTruth.state === 'spoofed_suspect';
+  // A masked debug extension is by itself enough to mark the answer unreliable; a software
+  // rasteriser remains exempt (SwiftShader is a capability, not a hard VM / cloud verdict).
+  const cloudOrMaskedGpu =
+    gpuTruth.state !== 'software_renderer' &&
+    (debugRendererMasked ||
+      gpuTruth.state === 'spoofed_suspect' ||
+      (datacenterAsn && maskedGpu));
 
   const vpnReasons: string[] = [];
   if (timezoneMismatch) {
@@ -5670,11 +5963,21 @@ export async function evaluateSecuritySignals(
   // VPN suspicion. `timezoneMismatch` stays intact below for vpnMethods/event output.
   const vpnSuspected = datacenterAsn;
 
-  // 3. VM / Hypervisor & OS Identity Integrity (WebGL GPU + native accessors)
-  const vmStatus = detectVmAndIntegrity(hardwareSignals.gpuVendor, hardwareSignals.gpuRenderer, {
-    screenResolution: browserDevice.screenResolution,
-    datacenterAsn,
-  });
+  // 3. VM / Hypervisor & OS Identity Integrity (WebGL GPU + native accessors).
+  // If the GPU answer is unreliable (canvas farbling or a masked/spoofed debug extension),
+  // its strings cannot ground a VM verdict: re-run with the GPU identity neutralised so only
+  // independent OS/UA evidence can still speak. SwiftShader remains a software capability.
+  const gpuAnswerInvalid =
+    debugRendererMasked || gpuTruth.state === 'spoofed_suspect' || Boolean(hardwareSignals.canvasNoise);
+  const vmStatus = gpuAnswerInvalid
+    ? detectVmAndIntegrity('', '', {
+        screenResolution: browserDevice.screenResolution,
+        datacenterAsn,
+      })
+    : detectVmAndIntegrity(hardwareSignals.gpuVendor, hardwareSignals.gpuRenderer, {
+        screenResolution: browserDevice.screenResolution,
+        datacenterAsn,
+      });
   const tamperReasons: string[] = [];
   // A virtual machine / software rasterizer is an environment signal (the VM card), not
   // evidence of active tampering. Counting it as tamperDetected pushed plain SwiftShader
@@ -5804,10 +6107,35 @@ export async function evaluateSecuritySignals(
     ];
   }
 
-  // Canvas farbling injects different pixels on every read. It is a privacy defence
-  // (Brave / Safari / Tor RFP), not an automation signature: keep the tampering verdict but
-  // do NOT set `anti_detect_browser`, which is the hard bot gate on the server.
-  if (canvasNoiseDetected) {
+  // Canvas/audio/shader noise is ambiguous on its own. A privacy-hardened runtime (Brave /
+  // Safari AFP / Firefox RFP / Tor) is an expected source of farbling: it is reported as
+  // privacy telemetry but NEVER scored as tampering. Only a hard contradiction — a fact
+  // privacy hardening cannot explain — may turn noise into anti-detect evidence.
+  const audioNoiseDetected = Boolean(hardwareSignals.audioNoise);
+  const hardNoiseContradiction = Boolean(
+    browserDevice.devtoolsDeviceEmulation ||
+      vmStatus.isOsTampered ||
+      botAssessment.isBot ||
+      (tampering.tampering_details.hardAutomationEvidence ?? []).length > 0
+  );
+  const privacyNoiseVerdict = classifyPrivacyNoise({
+    privacyHardened,
+    canvasNoise: canvasNoiseDetected || Boolean(hardwareSignals.canvasNoise),
+    audioNoise: audioNoiseDetected,
+    shaderNoise: false,
+    hardContradiction: hardNoiseContradiction,
+    vendorSignature: privacyHardened ? 'privacy-hardened' : null,
+  });
+  const noiseExplanation = privacyNoiseVerdict.privacy_settings
+    ? 'privacy-hardened canvas/audio noise (privacy signature, not tampering)'
+    : 'canvas/audio read noise (no privacy signature; ambiguity-only telemetry)';
+  if (canvasNoiseDetected || audioNoiseDetected) {
+    if (!tampering.tampering_details.reasons.some((reason) => /canvas|audio/i.test(reason))) {
+      tampering.tampering_details.reasons.push(noiseExplanation);
+    }
+  }
+  if (!privacyNoiseVerdict.privacy_settings && (canvasNoiseDetected || audioNoiseDetected)) {
+    // Unexplained, uniform per-read noise remains active-spoofing evidence.
     tampering.tampering = true;
     tampering.tampering_confidence = 'high';
     tampering.tampering_ml_score = Math.max(0.72, tampering.tampering_ml_score);
@@ -5815,11 +6143,9 @@ export async function evaluateSecuritySignals(
       0.6,
       tampering.tampering_details.anomaly_score
     );
-    if (!tampering.tampering_details.reasons.some((reason) => /canvas/i.test(reason))) {
-      tampering.tampering_details.reasons.push(
-        'Canvas toDataURL/getImageData pixel noise (farbling) detected'
-      );
-    }
+  } else if (privacyNoiseVerdict.privacy_settings && !hardNoiseContradiction) {
+    tampering.tampering_details.anti_detect_browser = false;
+    tampering.tampering_details.privacy_hardened = true;
   }
 
   // Genuine Tor Browser / Firefox RFP confirmation gate.
@@ -5833,7 +6159,7 @@ export async function evaluateSecuritySignals(
     botAssessment.webdriver ||
     botAssessment.cdpDetected ||
     Boolean(botAssessment.stealthPluginDetected) ||
-    canvasNoiseDetected ||
+    (canvasNoiseDetected && !privacyNoiseVerdict.privacy_settings) ||
     browserDevice.devtoolsDeviceEmulation ||
     vmStatus.isOsTampered ||
     tampering.tampering_details.reasons.some((reason) =>
@@ -6032,6 +6358,50 @@ export async function evaluateSecuritySignals(
   const riskLevel: RiskLevel =
     suspectScore >= 7 ? 'High' : suspectScore >= 3 ? 'Medium' : 'Low';
 
+  /* Informational media preferences. Every value comes from a real `matchMedia` read (or the
+     real navigator/Intl locale/timezone), never from a constant. Accessibility / theme choices
+     are ordinary user preferences and are never an anti-detect, bot, score or identity input. */
+  const mediaMatches = (query: string): boolean | null => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return null;
+    try {
+      return window.matchMedia(query).matches;
+    } catch {
+      return null;
+    }
+  };
+  const colorSchemeDark = mediaMatches('(prefers-color-scheme: dark)');
+  const colorSchemeLight = mediaMatches('(prefers-color-scheme: light)');
+  const contrastMore = mediaMatches('(prefers-contrast: more)');
+  const contrastLess = mediaMatches('(prefers-contrast: less)');
+  const contrastForced = mediaMatches('(prefers-contrast: forced)');
+  const browserLocale =
+    typeof navigator !== 'undefined' && typeof navigator.language === 'string'
+      ? navigator.language
+      : null;
+  let browserTimezoneValue: string | null = null;
+  try {
+    browserTimezoneValue = Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+  } catch {
+    browserTimezoneValue = null;
+  }
+  const mediaPreferences = resolveMediaPreferences({
+    forcedColors: mediaMatches('(forced-colors: active)'),
+    reducedMotion: mediaMatches('(prefers-reduced-motion: reduce)'),
+    reducedTransparency: mediaMatches('(prefers-reduced-transparency: reduce)'),
+    colorScheme:
+      colorSchemeDark === true ? 'dark' : colorSchemeLight === true ? 'light' : null,
+    contrast:
+      contrastForced === true
+        ? 'forced'
+        : contrastMore === true
+        ? 'more'
+        : contrastLess === true
+        ? 'less'
+        : null,
+    locale: browserLocale,
+    timezone: browserTimezoneValue,
+  });
+
   return {
     isBot,
     botSignals,
@@ -6047,6 +6417,17 @@ export async function evaluateSecuritySignals(
     host_app: clientRuntime.host_app,
     client_type: clientRuntime.client_type,
     gpuObservation,
+    /* Additive normalized truth mirrors — copied verbatim, never re-derived into a verdict. */
+    gpu_truth_state: gpuTruth.state,
+    gpu_answer_unreliable: gpuTruth.answerUnreliable,
+    headless_mode: /headless[_-]?shell|chrome[_-]?headless[_-]?shell/i.test(uaSnapshot)
+      ? 'shell'
+      : /HeadlessChrome/i.test(uaSnapshot)
+      ? 'new'
+      : null,
+    audio_stability_class: hardwareSignals.audioStabilityClass ?? null,
+    media_preferences: mediaPreferences as unknown as Record<string, unknown>,
+    active_cdp_inspection: inspectorProbes.activeCdpInspection === true,
     cdpReasonIds,
     cdpAttached: stealthSnapshot.cdpRuntimeProof,
     /* Additive, informational privacy/stealth telemetry — never a verdict or risk input. */
@@ -6133,7 +6514,8 @@ export async function evaluateSecuritySignals(
       return rawAttributes;
     })(),
     /* Privacy settings: Tor Browser RFP / anti-fingerprinting evidence, including canvas farbling. */
-    privacySettings: torBrowserClient.detected || canvasNoiseDetected,
+    // Noise alone never creates a privacy signature; only an explicit posture / vendor does.
+    privacySettings: privacyNoiseVerdict.privacy_settings,
     /* Removed probes are neutralised so downstream consumers see explicit falses. */
     devToolsOpen: false,
     adBlockerDetected: false,
@@ -7011,7 +7393,8 @@ function buildIdentityProfile(
   clientGeoHint: ClientGeoHint | null,
   hardwareFingerprint: string,
   browserFingerprint: string,
-  cpuArchitecture: string
+  cpuArchitecture: string,
+  audioUsableForIdentity = true
 ): Record<string, unknown> {
   const ua = normalizeIdentity({
     userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
@@ -7032,10 +7415,14 @@ function buildIdentityProfile(
     signals.webglExtensions.parameters ?? '',
     signals.webglExtensions.shaderPrecisions ?? '',
   ]);
-  const audioHash = hashStrings([
-    String(signals.audio.sum ?? ''),
-    String(signals.audio.audioBaseLatency ?? ''),
-  ]);
+  // A noisy/instrumented audio probe is excluded from identity anchors. The exact stable
+  // float survives byte-for-byte via `audioAnchorValue`; no rounding is ever applied.
+  const audioSum = audioUsableForIdentity
+    ? audioAnchorValue(signals.audio.sum as number)
+    : null;
+  const audioHash = audioUsableForIdentity
+    ? hashStrings([String(audioSum ?? ''), String(signals.audio.audioBaseLatency ?? '')])
+    : '';
   const emojiRectHash = hashStrings([
     String(signals.emoji.width ?? ''),
     String(signals.emoji.height ?? ''),
@@ -7118,9 +7505,11 @@ function buildIdentityProfile(
       renderer: gpuRenderer,
     },
     audio: {
-      sum: signals.audio.sum,
-      baseLatency: signals.audio.audioBaseLatency,
+      // `null` / empty hash for noisy audio: the raw float must never mint a new identity.
+      sum: audioSum,
+      baseLatency: audioUsableForIdentity ? signals.audio.audioBaseLatency : null,
       hash: audioHash,
+      usableForIdentity: audioUsableForIdentity,
     },
     fontPrefs: {
       widths: signals.fontPreferences.widths,
@@ -7467,10 +7856,11 @@ export async function identifyCurrentVisitor(options?: {
   }
 
   const execute = async (): Promise<IntelVisitorResponse> => {
-    const [browserDevice, clientGeoHint, clientHints] = await Promise.all([
+    const [browserDevice, clientGeoHint, clientHints, grantedGeolocation] = await Promise.all([
       collectBrowserDeviceInfo(),
       collectClientGeoHint(),
       collectClientHints(),
+      collectGrantedGeolocation(),
     ]);
     const stored = getFirstPartyStorage();
     // The legacy hardware probe and the new tri-layer collectors run concurrently, so the
@@ -7568,7 +7958,8 @@ export async function identifyCurrentVisitor(options?: {
           clientGeoHint,
           identityHardwareFingerprint,
           identityBrowserFingerprint,
-          hardwareSignals.architecture
+          hardwareSignals.architecture,
+          hardwareSignals.audioUsableForIdentity !== false
         )
       : null;
 
@@ -7633,6 +8024,21 @@ export async function identifyCurrentVisitor(options?: {
     // inspector telemetry as well as inside `securitySignals`.
     const freshHuman = measureHumanCorroboration(hardwareSignals.gpuRenderer);
     const freshInteractionEvidence = getInteractionEvidence();
+    // Domain-separated stability key for the (visitor_id, hardware_id) pair. It is derived
+    // ONLY from durable identity anchors — never from bot, audio, privacy or score inputs —
+    // so a confidence tier keyed by it cannot move when volatile probes change.
+    const confidenceStabilityKey = (
+      await sha256Hex(
+        `INTEL_CONFIDENCE_STABILITY_V1|${stored.visitorId ?? ''}|${hardwareSignals.hardwareId}`
+      )
+    ).slice(0, 16);
+    // Additive, browser-fix-only proximity. IP city is deliberately never passed here.
+    const proximityField = grantedGeolocation.hexProximity
+      ? proximityBodyField({
+          proximity: grantedGeolocation.hexProximity,
+          reason: 'ok',
+        })
+      : undefined;
 
     const response = await fetch('/api/visitor/identify', {
       method: 'POST',
@@ -7673,6 +8079,18 @@ export async function identifyCurrentVisitor(options?: {
         host_app: securitySignals.host_app,
         client_type: securitySignals.client_type,
         gpuObservation: securitySignals.gpuObservation,
+        gpu_truth_state: securitySignals.gpu_truth_state,
+        gpu_answer_unreliable: securitySignals.gpu_answer_unreliable,
+        audio_stability_class: securitySignals.audio_stability_class,
+        media_preferences: securitySignals.media_preferences,
+        active_cdp_inspection: securitySignals.active_cdp_inspection,
+        confidence_stability_key: confidenceStabilityKey,
+        // Permission-gated browser geolocation. Never IP-city proximity.
+        geolocationPermission: grantedGeolocation.geolocationPermission,
+        grantedGeolocation: grantedGeolocation.grantedGeolocation,
+        geolocationAccuracyM: grantedGeolocation.geolocationAccuracyM,
+        accuracy_m: grantedGeolocation.geolocationAccuracyM,
+        ...(proximityField ?? {}),
         browserTimezone: securitySignals.browserTimezone,
         // Additive, informational privacy/stealth telemetry mirrored from securitySignals.
         privacy_settings: securitySignals.privacy_settings,

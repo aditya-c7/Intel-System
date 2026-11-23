@@ -21,6 +21,12 @@
  *   7. UA looks like a bot on its own                → not_detected / suspected-automation.
  *   8. Nothing above fired                           → human-or-unverified.
  *
+ * Additive, non-escalating signal: `activeCdpInspection` records a SECOND external CDP
+ * client that enabled the Runtime / Page domains. That is an active protocol-inspection
+ * session — not docked human DevTools — and is reported ONLY as the weight-0 reason
+ * `bot.cdp-active-inspection` plus the distinct `automation_protocol_inspection_active`
+ * state. It is never a bad-bot path and never creates a second taxonomy.
+ *
  * The evidence weights are the four-tier taxonomy defined in `src/lib/verdict.ts`
  * (`hard` / `medium` / `weak` / `developer_tools`). They are mirrored here so this
  * facade stays import-free and Workers-safe — keep the id tables in sync with
@@ -121,6 +127,12 @@ export interface BotVerdictInput {
   /** Shadow stealth-signal evaluation folded into the probe-evidence channel. */
   stealth?: BotVerifierStealth | null;
   /**
+   * A SECOND external CDP client has enabled the Runtime / Page domains — an active
+   * protocol-inspection session, distinct from docked human DevTools. Purely additive:
+   * publishes `bot.cdp-active-inspection` at weight 0 and the distinct active state.
+   */
+  activeCdpInspection?: boolean;
+  /**
    * Resolved IP matches an EXACT published CIDR prefix from an official operator feed
    * (OpenAI / Google / Anthropic / Perplexity), never a whole cloud ASN. Out-of-list
    * means unverified — not proven malicious — and stays inconclusive below.
@@ -162,9 +174,20 @@ export interface BotVerdict {
   identity: BotIdentity;
   /** Confidence of this verdict. */
   confidence: BotConfidence;
+  /**
+   * Distinct protocol-inspection state. `automation_protocol_inspection_active` only when
+   * `activeCdpInspection` was set; otherwise `automation_protocol_inspection_idle`. It is a
+   * separate axis — it never changes the verdict label, `bot` or `isBot`.
+   */
+  inspection_state: CdpInspectionState;
+  /** Alias of `inspection_state` using the full state vocabulary. */
+  automation_protocol_inspection_state: CdpInspectionState;
 }
 
-type BotVerdictCore = Omit<BotVerdict, 'bot' | 'isBot' | 'identity' | 'confidence'>;
+type BotVerdictCore = Omit<
+  BotVerdict,
+  'bot' | 'isBot' | 'identity' | 'confidence' | 'inspection_state' | 'automation_protocol_inspection_state'
+>;
 
 /* -------------------------------------------------------------------------- */
 /* Four-tier reason-weight taxonomy (mirror of src/lib/verdict.ts)             */
@@ -180,6 +203,20 @@ export type ReasonNamespace = 'automation' | 'verdict';
  */
 export const CORROBORATED_CDP_REASON_ID = 'bot.stealth-automation-uncorroborated';
 export const CORROBORATED_CHROMIUM_CDP_REASON_ID = 'bot.chromium-automation-uncorroborated';
+
+/**
+ * Additive, weight-0 observation: a SECOND external CDP client enabled the Runtime / Page
+ * domains. That is an active automation-protocol inspection session — NOT docked human
+ * DevTools — and is reported for attribution only. It can never escalate to a bad bot.
+ */
+export const ACTIVE_CDP_INSPECTION_REASON_ID = 'bot.cdp-active-inspection';
+
+/** Distinct state published on the verdict when `activeCdpInspection` is set on the input. */
+export type CdpInspectionState =
+  | 'automation_protocol_inspection_active'
+  | 'automation_protocol_inspection_idle';
+export const ACTIVE_CDP_INSPECTION_STATE: CdpInspectionState = 'automation_protocol_inspection_active';
+export const IDLE_CDP_INSPECTION_STATE: CdpInspectionState = 'automation_protocol_inspection_idle';
 
 /**
  * Probe reason ids that are, by themselves, proof of an automated runtime.
@@ -217,6 +254,9 @@ const DEVELOPER_TOOLS_REASON_IDS: ReadonlySet<string> = new Set([
   'cdp.runtime.enable.empty_source',
   'cdp.network.enable.pre_load_message',
   'bot.cdp-runtime-leak',
+  // A second external CDP client driving Runtime / Page: active inspection, weight 0.
+  // Exact entry wins over the generic weak `bot.` prefix rule — never a hard path.
+  ACTIVE_CDP_INSPECTION_REASON_ID,
   // Inconclusive stealth probes: reported at weight 0, never escalate or corroborate.
   'stealth.inconclusive',
 ]);
@@ -599,10 +639,15 @@ export function composeBotVerdict(input: BotVerdictInput): BotVerdict {
       input.directory?.status
   );
   const reasonIdentity = identityForReason(core.reason);
+  const inspectionState: CdpInspectionState =
+    input.activeCdpInspection === true ? ACTIVE_CDP_INSPECTION_STATE : IDLE_CDP_INSPECTION_STATE;
   return {
     ...core,
     bot,
     isBot: bot !== 'not_detected',
+    // Separate, additive axis: never feeds the verdict, `bot` or `isBot`.
+    inspection_state: inspectionState,
+    automation_protocol_inspection_state: inspectionState,
     // A spoofed-impersonation core result is authoritative: an input-level 'unknown'
     // or 'verified' claim must never downgrade identity='spoofed'. All other reasons
     // keep the existing explicit-claim-then-reason precedence.
@@ -649,7 +694,12 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
     });
     if (reason && !stealthReasons.includes(reason)) stealthReasons.push(reason);
   }
-  const allProbeReasons = [...probeReasons, ...stealthReasons];
+  // Additive active-CDP-inspection observation. It joins the SAME probe-evidence channel
+  // only so it is preserved in `reason_ids`; its weight-0 `developer_tools` classification
+  // cannot satisfy the hard/medium gate below. No verdict rung is added or reordered.
+  const activeInspectionReasons: string[] =
+    input.activeCdpInspection === true ? [ACTIVE_CDP_INSPECTION_REASON_ID] : [];
+  const allProbeReasons = [...probeReasons, ...stealthReasons, ...activeInspectionReasons];
   const effectiveProbeVerdict = probeVerdict === 'agent' || stealthDetected ? 'agent' : probeVerdict;
 
   /* 0 — Signed good agent: WBA cryptographic proof + signed identity + an
@@ -733,7 +783,8 @@ function composeBotVerdictCore(input: BotVerdictInput): BotVerdictCore {
   }
 
   /* 4 — Client probe found corroborated automated-runtime evidence.
-   *     A bare cdp.* reason is developer_tools (weight 0) and cannot get here. */
+   *     A bare cdp.* reason and `bot.cdp-active-inspection` are developer_tools
+   *     (weight 0) and cannot get here on their own. */
   if (effectiveProbeVerdict === 'agent' && isHardAgentReason(allProbeReasons)) {
     return {
       verdict: 'bad',

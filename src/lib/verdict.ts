@@ -25,6 +25,11 @@
  *            CDP bridge left uncorroborated by human input after the dwell window)
  *   medium — meaningful only in pairs, or paired with any weak reason
  *   weak   — never sufficient alone; kept for telemetry/attribution only
+ *
+ * Additive, weight-0 observation: `bot.cdp-active-inspection` records a SECOND external CDP
+ * client enabling the Runtime / Page domains (active protocol inspection — not docked human
+ * DevTools). It lives in the `developer_tools` tier and publishes the distinct
+ * `automation_protocol_inspection_active` state without ever flipping the verdict to bad.
  */
 
 import type { VerdictTier } from './telemetryContract';
@@ -43,6 +48,13 @@ export type ReasonWeight = 'hard' | 'medium' | 'weak' | 'developer_tools';
 export const CORROBORATED_CDP_REASON_ID = 'bot.stealth-automation-uncorroborated';
 /** Chromium-flavoured alias retained for parity with the server's `chromium_automation`. */
 export const CORROBORATED_CHROMIUM_CDP_REASON_ID = 'bot.chromium-automation-uncorroborated';
+
+/**
+ * Additive, weight-0 observation: a SECOND external CDP client enabled the Runtime / Page
+ * domains — an active automation-protocol inspection session, NOT docked human DevTools.
+ * It is reported in the `developer_tools` tier and can never escalate to a bad bot.
+ */
+export const ACTIVE_CDP_INSPECTION_REASON_ID = 'bot.cdp-active-inspection';
 
 export type AutomationVerdict = 'human' | 'uncertain' | 'automated';
 
@@ -100,6 +112,9 @@ const DEVELOPER_TOOLS_REASONS: ReadonlySet<string> = new Set([
   'cdp.runtime.enable.empty_source',
   'cdp.network.enable.pre_load_message',
   'bot.cdp-runtime-leak',
+  // A second external CDP client driving Runtime / Page: active inspection, weight 0.
+  // Exact entry wins over the generic weak `bot.` prefix rule — never a hard path.
+  ACTIVE_CDP_INSPECTION_REASON_ID,
   // A stealth probe that could not decide (no CSP, thrown exception, missing
   // preconditions) is reported at weight 0: it never escalates and never corroborates.
   'stealth.inconclusive',
@@ -381,6 +396,30 @@ export function deriveBotVerdict(input: BotVerdictInput): BotVerdict {
 /* Phase 3 — 4-tier Verdict State Machine                                     */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Distinct, additive protocol-inspection state. A SECOND external CDP client enabling the
+ * Runtime / Page domains is an active automation-protocol inspection session — not docked
+ * human DevTools. It is its own axis: it never changes the verdict tier, bot signal or
+ * verdict parity, and never escalates the weight-0 reason to a bad bot.
+ */
+export type AutomationProtocolInspectionState =
+  | 'automation_protocol_inspection_active'
+  | 'automation_protocol_inspection_idle';
+
+export const ACTIVE_CDP_INSPECTION_STATE: AutomationProtocolInspectionState =
+  'automation_protocol_inspection_active';
+export const IDLE_CDP_INSPECTION_STATE: AutomationProtocolInspectionState =
+  'automation_protocol_inspection_idle';
+
+/** Resolve the state; active only for an explicit `activeCdpInspection === true`. */
+export function automationProtocolInspectionState(
+  activeCdpInspection?: boolean | null,
+): AutomationProtocolInspectionState {
+  return activeCdpInspection === true ? ACTIVE_CDP_INSPECTION_STATE : IDLE_CDP_INSPECTION_STATE;
+}
+/** Alias with the resolver naming used by the other state helpers. */
+export const resolveAutomationProtocolInspectionState = automationProtocolInspectionState;
+
 export interface VerdictStateInput {
   /** The gated automation classification (or the server bot verdict mapped onto it). */
   automation: AutomationVerdict;
@@ -390,12 +429,16 @@ export interface VerdictStateInput {
   humanCorroboration: 0 | 1;
   /** Independent interaction evidence (typing / pointer trail) for this event. */
   hasInteractionEvidence?: boolean;
+  /** A second external CDP client enabled Runtime / Page (weight 0, never bad bot). */
+  activeCdpInspection?: boolean;
 }
 
 export interface VerdictState {
   verdict_tier: VerdictTier;
   human_corroboration: 0 | 1;
   label: string;
+  /** Distinct protocol-inspection axis, published alongside (never inside) the tier. */
+  protocol_inspection_state: AutomationProtocolInspectionState;
 }
 
 /**
@@ -403,11 +446,15 @@ export interface VerdictState {
  * tampered and passive session — it can only be 1 on a clean session with recorded input.
  */
 export function decideVerdictTier(input: VerdictStateInput): VerdictState {
+  // Published on every path as a separate axis: the four tiers and human corroboration
+  // are untouched by active inspection.
+  const protocol_inspection_state = automationProtocolInspectionState(input.activeCdpInspection);
   if (input.tamperingDetected) {
     return {
       verdict_tier: 'Tampered / Spoofed Environment',
       human_corroboration: 0,
       label: 'Tampered / Spoofed Environment',
+      protocol_inspection_state,
     };
   }
   if (input.automation === 'automated') {
@@ -415,6 +462,7 @@ export function decideVerdictTier(input: VerdictStateInput): VerdictState {
       verdict_tier: 'Verified Automation',
       human_corroboration: 0,
       label: 'Verified Automation',
+      protocol_inspection_state,
     };
   }
   if (input.humanCorroboration === 1 && input.hasInteractionEvidence !== false) {
@@ -422,12 +470,14 @@ export function decideVerdictTier(input: VerdictStateInput): VerdictState {
       verdict_tier: 'Verified Human Interactive Session',
       human_corroboration: 1,
       label: 'Verified Human Interactive Session',
+      protocol_inspection_state,
     };
   }
   return {
     verdict_tier: 'Unverified / Passive Session',
     human_corroboration: 0,
     label: 'Unverified / Passive Session',
+    protocol_inspection_state,
   };
 }
 

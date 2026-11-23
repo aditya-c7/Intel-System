@@ -4,6 +4,13 @@ import { resolveCanonical, isSwiftShader, SWIFTSHADER_LABEL } from './canonical'
 
 export type { RiskTier };
 
+/** Narrow an unknown transport value to a plain record without changing it. */
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
 /**
  * Smart Signals grid.
  *
@@ -273,6 +280,31 @@ export function resolveVmVerdict(
   const signalState = interpretVmText(signalStatus);
   const unavailablePattern = /unavailable|masked|indeterminate|inconclusive|^none$|n\/a/i;
   const unavailable = unavailablePattern.test(signalStatus) || unavailablePattern.test(label);
+
+  // Additive GPU truth mirrors gate every physical-hardware claim. A masked, spoofed or
+  // otherwise unreliable GPU answer is absence of evidence — it can never read
+  // "Physical Hardware" / "Unmasked physical GPU verified", no matter what the raw VM
+  // status/detail says. These are server values, never client-derived.
+  const gpuTruth =
+    typeof canonicalView.gpu_truth_state === 'string'
+      ? canonicalView.gpu_truth_state.trim().toLowerCase()
+      : '';
+  const gpuUnreliable = canonicalView.gpu_answer_unreliable === true;
+  const observation = canonicalView.gpuObservation;
+  const observationRestricted =
+    observation === 'masked_by_privacy' || observation === 'observation_unavailable';
+  const truthSaysPhysical =
+    (gpuTruth === 'hardware' || gpuTruth === 'physical_hardware') &&
+    !gpuUnreliable &&
+    !observationRestricted;
+  const truthSaysMasked =
+    /masked|spoof/i.test(gpuTruth) ||
+    /masked|spoof/i.test(signalStatus) ||
+    /masked|spoof/i.test(label) ||
+    observation === 'masked_by_privacy';
+  const truthBlocksPhysical =
+    (gpuTruth.length > 0 && !truthSaysPhysical) || observationRestricted || gpuUnreliable || unavailable;
+
   const gpuVendor = data.hardwareSignals?.gpuVendor ?? '';
   const gpuRenderer = data.hardwareSignals?.gpuRenderer ?? '';
   const realUnmaskedGpu =
@@ -306,9 +338,20 @@ export function resolveVmVerdict(
   // the same invariant the server applies when it reconciles `virtual_machine: false`.
   if (isVmFlag === false && (state === 'vm' || state === 'physical')) state = 'unknown';
   if (unavailable && (state === 'vm' || state === 'physical')) state = 'unknown';
+  if (state === 'physical' && truthBlocksPhysical) state = 'unknown';
 
+  // The restricted-GPU label replaces "Not determinable" only when a physical claim was
+  // actually blocked: explicitly masked / spoofed answers read "Masked / Unverified", while an
+  // unavailable, unknown or merely unreliable answer reads "Unavailable / Browser-Restricted".
+  const restrictedGpuStatus = truthSaysMasked
+    ? 'Masked / Unverified'
+    : truthBlocksPhysical
+    ? 'Unavailable / Browser-Restricted'
+    : null;
   const status =
-    state === 'vm'
+    state === 'unknown' && restrictedGpuStatus
+      ? restrictedGpuStatus
+      : state === 'vm'
       ? signalState === 'vm'
         ? signalStatus
         : 'Virtual Machine'
@@ -583,19 +626,33 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
   // verdict or the structured signature outcome — as one more server-provided vote beside the
   // legacy flags. An absent mirror leaves those flags unchanged, so older payloads render exactly
   // as before and the tile keeps the same OR semantics as the Event JSON.
-  const privacyMirror = canonicalView.privacy_settings;
+  // The structured `privacy_settings` mirror is authoritative when present: its boolean
+  // verdict, privacy_hardened flag, signature ids and reason strings are all read from the
+  // server object (never re-derived). Legacy flat signals stay as a fallback only, so an older
+  // payload that never supplied the structured mirror still renders exactly as before.
+  const privacyMirror = asRecord(canonicalView.privacy_settings);
   const privacyFromMirror =
-    typeof privacyMirror === 'boolean'
-      ? privacyMirror
-      : privacyMirror && typeof privacyMirror === 'object' && typeof privacyMirror.privacy_settings === 'boolean'
+    typeof canonicalView.privacy_settings === 'boolean'
+      ? canonicalView.privacy_settings
+      : typeof privacyMirror?.privacy_settings === 'boolean'
       ? privacyMirror.privacy_settings
+      : typeof privacyMirror?.privacy_hardened === 'boolean'
+      ? privacyMirror.privacy_hardened
       : undefined;
-  const privacyMirrorReasons =
-    privacyMirror && typeof privacyMirror === 'object' && Array.isArray(privacyMirror.reasons)
-      ? privacyMirror.reasons.filter(
-          (reason): reason is string => typeof reason === 'string' && reason.trim().length > 0
-        )
-      : undefined;
+  const privacyMirrorReasons = Array.isArray(privacyMirror?.reasons)
+    ? privacyMirror.reasons.filter(
+        (reason): reason is string => typeof reason === 'string' && reason.trim().length > 0
+      )
+    : [];
+  const privacySignatureIdsRaw =
+    canonicalView.privacy_signature_ids ??
+    privacyMirror?.privacy_signature_ids ??
+    privacyMirror?.signatures;
+  const privacySignatureIds = Array.isArray(privacySignatureIdsRaw)
+    ? privacySignatureIdsRaw.filter(
+        (id): id is string => typeof id === 'string' && id.trim().length > 0
+      )
+    : [];
   const privacySettings = Boolean(
     privacyFromMirror ||
       signals.privacySettings ||
@@ -608,9 +665,10 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     status: privacySettings ? 'Yes' : 'Not detected',
     triggered: privacySettings,
     detail:
+      privacyMirrorReasons[0] ||
+      (privacySignatureIds.length > 0 ? `Signatures: ${privacySignatureIds.join(', ')}` : undefined) ||
       signals.privacyDetail ||
       (signals.isTorBrowserClient ? 'Tor Browser RFP' : undefined) ||
-      privacyMirrorReasons?.[0] ||
       undefined,
   });
 
@@ -761,21 +819,49 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     detail: `Canonical score ${suspectScore}/10`,
   });
 
-  // Fix 5 — the server always computes the metro-zone geohash synchronously, so this tile
-  // never waits on a browser geolocation callback. IP coordinates are never printed here;
-  // the tile reports an IP-only zone estimate when no finer metro zone was resolved.
-  const proximityResolved = Boolean(data.proximity?.resolved);
-  const proximityStatus =
-    data.proximity?.zone_label ||
-    (data.location.isLocationVerified
-      ? `${city || region || country || 'Verified zone'}`
-      : 'Zone Unresolved (IP-only)');
+  // Proximity is EXCLUSIVELY a browser-granted geolocation observation. IP-derived city /
+  // geohash zone is never proximity evidence, so neither is read here. The tile requires an
+  // explicit granted permission AND real browser-supplied coordinates; without both it
+  // reports the same honest no-proximity state regardless of the egress location.
+  const proximityTransport = asRecord(data.proximity);
+  const permissionRaw =
+    canonicalView.geolocationPermission ??
+    proximityTransport?.permission ??
+    proximityTransport?.geolocationPermission ??
+    proximityTransport?.geolocation_permission;
+  const permission = typeof permissionRaw === 'string' ? permissionRaw.trim().toLowerCase() : '';
+  const grantedRaw =
+    canonicalView.grantedGeolocation ??
+    proximityTransport?.grantedGeolocation ??
+    proximityTransport?.granted_geolocation ??
+    proximityTransport?.coordinates;
+  const granted = asRecord(grantedRaw);
+  // The canonical GrantedGeolocation shape is { lat, lon, accuracyM }; the legacy
+  // { latitude, longitude } spelling is accepted as a transport fallback only.
+  const grantedLatitude = granted?.lat ?? granted?.latitude;
+  const grantedLongitude = granted?.lon ?? granted?.longitude;
+  const hasCoordinates =
+    typeof grantedLatitude === 'number' &&
+    Number.isFinite(grantedLatitude) &&
+    typeof grantedLongitude === 'number' &&
+    Number.isFinite(grantedLongitude);
+  const proximityGranted = permission === 'granted' && hasCoordinates;
+  const accuracyRaw =
+    canonicalView.accuracy_m ??
+    proximityTransport?.accuracy_m ??
+    granted?.accuracyM ??
+    granted?.accuracy_m;
+  const accuracy =
+    typeof accuracyRaw === 'number' && Number.isFinite(accuracyRaw) ? accuracyRaw : null;
+  const proximityStatus = proximityGranted
+    ? `Granted${accuracy !== null ? ` · accuracy ±${accuracy} m` : ''}`
+    : 'No proximity (permission required/denied)';
   rows.push({
     key: 'proximity',
     label: 'Proximity Detection',
     status: proximityStatus,
     triggered: false,
-    tone: proximityResolved ? 'clean' : 'neutral',
+    tone: proximityGranted ? 'clean' : 'neutral',
   });
 
   rows.push({

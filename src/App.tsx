@@ -1767,6 +1767,44 @@ export default function App() {
       ...(canonical.network_layer_hash != null
         ? { network_layer_hash: canonical.network_layer_hash }
         : {}),
+      // Remaining additive truth / observation mirrors — published ONLY when the server
+      // actually supplied them. Every value is the canonical envelope's verbatim pass-through;
+      // no Boolean()/Number() coercion, no default and no client-side re-derivation is applied.
+      ...(canonical.gpu_truth_state != null ? { gpu_truth_state: canonical.gpu_truth_state } : {}),
+      ...(canonical.gpu_answer_unreliable != null
+        ? { gpu_answer_unreliable: canonical.gpu_answer_unreliable }
+        : {}),
+      ...(canonical.headless_mode != null ? { headless_mode: canonical.headless_mode } : {}),
+      ...(canonical.geolocationPermission != null
+        ? { geolocationPermission: canonical.geolocationPermission }
+        : {}),
+      ...(canonical.grantedGeolocation != null
+        ? { grantedGeolocation: canonical.grantedGeolocation }
+        : {}),
+      ...(canonical.accuracy_m != null ? { accuracy_m: canonical.accuracy_m } : {}),
+      ...(canonical.privacy_signature_ids != null
+        ? { privacy_signature_ids: canonical.privacy_signature_ids }
+        : {}),
+      ...(canonical.media_preferences != null
+        ? { media_preferences: canonical.media_preferences }
+        : {}),
+      ...(canonical.active_cdp_inspection != null
+        ? { active_cdp_inspection: canonical.active_cdp_inspection }
+        : {}),
+      ...(canonical.id_scope != null ? { id_scope: canonical.id_scope } : {}),
+      ...(canonical.context_isolated != null
+        ? { context_isolated: canonical.context_isolated }
+        : {}),
+      ...(canonical.audio_stability_class != null
+        ? { audio_stability_class: canonical.audio_stability_class }
+        : {}),
+      ...(canonical.confidence_stability_key != null
+        ? { confidence_stability_key: canonical.confidence_stability_key }
+        : {}),
+      // Read-only incognito diagnostics: the server's own diagnostic record, exposed verbatim
+      // whenever it is present. Deliberately NOT gated on `intel_diag` / sessionStorage and not
+      // a client-side session flag — nothing here is fabricated from the flag-gated hook.
+      ...(canonical.diagnostics != null ? { diagnostics: canonical.diagnostics } : {}),
     };
   }, [
     data,

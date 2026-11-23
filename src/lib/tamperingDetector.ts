@@ -49,6 +49,18 @@
  * never set the flag either. Worker collection order (service → shared → dedicated) and
  * its timeouts (4s / 3s / 3s) are collection-side concerns; this function only consumes the
  * resulting observations.
+ *
+ * T9/T11 corrections (all additive):
+ *  - canvas read noise is a real tampering signal (per-read pixels contradict a stable device)
+ *    but it is NOT an anti-detect/browser-automation signal, and it invalidates any claim that
+ *    a GPU string is an unmasked physical-hardware anchor;
+ *  - under privacy hardening (Brave RFP / Tor / Safari AFP) only cross-scope UA/platform/brands,
+ *    iframe realm, cyclic __proto__ and a full 12-triple shader OS contradiction may escalate.
+ *    All other drift stays a 0.5 warning with no score and no `anti_detect_browser`;
+ *  - a masked WEBGL_debug_renderer_info extension or a stealth/template renderer string
+ *    ("Intel Iris OpenGL Engine", "WebKit WebGL", placeholders) is published as the additive
+ *    `gpu_answer_unreliable` warning (rating 0.5), never as a hardware anchor;
+ *  - cdc_* / webdriver / CDP artifacts remain decoupled from `anti_detect_browser`.
  */
 
 import { resolveTamperingLies, type TamperingLiesResult, type WorkerScopeObservations } from './tamperingLies';
@@ -72,6 +84,12 @@ export interface TamperingDetails {
   /** Additive shadow mirror of the cross-scope lie verdict, colocated with the other tamper
    * telemetry. Identical to the top-level `tampering_lies`; never a verdict input. */
   tampering_lies?: TamperingLiesResult;
+  /** ADDITIVE (T9/T11): true when the observed canvas read noise, a masked
+   * `WEBGL_debug_renderer_info` extension or a stealth/template GPU string makes the GPU answer
+   * unusable as a direct physical-hardware anchor. Informational only. */
+  gpu_answer_unreliable?: boolean;
+  /** ADDITIVE (T9/T11): the observed canvas read-noise signal, when supplied by the caller. */
+  canvas_noise?: boolean;
 }
 
 export interface TamperingAssessment {
@@ -89,6 +107,9 @@ export interface TamperingAssessment {
   /** Additive rating metadata for `tampering_lies`: which signals were STRONG (rating 1)
    * versus SOFT warnings (rating 0.5). Never a verdict input. */
   tampering_lies_rating: TamperingLieRating;
+  /** ADDITIVE (T9/T11) mirror of `tampering_details.gpu_answer_unreliable`; never a
+   * canonical verdict, risk-score or hardware-anchor input. */
+  gpu_answer_unreliable?: boolean;
 }
 
 /** Rating metadata for the additive shadow lie verdict. */
@@ -139,6 +160,22 @@ export interface TamperingInput {
    * Additive only: the rated verdict is emitted as `tampering_lies` and cannot change this
    * function's canonical verdict, score, or anti_detect_browser flag. */
   tamperingLies?: (WorkerScopeObservations & TamperingLieExtras) | null;
+  /** ADDITIVE (T9/T11): per-read canvas pixel noise (farbling) observed by the collector.
+   * `canvasNoiseDetected` and `canvas.noise` are accepted aliases. */
+  canvasNoise?: boolean | null;
+  canvasNoiseDetected?: boolean | null;
+  canvas?: { noise?: boolean | null; classification?: string | null } | null;
+  /** ADDITIVE (T9/T11): the unmasked `WEBGL_debug_renderer_info` extension was unavailable
+   * or masked. `maskedByPrivacyGpu` / `gpuAnswerUnreliable` are accepted aliases. */
+  webglDebugRendererInfoMasked?: boolean | null;
+  debugRendererInfoMasked?: boolean | null;
+  maskedByPrivacyGpu?: boolean | null;
+  gpuAnswerUnreliable?: boolean | null;
+  /** Sibling `gpuTruth` aliases, accepted so callers can forward a resolved observation. */
+  debugExtensionAvailable?: boolean | null;
+  gpuTruthState?: 'hardware' | 'software_renderer' | 'masked' | 'spoofed_suspect' | 'unknown' | string | null;
+  /** Coarse, spoof-resistant capability bucket. Telemetry only: it can never anchor hardware. */
+  gpuCapabilityClass?: string | null;
 }
 
 /** Desktop-only platform strings. A real handheld never reports one. */
@@ -147,6 +184,68 @@ const DESKTOP_PLATFORM_PATTERN = /^(Win32|Win64|Windows|MacIntel|Macintosh|Linux
 /** Desktop GPU families that can never drive a physical phone or tablet. */
 const DESKTOP_GPU_PATTERN =
   /NVIDIA|GeForce|Radeon|RDNA|Intel\(R\)|Iris|UHD Graphics|HD Graphics|Direct3D|D3D11|Apple M[1-9]/i;
+
+/**
+ * Stealth/template GPU answers: these are renderer *placeholders*, not a directly observed
+ * physical GPU. Safari/AFP and stealth shims return e.g. "Intel Iris OpenGL Engine" when the
+ * unmasked-info extension is blocked. Word boundaries keep legitimate ANGLE strings
+ * ("... Direct3D11 vs_5_0 ...", "Apple M4") out of this bucket.
+ */
+const UNRELIABLE_GPU_STRING_PATTERN =
+  /\bOpenGL Engine\b|\bWebGL (?:Renderer|Vendor)\b|\bStandard WebGL\b|\bWebKit WebGL\b|\b(?:Unavailable|Unknown|Generic|Mozilla)\b|\bn\/?a\b/i;
+
+/** Canonical, machine-readable reason id shared by all GPU-unreliable causes. */
+const GPU_UNRELIABLE_REASON = 'gpu_answer_unreliable';
+
+/** Strict boolean reader: truthy junk (1, 'true', {}) is never treated as evidence. */
+function isTrueFlag(...values: unknown[]): boolean {
+  return values.some((value) => value === true);
+}
+
+/** Canvas farbling may be reported through several collector aliases. */
+function hasCanvasNoise(input: TamperingInput): boolean {
+  if (isTrueFlag(input.canvasNoise, input.canvasNoiseDetected)) return true;
+  try {
+    const canvas = input.canvas;
+    if (canvas && typeof canvas === 'object') {
+      if (canvas.noise === true) return true;
+      if (/canvas_noise/i.test(canvas.classification || '')) return true;
+    }
+  } catch {
+    // Ignore hostile sub-objects.
+  }
+  return false;
+}
+
+/**
+ * A masked unmasked-info extension, a placeholder/template renderer, or canvas farbling
+ * (which perturbs every read of the same surface) makes any "unmasked physical GPU" claim
+ * unreliable. Purely additive: no points, no anti-detect flag, no hardware anchor.
+ */
+function gpuAnswerIsUnreliable(input: TamperingInput, gpuSignature: string): boolean {
+  if (
+    isTrueFlag(
+      input.webglDebugRendererInfoMasked,
+      input.debugRendererInfoMasked,
+      input.maskedByPrivacyGpu,
+      input.gpuAnswerUnreliable
+    )
+  ) {
+    return true;
+  }
+  // An explicit "extension unavailable" observation, or a sibling gpuTruth state that is not a
+  // directly observed hardware/software identity, is likewise not a hardware anchor.
+  if (input.debugExtensionAvailable === false) return true;
+  if (
+    input.gpuTruthState === 'masked' ||
+    input.gpuTruthState === 'spoofed_suspect' ||
+    input.gpuTruthState === 'unknown'
+  ) {
+    return true;
+  }
+  if (gpuSignature && UNRELIABLE_GPU_STRING_PATTERN.test(gpuSignature)) return true;
+  return hasCanvasNoise(input);
+}
 
 function readNavigatorString(getter: () => unknown): string {
   try {
@@ -322,7 +421,7 @@ const STRONG_LIE_REASON =
 
 /** SOFT (rating 0.5) lie evidence: warnings legitimately produced by Chrome privacy tools. */
 const WEAK_LIE_REASON =
-  /navigator\.(?:languages|hardwareConcurrency|deviceMemory) divergence|ActiveText color|silent audio buffer|repeated audio reads diverged|proxy-wrapped|iframe stealth trap/i;
+  /navigator\.(?:languages|hardwareConcurrency|deviceMemory) divergence|ActiveText color|silent audio buffer|repeated audio reads diverged|proxy-wrapped|iframe stealth trap|gpu_answer_unreliable/i;
 
 /**
  * Rate the additive lie reasons. Only STRONG (rating 1) contradictions may set the shadow
@@ -352,6 +451,39 @@ function rateLieReasons(reasons: string[], shaderTriples?: number | null): Tampe
     weak_signals,
     warning_only: strong_signals.length === 0 && weak_signals.length > 0,
   };
+}
+
+/**
+ * Under privacy hardening only the STRONG contradictions may contribute score: cross-scope
+ * UA / platform / brands, a clean-iframe realm leak, a cyclic __proto__ trap and a full
+ * 12-triple shader OS mismatch. The resolver itself treats cores/memory/languages drift and an
+ * ActiveText OS mismatch as hard, but the rating layer classifies them as 0.5 warnings, so this
+ * sanitised copy removes them from the *score* path (the reasons remain visible for telemetry).
+ * An automation stack frame is a CDP artifact and is likewise removed from the score path.
+ */
+function stripSoftLieFields(
+  source: (WorkerScopeObservations & TamperingLieExtras) | null
+): WorkerScopeObservations & TamperingLieExtras {
+  const copy: Record<string, unknown> = { ...(source ?? {}) };
+  for (const scopeName of ['window', 'dedicated', 'shared', 'service']) {
+    const scope = copy[scopeName];
+    if (scope && typeof scope === 'object' && !Array.isArray(scope)) {
+      const clean: Record<string, unknown> = { ...(scope as Record<string, unknown>) };
+      clean.cores = null;
+      clean.memory = null;
+      clean.languages = null;
+      copy[scopeName] = clean;
+    }
+  }
+  copy.activeTextColor = null;
+  copy.claimedOs = null;
+  copy.automationStackFrames = null;
+  const triples = source?.shaderPrecisionTripleCount;
+  if (typeof triples === 'number' && Number.isFinite(triples) && triples < 12) {
+    copy.shaderPrecisionProfile = null;
+    copy.claimedGpuOs = null;
+  }
+  return copy as WorkerScopeObservations & TamperingLieExtras;
 }
 
 function detectEngine(): { evalLen: number; isV8: boolean; hasChrome: boolean; isWebKit: boolean } {
@@ -471,6 +603,11 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     typeof window !== 'undefined' && window.screen ? Number(window.screen.width) || 0 : 0;
   const reasons: string[] = [];
   const hardAutomationEvidence = detectAutomationTamper();
+  // T9/T11: canvas farbling is a genuine tampering signal, but never an anti-detect /
+  // automation signal. A masked or template GPU answer cannot anchor physical hardware.
+  const canvasNoise = hasCanvasNoise(input);
+  const gpuSignature = `${input.webglVendor || ''} ${input.webglRenderer || ''}`.trim();
+  const gpuUnreliable = gpuAnswerIsUnreliable(input, gpuSignature);
   let anomalyPoints = 0;
   let devtoolsEmulation = false;
   let antiDetect = false;
@@ -566,8 +703,8 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     );
   }
 
-  // 5. A desktop GPU renderer under a mobile user-agent claim.
-  const gpuSignature = `${input.webglVendor || ''} ${input.webglRenderer || ''}`.trim();
+  // 5. A desktop GPU renderer under a mobile user-agent claim. `gpuSignature` is computed once
+  //    at the top of this function and reused by the GPU-reliability check.
   if (claimsMobile && gpuSignature && DESKTOP_GPU_PATTERN.test(gpuSignature)) {
     devtoolsEmulation = true;
     anomalyPoints += 45;
@@ -637,12 +774,31 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
     reasons.push(...hardAutomationEvidence);
   }
 
+  // 10. T9/T11 canvas farbling. It is a real tampering signal (the same surface produces
+  //     different pixels on every read), but under privacy hardening it is an intentional
+  //     defence: keep the tampering verdict and the reason, and add NO anomaly points and NO
+  //     anti-detect flag. Outside privacy hardening it carries its own weight.
+  if (canvasNoise) {
+    if (!privacyHardened) anomalyPoints += 60;
+    if (!reasons.some((reason) => /canvas/i.test(reason))) {
+      reasons.push('Canvas toDataURL/getImageData pixel noise (farbling) detected');
+    }
+  }
+
+  // 11. T9/T11 GPU answer reliability. A masked unmasked-info extension, a stealth/template
+  //     renderer or canvas farbling means the GPU string is NOT a physical-hardware anchor.
+  //     This is a soft 0.5 warning on the shadow rating: no points, no anti-detect flag.
+  if (gpuUnreliable && !reasons.includes(GPU_UNRELIABLE_REASON)) {
+    reasons.push(GPU_UNRELIABLE_REASON);
+  }
+
   const clampedScore = Math.min(1, Number((anomalyPoints / 100).toFixed(4)));
-  // A privacy-hardened runtime keeps only hard device-emulation evidence; anti-detect
-  // points are suppressed so an intentional defence never becomes a tamper verdict.
+  // A privacy-hardened runtime keeps only hard device-emulation evidence and canvas
+  // farbling (an intentional defence with its own tamper signal); anti-detect points are
+  // suppressed so an intentional defence never becomes an anti-detect / bot verdict.
   const isTampered = privacyHardened
-    ? devtoolsEmulation
-    : devtoolsEmulation || antiDetect || anomalyPoints >= 40;
+    ? devtoolsEmulation || canvasNoise
+    : devtoolsEmulation || antiDetect || canvasNoise || anomalyPoints >= 40;
 
   // ADDITIVE shadow path. Every canonical value above is already final; nothing below can
   // change `tampering`, `anti_detect_browser`, `tampering_ml_score`, or any risk/verdict tier.
@@ -660,11 +816,16 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
   try {
     const source =
       input.tamperingLies && typeof input.tamperingLies === 'object' ? input.tamperingLies : null;
+    const privacyForLies = privacyHardened || source?.privacyHardened === true;
+    // cdc_* / webdriver / CDP artifacts (stack frames included) are ALWAYS artifact-only:
+    // they report a score/reason but can never switch anti_detect_browser on.
     const automationArtifactOnly =
-      source?.automationArtifactOnly === true || observesAutomationArtifacts(hardAutomationEvidence);
+      source?.automationArtifactOnly === true ||
+      source?.automationStackFrames === true ||
+      observesAutomationArtifacts(hardAutomationEvidence);
     const resolved = resolveTamperingLies({
       ...(source ?? {}),
-      privacyHardened: privacyHardened || source?.privacyHardened === true,
+      privacyHardened: privacyForLies,
       automationArtifactOnly,
     });
 
@@ -693,11 +854,26 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
       reasons.push('cyclic __proto__ trap succeeded (Proxy-wrapped native)');
     }
 
+    // T9/T11: a masked renderer / stealth GPU template / farbled canvas is reported as an
+    // informational 0.5 warning. It never contributes shadow score or anti_detect_browser.
+    if (gpuUnreliable && !reasons.includes(GPU_UNRELIABLE_REASON)) {
+      reasons.push(GPU_UNRELIABLE_REASON);
+    }
+
     tampering_lies_rating = rateLieReasons(reasons, source?.shaderPrecisionTripleCount);
+    // Privacy hardening removes the score contribution of every 0.5 warning; only the four
+    // allowed hard contradictions may still raise the shadow score. Reasons stay visible.
+    const scoreSource = privacyForLies
+      ? resolveTamperingLies({
+          ...stripSoftLieFields(source),
+          privacyHardened: true,
+          automationArtifactOnly,
+        })
+      : resolved;
     tampering_lies = {
       anomaly_score: Math.max(
         0,
-        Number((resolved.anomaly_score - droppedAudio * 0.15).toFixed(4))
+        Number((scoreSource.anomaly_score - droppedAudio * 0.15).toFixed(4))
       ),
       // Only STRONG (rating 1) evidence can set the flag, and automation artifacts never can.
       anti_detect_browser: tampering_lies_rating.rating === 1 && !automationArtifactOnly,
@@ -721,8 +897,11 @@ export function detectBrowserTampering(input: TamperingInput = {}): TamperingAss
       reasons,
       hardAutomationEvidence: privacyHardened ? [] : hardAutomationEvidence,
       tampering_lies,
+      gpu_answer_unreliable: gpuUnreliable,
+      canvas_noise: canvasNoise,
     },
     tampering_lies,
     tampering_lies_rating,
+    gpu_answer_unreliable: gpuUnreliable,
   };
 }

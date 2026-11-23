@@ -1229,3 +1229,680 @@ export function checkIntegratedFieldInvariants(
     return [];
   }
 }
+
+/* -------------------------------------------------------------------------- */
+/* Remaining benchmark defects — additive invariant helpers                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * First explicitly published value across a list of records and aliases. `null`/`undefined`
+ * are absence of evidence, so a literal `false`/`0`/`''` still wins. Every read is guarded by
+ * `shadowField`, so hostile getters / proxies cannot escape as a throw.
+ */
+function integratedPick(records: readonly unknown[], keys: readonly string[]): unknown {
+  for (const record of records) {
+    for (const key of keys) {
+      const value = shadowField(record, key);
+      if (value !== undefined && value !== null) return value;
+    }
+  }
+  return undefined;
+}
+
+function integratedPickBool(records: readonly unknown[], keys: readonly string[]): boolean | undefined {
+  const value = integratedPick(records, keys);
+  if (typeof value === 'boolean') return value;
+  return shadowBool(value, 'detected');
+}
+
+function integratedPickText(records: readonly unknown[], keys: readonly string[]): string {
+  const value = integratedPick(records, keys);
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function integratedPickNumber(records: readonly unknown[], keys: readonly string[]): number | undefined {
+  const value = integratedPick(records, keys);
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/** Text may arrive as a flat string or as a list of reason tokens. */
+function integratedPickTokens(records: readonly unknown[], keys: readonly string[]): string {
+  const parts: string[] = [];
+  for (const record of records) {
+    for (const key of keys) {
+      const value = shadowField(record, key);
+      if (typeof value === 'string') parts.push(value);
+      else if (Array.isArray(value)) {
+        try {
+          for (const item of value as readonly unknown[]) {
+            if (typeof item === 'string') parts.push(item);
+          }
+        } catch {
+          /* hostile iterator: keep the safely read prefix */
+        }
+      }
+    }
+  }
+  return parts.join(' ');
+}
+
+function integratedFiniteArray(value: unknown): number[] {
+  const finite: number[] = [];
+  if (!Array.isArray(value)) return finite;
+  try {
+    let seen = 0;
+    for (const item of value as readonly unknown[]) {
+      if (++seen > 4096) break;
+      if (typeof item === 'number' && Number.isFinite(item)) finite.push(item);
+    }
+  } catch {
+    /* hostile iterator: keep the safely read prefix */
+  }
+  return finite;
+}
+
+/* -------------------------------------------------------------------------- */
+/* GPU truth                                                                   */
+/* -------------------------------------------------------------------------- */
+
+/** Fields accepted by the GPU-truth invariant. All optional; absence is never a diagnostic. */
+export interface GpuTruthInvariantInput {
+  gpu_truth_state?: string | null;
+  gpuTruthState?: string | null;
+  gpu_observation?: GpuObservation | string | null;
+  gpuObservation?: GpuObservation | string | null;
+  claimed_hardware_anchor?: boolean | null;
+  hardware_claim?: boolean | null;
+  hardwareClaim?: boolean | null;
+  physical_gpu_claim?: boolean | null;
+  physicalGpuClaim?: boolean | null;
+  unmasked_physical_gpu?: boolean | null;
+  unmaskedPhysicalGpu?: boolean | null;
+  gpu_label?: string | null;
+  gpuLabel?: string | null;
+  gpu_claim?: string | null;
+  status?: string | null;
+  detail?: string | null;
+  reasons?: readonly string[] | string | null;
+  vendor?: string | null;
+  renderer?: string | null;
+  unmaskedVendor?: string | null;
+  unmaskedRenderer?: string | null;
+  debugExtensionAvailable?: boolean | null;
+  webgl_debug_renderer_info?: boolean | null;
+  stealthTemplate?: boolean | null;
+  stealth_template?: boolean | null;
+  gpuTemplate?: boolean | null;
+  shaderPrecisionProfile?: string | null;
+  privacyHardened?: boolean | null;
+  [key: string]: unknown;
+}
+
+/** Known stealth-template renderer/vendor strings and generic "manufacturer" templates. */
+const INVARIANT_STEALTH_GPU_TEMPLATE =
+  /intel\s*(?:\(r\))?\s*iris\s*opengl\s*engine|intel\s*opengl\s*engine|\bintel\s+inc\.?\b.*\b(?:generic|opengl|basic)\s+(?:renderer|engine)|\bgeneric\s+(?:opengl|webgl)?\s*renderer|\bconstant\s+webgl\b/i;
+
+/** A positive hardware claim in a human-readable label/detail, with negation guarded. */
+function integratedHardwareClaimText(text: string): boolean {
+  if (!text) return false;
+  const claim =
+    /unmasked\s+(?:physical\s+)?gpu|physical\s+(?:hardware|gpu)|hardware\s+(?:anchor|identity|gpu|acceleration)|(?:is|verified|real)\s+hardware|hardware_visible/i;
+  const denial = /\b(?:not|never|cannot|no|non)[-\s]|masked|unavailable|unknown|software|unverified/i;
+  // Check clause by clause so "masked/unavailable — not physical hardware" is not a claim.
+  const clauses = text.split(/[.;!?\n]| - | — /);
+  return clauses.some((clause) => claim.test(clause) && !denial.test(clause));
+}
+
+/**
+ * Zero-contradiction guard for GPU truth. It adds three diagnostics, and ONLY three:
+ *  1. an unmasked/physical-hardware claim backed solely by spoofable masked
+ *     `gl.getParameter` strings (no usable `WEBGL_debug_renderer_info` identity);
+ *  2. the same class of hardware claim while the debug extension is masked / unavailable;
+ *  3. a stealth-template GPU string accepted as hardware.
+ *
+ * Software / SwiftShader renderers are never flagged as hardware claims here, and masking by
+ * itself (with no hardware claim) is never a diagnostic. Pure and total — never throws.
+ */
+export function checkGpuTruthInvariants(input: GpuTruthInvariantInput = {}): string[] {
+  try {
+    const source = input && typeof input === 'object' ? input : ({} as GpuTruthInvariantInput);
+    const records: unknown[] = [
+      source,
+      shadowField(source, 'gpu'),
+      shadowField(source, 'gpu_truth'),
+      shadowField(source, 'gpuTruth'),
+      shadowField(source, 'hardwareSignals'),
+      shadowField(source, 'webgl'),
+    ];
+    const diagnostics: string[] = [];
+
+    const truthState = integratedPickText(records, ['gpu_truth_state', 'gpuTruthState', 'state']);
+    const observation = integratedPickText(records, ['gpu_observation', 'gpuObservation', 'observation']);
+    const unmaskedVendor = integratedPickText(records, [
+      'unmaskedVendor', 'unmasked_vendor', 'vendor_unmasked', 'UNMASKED_VENDOR_WEBGL',
+    ]);
+    const unmaskedRenderer = integratedPickText(records, [
+      'unmaskedRenderer', 'unmasked_renderer', 'renderer_unmasked', 'UNMASKED_RENDERER_WEBGL',
+    ]);
+    const maskedVendor = integratedPickText(records, ['vendor', 'maskedVendor']);
+    const maskedRenderer = integratedPickText(records, ['renderer', 'maskedRenderer']);
+    const debugAvailable = integratedPickBool(records, [
+      'debugExtensionAvailable', 'debug_extension_available', 'webgl_debug_renderer_info',
+      'unmaskedInfoAvailable',
+    ]);
+    const templateFlag = integratedPickBool(records, [
+      'stealthTemplate', 'stealth_template', 'gpuTemplate', 'gpu_template', 'spoofedGpuTemplate',
+    ]);
+    const claimTokens = integratedPickTokens(records, [
+      'gpu_label', 'gpuLabel', 'gpu_claim', 'gpuClaim', 'claim', 'status', 'detail', 'label',
+      'reason', 'reasons', 'diagnostic',
+    ]);
+
+    // A claim may be an explicit boolean, an explicit truth state, or a human-readable label.
+    const claimFlag =
+      integratedPickBool(records, [
+        'claimed_hardware_anchor', 'hardware_claim', 'hardwareClaim', 'physical_gpu_claim',
+        'physicalGpuClaim', 'unmasked_physical_gpu', 'unmaskedPhysicalGpu', 'claimsUnmaskedGpu',
+        'physical_hardware', 'physicalHardware',
+      ]) === true;
+    const truthHardware =
+      truthState === 'hardware' || observation === 'hardware_visible' || claimFlag;
+    const claim =
+      claimFlag ||
+      integratedHardwareClaimText(claimTokens) ||
+      (truthHardware && (truthState === 'hardware' || observation === 'hardware_visible'));
+
+    const usableUnmasked = (value: string): boolean => {
+      const text = normalizedGpuValue(value);
+      if (isGpuNamePlaceholder(text)) return false;
+      if (SOFTWARE_OR_VIRTUAL_GPU_IDENTIFIER.test(text) || GOOGLE_SOFTWARE_VENDOR.test(text)) return false;
+      return true;
+    };
+    const hasUnmaskedIdentity = usableUnmasked(unmaskedVendor) || usableUnmasked(unmaskedRenderer);
+    const maskedStringsPresent = Boolean(normalizedGpuValue(maskedVendor) || normalizedGpuValue(maskedRenderer));
+    const maskedState =
+      debugAvailable === false ||
+      truthState === 'masked' ||
+      truthState === 'unknown' ||
+      observation === 'masked_by_privacy' ||
+      observation === 'observation_unavailable';
+
+    // 1 & 2. A hardware claim is only admissible with a real, unmasked identity. Masked
+    // strings from gl.getParameter (and a masked/absent debug extension) are spoofable and
+    // can never establish "physical hardware".
+    if (claim && !hasUnmaskedIdentity && maskedStringsPresent) {
+      diagnostics.push(
+        "an 'unmasked physical GPU' hardware claim is backed only by spoofable masked gl.getParameter strings; no WEBGL_debug_renderer_info identity was observed"
+      );
+    }
+    if (claim && !hasUnmaskedIdentity && maskedState) {
+      diagnostics.push(
+        'a masked/unavailable WEBGL_debug_renderer_info extension cannot support a physical-hardware claim'
+      );
+    }
+
+    // 3. Known forged GPU strings (stealth templates) are not hardware anchors, even when a
+    // resolver promoted them to `hardware`.
+    const templateString =
+      INVARIANT_STEALTH_GPU_TEMPLATE.test(`${maskedVendor} ${maskedRenderer}`) ||
+      INVARIANT_STEALTH_GPU_TEMPLATE.test(`${unmaskedVendor} ${unmaskedRenderer}`);
+    if ((templateFlag === true || templateString) && (truthHardware || claim)) {
+      diagnostics.push(
+        'a stealth-template GPU string must not be accepted as a hardware / unmasked physical GPU observation'
+      );
+    }
+    return diagnostics;
+  } catch {
+    return [];
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Audio identity                                                             */
+/* -------------------------------------------------------------------------- */
+
+export interface AudioIdentityInvariantInput {
+  stability?: string | null;
+  audio_stability?: string | null;
+  usableForIdentity?: boolean | null;
+  noiseReasons?: readonly string[] | string | null;
+  renderSums?: readonly number[] | null;
+  getChannelDataWrapped?: boolean | null;
+  copyFromChannelMatches?: boolean | null;
+  silentBufferNonZero?: boolean | null;
+  audioSilentBufferNonZero?: boolean | null;
+  audioRepeatReadDiverged?: boolean | null;
+  audioNoise?: boolean | null;
+  audio_noise?: boolean | null;
+  privacyHardened?: boolean | null;
+  tamperingInconclusive?: boolean | null;
+  identity_rotated?: boolean | null;
+  identityRotated?: boolean | null;
+  visitor_id_changed?: boolean | null;
+  visitorIdChanged?: boolean | null;
+  id_changed?: boolean | null;
+  identity_before?: string | null;
+  identity_after?: string | null;
+  visitor_id_before?: string | null;
+  visitor_id_after?: string | null;
+  confidence_dropped?: boolean | null;
+  confidenceDropped?: boolean | null;
+  confidence_drop?: number | null;
+  confidence_before?: number | null;
+  confidence_after?: number | null;
+  score_before?: number | null;
+  score_after?: number | null;
+  confidence_delta?: number | null;
+  [key: string]: unknown;
+}
+
+/**
+ * Noise in the audio fingerprint may only *exclude* that signal from the identity anchor.
+ * It can never rotate an identity or lower a confidence score. Reports a contradiction only
+ * when both sides were actually observed: noise/repeat-read divergence plus a published
+ * rotation or confidence drop. Pure and total — never throws.
+ */
+export function checkAudioIdentityInvariants(input: AudioIdentityInvariantInput = {}): string[] {
+  try {
+    const source = input && typeof input === 'object' ? input : ({} as AudioIdentityInvariantInput);
+    const records: unknown[] = [
+      source,
+      shadowField(source, 'audio'),
+      shadowField(source, 'audio_truth'),
+      shadowField(source, 'audioTruth'),
+      shadowField(source, 'audioStability'),
+      shadowField(source, 'identity'),
+      shadowField(source, 'confidence'),
+    ];
+    const diagnostics: string[] = [];
+
+    const stability = integratedPickText(records, ['stability', 'audio_stability', 'audioStability']);
+    const noiseReasons = integratedPickTokens(records, ['noiseReasons', 'noise_reasons']);
+    const sums = integratedFiniteArray(integratedPick(records, ['renderSums', 'render_sums']));
+    let divergent = false;
+    if (sums.length > 1) {
+      const first = sums[0];
+      for (let i = 1; i < sums.length; i += 1) {
+        if (sums[i] !== first) {
+          divergent = true;
+          break;
+        }
+      }
+    } else if (Array.isArray(integratedPick(records, ['renderSums', 'render_sums'])) && sums.length === 0) {
+      // No finite render at all is "unavailable", never noise on its own.
+      divergent = false;
+    }
+    const noise =
+      stability === 'noisy' ||
+      Boolean(noiseReasons.trim()) ||
+      divergent ||
+      integratedPickBool(records, [
+        'audioNoise', 'audio_noise', 'noiseObserved', 'getChannelDataWrapped',
+        'silentBufferNonZero', 'audioSilentBufferNonZero', 'audioRepeatReadDiverged',
+      ]) === true ||
+      integratedPickBool(records, ['usableForIdentity', 'usable_for_identity']) === false
+        ? true
+        : integratedPickBool(records, ['copyFromChannelMatches', 'copy_from_channel_matches']) === false;
+    if (!noise) return [];
+
+    const beforeId = integratedPickText(records, [
+      'identity_before', 'identityBefore', 'visitor_id_before', 'visitorIdBefore',
+    ]);
+    const afterId = integratedPickText(records, [
+      'identity_after', 'identityAfter', 'visitor_id_after', 'visitorIdAfter',
+    ]);
+    const rotated =
+      integratedPickBool(records, [
+        'identity_rotated', 'identityRotated', 'visitor_id_changed', 'visitorIdChanged',
+        'id_changed', 'idChanged', 'identity_changed',
+      ]) === true ||
+      (Boolean(beforeId) && Boolean(afterId) && beforeId !== afterId);
+    if (rotated) {
+      diagnostics.push(
+        'audio noise / repeat-read divergence must never rotate the identity: noise may only remove the audio anchor'
+      );
+    }
+
+    const beforeScore = integratedPickNumber(records, [
+      'confidence_before', 'confidenceBefore', 'score_before', 'scoreBefore', 'rawScore',
+    ]);
+    const afterScore = integratedPickNumber(records, [
+      'confidence_after', 'confidenceAfter', 'score_after', 'scoreAfter', 'confidence',
+    ]);
+    const dropped =
+      integratedPickBool(records, ['confidence_dropped', 'confidenceDropped', 'confidenceDrop']) === true ||
+      (beforeScore !== undefined && afterScore !== undefined && afterScore < beforeScore) ||
+      (integratedPickNumber(records, ['confidence_drop', 'confidence_delta', 'confidenceDelta']) ?? 0) < 0;
+    if (dropped) {
+      diagnostics.push(
+        'audio noise / repeat-read divergence must never drop a confidence score: only anchor eligibility may change'
+      );
+    }
+    return diagnostics;
+  } catch {
+    return [];
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Privacy noise                                                              */
+/* -------------------------------------------------------------------------- */
+
+export interface PrivacyNoiseInvariantInput {
+  privacyHardened?: boolean | null;
+  privacy_hardened?: boolean | null;
+  privacySettings?: boolean | { detected?: boolean | null } | null;
+  privacy_settings?: boolean | { detected?: boolean | null } | null;
+  vendorSignature?: string | null;
+  vendor_signature?: string | null;
+  braveShields?: boolean | null;
+  torBrowser?: boolean | null;
+  firefoxFpp?: boolean | null;
+  resistFingerprinting?: boolean | null;
+  safariAtfp?: boolean | null;
+  userAgent?: string | null;
+  canvasNoise?: boolean | null;
+  audioNoise?: boolean | null;
+  shaderNoise?: boolean | null;
+  noiseObserved?: boolean | null;
+  audioPrivacyNoise?: boolean | null;
+  audioSilentBufferNonZero?: boolean | null;
+  prototypeProxy?: boolean | null;
+  iframeStealthTrap?: boolean | null;
+  hardContradiction?: boolean | null;
+  contradiction_evidence?: boolean | null;
+  contradictionEvidence?: boolean | null;
+  forged_privacy_signature?: boolean | null;
+  anti_detect_browser?: boolean | null;
+  antiDetectBrowser?: boolean | null;
+  anomaly_score?: number | null;
+  anomalyScore?: number | null;
+  tampering?: { anti_detect_browser?: boolean | null } | null;
+  tampering_details?: { anti_detect_browser?: boolean | null } | null;
+  [key: string]: unknown;
+}
+
+/** Accepted vendor signatures whose noise is an expected privacy defence, not anti-detect. */
+const INVARIANT_ACCEPTED_PRIVACY_VENDOR =
+  /brave|braveshields|firefox[-\s]?(?:rfp|fpp|resistfingerprinting)|torbrowser|\btor\b|safari[-\s]?(?:afp|advanced)|resistfingerprinting/i;
+
+/**
+ * Noise from a privacy-hardened browser (Brave / Firefox RFP / Tor / Safari AFP) must never be
+ * scored as `anti_detect_browser` nor raise `anomaly_score`. An explicit hard contradiction /
+ * forged-signature finding is the sole exemption. Does not feed the core spec verdict and does
+ * not change any privacy / SwiftShader exemption. Pure and total — never throws.
+ */
+export function checkPrivacyNoiseInvariants(input: PrivacyNoiseInvariantInput = {}): string[] {
+  try {
+    const source = input && typeof input === 'object' ? input : ({} as PrivacyNoiseInvariantInput);
+    const records: unknown[] = [
+      source,
+      shadowField(source, 'privacy'),
+      shadowField(source, 'privacy_settings'),
+      shadowField(source, 'privacySettings'),
+      shadowField(source, 'tampering'),
+      shadowField(source, 'tampering_details'),
+      shadowField(source, 'tamperingDetails'),
+    ];
+    const diagnostics: string[] = [];
+
+    const vendor = integratedPickText(records, ['vendorSignature', 'vendor_signature']);
+    const privacyContext: PrivacyContext = {
+      privacyHardened: integratedPickBool(records, ['privacyHardened', 'privacy_hardened']) ?? false,
+      firefoxFpp: integratedPickBool(records, ['firefoxFpp', 'firefox_fpp']) ?? false,
+      resistFingerprinting: integratedPickBool(records, ['resistFingerprinting', 'resist_fingerprinting']) ?? false,
+      safariAtfp: integratedPickBool(records, ['safariAtfp', 'safari_afp']) ?? false,
+      torBrowser: integratedPickBool(records, ['torBrowser', 'tor_browser']) ?? false,
+      braveShields: integratedPickBool(records, ['braveShields', 'brave_shields']) ?? false,
+      userAgent: integratedPickText(records, ['userAgent', 'user_agent']),
+    };
+    const privacyEvidence =
+      resolvePrivacyHardened(privacyContext) ||
+      INVARIANT_ACCEPTED_PRIVACY_VENDOR.test(vendor) ||
+      integratedBool(source, 'privacy_settings') === true ||
+      integratedBool(source, 'privacySettings') === true;
+    const noise =
+      integratedPickBool(records, [
+        'canvasNoise', 'canvas_noise', 'audioNoise', 'audio_noise', 'shaderNoise', 'shader_noise',
+        'noiseObserved', 'audioPrivacyNoise', 'audioSilentBufferNonZero', 'prototypeProxy',
+        'iframeStealthTrap',
+      ]) === true;
+    if (!privacyEvidence) return [];
+
+    const exempt =
+      integratedPickBool(records, [
+        'hardContradiction', 'hard_contradiction', 'contradiction_evidence', 'contradictionEvidence',
+        'forged_privacy_signature', 'forgedPrivacySignature',
+      ]) === true;
+    if (exempt) return [];
+
+    const antiDetect = integratedBool(source, 'anti_detect_browser') ??
+      integratedBool(source, 'antiDetectBrowser') ??
+      integratedPickBool(records, ['anti_detect_browser', 'antiDetectBrowser']) === true;
+    const anomalyScore = integratedPickNumber(records, ['anomaly_score', 'anomalyScore']);
+    if (!noise && antiDetect !== true && !(anomalyScore !== undefined && anomalyScore > 0)) return [];
+
+    if (antiDetect === true) {
+      diagnostics.push(
+        'privacy-hardened noise must not be scored as anti_detect_browser=true without a hard contradiction'
+      );
+    }
+    if (anomalyScore !== undefined && anomalyScore > 0) {
+      diagnostics.push(
+        'privacy-hardened noise must not raise anomaly_score above 0 without a hard contradiction'
+      );
+    }
+    return diagnostics;
+  } catch {
+    return [];
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Geolocation proximity                                                      */
+/* -------------------------------------------------------------------------- */
+
+export interface GeolocationProximityInvariantInput {
+  permission?: string | null;
+  geolocation_permission?: string | null;
+  geolocationPermission?: string | null;
+  geo_permission?: string | null;
+  lat?: number | null;
+  lon?: number | null;
+  latitude?: number | null;
+  longitude?: number | null;
+  accuracyM?: number | null;
+  accuracy_m?: number | null;
+  ipCity?: unknown;
+  ip_city?: unknown;
+  city?: unknown;
+  proximity?: unknown;
+  hex_proximity?: unknown;
+  hexProximity?: unknown;
+  proximity_populated?: boolean | null;
+  proximityPopulated?: boolean | null;
+  proximity_source?: string | null;
+  proximitySource?: string | null;
+  source?: string | null;
+  position?: unknown;
+  coords?: unknown;
+  geolocation?: unknown;
+  result?: unknown;
+  proximityResult?: unknown;
+  [key: string]: unknown;
+}
+
+/** True only for the exact string `granted` — no trim, case-fold or coercion. */
+function integratedPermissionGranted(value: unknown): boolean {
+  return typeof value === 'string' && value === 'granted';
+}
+
+function integratedHasValue(value: unknown): boolean {
+  if (value === undefined || value === null || value === false) return false;
+  if (typeof value === 'string') return value.trim().length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  return true;
+}
+
+/**
+ * Permission gate for proximity. Two contradictions are reported:
+ *  1. a proximity populated from an IP city while geolocation permission is not `granted`;
+ *  2. granted browser coordinates that were ignored (no proximity derived from the fix, or
+ *     an IP/geoip source substituted for the granted fix).
+ * Absence of a fix with no published proximity is never a diagnostic. Pure and total.
+ */
+export function checkGeolocationProximityInvariants(
+  input: GeolocationProximityInvariantInput = {}
+): string[] {
+  try {
+    const source = input && typeof input === 'object' ? input : ({} as GeolocationProximityInvariantInput);
+    const geo = shadowField(source, 'geolocation');
+    const position = shadowField(source, 'position') ?? shadowField(geo, 'position');
+    const coords = shadowField(source, 'coords') ?? shadowField(position, 'coords');
+    const records: unknown[] = [
+      source, geo, position, coords,
+      shadowField(source, 'result'), shadowField(source, 'proximityResult'),
+    ];
+    const diagnostics: string[] = [];
+
+    const permissionRaw = integratedPick(records, [
+      'permission', 'geolocation_permission', 'geolocationPermission', 'geo_permission',
+    ]);
+    const granted = integratedPermissionGranted(permissionRaw);
+
+    const lat = integratedPickNumber(records, ['lat', 'latitude']);
+    const lon = integratedPickNumber(records, ['lon', 'longitude']);
+    const accuracyM = integratedPickNumber(records, ['accuracyM', 'accuracy_m', 'accuracy']);
+    const hasValidFix =
+      lat !== undefined && lat >= -90 && lat <= 90 &&
+      lon !== undefined && lon >= -180 && lon <= 180 &&
+      accuracyM !== undefined && accuracyM > 0;
+
+    const published = integratedPick(records, [
+      'proximity', 'hex_proximity', 'hexProximity', 'proximity_populated', 'proximityPopulated',
+    ]);
+    const publishedProximity = integratedHasValue(published);
+    const sourceLabel = integratedPickText(records, [
+      'proximity_source', 'proximitySource', 'source', 'reason',
+    ]).toLowerCase();
+    const ipDerived = /\bip\b|geoip|ip[-\s_]?(?:city|geolocat|lookup)|city[-\s_]?lookup/i.test(sourceLabel);
+
+    if (!granted && publishedProximity) {
+      diagnostics.push(
+        "proximity must not be populated from an IP city when geolocation permission is not exactly 'granted'"
+      );
+    }
+    if (granted && hasValidFix && (!publishedProximity || ipDerived)) {
+      diagnostics.push(
+        'granted browser coordinates were ignored: proximity must derive from the granted fix, never from IP geolocation'
+      );
+    }
+    return diagnostics;
+  } catch {
+    return [];
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Active CDP inspector                                                       */
+/* -------------------------------------------------------------------------- */
+
+export interface ActiveCdpInvariantInput {
+  activeCdpInspection?: boolean | null;
+  active_cdp_inspection?: boolean | null;
+  secondClientAttached?: boolean | null;
+  second_client_attached?: boolean | null;
+  secondCdpInspector?: boolean | null;
+  second_cdp_inspector?: boolean | null;
+  runtimeEnableCount?: number | null;
+  nameGetterCount?: number | null;
+  prepareStackTraceCount?: number | null;
+  state?: string | null;
+  activeCdpState?: string | null;
+  inspector_state?: string | null;
+  inspectorState?: string | null;
+  cdp_attached?: boolean | null;
+  developer_tools?: boolean | null;
+  cdpAttached?: boolean | null;
+  strongCdpProof?: boolean | null;
+  developerTools?: boolean | null;
+  devtoolsActiveVerified?: boolean | null;
+  devtoolsAttached?: boolean | null;
+  reason_ids?: readonly string[] | string | null;
+  reasons?: readonly string[] | string | null;
+  [key: string]: unknown;
+}
+
+/** Inspector spellings that represent DevTools UI evidence only, never a protocol binding. */
+const DEVTOOLS_ONLY_STATES: ReadonlySet<string> = new Set([
+  'devtools_active_verified', 'devtools_docked_suspected', 'docked_devtools',
+]);
+
+/**
+ * A second, actively inspecting CDP client is protocol attachment evidence. It must be
+ * published on the `cdp_attached` axis; it can never be relabelled `developer_tools` unless a
+ * verified DevTools UI canary corroborates it (`yes-corroborated` / `corroborated`). Pure and
+ * total — never throws, and never changes the existing inspector mapping.
+ */
+export function checkActiveCdpInvariants(input: ActiveCdpInvariantInput = {}): string[] {
+  try {
+    const source = input && typeof input === 'object' ? input : ({} as ActiveCdpInvariantInput);
+    const records: unknown[] = [
+      source,
+      shadowField(source, 'activeCdp'),
+      shadowField(source, 'active_cdp'),
+      shadowField(source, 'automation'),
+      shadowField(source, 'inspector'),
+    ];
+    const diagnostics: string[] = [];
+
+    const state = integratedPickText(records, [
+      'state', 'activeCdpState', 'active_cdp_state', 'inspector_state', 'inspectorState',
+    ]);
+    const reasonTokens = integratedPickTokens(records, ['reason_ids', 'reasonIds', 'reasons']);
+    const secondClient = integratedPickBool(records, [
+      'secondClientAttached', 'second_client_attached', 'secondCdpInspector', 'second_cdp_inspector',
+      'activeCdpInspection', 'active_cdp_inspection',
+    ]) === true;
+    const runtimeCount = integratedPickNumber(records, ['runtimeEnableCount', 'runtime_enable_count']) ?? 0;
+    const nameCount = integratedPickNumber(records, ['nameGetterCount', 'name_getter_count']) ?? 0;
+    const prepareCount = integratedPickNumber(records, ['prepareStackTraceCount', 'prepare_stack_trace_count']) ?? 0;
+    const cdpProbe =
+      integratedPickBool(records, ['cdpAttached', 'cdpAttachedProof', 'strongCdpProof']) === true;
+    const activeCdp =
+      secondClient ||
+      prepareCount > 0 ||
+      (secondClient && runtimeCount > 0) ||
+      reasonTokens.includes('bot.cdp-active-inspection') ||
+      state === 'automation_protocol_inspection_active' ||
+      state === 'automation_protocol_attached' ||
+      state === 'yes-unattributed' ||
+      state === 'yes-corroborated' ||
+      cdpProbe;
+    if (!activeCdp) return [];
+
+    const uiVerified =
+      integratedPickBool(records, ['devtoolsActiveVerified', 'devtoolsAttached', 'developerTools']) === true;
+    const publishedCdp = integratedPickBool(records, ['cdp_attached', 'cdpAttachedPublished']);
+    const publishedDevtools = integratedPickBool(records, ['developer_tools', 'developerToolsPublished']);
+    const corroborated =
+      state === 'corroborated' || state === 'yes-corroborated' ||
+      (publishedCdp === true && publishedDevtools === true) ||
+      (cdpProbe && uiVerified && state !== 'automation_protocol_inspection_active');
+    if (corroborated) return [];
+
+    if (publishedDevtools === true || DEVTOOLS_ONLY_STATES.has(state)) {
+      diagnostics.push(
+        'a second active CDP inspector must not be published as developer_tools: protocol attachment belongs on the cdp_attached axis'
+      );
+    }
+    if (publishedCdp === false || state === 'no' || state === 'closed' || DEVTOOLS_ONLY_STATES.has(state)) {
+      diagnostics.push(
+        'an active CDP inspector cannot be collapsed to no inspector / cdp_attached=false'
+      );
+    }
+    return diagnostics;
+  } catch {
+    return [];
+  }
+}

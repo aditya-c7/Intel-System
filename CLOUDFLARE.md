@@ -78,6 +78,24 @@ npm run build
 node scripts/build-worker.mjs
 ```
 
+## Benchmark report (shadow / offline)
+
+The frozen benchmark corpus for the truth/helper modules lives in
+`scripts/fixtures/benchmark15.json` (schema_version 1, `frozen: true`, 15 cases) and is driven by
+`scripts/test-benchmark15.ts`:
+
+```sh
+npx tsx scripts/test-benchmark15.ts
+```
+
+It is **SHADOW-OFFLINE**: pure, already-in-repo helper modules only; the sole I/O is reading the
+frozen fixture. It makes no live requests, launches no browser, does not deploy, and writes no
+files. The **report is the stdout trace** — a per-case PASS / FAIL / SKIP listing followed by the
+`RESULT` line. A missing helper is reported as SKIP with an explicit reason; any FAIL exits
+non-zero. Expectations are golden — never edit an expected value to make a case green; fix the
+implementation instead. Passing this local harness is not a production-deployment signal; deploy
+remains the manual gate above.
+
 ## Incognito diagnostics capture (shadow)
 
 This is a manual, opt-in procedure gated by the same deploy rules as everything else: deploy only via the human gate above after verification passes; there is no auto-deploy.
@@ -92,4 +110,15 @@ The `intelDiag` flag is off by default, adds no UI, and does not affect any verd
 
 ## Implementation status
 
-For the honest, code-path-level state of the current integration wave — what is live/integrated, shadow-only, or backlog; the locked constraints (0–10, uncalibrated, zero alarms, no new panels, manual deploy, zero SDK); the phase history; and the diagnostics capture procedure — see [docs/IMPLEMENTATION_STATUS.md](./docs/IMPLEMENTATION_STATUS.md). This deployment guide remains the source of truth for the manual deploy command and Cloudflare configuration.
+For the honest, code-path-level state of the integration wave **and the remaining-fix wave** — what is wired (audio identity stability, GPU truth from masked/unmasked strings, the permission-gated geolocation bridge with no IP fallback, privacy-noise suppression, active-CDP state, headless shell/new granularity) versus helper-only or not-yet-published (extra `points: 0` evidence, confidence stability, identity scope, media preferences) — see
+[docs/IMPLEMENTATION_STATUS.md](./docs/IMPLEMENTATION_STATUS.md). It also records the locked
+constraints (0–10, uncalibrated, zero alarms, no new panels, manual deploy, zero SDK), the
+benchmark report location (§6 there), the phase history and the diagnostics capture procedure.
+This deployment guide remains the source of truth for the manual deploy command and Cloudflare
+configuration.
+
+Additive truth/observation mirrors declared on the telemetry envelope are optional and
+verbatim: a field the server did not publish stays absent and is never re-derived into a score,
+tier or verdict in the browser. Several declared mirrors have no producer in the current
+working tree (see §4 of the status document). One bridge that *is* wired is proximity: the
+identify route admits only a browser-granted fix, with no IP fallback.
