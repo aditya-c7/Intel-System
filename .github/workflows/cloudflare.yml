@@ -30,5 +30,5 @@ jobs:
         env:
           WRANGLER_SEND_METRICS: 'false'
       - run: node scripts/test-worker.mjs
-      - name: Run the full aggregate suite (strict browser mode: a browser SKIP fails CI)
+      - name: "Run the full aggregate suite (strict browser mode: a browser SKIP fails CI)"
         run: npm run test:all

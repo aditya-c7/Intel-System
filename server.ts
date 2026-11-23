@@ -2131,7 +2131,8 @@ function userAgentsCompatible(headerUserAgent: string, payloadUserAgent: string)
   return true;
 }
 
-const AUTOMATION_UA_PATTERN = /playwright|puppeteer|selenium|cypress|phantomjs/i;
+const AUTOMATION_UA_PATTERN =
+  /playwright|puppeteer|selenium|cypress|phantomjs|headlesschrome|headless[_-]?shell|chrome-headless-shell/i;
 
 const DATACENTER_NETWORK_PATTERN =
   /\b(amazon|amazonaws|aws|google cloud|azure|microsoft azure|digitalocean|hetzner|linode|akamai|ovh|vultr|oracle cloud|alibaba|aliyun|tencent|leaseweb|contabo|m247|choopa|datacamp)\b/i;
@@ -6886,7 +6887,13 @@ function sanitizeAndReinforceSecuritySignals(
   const cdpDetected = strongCdpProof && Boolean(raw?.cdpDetected);
   const verifiedIsBot = strongCdpProof && Boolean(raw?.isBot);
   const verifiedStealthPlugin = strongCdpProof && Boolean(raw?.stealthPluginDetected);
-  const isHeadless = Boolean(raw?.isHeadless);
+  // The HTTP User-Agent is server-observed evidence; a bare client-side isHeadless claim is not.
+  // Detect the headless token from the real request header so a forged "human" body cannot hide
+  // a HeadlessChrome / headless_shell client. Keep the client hint as a secondary signal.
+  const serverObservedHeadlessUa = /headlesschrome|headless[_-]?shell|chrome-headless-shell|phantomjs|slimerjs/i.test(
+    requestContext.requestUserAgent ?? ''
+  );
+  const isHeadless = Boolean(raw?.isHeadless) || serverObservedHeadlessUa;
   const rawBotReason =
     typeof raw?.botReason === 'string' && raw.botReason.trim()
       ? raw.botReason.trim().slice(0, 200)
@@ -6931,11 +6938,21 @@ function sanitizeAndReinforceSecuritySignals(
       raw?.automationEnvironment === 'electron' ||
       raw?.automationEnvironment === 'ide_webview'
   );
+  // A server-observed HeadlessChrome / headless_shell User-Agent is protocol-level automation
+  // evidence, not a spoofable client claim. It belongs in the same hard-automation set as the
+  // stealth / anti-detect artifacts so the tile reaches the 9/10 tier and is labelled as headless
+  // automation. A signed / verified agent classification still wins first: never escalate an
+  // ai_agent / good_bot verdict on the strength of the UA alone.
+  const headlessAutomationEvidence =
+    serverObservedHeadlessUa &&
+    requestContext.botClassification?.subtype !== 'ai_agent' &&
+    requestContext.botClassification?.subtype !== 'good_bot';
   const stealthAutomation = Boolean(
     verifiedStealthPlugin ||
       antiDetectBrowser ||
       automationTargetedTampering ||
-      requestContext.corroboratedCdpEscalation
+      requestContext.corroboratedCdpEscalation ||
+      headlessAutomationEvidence
   );
   // A bare CDP Runtime leak proves automation, but it is not active deception: stock Playwright
   // and Puppeteer always emit it. Only plugin patches, an anti-detect footprint, automation-
@@ -6945,7 +6962,8 @@ function sanitizeAndReinforceSecuritySignals(
     verifiedStealthPlugin ||
       antiDetectBrowser ||
       automationTargetedTampering ||
-      requestContext.corroboratedCdpEscalation
+      requestContext.corroboratedCdpEscalation ||
+      headlessAutomationEvidence
   );
   const hardAutomationReasons: string[] = [];
   if (automationTargetedTampering) {
@@ -6964,6 +6982,9 @@ function sanitizeAndReinforceSecuritySignals(
   }
   if (mlTampering) {
     hardAutomationReasons.push(`Browser tampering ML score ${tamperingMlScore.toFixed(3)}`);
+  }
+  if (headlessAutomationEvidence) {
+    hardAutomationReasons.push('Headless browser user-agent (server-observed automation runtime)');
   }
   if (requestContext.corroboratedCdpEscalation) {
     hardAutomationReasons.push(
@@ -7726,9 +7747,9 @@ function sanitizeAndReinforceSecuritySignals(
   // claim may diverge from the boolean in the JSON.
   const vmLike = isVm;
   // A genuine hypervisor host / spoofed environment is 6, an emulator 8, cryptographic tampering
-  // 10. A software renderer is an honest environment observation (3), NEVER a confirmed VM and
-  // NEVER "Physical Hardware". An UNKNOWN / masked / unavailable renderer is absence of evidence,
-  // so it scores 0 — a bare cloud egress scores 0 on this tile too.
+  // 10. Software-rendered AND masked / unavailable renderers are honest environment observations
+  // (3) — hardware reliability is unverified either way. This is NEVER a confirmed VM and NEVER
+  // "Physical Hardware"; a real, unmasked physical GPU still scores 0.
   const vmScore = tamperedRequest || replayDetected
     ? 10
     : emulatorDetected
@@ -7737,7 +7758,7 @@ function sanitizeAndReinforceSecuritySignals(
     ? 6
     : isTampered
     ? 6
-    : softwareRenderedGpu
+    : softwareRenderedGpu || isGpuMaskedOrUnavailable
     ? 3
     : hasRealUnmaskedGpu
     ? 0
@@ -9338,10 +9359,16 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
           ?.automationTargetedTampering
       )
     );
+    // A server-observed headless User-Agent is protocol-level automation evidence even when the
+    // client body claims a normal browser. Signed-good agents are resolved later and still win.
+    const serverHeadlessUaForAutomation = /headlesschrome|headless[_-]?shell|chrome-headless-shell|phantomjs|slimerjs/i.test(
+      fullRequestUserAgent || ''
+    );
     let hardAutomationSignals =
       (!rfpExemptRequest || automationTargetedTampering) &&
       Boolean(
         automationTargetedTampering ||
+          serverHeadlessUaForAutomation ||
           (strongCdpProof && rawSecuritySignals?.stealthPluginDetected) ||
           rawSecuritySignals?.tamperingDetails?.anti_detect_browser
       );
