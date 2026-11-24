@@ -23,6 +23,14 @@ import {
   normalizeWebGpuSurfaces,
   normalizeWebglSurfaces,
 } from '../src/lib/entropyMatrix.ts';
+import {
+  EMOJI_DOMRECT_METRICS,
+  FONT_PREFERENCE_PRESETS,
+  FPJS15_VECTOR_KEYS,
+  FJS_V5_HIGH_VALUE_FONT_FAMILIES,
+  LOCATION_INFO_FIELDS,
+  buildFjsV5ParitySnapshot,
+} from '../src/lib/fjsV5Parity.ts';
 
 let passed = 0;
 const failures: string[] = [];
@@ -280,6 +288,126 @@ for (const [name, fn] of suites) {
   else console.log(`  non-deterministic: ${name}`);
 }
 check('repeated normalization is byte-identical for all surfaces', deterministicOk === suites.length, `${deterministicOk}/${suites.length}`);
+
+/* -------------------------------------------------------------------------- */
+/* FJS-v5 parity snapshot (additive shadow surface — checks added only)        */
+/* -------------------------------------------------------------------------- */
+section('buildFjsV5ParitySnapshot (shadow parity)');
+
+// Existing normalizers above are untouched; these checks only READ the new snapshot.
+const paritySample = {
+  fonts: { installed: ['Arial', 'Segoe UI'], platformClassGuess: 'windows' },
+  rawFonts: ['Verdana'],
+  fontPreferences: { widths: { default: 42.5, apple: 43, serif: null }, widthsExactIntegers: false },
+  emoji: { font: 'serif', width: 17.25, height: 18, x: 0, top: null },
+  math: { values: { acos: '0.123', sin: '-0.5' }, vector: [1, 2] },
+  location: { publicIp: '203.0.113.7', city: 'Test', latitude: null, isVpnOrHosting: false },
+  battery: { level: 0.9 },
+  keyboard: { keys: ['a'] },
+};
+
+const parity = buildFjsV5ParitySnapshot(paritySample);
+
+check('snapshot surface is stable and namespaced', parity.surface === 'fjs-v5-parity' && parity.status === 'ok', parity.status);
+check('snapshot is deterministic (repeat calls byte-identical)', same(parity, buildFjsV5ParitySnapshot(paritySample)), 'repeat call');
+check('snapshot is input-order independent for detection sets', same(
+  buildFjsV5ParitySnapshot({ fonts: { installed: ['Arial', 'Verdana'], platformClassGuess: 'linux' } }).fontCoverage.families,
+  buildFjsV5ParitySnapshot({ fonts: { installed: ['Verdana', 'Arial'], platformClassGuess: 'linux' } }).fontCoverage.families
+), 'shuffled detections');
+check('16 canonical high-value families, each with a 3-way status',
+  FJS_V5_HIGH_VALUE_FONT_FAMILIES.length === 16 && parity.fontCoverage.families.length === 16 &&
+  parity.fontCoverage.families.every((entry) => ['present', 'derived', 'absent'].includes(entry.status)),
+  `${FJS_V5_HIGH_VALUE_FONT_FAMILIES.length} families`);
+check('literal detections are the only "present" families',
+  same(parity.fontCoverage.families.filter((f) => f.status === 'present').map((f) => f.family), ['Arial', 'Segoe UI', 'Verdana']),
+  JSON.stringify(parity.fontCoverage.families.filter((f) => f.status === 'present').map((f) => f.family)));
+check('platform-class markers are labelled derived, never detected',
+  parity.fontCoverage.families.some((f) => f.status === 'derived' && !f.detected && f.reason === 'derived-from-platform-class-marker') &&
+  parity.fontCoverage.families.every((f) => !f.detected || f.reason === 'direct-detection'),
+  `derived=${parity.fontCoverage.counts.derived}`);
+check('family counts mirror the family list',
+  parity.fontCoverage.counts.present + parity.fontCoverage.counts.derived + parity.fontCoverage.counts.absent === 16 &&
+  parity.fontCoverage.counts.present === parity.fontCoverage.families.filter((f) => f.status === 'present').length,
+  JSON.stringify(parity.fontCoverage.counts));
+check('no fabricated detection: detected=true implies literal input membership',
+  parity.fontCoverage.families.every((f) =>
+    !f.detected || ['arial', 'segoe ui', 'verdana'].includes(f.family.toLowerCase())),
+  'detection provenance');
+check('emoji reports DOMRect metric presence from the existing shape',
+  EMOJI_DOMRECT_METRICS.length === 8 && same(parity.emoji.present, ['width', 'height', 'x']) &&
+  parity.emoji.status === 'present' && parity.emoji.declaredFontStack,
+  JSON.stringify(parity.emoji.present));
+check('math reports FPJS 15-vector presence without emitting values',
+  FPJS15_VECTOR_KEYS.length === 15 && parity.math.count === 3 &&
+  same(parity.math.present, ['acos', 'acosh', 'sin']) &&
+  !('values' in parity.math) && !('hash' in parity.math),
+  JSON.stringify(parity.math.present));
+check('fontPreferences reports the 7 presets and integer flag',
+  FONT_PREFERENCE_PRESETS.length === 7 && same(parity.fontPreferences.measured, ['default', 'apple']) &&
+  parity.fontPreferences.widthsExactIntegers === false && parity.fontPreferences.status === 'present',
+  JSON.stringify(parity.fontPreferences.measured));
+check('geoFields reports LocationInfo field parity',
+  LOCATION_INFO_FIELDS.length === 14 && parity.geoFields.status === 'partial' &&
+  ['city', 'isVpnOrHosting', 'publicIp'].every((f) => parity.geoFields.present.includes(f)) &&
+  ['asn', 'country', 'isp'].every((f) => parity.geoFields.missing.includes(f)),
+  JSON.stringify(parity.geoFields.present));
+check('battery is honestly absent (no client producer)',
+  parity.battery.status === 'absent' && parity.battery.consumer === 'none' && parity.battery.dataProvided === true,
+  JSON.stringify(parity.battery));
+check('keyboard is honestly descriptive (no verdict consumer)',
+  parity.keyboard.status === 'descriptive' && parity.keyboard.consumer === 'none' && parity.keyboard.dataProvided === true,
+  JSON.stringify(parity.keyboard));
+
+// Additive-only: no mutation of the caller's payload, envelope fields, or scores.
+const frozenInput = Object.freeze({
+  fonts: Object.freeze({ installed: Object.freeze(['Arial']) }),
+  location: Object.freeze({ publicIp: '198.51.100.1' }),
+  envelope: Object.freeze({ timestamp: 1, nonce: 'n', hardwareId: 'h', userAgent: 'ua', platform: 'p', screenResolution: 's', timezone: 't' }),
+  risk: Object.freeze({ score_0_100: 42 }),
+});
+const beforeFrozen = JSON.stringify(frozenInput);
+const frozenSnapshot = buildFjsV5ParitySnapshot(frozenInput);
+check('snapshot never mutates its input (additive read-only)', JSON.stringify(frozenInput) === beforeFrozen, 'frozen input');
+check('snapshot emits no envelope/verdict/score/hash fields',
+  !Object.keys(frozenSnapshot).some((k) =>
+    ['timestamp', 'nonce', 'hardwareId', 'userAgent', 'platform', 'screenResolution', 'timezone', 'risk', 'score', 'verdict', 'confidence', 'hash', 'digest'].includes(k)),
+  Object.keys(frozenSnapshot).join(','));
+
+// Hostile / wrong-typed inputs fail closed with empty or absent descriptors.
+const hostileParityProxy = new Proxy({}, { get() { throw new Error('hostile getter'); }, ownKeys() { throw new Error('hostile keys'); } });
+const hostileParityCases: Array<[string, unknown]> = [
+  ['proxy', hostileParityProxy],
+  ['null', null],
+  ['number', 42],
+  ['string', 'bad'],
+  ['array', [1, 2, 3]],
+  ['hostile nested', { fonts: hostileParityProxy, emoji: hostileParityProxy, math: hostileParityProxy, location: hostileParityProxy }],
+];
+
+let hostileParityOk = 0;
+for (const [name, input] of hostileParityCases) {
+  const result = noThrow(() => buildFjsV5ParitySnapshot(input));
+  const wellFormed = result !== null &&
+    result.surface === 'fjs-v5-parity' &&
+    result.fontCoverage.families.length === 16 &&
+    result.fontCoverage.families.every((f) => f.status === 'absent' && !f.detected) &&
+    result.emoji.status === 'absent' && result.math.status === 'absent' &&
+    result.fontPreferences.status === 'absent' && result.geoFields.status === 'absent' &&
+    result.battery.status === 'absent' && result.keyboard.status === 'descriptive';
+  if (wellFormed) hostileParityOk += 1;
+  else console.log(`  hostile parity case failed: ${name}`);
+}
+check('hostile/null/wrong-typed input fails closed with empty descriptors',
+  hostileParityOk === hostileParityCases.length, `${hostileParityOk}/${hostileParityCases.length}`);
+
+const cyclicParity: Record<string, unknown> = {};
+cyclicParity.self = cyclicParity;
+cyclicParity.fonts = cyclicParity;
+check('cyclic parity input does not throw and fails closed',
+  noThrow(() => buildFjsV5ParitySnapshot(cyclicParity))?.fontCoverage.counts.present === 0, 'cyclic fonts');
+check('empty parity input is unavailable, not fabricated',
+  buildFjsV5ParitySnapshot({}).status === 'unavailable' &&
+  buildFjsV5ParitySnapshot({}).fontCoverage.counts.absent === 16, 'empty input');
 
 /* -------------------------------------------------------------------------- */
 
