@@ -1873,7 +1873,7 @@ function normalizeFeed(sourceId, body, fetchedAt) {
         collectJsonPrefixes(parsed, collector, /* @__PURE__ */ new Set());
       }
       if (collector.list.length === 0) {
-        for (const token of text.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g) ?? []) addPrefix(collector, token);
+        for (const token2 of text.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g) ?? []) addPrefix(collector, token2);
       }
     } else if (format === "sail-toml") {
       const modified = text.match(/^\s*modified\s*=\s*["']([^"']+)["']/m);
@@ -2714,8 +2714,8 @@ function parseStructuredBoolean(value) {
   if (value === true) return true;
   if (typeof value === "number") return value === 1;
   if (typeof value !== "string") return false;
-  const token = value.trim().replace(/^[?"']+|[?"']+$/g, "").toLowerCase();
-  return token === "1" || token === "true";
+  const token2 = value.trim().replace(/^[?"']+|[?"']+$/g, "").toLowerCase();
+  return token2 === "1" || token2 === "true";
 }
 var parseMobileFlag = parseStructuredBoolean;
 var parseWow64 = parseStructuredBoolean;
@@ -2882,8 +2882,8 @@ var BROWSER_SPECS = [
     uaTokens: [/Version\/([\d.]+).*Safari/]
   }
 ];
-function firstMatch(token, ua) {
-  const m = token.exec(ua);
+function firstMatch(token2, ua) {
+  const m = token2.exec(ua);
   if (m === null) return null;
   return (m[1] ?? "").trim() || null;
 }
@@ -2917,8 +2917,8 @@ function brandToSpec(brands) {
 }
 function uaToSpec(ua) {
   for (const spec of BROWSER_SPECS) {
-    for (const token of spec.uaTokens) {
-      if (token.test(ua)) return spec;
+    for (const token2 of spec.uaTokens) {
+      if (token2.test(ua)) return spec;
     }
   }
   return null;
@@ -3006,8 +3006,8 @@ function resolveBrowser(ua, uad, secCh) {
   return empty;
 }
 function findUaVersion(spec, ua) {
-  for (const token of spec.uaTokens) {
-    const v = firstMatch(token, ua);
+  for (const token2 of spec.uaTokens) {
+    const v = firstMatch(token2, ua);
     if (v) return v;
   }
   return null;
@@ -3028,12 +3028,12 @@ function fallbackMajorFromUa(browserName, ua) {
   if (!ua) return { name: browserName, full: "", major: "" };
   const tokens = [...tokensForName(browserName)];
   for (const spec of BROWSER_SPECS) {
-    for (const token of spec.uaTokens) {
-      if (tokens.indexOf(token) === -1) tokens.push(token);
+    for (const token2 of spec.uaTokens) {
+      if (tokens.indexOf(token2) === -1) tokens.push(token2);
     }
   }
-  for (const token of tokens) {
-    const v = firstMatch(token, ua);
+  for (const token2 of tokens) {
+    const v = firstMatch(token2, ua);
     if (v) return { name: browserName, full: v, major: majorOf(v) };
   }
   return { name: browserName, full: "", major: "" };
@@ -3609,10 +3609,10 @@ function unquote2(value) {
 function parseMobile(raw) {
   const text = typeof raw === "string" ? raw.trim() : "";
   if (!text) return "";
-  const token = text.replace(/^\?/, "").trim();
-  if (token === "1") return "true";
-  if (token === "0") return "false";
-  return token;
+  const token2 = text.replace(/^\?/, "").trim();
+  if (token2 === "1") return "true";
+  if (token2 === "0") return "false";
+  return token2;
 }
 function parseClientHintHeaders(headers) {
   try {
@@ -4492,8 +4492,8 @@ function fnv1a64(input) {
 }
 function simhash64(tokens) {
   const votes = new Array(64).fill(0);
-  for (const token of tokens) {
-    const hash = fnv1a64(normalizeText(token));
+  for (const token2 of tokens) {
+    const hash = fnv1a64(normalizeText(token2));
     for (let bit = 0; bit < 64; bit += 1) {
       votes[bit] += hash >> BigInt(bit) & 1n ? 1 : -1;
     }
@@ -6668,8 +6668,8 @@ function fnv64(input, seed) {
   }
   return h;
 }
-function tokenWords(token) {
-  return SEEDS.map((seed) => fnv64(token, seed));
+function tokenWords(token2) {
+  return SEEDS.map((seed) => fnv64(token2, seed));
 }
 function simhash512(features) {
   const tokens = [];
@@ -6683,8 +6683,8 @@ function simhash512(features) {
     }
   }
   const weights = new Array(LSH_CONFIG.bits).fill(0);
-  for (const token of tokens) {
-    const words = tokenWords(token);
+  for (const token2 of tokens) {
+    const words = tokenWords(token2);
     for (let w = 0; w < 8; w += 1) {
       const word = words[w];
       for (let bit = 0; bit < 64; bit += 1) {
@@ -11004,13 +11004,13 @@ function parseSignatureHeaders(rawSignature, rawInput, rawAgent) {
   let cursor = 0;
   let tokenMatch;
   while ((tokenMatch = tokenPattern.exec(coveredText)) !== null) {
-    const token = tokenMatch[0];
+    const token2 = tokenMatch[0];
     const gap = coveredText.slice(cursor, tokenMatch.index);
     if (gap.trim() !== "") {
       parsed.error = "invalid_covered_component";
       return parsed;
     }
-    const name = unquote3(token);
+    const name = unquote3(token2);
     if (name === null || !name || !isAscii(name)) {
       parsed.error = "invalid_covered_component";
       return parsed;
@@ -11025,7 +11025,7 @@ function parseSignatureHeaders(rawSignature, rawInput, rawAgent) {
       return parsed;
     }
     parsed.covered.push(lowered);
-    cursor = tokenMatch.index + token.length;
+    cursor = tokenMatch.index + token2.length;
   }
   if (coveredText.slice(cursor).trim() !== "" || parsed.covered.length === 0) {
     parsed.error = "invalid_covered_component";
@@ -11773,12 +11773,12 @@ function normalizeLabel(value) {
 function isResidentialAsnType(value) {
   const label = normalizeLabel(value);
   if (!label) return false;
-  return RESIDENTIAL_ASN_TOKENS.some((token) => label === token || label.includes(token));
+  return RESIDENTIAL_ASN_TOKENS.some((token2) => label === token2 || label.includes(token2));
 }
 function isDatacenterAsnType(value) {
   const label = normalizeLabel(value);
   if (!label) return false;
-  return DATACENTER_ASN_TOKENS.some((token) => label.includes(token));
+  return DATACENTER_ASN_TOKENS.some((token2) => label.includes(token2));
 }
 function usableAsn(value) {
   try {
@@ -12633,8 +12633,8 @@ function normalize(value) {
   return value.trim().toLowerCase().replace(/\s+/g, " ");
 }
 function isPresent(value) {
-  const token = normalize(value);
-  return token !== "" && !MISSING_STRINGS.has(token);
+  const token2 = normalize(value);
+  return token2 !== "" && !MISSING_STRINGS.has(token2);
 }
 function isConstantWebGLString(value) {
   return CONSTANT_WEBGL_STRINGS.has(normalize(value));
@@ -12643,13 +12643,13 @@ function isIntelIncVendor(value) {
   return /^intel\s+inc\.?$/i.test(value.trim());
 }
 function shaderPrecisionStrength(profile) {
-  const token = normalize(profile);
-  if (!token) return "unknown";
-  if (/^(low|lowp|none|no|0|n\/a|na|err|error|unavailable|unknown)$/.test(token)) return "weak";
-  if (/\blowp?\b/.test(token)) return "weak";
-  if (/\bhighp?\b|\bhigh\b/.test(token)) return "strong";
-  if (/^\d+(?:\|\d+)?$/.test(token)) {
-    const parts = token.split("|").map((part) => Number(part));
+  const token2 = normalize(profile);
+  if (!token2) return "unknown";
+  if (/^(low|lowp|none|no|0|n\/a|na|err|error|unavailable|unknown)$/.test(token2)) return "weak";
+  if (/\blowp?\b/.test(token2)) return "weak";
+  if (/\bhighp?\b|\bhigh\b/.test(token2)) return "strong";
+  if (/^\d+(?:\|\d+)?$/.test(token2)) {
+    const parts = token2.split("|").map((part) => Number(part));
     if (parts.every((part) => part <= 10)) return "weak";
     if (parts.every((part) => part >= 20)) return "strong";
   }
@@ -13733,6 +13733,333 @@ function buildNetworkTruthShadow(input) {
   }
 }
 
+// src/lib/identityTiers.ts
+var VOLATILE_SIGNAL_KEYS = /* @__PURE__ */ new Set([
+  "audioFingerprint",
+  "audioNoise",
+  "audioSum",
+  "canvas",
+  "canvasHash",
+  "canvasNoise",
+  "localStorageQuota",
+  "quota",
+  "storageQuota",
+  "timezoneOffset"
+]);
+var WEBGPU_RESEARCH_ONLY_KEYS = /* @__PURE__ */ new Set([
+  "atomicContention",
+  "atomicHistogram",
+  "drawnApart",
+  "lockedApart",
+  "webgpuAtomicContention"
+]);
+var WEBGPU_RESEARCH_ONLY_NOTE = "Atomic-contention WebGPU identity (DrawnApart/LockedApart/atomic histograms) is RESEARCH_ONLY: cross-visit stability 57/80, timer-sensitive (a 32ms clamp collapses AUROC), GPU/driver/thermal dependent, and requires a labeled training corpus. It is NOT a cryptographic or stable hardware id and is never hashed into this profile.";
+var WEBGPU_STATIC_ENTROPY = {
+  bits: 5.19,
+  anonymitySets: 122,
+  surface: "device.features Set + static limits (maxComputeWorkgroupSizeX/Y/Z, maxComputeWorkgroupsPerDimension)",
+  note: "adapter.info {vendor,architecture,device,description} is frequently empty; this is a weak, heuristic fingerprint surface, not a verified device identity."
+};
+function safeGet2(source, key) {
+  if (source === null || source === void 0) return void 0;
+  const kind = typeof source;
+  if (kind !== "object" && kind !== "function") return void 0;
+  try {
+    return source[key];
+  } catch {
+    return void 0;
+  }
+}
+function asString2(value) {
+  if (typeof value !== "string") return "";
+  const text = value.trim();
+  if (!text) return "";
+  return text.length > 256 ? text.slice(0, 256) : text;
+}
+function asFiniteNumber(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return value;
+}
+function token(value) {
+  return asString2(value).toLowerCase().replace(/\s+/g, " ").trim();
+}
+function intToken(value) {
+  const n = asFiniteNumber(value);
+  if (n === null || n < 0) return "";
+  return String(Math.trunc(n));
+}
+function memoryBucket(value) {
+  const gb = asFiniteNumber(value);
+  if (gb === null || gb <= 0) return "";
+  const bucket = Math.pow(2, Math.floor(Math.log2(gb)));
+  return Number.isFinite(bucket) ? String(bucket) : "";
+}
+function coresBucket(value) {
+  const n = asFiniteNumber(value);
+  if (n === null || n <= 0) return "";
+  if (n <= 2.5) return "1-2";
+  if (n <= 4.5) return "3-4";
+  if (n <= 8.5) return "5-8";
+  if (n <= 16.5) return "9-16";
+  return "17+";
+}
+function countBucket(value) {
+  const n = asFiniteNumber(value);
+  if (n === null || n < 0) return "";
+  if (n < 10) return "0-9";
+  if (n < 50) return "10-49";
+  if (n < 100) return "50-99";
+  if (n < 200) return "100-199";
+  return "200+";
+}
+function gpuRendererFamily(value) {
+  const t = token(value);
+  if (!t) return "";
+  if (/swiftshader|llvmpipe|softpipe|software|basic render|virgl|ranchu/.test(t)) return "software";
+  if (/nvidia|geforce|quadro|\brtx\b|\bgtx\b/.test(t)) return "nvidia";
+  if (/radeon|\bamd\b/.test(t)) return "amd";
+  if (/intel|iris|uhd|hd graphics|arc/.test(t)) return "intel";
+  if (/apple m[1-9]|apple gpu/.test(t)) return "apple";
+  if (/adreno|mali|powervr|arm gpu/.test(t)) return "arm";
+  return "unknown";
+}
+function asTokenList(value) {
+  if (value === null || value === void 0) return [];
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  const push = (item) => {
+    const valueToken = token(item);
+    if (valueToken && !seen.has(valueToken) && out.length < 64) {
+      seen.add(valueToken);
+      out.push(valueToken);
+    }
+  };
+  try {
+    if (Array.isArray(value)) {
+      for (const item of value) push(item);
+    } else if (value instanceof Set) {
+      for (const item of value) push(item);
+    } else if (typeof value?.[Symbol.iterator] === "function") {
+      for (const item of value) push(item);
+    } else {
+      push(value);
+    }
+  } catch {
+  }
+  return out.sort();
+}
+function webgpuInfoField(signals, name) {
+  const flat = safeGet2(signals, `webgpu${name}`);
+  if (flat !== void 0) return token(flat);
+  const info = safeGet2(signals, "webgpuAdapterInfo");
+  return token(safeGet2(info, name.charAt(0).toLowerCase() + name.slice(1)));
+}
+function webgpuLimit(signals, name) {
+  const flat = safeGet2(signals, `webgpu${name}`);
+  if (flat !== void 0) return intToken(flat);
+  return intToken(safeGet2(safeGet2(signals, "webgpuLimits"), name));
+}
+function webgpuFeatureTokens(signals) {
+  const flat = safeGet2(signals, "webgpuFeatures");
+  if (flat !== void 0) return asTokenList(flat);
+  return asTokenList(safeGet2(safeGet2(signals, "webgpuDeviceFeatures"), "features"));
+}
+function resolveSupplementaryHighRecall(signals) {
+  const groups = [
+    { prefix: "arch", signal: "architecture", normalize: token },
+    { prefix: "browser", signal: "browserFamily", normalize: token },
+    { prefix: "cores", signal: "hardwareConcurrency", normalize: coresBucket },
+    { prefix: "device-class", signal: "deviceClass", normalize: token },
+    { prefix: "engine", signal: "engine", normalize: token },
+    { prefix: "gpu-family", signal: "gpuArchFamily", normalize: token },
+    { prefix: "gpu-renderer", signal: "gpuRenderer", normalize: token },
+    { prefix: "gpu-vendor", signal: "gpuVendor", normalize: token },
+    { prefix: "os", signal: "hostOs", normalize: token },
+    { prefix: "os-family", signal: "osFamily", normalize: token }
+  ];
+  const keys = /* @__PURE__ */ new Set();
+  for (const group of groups) {
+    const value = group.normalize(safeGet2(signals, group.signal));
+    if (value) keys.add(`grp:${group.prefix}:${value}`);
+  }
+  if (keys.size === 0) keys.add("grp:unclassified");
+  return Array.from(keys).sort();
+}
+var MASK643 = (1n << 64n) - 1n;
+var FNV_PRIME64 = 0x100000001b3n;
+var FNV_OFFSETS = [
+  0xcbf29ce484222325n,
+  0x84222325cbf29ce4n,
+  0x9e3779b97f4a7c15n,
+  0xbf58476d1ce4e5b9n,
+  0x94d049bb133111ebn,
+  0x7f4a7c15bf58476dn,
+  0x2545f4914f6cdd1dn,
+  0xd6e8feb86659fd93n
+];
+function fnv1a643(input, offset) {
+  let hash = offset & MASK643;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= BigInt(input.charCodeAt(i));
+    hash = hash * FNV_PRIME64 & MASK643;
+  }
+  return hash & MASK643;
+}
+function hash512(features) {
+  const serialized = Object.keys(features).sort().map((key) => `${key}=${features[key]}`).join("|");
+  let out = "";
+  for (const offset of FNV_OFFSETS) {
+    out += fnv1a643(serialized, offset).toString(16).padStart(16, "0");
+  }
+  return out;
+}
+function buildHardwareFeatures(signals) {
+  const features = {};
+  const add = (key, value) => {
+    if (value) features[key] = value;
+  };
+  add("architecture", token(safeGet2(signals, "architecture")));
+  add("browser_family", token(safeGet2(signals, "browserFamily")));
+  add("cpu_cores_bucket", coresBucket(safeGet2(signals, "hardwareConcurrency")));
+  add("device_class", token(safeGet2(signals, "deviceClass")));
+  add("engine", token(safeGet2(signals, "engine")));
+  add("gpu_arch_family", token(safeGet2(signals, "gpuArchFamily")));
+  add("gpu_renderer", token(safeGet2(signals, "gpuRenderer")));
+  add("gpu_renderer_family", gpuRendererFamily(safeGet2(signals, "gpuRenderer")));
+  add("gpu_vendor", token(safeGet2(signals, "gpuVendor")));
+  add("host_os", token(safeGet2(signals, "hostOs")));
+  add("memory_gb_bucket", memoryBucket(safeGet2(signals, "deviceMemory")));
+  add("os_family", token(safeGet2(signals, "osFamily")));
+  add("platform", token(safeGet2(signals, "platform")));
+  add("audio_channels", intToken(safeGet2(signals, "audioOutputChannels")));
+  add("audio_sample_rate", intToken(safeGet2(signals, "audioSampleRate")));
+  add("color_depth", intToken(safeGet2(signals, "colorDepth")));
+  add("font_count", countBucket(safeGet2(signals, "fontCount")));
+  add("font_list", asTokenList(safeGet2(signals, "systemFonts")).join(","));
+  add("pixel_depth", intToken(safeGet2(signals, "pixelDepth")));
+  add("screen_height", intToken(safeGet2(signals, "screenHeight")));
+  add("screen_width", intToken(safeGet2(signals, "screenWidth")));
+  add("timezone_name", token(safeGet2(signals, "timezone")));
+  add("webgpu_adapter_arch", webgpuInfoField(signals, "Architecture"));
+  add("webgpu_adapter_desc", webgpuInfoField(signals, "Description"));
+  add("webgpu_adapter_device", webgpuInfoField(signals, "Device"));
+  add("webgpu_adapter_vendor", webgpuInfoField(signals, "Vendor"));
+  add("webgpu_features", webgpuFeatureTokens(signals).join(","));
+  add("webgpu_limits_compute_wg_x", webgpuLimit(signals, "maxComputeWorkgroupSizeX"));
+  add("webgpu_limits_compute_wg_y", webgpuLimit(signals, "maxComputeWorkgroupSizeY"));
+  add("webgpu_limits_compute_wg_z", webgpuLimit(signals, "maxComputeWorkgroupSizeZ"));
+  add("webgpu_limits_dispatch_dim", webgpuLimit(signals, "maxComputeWorkgroupsPerDimension"));
+  return features;
+}
+function resolveHardwareSimHashProfile(signals) {
+  const features = buildHardwareFeatures(signals);
+  const ignoredVolatileKeys = [];
+  for (const key of VOLATILE_SIGNAL_KEYS) {
+    if (safeGet2(signals, key) !== void 0) ignoredVolatileKeys.push(key);
+  }
+  ignoredVolatileKeys.sort();
+  const referencedSignals = [];
+  for (const key of WEBGPU_RESEARCH_ONLY_KEYS) {
+    if (safeGet2(signals, key) !== void 0) referencedSignals.push(key);
+  }
+  referencedSignals.sort();
+  return {
+    features,
+    hash512: hash512(features),
+    usedKeys: Object.keys(features).sort(),
+    ignoredVolatileKeys,
+    heuristic: true,
+    verifiedDeviceIdentity: false,
+    webgpuStaticEntropy: WEBGPU_STATIC_ENTROPY,
+    researchOnly: {
+      atomicContentionWebGpu: "research_only",
+      note: WEBGPU_RESEARCH_ONLY_NOTE,
+      referencedSignals
+    }
+  };
+}
+
+// src/lib/supplementaryCohort.ts
+var SUPPLEMENTARY_COHORT_VERSION = "1";
+var COHORT_GROUP_PREFIXES = /* @__PURE__ */ new Set([
+  "arch",
+  "browser",
+  "cores",
+  "device-class",
+  "engine",
+  "gpu-family",
+  "gpu-renderer",
+  "gpu-vendor",
+  "os",
+  "os-family"
+]);
+var UNCLASSIFIED_KEY = "cohort:unclassified";
+var COHORT_KEY_PREFIX = `cohort:v${SUPPLEMENTARY_COHORT_VERSION}:`;
+var MAX_GROUP_KEY_LENGTH = 512;
+var MASK644 = (1n << 64n) - 1n;
+var FNV_PRIME642 = 0x100000001b3n;
+var COHORT_HASH_OFFSETS = [
+  0xcbf29ce484222325n,
+  0x84222325cbf29ce4n
+];
+function fnv1a644(input, offset) {
+  let hash = offset & MASK644;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= BigInt(input.charCodeAt(i));
+    hash = hash * FNV_PRIME642 & MASK644;
+  }
+  return hash & MASK644;
+}
+function cohortDigest(serialized) {
+  return COHORT_HASH_OFFSETS.map(
+    (offset) => fnv1a644(serialized, offset).toString(16).padStart(16, "0")
+  ).join("");
+}
+function failClosed2() {
+  return {
+    cohort_key: UNCLASSIFIED_KEY,
+    evidence_score: 0,
+    version: SUPPLEMENTARY_COHORT_VERSION,
+    status: "shadow"
+  };
+}
+function deriveSupplementaryCohort(input) {
+  try {
+    const profile = resolveHardwareSimHashProfile(input);
+    if (profile.heuristic !== true || profile.verifiedDeviceIdentity !== false || !/^[0-9a-f]{128}$/.test(profile.hash512)) {
+      return failClosed2();
+    }
+    const groups = resolveSupplementaryHighRecall(input);
+    const selected = [];
+    for (const key of groups) {
+      if (typeof key !== "string" || key.length === 0 || key.length > MAX_GROUP_KEY_LENGTH) continue;
+      if (!key.startsWith("grp:")) continue;
+      const rest = key.slice(4);
+      const separator = rest.indexOf(":");
+      if (separator <= 0) continue;
+      const prefix = rest.slice(0, separator);
+      const value = rest.slice(separator + 1);
+      if (!COHORT_GROUP_PREFIXES.has(prefix) || !value) continue;
+      selected.push(key);
+    }
+    selected.sort();
+    if (selected.length === 0) return failClosed2();
+    const cohort_key = COHORT_KEY_PREFIX + cohortDigest(selected.join("|"));
+    const evidence_score = Math.min(
+      100,
+      Math.max(0, Math.round(selected.length / COHORT_GROUP_PREFIXES.size * 100))
+    );
+    return {
+      cohort_key,
+      evidence_score,
+      version: SUPPLEMENTARY_COHORT_VERSION,
+      status: "shadow"
+    };
+  } catch {
+    return failClosed2();
+  }
+}
+
 // server.ts
 var GOOD_BOT_UA_RULES2 = GOOD_BOT_UA_RULES;
 var AI_AGENT_UA_RULES2 = AI_AGENT_UA_RULES;
@@ -14539,14 +14866,14 @@ function identifyRateLimit(req, res, next) {
 function signVisitorId(visitorId) {
   return crypto.createHmac("sha256", HMAC_SECRET).update(visitorId).digest("hex");
 }
-function verifyVisitorToken(visitorId, token) {
-  if (!visitorId || !token || typeof visitorId !== "string" || typeof token !== "string") {
+function verifyVisitorToken(visitorId, token2) {
+  if (!visitorId || !token2 || typeof visitorId !== "string" || typeof token2 !== "string") {
     return false;
   }
   const expected = signVisitorId(visitorId);
-  if (expected.length !== token.length) return false;
+  if (expected.length !== token2.length) return false;
   try {
-    return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(token, "hex"));
+    return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(token2, "hex"));
   } catch {
     return false;
   }
@@ -14932,7 +15259,7 @@ function classifyIspNetwork(isp, org, asn) {
     matchConsumerRule("Jio (Reliance Jio)", "Residential Broadband", [55836], /reliance jio|\bjio\b/i) || matchConsumerRule("Airtel Xstream", "Residential Broadband", [24560, 45609, 9498], /bharti airtel|\bairtel\b/i) || matchConsumerRule("ACT Fibernet", "Residential Broadband", [24309], /act fibernet|atria convergence/i) || matchConsumerRule("BSNL Broadband", "Residential Broadband", [9829], /\bbsnl\b|bharat sanchar/i) || matchConsumerRule("Tata Play / Hathway", "Residential Broadband", [], /tata play|tata sky broadband|hathway|excitel/i)
   );
   const asnTokenHits = Array.from(asnNumbers).map((n) => `AS${n}`);
-  const torAsnHit = asnTokenHits.find((token) => matchesTorOperatorAsn(token));
+  const torAsnHit = asnTokenHits.find((token2) => matchesTorOperatorAsn(token2));
   const torOrgHit = TOR_OPERATOR_ORG_PATTERN.test(keywordHaystack);
   if (torAsnHit !== void 0 || torOrgHit) {
     return {
@@ -20611,6 +20938,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       // The RTT variable computed inside buildLatencyBasis is scoped elsewhere; the
       // shadow helper treats an omitted sample as absent and never fabricates one.
     }) : void 0;
+    const supplementaryCohortShadow = diagnostics ? deriveSupplementaryCohort(identityProfile) : void 0;
     const publishedHeadlessMode = typeof rawExtras.headless_mode === "string" && (rawExtras.headless_mode === "shell" || rawExtras.headless_mode === "new") ? rawExtras.headless_mode : uaIdentity.headless_mode ?? null;
     const publishedGpuObservation = specAssessment.gpu_observation;
     const publishedGpuTruthState = typeof rawExtras.gpu_truth_state === "string" ? rawExtras.gpu_truth_state : identifyGpuTruth.state;
@@ -20757,6 +21085,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       ...diagnostics ? { diagnostics } : {},
       // Additive network-truth shadow — descriptive only, same flag gate, never scored.
       ...networkTruthShadow ? { network_truth_shadow: networkTruthShadow } : {},
+      ...supplementaryCohortShadow ? { supplementary_cohort_shadow: supplementaryCohortShadow } : {},
       // Additive shadow truth mirrors. proxy_details / vpn_methods match the shapes the
       // dashboard adapter already reads; the zero-trust and fingerprint blocks are diagnostics
       // only (strict-origin is opt-in and never enforced here).
@@ -20811,6 +21140,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       ...diagnostics ? { diagnostics } : {},
       // Additive network-truth shadow mirror — same flag gate, descriptive only, never scored.
       ...networkTruthShadow ? { network_truth_shadow: networkTruthShadow } : {},
+      ...supplementaryCohortShadow ? { supplementary_cohort_shadow: supplementaryCohortShadow } : {},
       suspectScore: securitySignals.suspectScore,
       riskLevel: securitySignals.riskLevel,
       riskBadgeText: securitySignals.riskBadgeText,

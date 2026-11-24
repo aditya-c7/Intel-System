@@ -168,6 +168,9 @@ import { buildCalibrationCorpus } from './src/lib/calibrationCorpus';
 // Additive network-truth shadow: pure/descriptive, published ONLY under the existing
 // incognito-diagnostics flag as a mirror; never read into any score, verdict or trust claim.
 import { buildNetworkTruthShadow } from './src/lib/networkTruthShadow';
+// Additive supplementary cohort shadow: a NON-canonical, namespaced key derived only from
+// stable cohort groups. Published under the diagnostics flag; never an identity or score input.
+import { deriveSupplementaryCohort } from './src/lib/supplementaryCohort';
 
 /* -------------------------------------------------------------------------- */
 /* Shared agent registry adapter                                                */
@@ -11324,6 +11327,10 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         })
       : undefined;
 
+    const supplementaryCohortShadow = diagnostics
+      ? deriveSupplementaryCohort(identityProfile)
+      : undefined;
+
     // Additive normalized truth / stability mirrors. Each value is copied verbatim from its
     // producer (collector securitySignals/hardwareSignals or the canonical server resolvers);
     // none of them is re-derived into a score, tier, verdict or identifier.
@@ -11503,6 +11510,9 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       ...(diagnostics ? { diagnostics } : {}),
       // Additive network-truth shadow — descriptive only, same flag gate, never scored.
       ...(networkTruthShadow ? { network_truth_shadow: networkTruthShadow } : {}),
+      ...(supplementaryCohortShadow
+        ? { supplementary_cohort_shadow: supplementaryCohortShadow }
+        : {}),
       // Additive shadow truth mirrors. proxy_details / vpn_methods match the shapes the
       // dashboard adapter already reads; the zero-trust and fingerprint blocks are diagnostics
       // only (strict-origin is opt-in and never enforced here).
@@ -11538,6 +11548,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       network_fingerprint_truth: unknown;
       /** Additive flag-gated network-truth shadow mirror (descriptive, never scored). */
       network_truth_shadow?: unknown;
+      /** Additive flag-gated supplementary cohort key (shadow only, never canonical). */
+      supplementary_cohort_shadow?: unknown;
       /** Additive active-CDP inspection audit trail (never scored or verdict-changing). */
       active_cdp_reasons: unknown;
     } = {
@@ -11589,6 +11601,9 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       ...(diagnostics ? { diagnostics } : {}),
       // Additive network-truth shadow mirror — same flag gate, descriptive only, never scored.
       ...(networkTruthShadow ? { network_truth_shadow: networkTruthShadow } : {}),
+      ...(supplementaryCohortShadow
+        ? { supplementary_cohort_shadow: supplementaryCohortShadow }
+        : {}),
       suspectScore: securitySignals.suspectScore,
       riskLevel: securitySignals.riskLevel,
       riskBadgeText: securitySignals.riskBadgeText,
