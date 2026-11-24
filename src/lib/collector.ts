@@ -62,6 +62,7 @@ import {
   savePcLock,
   type DeviceGateResult,
 } from './deviceDetect';
+import { buildTimingShadow } from './collectorTimingShadow';
 
 const STORAGE_KEYS = {
   VISITOR_ID: 'intel_fp_vid',
@@ -8656,6 +8657,10 @@ export async function identifyCurrentVisitor(options?: {
               : {}),
           }
         : null;
+    // Additive, flag-gated timing shadow. Computed ONLY when diagnostics are on: the default
+    // path calls no helper, reads no clock and allocates no shadow object. `load_get_timing`
+    // above is built from the same recorded timings and is left byte-for-byte untouched.
+    const timingShadow = incog.diagnostics ? buildTimingShadow(recordedTimings) : undefined;
 
     // Fresh, post-interaction corroboration on EVERY identify payload — never a value
     // cached at page load. Mirrored at top level for the server verdict state machine and
@@ -8702,6 +8707,9 @@ export async function identifyCurrentVisitor(options?: {
         // Additive entropy/timing mirrors — informational only, never a verdict or rank input.
         ...(additiveEntropy ? { entropyTelemetry: additiveEntropy } : {}),
         ...(loadGetTiming ? { load_get_timing: loadGetTiming } : {}),
+        // Additive, flag-gated timing shadow — present ONLY under intelDiag=1 or the session
+        // flag. No verdict, rank, digest or scoring path ever reads this field.
+        ...(timingShadow ? { timing_shadow: timingShadow } : {}),
         hardwareFingerprint: identityHardwareFingerprint,
         browserFingerprint: identityBrowserFingerprint,
         sessionId: stored.sessionId || identitySessionId,
