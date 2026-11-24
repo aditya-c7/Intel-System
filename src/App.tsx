@@ -2328,7 +2328,7 @@ export default function App() {
                                 className="absolute left-0 top-full z-30 mt-2 w-72 max-w-[calc(100vw-2rem)] rounded-xl border border-slate-200 bg-white p-3 text-left shadow-lg"
                               >
                                 <p className="mt-1.5 whitespace-pre-line text-[11px] leading-relaxed text-slate-600">
-                                  {'Match evidence, not a probability\n\nThis number is an evidence-based match score from the server. It is uncalibrated: no held-out check with at least 200 independent labelled pairs and ECE ≤ 0.05 has passed, so it is shown as “Match evidence”, never as “Confidence”.\n\nThe authoritative values are in the Event JSON under canonical.identity.confidence_label and calibration_status.'}
+                                  {'Match evidence, not a probability'}
                                 </p>
                               </div>
                             )}
