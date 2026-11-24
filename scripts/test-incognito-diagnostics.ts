@@ -37,6 +37,7 @@ import {
   percentilesFromTimings,
   type CollectorTimingStats,
 } from '../src/lib/collectorTimingShadow';
+import { buildFjsV5ParitySnapshot } from '../src/lib/fjsV5Parity';
 
 let passed = 0;
 const failures: string[] = [];
@@ -635,6 +636,29 @@ function main(): void {
     assert.equal(JSON.stringify(off.load_get_timing), JSON.stringify(on.load_get_timing));
     assert.deepEqual(Object.keys(on).sort(), ['load_get_timing', 'timing_shadow']);
     assert.deepEqual(on.timing_shadow, buildTimingShadow(recordedTimings));
+  });
+
+  check('flag-off payload has no fjs_v5_parity_shadow; flag-on is descriptive only', () => {
+    const sample = { fonts: { installed: ['Arial', 'Roboto'] } };
+    const compose = (diagOn: boolean): Record<string, unknown> => ({
+      ...(diagOn
+        ? { fjs_v5_parity_shadow: buildFjsV5ParitySnapshot(sample) }
+        : {}),
+    });
+    const off = compose(false);
+    const on = compose(true);
+    assert.deepEqual(off, {});
+    const shadow = on.fjs_v5_parity_shadow as Record<string, unknown>;
+    assert.equal(shadow.surface, 'fjs-v5-parity');
+    assert.equal(typeof shadow.fontCoverage, 'object');
+    // No verdict/score surface may appear as a FIELD (prose notes may mention the words).
+    for (const key of Object.keys(shadow)) {
+      assert.equal(['surface', 'status', 'fontCoverage', 'emoji', 'math', 'fontPreferences', 'geoFields', 'battery', 'keyboard', 'reasons'].includes(key), true, `unexpected shadow key ${key}`);
+    }
+    const asString = JSON.stringify(shadow);
+    for (const forbidden of ['"score10"', '"risk_level"', '"digest"', '"confidence_score"']) {
+      assert.equal(asString.includes(forbidden), false, `shadow must not carry ${forbidden}`);
+    }
   });
 }
 
