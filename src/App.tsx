@@ -2327,18 +2327,8 @@ export default function App() {
                                 aria-label="About match evidence and calibration"
                                 className="absolute left-0 top-full z-30 mt-2 w-72 max-w-[calc(100vw-2rem)] rounded-xl border border-slate-200 bg-white p-3 text-left shadow-lg"
                               >
-                                <p className="text-[11px] font-semibold text-slate-900">
-                                  Match evidence, not a probability
-                                </p>
-                                <p className="mt-1.5 text-[11px] leading-relaxed text-slate-600">
-                                  This number is an evidence-based match score from the server. It
-                                  is uncalibrated: no held-out check with at least 200 independent
-                                  labelled pairs and ECE ≤ 0.05 has passed, so it is shown as
-                                  “Match evidence”, never as “Confidence”.
-                                </p>
-                                <p className="mt-2 border-t border-slate-100 pt-2 text-[10px] leading-relaxed text-slate-500">
-                                  The authoritative values are in the Event JSON under
-                                  canonical.identity.confidence_label and calibration_status.
+                                <p className="mt-1.5 whitespace-pre-line text-[11px] leading-relaxed text-slate-600">
+                                  {'Match evidence, not a probability\n\nThis number is an evidence-based match score from the server. It is uncalibrated: no held-out check with at least 200 independent labelled pairs and ECE ≤ 0.05 has passed, so it is shown as “Match evidence”, never as “Confidence”.\n\nThe authoritative values are in the Event JSON under canonical.identity.confidence_label and calibration_status.'}
                                 </p>
                               </div>
                             )}
