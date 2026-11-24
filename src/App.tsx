@@ -2305,7 +2305,6 @@ export default function App() {
                         canonical.confidenceLabel.trim()
                           ? canonical.confidenceLabel.trim()
                           : null;
-                      const isUncalibrated = canonical?.calibrationStatus !== 'calibrated';
                       return (
                         <>
                           <div
@@ -2332,9 +2331,10 @@ export default function App() {
                                   Match evidence, not a probability
                                 </p>
                                 <p className="mt-1.5 text-[11px] leading-relaxed text-slate-600">
-                                  {isUncalibrated
-                                    ? 'This number is an evidence-based match score from the server. It is uncalibrated: no held-out check with at least 200 independent labelled pairs and ECE ≤ 0.05 has passed, so it is shown as “Match evidence”, never as “Confidence”.'
-                                    : 'A held-out calibration check has passed (at least 200 independent labelled pairs, ECE ≤ 0.05), so the server may present this score as calibrated confidence.'}
+                                  This number is an evidence-based match score from the server. It
+                                  is uncalibrated: no held-out check with at least 200 independent
+                                  labelled pairs and ECE ≤ 0.05 has passed, so it is shown as
+                                  “Match evidence”, never as “Confidence”.
                                 </p>
                                 <p className="mt-2 border-t border-slate-100 pt-2 text-[10px] leading-relaxed text-slate-500">
                                   The authoritative values are in the Event JSON under
