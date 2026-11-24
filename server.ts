@@ -165,6 +165,9 @@ import { buildExtraEvidenceLines } from './src/lib/riskEvidenceExtra';
 import { resolveHighActivityThreshold, DEFAULT_FLOOR } from './src/lib/rollingPercentile';
 import { rarityDecision as computeRarityDecision } from './src/lib/rarityColdStart';
 import { buildCalibrationCorpus } from './src/lib/calibrationCorpus';
+// Additive network-truth shadow: pure/descriptive, published ONLY under the existing
+// incognito-diagnostics flag as a mirror; never read into any score, verdict or trust claim.
+import { buildNetworkTruthShadow } from './src/lib/networkTruthShadow';
 
 /* -------------------------------------------------------------------------- */
 /* Shared agent registry adapter                                                */
@@ -11298,6 +11301,29 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       (securitySignals as SecuritySignals & { proxy_details?: ProxyDetails }).proxy_details ?? null;
     const shadowVpnMethods = securitySignals.vpnMethods ?? null;
 
+    // Additive network-truth shadow. Built ONLY under the existing incognito-diagnostics flag
+    // (`diagnostics`): when the flag is off the helper is never called and both mirrors below
+    // spread nothing, so the envelope and response stay byte-identical. The helper is pure and
+    // descriptive — it is never read into the 0-10 headline, 0-100 ledger, verdict tier, isBot,
+    // auth, risk/score/confidence or the 8-field canonical envelope string.
+    const networkTruthShadow = diagnostics
+      ? buildNetworkTruthShadow({
+          edgeTransport: {
+            httpProtocol: edgeTransport.httpProtocol,
+            // Server readEdgeTransport drops clientQuicRtt; it is never fabricated here.
+            clientTcpRtt: edgeTransport.clientTcpRtt,
+            colo: edgeTransport.colo,
+          },
+          geo: {
+            countryCode: location.countryCode,
+            country: location.country,
+          },
+          proxyDetails: shadowProxyDetails,
+          // The RTT variable computed inside buildLatencyBasis is scoped elsewhere; the
+          // shadow helper treats an omitted sample as absent and never fabricates one.
+        })
+      : undefined;
+
     // Additive normalized truth / stability mirrors. Each value is copied verbatim from its
     // producer (collector securitySignals/hardwareSignals or the canonical server resolvers);
     // none of them is re-derived into a score, tier, verdict or identifier.
@@ -11475,6 +11501,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       verdict_tier: effectiveVerdictTier,
       // Additive incognito diagnostics — verbatim, flag-gated pass-through (never scored).
       ...(diagnostics ? { diagnostics } : {}),
+      // Additive network-truth shadow — descriptive only, same flag gate, never scored.
+      ...(networkTruthShadow ? { network_truth_shadow: networkTruthShadow } : {}),
       // Additive shadow truth mirrors. proxy_details / vpn_methods match the shapes the
       // dashboard adapter already reads; the zero-trust and fingerprint blocks are diagnostics
       // only (strict-origin is opt-in and never enforced here).
@@ -11508,6 +11536,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       vpn_methods: unknown;
       zero_trust: unknown;
       network_fingerprint_truth: unknown;
+      /** Additive flag-gated network-truth shadow mirror (descriptive, never scored). */
+      network_truth_shadow?: unknown;
       /** Additive active-CDP inspection audit trail (never scored or verdict-changing). */
       active_cdp_reasons: unknown;
     } = {
@@ -11557,6 +11587,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       incognito: securitySignals.isIncognito,
       // Additive, flag-gated console diagnostics — inert pass-through, never scored.
       ...(diagnostics ? { diagnostics } : {}),
+      // Additive network-truth shadow mirror — same flag gate, descriptive only, never scored.
+      ...(networkTruthShadow ? { network_truth_shadow: networkTruthShadow } : {}),
       suspectScore: securitySignals.suspectScore,
       riskLevel: securitySignals.riskLevel,
       riskBadgeText: securitySignals.riskBadgeText,

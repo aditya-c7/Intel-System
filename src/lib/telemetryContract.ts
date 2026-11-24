@@ -373,6 +373,39 @@ export interface TamperingDetailsMirror {
   hardAutomationEvidence?: string[];
 }
 
+/**
+ * Additive network-truth shadow mirror (shape mirrors `src/lib/networkTruthShadow.ts`, kept
+ * local so this file stays import-free). Every member is OPTIONAL and absent unless a genuine
+ * signal was supplied by the pure producer. Nothing here is a score, tier, verdict or trust /
+ * verification claim — it is descriptive transport observation only.
+ */
+export interface NetworkTruthShadowMirror {
+  /** Proxy provider name, present only when genuinely supplied. */
+  proxyProvider?: string;
+  /** ISO-8601 proxy observation time, present only when genuinely supplied. */
+  proxyObservedAt?: string;
+  /** Descriptive QUIC / RTT-source normalization of the observed edge transport. */
+  edgeTransport?: {
+    quicNormalized: {
+      status: 'quic_signal_present' | 'no_quic_signal';
+      basis: 'httpProtocol' | 'edgeL4' | 'none';
+      label: string;
+      zeroTcpRttNote?: string;
+    };
+    effectiveRttSource: {
+      source: 'clientQuicRtt' | 'clientTcpRtt' | 'clientReportedRtt' | 'unavailable';
+      label: string;
+    };
+    colo?: string;
+  };
+  /** Descriptive light-distance caveat: approximation, not JA4L, no mismatch asserted. */
+  lightDistance?: {
+    label: string;
+    direction: string;
+    note: string;
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Additive research / calibration / verification mirrors (all OPTIONAL)       */
 /* -------------------------------------------------------------------------- */
@@ -473,6 +506,8 @@ export interface CanonicalTelemetryEnvelope {
   proxy_details?: ProxyDetailsMirror | null;
   /** Server `vpnMethods` block mirror. */
   vpn_methods?: VpnMethodsMirror | null;
+  /** Additive, flag-gated network-truth shadow (descriptive only; never a score or verdict). */
+  network_truth_shadow?: NetworkTruthShadowMirror | null;
   /** Privacy-signature / private-browsing mirror (`privacySettings`). */
   privacy_settings?: boolean | PrivacySettingsMirror | null;
   /** Four-tier stealth-evaluation mirror (`stealthPluginDetected`). */

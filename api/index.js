@@ -2041,9 +2041,504 @@ function resolveAgentProofMethod(headers, allowlistedAgents = []) {
   return "none";
 }
 
+// src/server/agents/botVerifier.ts
+var CORROBORATED_CDP_REASON_ID = "bot.stealth-automation-uncorroborated";
+var CORROBORATED_CHROMIUM_CDP_REASON_ID = "bot.chromium-automation-uncorroborated";
+var ACTIVE_CDP_INSPECTION_REASON_ID = "bot.cdp-active-inspection";
+var ACTIVE_CDP_INSPECTION_STATE = "automation_protocol_inspection_active";
+var IDLE_CDP_INSPECTION_STATE = "automation_protocol_inspection_idle";
+var HARD_AGENT_REASON_IDS = [
+  "navigator.webdriver",
+  "automation user-agent",
+  // legacy substring alias for an automation UA
+  "ua.headless-chrome",
+  "ua.automation-signature",
+  "cdp.ua_override.empty_brands",
+  "page.ua.cursor",
+  "page.platform.cloudflare-workers",
+  "launch.ipc-flooding-switch",
+  // Shadow stealth probes mapped into THIS hard tier (no second taxonomy).
+  "stealth.bypass-csp",
+  "playwright.init-scripts",
+  // Confirmed (RED) stealth variants: protocol-level impossibilities. Plain ids stay
+  // medium/weak, so page-script / extension / user-setting artifacts cannot escalate.
+  "stealth.runtime-enable-protocol",
+  "stealth.document-interception-protocol",
+  "stealth.storage-partitioning-protocol",
+  "stealth.puppeteer-source-url",
+  "stealth.playwright-source-url",
+  "bot.cdp-tampered",
+  "bot.playwright-binding",
+  // RS-E: cdc_* binding globals are UNATTRIBUTED runtime artifacts (CDP bridge / injected
+  // client) — a different evidentiary class from deterministic automation proof. They are
+  // recorded in the weight-0 developer_tools tier below and can never disqualify a signed
+  // good agent. Only corroborated hard automation can reach `bad`, after every crypto rung.
+  CORROBORATED_CDP_REASON_ID,
+  CORROBORATED_CHROMIUM_CDP_REASON_ID
+];
+var DEVELOPER_TOOLS_REASON_IDS = /* @__PURE__ */ new Set([
+  "cdp.runtime.enable.empty_source",
+  "cdp.network.enable.pre_load_message",
+  "bot.cdp-runtime-leak",
+  // RS-E: cdc_* / bare CDP are unattributed runtime artifacts — telemetry-only evidence.
+  // Automation is expected for verified agents and cannot disqualify signed good.
+  "cdc.global.binding",
+  // A second external CDP client driving Runtime / Page: active inspection, weight 0.
+  // Exact entry wins over the generic weak `bot.` prefix rule — never a hard path.
+  ACTIVE_CDP_INSPECTION_REASON_ID,
+  // Inconclusive stealth probes: reported at weight 0, never escalate or corroborate.
+  "stealth.inconclusive"
+]);
+var MEDIUM_REASON_IDS = /* @__PURE__ */ new Set([
+  "headless.shell.url_scheme_port",
+  "headless.linux.no_pointer",
+  "headless.heap-3digit-rounding",
+  "headless.font-exact-integers",
+  "headless.no-intlyen-key",
+  "headless.secch-headless-mismatch",
+  "instinct.credentials.wrappers",
+  "instinct.geetest.accessor-pair",
+  "muse.cloud-browser.password-manager",
+  "grok.cloud-computer.environment",
+  "codex.prompt.anonymous-native",
+  "codex.keyboard.empty-layout-map",
+  // Conditional stealth probes: corroboration or a companion is mandatory.
+  "stealth.runtime-enable-leak",
+  "stealth.document-interception",
+  "stealth.storage-partitioning"
+]);
+var WEAK_REASON_IDS = /* @__PURE__ */ new Set([
+  "headless.swiftshader.caveat",
+  "launch.no-speech-voices",
+  "kinematics.zero_pointer_trail",
+  "kinematics.screenshot_offset",
+  "playwright.mcp.pressure",
+  "chatgpt.badge.active",
+  "chatgpt.badge.overlay",
+  "claude.marker.active",
+  "codex.overlay.shadow-root",
+  "input.hidden-document",
+  "bot.software-gpu",
+  "bot.empty-languages",
+  "bot.zero-geometry",
+  "bot.rtt-zero",
+  "bot.plugins-empty",
+  "bot.webdriver-getter-tampered-cdp",
+  "bot.webdriver-getter-tampered",
+  "bot.automation-getter-tampered",
+  // Telemetry-only stealth artifacts. Exact entries keep the source-URL leak in
+  // `weak` rather than the bare `cdp.` developer_tools prefix — never hard.
+  "cdp.runtime.evaluate.source-url",
+  "bot.popup-blocking"
+]);
+var PREFIX_RULES = [
+  { prefix: "cdp.", weight: "developer_tools" },
+  // bare CDP is weight 0
+  // RS-E: cdc_* binding globals are unattributed runtime artifacts (weight 0), not proof
+  // of a driven runtime. Exact entries win, so `cdc.global.binding` stays developer_tools.
+  { prefix: "cdc.", weight: "developer_tools" },
+  { prefix: "playwright.", weight: "hard" },
+  { prefix: "ua.headless", weight: "hard" },
+  { prefix: "selenium.", weight: "hard" },
+  { prefix: "webdriver.", weight: "hard" },
+  { prefix: "headless.", weight: "medium" },
+  { prefix: "instinct.", weight: "medium" },
+  { prefix: "muse.", weight: "medium" },
+  { prefix: "grok.", weight: "medium" },
+  { prefix: "codex.", weight: "medium" },
+  { prefix: "kinematics.", weight: "weak" },
+  { prefix: "behavior.", weight: "weak" },
+  { prefix: "bot.", weight: "weak" }
+];
+var AUTOMATION_REASON_IDS = /* @__PURE__ */ new Set([
+  "cdp.runtime.enable",
+  "cdp.console.debug",
+  "cdp.network.order",
+  "launch.no-speech-voices",
+  "launch.no-languagedetector",
+  "ua.brands-vs-ua-mismatch",
+  "headless.any-pointer-none",
+  "headless.swiftshader.caveat",
+  "headless.no-intlyen-key",
+  "headless.chrome-extension-port",
+  "headless.heap-3digit-rounding",
+  "headless.font-exact-integers",
+  "headless.secch-headless-mismatch",
+  "behavior.pointer-stale",
+  "behavior.zero-pressure",
+  "behavior.hidden-input",
+  "muse",
+  "grok-bot",
+  "codex-browser",
+  "instinct",
+  "chatgpt.badge.active",
+  "claude.marker.active"
+]);
+function classifyReasonId(reasonId) {
+  const id = (reasonId || "").trim().toLowerCase();
+  if (!id) return "weak";
+  if (HARD_AGENT_REASON_IDS.includes(id)) return "hard";
+  if (id.includes("automation user-agent")) return "hard";
+  if (DEVELOPER_TOOLS_REASON_IDS.has(id)) return "developer_tools";
+  if (MEDIUM_REASON_IDS.has(id)) return "medium";
+  if (WEAK_REASON_IDS.has(id)) return "weak";
+  for (const rule of PREFIX_RULES) {
+    if (id.startsWith(rule.prefix)) return rule.weight;
+  }
+  return "weak";
+}
+function reasonNamespace(reasonId) {
+  const id = (reasonId || "").trim().toLowerCase();
+  if (!id) return "verdict";
+  if (HARD_AGENT_REASON_IDS.some((hard) => hard === id || id.startsWith(hard))) {
+    return "verdict";
+  }
+  if (AUTOMATION_REASON_IDS.has(id)) return "automation";
+  if (/^(launch\.|behavior\.|cdp\.|stealth\.|ua\.|muse$|grok-bot$|codex-browser$|instinct$|chatgpt\.|claude\.)/.test(id)) {
+    return "automation";
+  }
+  return "verdict";
+}
+var STEALTH_SIGNAL_REASON_IDS = Object.freeze({
+  runtimeEnableLeak: "stealth.runtime-enable-leak",
+  ipcFloodingProtection: "launch.ipc-flooding-switch",
+  documentInterception: "stealth.document-interception",
+  storagePartitioning: "stealth.storage-partitioning",
+  cdpBindingGlobals: "cdp.runtime.enable",
+  sourceUrlLeak: "cdp.runtime.evaluate.source-url",
+  pwInitScripts: "playwright.init-scripts",
+  exposeFunctionLeak: "bot.playwright-binding",
+  bypassCsp: "stealth.bypass-csp",
+  popupBlocking: "bot.popup-blocking",
+  marionette: "navigator.webdriver",
+  chromeHeadlessShell: "ua.headless-chrome"
+});
+function stealthReasonId(id, corroborated = false, options = {}) {
+  const base = STEALTH_SIGNAL_REASON_IDS[id];
+  if (base === void 0) return null;
+  if (options.inconclusive) return "stealth.inconclusive";
+  if (id === "cdpBindingGlobals") {
+    return corroborated ? CORROBORATED_CDP_REASON_ID : base;
+  }
+  if (id === "sourceUrlLeak") {
+    if (options.confirmed) {
+      return options.source === "puppeteer" ? "stealth.puppeteer-source-url" : "stealth.playwright-source-url";
+    }
+    return base;
+  }
+  if (id === "chromeHeadlessShell") {
+    return options.soft ? "headless.swiftshader.caveat" : base;
+  }
+  if (id === "runtimeEnableLeak") {
+    return options.confirmed && !options.docked ? "stealth.runtime-enable-protocol" : base;
+  }
+  if (id === "documentInterception") {
+    return options.confirmed ? "stealth.document-interception-protocol" : base;
+  }
+  if (id === "storagePartitioning") {
+    return options.confirmed ? "stealth.storage-partitioning-protocol" : base;
+  }
+  return base;
+}
+function gateAgentReasons(reasons) {
+  const hardReasons = [];
+  const mediumReasons = [];
+  const weakReasons = [];
+  const developerToolsReasons = [];
+  const namespaces = { automation: 0, verdict: 0 };
+  for (const reason of reasons || []) {
+    const id = (reason || "").trim();
+    if (!id) continue;
+    namespaces[reasonNamespace(id)] += 1;
+    switch (classifyReasonId(id)) {
+      case "hard":
+        hardReasons.push(id);
+        break;
+      case "medium":
+        mediumReasons.push(id);
+        break;
+      case "developer_tools":
+        developerToolsReasons.push(id);
+        break;
+      default:
+        weakReasons.push(id);
+        break;
+    }
+  }
+  let verdict = "human";
+  if (hardReasons.length > 0) verdict = "automated";
+  else if (mediumReasons.length >= 2) verdict = "automated";
+  else if (mediumReasons.length === 1 && weakReasons.length > 0) verdict = "automated";
+  else if (mediumReasons.length === 1) verdict = "uncertain";
+  return { verdict, hardReasons, mediumReasons, weakReasons, developerToolsReasons, namespaces };
+}
+function isHardAgentReason(reasons) {
+  return gateAgentReasons(reasons).verdict === "automated";
+}
+var GOOD_AGENT_CATEGORIES = /* @__PURE__ */ new Set([
+  "assistant",
+  "agent",
+  "ai_assistant",
+  "ai_agent"
+]);
+function normalizedCategory(value) {
+  return typeof value === "string" ? value.trim().toLowerCase().replace(/[\s-]+/g, "_") : "";
+}
+function isAssistantOrAgentCategory(values) {
+  return values.some((value) => GOOD_AGENT_CATEGORIES.has(normalizedCategory(value)));
+}
+function normalizeIdentity(value) {
+  const id = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return id === "verified" || id === "signed" || id === "spoofed" || id === "unknown" ? id : null;
+}
+function hasSignedIdentity(values) {
+  return values.some((value) => normalizeIdentity(value) === "signed");
+}
+function proofString(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+function hasSignedProof(wba) {
+  const reason = proofString(wba.reason);
+  const method = proofString(wba.verification_method);
+  return normalizeIdentity(wba.identity) === "signed" || reason === "signed-agent" || method === "rfc9421" || method === "signed_agent";
+}
+function isWbaValid(wba) {
+  const outcome = proofString(wba.outcome);
+  if (outcome === "invalid" || outcome === "neutral") return false;
+  if (outcome === "valid") return true;
+  const result = proofString(wba.result);
+  if (result === "invalid" || result === "neutral") return false;
+  if (result === "valid") return true;
+  const status = proofString(wba.status);
+  if (status === "invalid" || status === "neutral") return false;
+  return wba.verified === true;
+}
+var CLAIMED_OFFICIAL_BOT_PATTERN = /googlebot|googleother|google-inspectiontool|gptbot|chatgpt-user|oai-searchbot|claudebot|claude-user|claude-searchbot|perplexitybot|perplexity-user|ccbot|bingbot|applebot|meta-externalagent|grokbot|bedrockagentcore|mistralai[_-]?user|manus-user/i;
+var CLAIMED_BOT_CATEGORIES = /* @__PURE__ */ new Set([
+  "ai_crawler",
+  "search_crawler",
+  "link_preview",
+  "crawler"
+]);
+function claimsOfficialBotIdentity(input) {
+  if (input.uaLooksLikeBot === true) return true;
+  const pieces = [];
+  for (const value of [
+    input.userAgent,
+    input.ua,
+    input.webBotAuth?.bot_id,
+    input.webBotAuth?.operator,
+    input.directory?.bot_id,
+    input.directory?.operator
+  ]) {
+    if (typeof value === "string" && value.length > 0) pieces.push(value);
+  }
+  const claimedText = pieces.join(" ");
+  if (claimedText && CLAIMED_OFFICIAL_BOT_PATTERN.test(claimedText)) return true;
+  return [
+    input.category,
+    input.webBotAuth?.category,
+    input.directory?.category
+  ].some((value) => CLAIMED_BOT_CATEGORIES.has(normalizedCategory(value)));
+}
+function composeBotVerdict(input) {
+  const core = composeBotVerdictCore(input);
+  const bot = botSignalFor(core.verdict);
+  const explicitIdentity = normalizeIdentity(
+    input.webBotAuth?.identity ?? input.webBotAuth?.status ?? input.directory?.identity ?? input.directory?.status
+  );
+  const reasonIdentity = identityForReason(core.reason);
+  const inspectionState = input.activeCdpInspection === true ? ACTIVE_CDP_INSPECTION_STATE : IDLE_CDP_INSPECTION_STATE;
+  return {
+    ...core,
+    bot,
+    isBot: bot !== "not_detected",
+    // Separate, additive axis: never feeds the verdict, `bot` or `isBot`.
+    inspection_state: inspectionState,
+    automation_protocol_inspection_state: inspectionState,
+    // A spoofed-impersonation core result is authoritative: an input-level 'unknown'
+    // or 'verified' claim must never downgrade identity='spoofed'. A signed-good core result
+    // is equally authoritative for its own reason: identity MUST be 'signed' even when an
+    // upstream claim says 'verified' or 'unknown' (RS-E signed-good precedence / parity).
+    identity: reasonIdentity === "spoofed" ? "spoofed" : core.reason === "signed-agent" ? "signed" : core.reason === "verified-agent" ? "verified" : explicitIdentity ?? reasonIdentity,
+    confidence: confidenceForReason(core.reason)
+  };
+}
+function composeBotVerdictCore(input) {
+  const webBotAuth = input.webBotAuth ?? {};
+  const directory = input.directory ?? {};
+  const clientProbe = input.clientProbe ?? {};
+  const probeReasons = Array.isArray(clientProbe.reasons) ? clientProbe.reasons.filter((reason) => typeof reason === "string" && reason.length > 0) : [];
+  const probeVerdict = typeof clientProbe.verdict === "string" ? clientProbe.verdict.toLowerCase() : "";
+  const directoryStatus = typeof directory.status === "string" ? directory.status.toLowerCase() : "";
+  const stealth = input.stealth ?? null;
+  const stealthIdsRaw = stealth?.ids;
+  const stealthHardRaw = stealth?.hard;
+  const stealthIds = Array.isArray(stealthIdsRaw) ? stealthIdsRaw.filter((id) => typeof id === "string" && id.length > 0) : [];
+  const stealthHard = Array.isArray(stealthHardRaw) ? stealthHardRaw.filter((id) => typeof id === "string") : [];
+  const stealthDetected = stealth?.detected === true;
+  const inList = (list, id) => Array.isArray(list) && list.includes(id);
+  const stealthReasons = [];
+  for (const id of stealthIds) {
+    const reason = stealthReasonId(id, stealthHard.includes(id), {
+      confirmed: inList(stealth?.confirmed, id),
+      inconclusive: inList(stealth?.inconclusive, id),
+      soft: inList(stealth?.soft, id),
+      docked: inList(stealth?.docked, id),
+      source: stealth?.sourceUrlSource ?? null
+    });
+    if (reason && !stealthReasons.includes(reason)) stealthReasons.push(reason);
+  }
+  const activeInspectionReasons = input.activeCdpInspection === true ? [ACTIVE_CDP_INSPECTION_REASON_ID] : [];
+  const allProbeReasons = [...probeReasons, ...stealthReasons, ...activeInspectionReasons];
+  const effectiveProbeVerdict = probeVerdict === "agent" || stealthDetected ? "agent" : probeVerdict;
+  const signedProof = hasSignedProof(webBotAuth);
+  const signedWba = isWbaValid(webBotAuth) && (signedProof || hasSignedIdentity([webBotAuth.identity, webBotAuth.status]) || hasSignedIdentity([directory.identity, directory.status, directory.signed === true ? "signed" : null]));
+  if (signedWba && (signedProof || isAssistantOrAgentCategory([webBotAuth.category, directory.category, input.category]))) {
+    return {
+      verdict: "good",
+      reason: "signed-agent",
+      reason_ids: ["signed-agent"],
+      agent_verdict: webBotAuth.bot_id || webBotAuth.agentId || webBotAuth.operator || directory.bot_id || directory.operator || null,
+      verified: true,
+      severity: "none"
+    };
+  }
+  if (isWbaValid(webBotAuth)) {
+    return {
+      verdict: "good",
+      reason: "verified-agent",
+      reason_ids: ["verified-agent"],
+      agent_verdict: webBotAuth.bot_id || webBotAuth.operator || "verified-agent",
+      verified: true,
+      severity: "none"
+    };
+  }
+  if (directoryStatus === "spoofed") {
+    return {
+      verdict: "bad",
+      reason: "spoofed-impersonation",
+      reason_ids: ["spoofed-impersonation", ...allProbeReasons],
+      agent_verdict: directory.bot_id || directory.operator || null,
+      verified: false,
+      severity: "high"
+    };
+  }
+  if (directory.detected === true && (directoryStatus === "verified" || directory.signed === true)) {
+    return {
+      verdict: "good",
+      reason: directoryStatus === "verified" ? "verified-agent" : "signed-agent",
+      reason_ids: [directoryStatus === "verified" ? "verified-agent" : "signed-agent", ...allProbeReasons],
+      agent_verdict: directory.bot_id || directory.operator || null,
+      verified: directoryStatus === "verified",
+      severity: "none"
+    };
+  }
+  if (!isWbaValid(webBotAuth) && input.ipInKnownBotCidr !== true && claimsOfficialBotIdentity(input)) {
+    return {
+      verdict: "bad",
+      reason: "spoofed-impersonation",
+      reason_ids: ["spoofed-impersonation", ...allProbeReasons],
+      agent_verdict: webBotAuth.bot_id || webBotAuth.operator || directory.bot_id || directory.operator || null,
+      verified: false,
+      severity: "high"
+    };
+  }
+  if (effectiveProbeVerdict === "agent" && isHardAgentReason(allProbeReasons)) {
+    return {
+      verdict: "bad",
+      reason: "automated-runtime",
+      reason_ids: ["automated-runtime", ...allProbeReasons],
+      agent_verdict: null,
+      verified: false,
+      severity: "high"
+    };
+  }
+  if (effectiveProbeVerdict === "agent") {
+    return {
+      verdict: "not_detected",
+      reason: "suspected-automation",
+      reason_ids: ["suspected-automation", ...allProbeReasons],
+      agent_verdict: null,
+      verified: false,
+      severity: "low"
+    };
+  }
+  if (input.ipInKnownBotCidr === true && input.uaLooksLikeBot !== true) {
+    return {
+      verdict: "known-operator-network",
+      reason: "known-operator-network",
+      reason_ids: ["known-operator-network", ...allProbeReasons],
+      agent_verdict: null,
+      verified: false,
+      severity: "low"
+    };
+  }
+  if (input.uaLooksLikeBot === true) {
+    return {
+      verdict: "not_detected",
+      reason: "suspected-automation",
+      reason_ids: ["suspected-automation", ...allProbeReasons],
+      agent_verdict: null,
+      verified: false,
+      severity: "low"
+    };
+  }
+  return {
+    verdict: "human-or-unverified",
+    reason: "not_detected",
+    reason_ids: ["not_detected", ...allProbeReasons],
+    agent_verdict: null,
+    verified: false,
+    severity: "none"
+  };
+}
+function botSignalFor(label) {
+  switch (label) {
+    case "good":
+      return "good";
+    case "bad":
+      return "bad";
+    case "known-operator-network":
+      return "suspected";
+    case "not_detected":
+    case "human-or-unverified":
+    default:
+      return "not_detected";
+  }
+}
+function identityForReason(reason) {
+  switch (reason) {
+    case "verified-agent":
+      return "verified";
+    case "signed-agent":
+      return "signed";
+    case "spoofed-impersonation":
+      return "spoofed";
+    default:
+      return "unknown";
+  }
+}
+function confidenceForReason(reason) {
+  switch (reason) {
+    case "verified-agent":
+    case "signed-agent":
+    case "spoofed-impersonation":
+    case "automated-runtime":
+      return "high";
+    default:
+      return "low";
+  }
+}
+
 // src/shared/normalization/uaNormalizer.ts
 var GREASE_RE = /not.?a.?brand/i;
 var CHROMIUM_PLACEHOLDER = "chromium";
+var HEADLESS_UA_RE = /HeadlessChrome|headless[_-]?shell|chrome[_-]?headless[_-]?shell/i;
+var HEADLESS_BRAND_RE = /^(?:headlesschrome|headless[_-]?shell|chrome[_-]?headless[_-]?shell)$/i;
+var HEADLESS_VERSION_RE = /(?:HeadlessChrome|headless[_-]?shell|chrome[_-]?headless[_-]?shell)\/([\d.]+)/i;
+var HEADLESS_SHELL_UA_RE = /headless[_-]?shell|chrome[_-]?headless[_-]?shell/i;
+var HEADLESS_SHELL_BRAND_RE = /^(?:headless[_-]?shell|chrome[_-]?headless[_-]?shell)$/i;
 function splitStructuredList(raw) {
   const parts = [];
   let current = "";
@@ -2177,7 +2672,7 @@ function parseBrandList(raw) {
     const brand = parsed.value.trim();
     if (!brand) continue;
     const entry = { brand, version: (parsed.params.get("v") ?? "").trim() };
-    if (brand.toLowerCase() === "headlesschrome") entry.is_headless_brand = true;
+    if (HEADLESS_BRAND_RE.test(brand)) entry.is_headless_brand = true;
     out.push(entry);
   }
   return out;
@@ -2189,7 +2684,10 @@ function filterBrands(brands) {
 }
 function isPlaceholderVersion(version) {
   if (typeof version !== "string" || !version.trim()) return false;
-  return /^0+(?:\.0+)*$/.test(version.trim());
+  const v = version.trim();
+  if (/^0+(?:\.0+)*$/.test(v)) return true;
+  const major = v.split(".")[0];
+  return /^\d+$/.test(major) && Number(major) >= 999;
 }
 function hasRealBrand(brands) {
   return brands.some(
@@ -2244,6 +2742,13 @@ function parseSecCh(secCh) {
     wow64: parseWow64(headerValue3(secCh, "sec-ch-ua-wow64"))
   };
 }
+function resolveHeadlessMode(ua, uad, secCh) {
+  const brands = [...uad?.fullVersionList ?? [], ...secCh.brands];
+  const isShell = HEADLESS_SHELL_UA_RE.test(ua) || brands.some((b) => !!b && HEADLESS_SHELL_BRAND_RE.test(b.brand));
+  if (isShell) return "shell";
+  const isHeadless = HEADLESS_UA_RE.test(ua) || brands.some((b) => !!b && HEADLESS_BRAND_RE.test(b.brand));
+  return isHeadless ? "new" : null;
+}
 var BROWSER_SPECS = [
   {
     // Electron is a distinct binary/runtime (it embeds Chromium), not the engine version.
@@ -2286,8 +2791,68 @@ var BROWSER_SPECS = [
   },
   {
     name: "Headless Chrome",
-    brands: ["headlesschrome"],
-    uaTokens: [/HeadlessChrome\/([\d.]+)/]
+    brands: ["headlesschrome", "headless_shell", "chrome-headless-shell"],
+    uaTokens: [HEADLESS_VERSION_RE]
+  },
+  {
+    // Chromium fork: UA ends with `… Chrome/<ver> Safari/<ver> Arc/<ver>`.
+    name: "Arc",
+    brands: ["arc"],
+    uaTokens: [/Arc\/([\d.]+)/]
+  },
+  {
+    // Chromium fork: UA ends with `… Chrome/<ver> Safari/<ver> Vivaldi/<ver>`.
+    name: "Vivaldi",
+    brands: ["vivaldi"],
+    uaTokens: [/Vivaldi\/([\d.]+)/]
+  },
+  {
+    // Search crawler. Smartphone Googlebot UAs also carry a `Chrome/<ver>` token,
+    // so this spec must precede Google Chrome in the UA regex scan.
+    name: "Googlebot",
+    brands: [],
+    uaTokens: [/Googlebot\/([\d.]+)/, /Googlebot-Mobile\/([\d.]+)/, /Googlebot-Image\/([\d.]+)/]
+  },
+  {
+    name: "GPTBot",
+    brands: [],
+    uaTokens: [/GPTBot\/([\d.]+)/]
+  },
+  {
+    name: "ChatGPT-User",
+    brands: [],
+    uaTokens: [/ChatGPT-User\/([\d.]+)/]
+  },
+  {
+    name: "OAI-SearchBot",
+    brands: [],
+    uaTokens: [/OAI-SearchBot\/([\d.]+)/]
+  },
+  {
+    name: "ClaudeBot",
+    brands: [],
+    /* Anthropic also emits the lowercase `claudebot/<ver>` spelling. */
+    uaTokens: [/ClaudeBot\/([\d.]+)/i]
+  },
+  {
+    name: "Claude-User",
+    brands: [],
+    uaTokens: [/Claude-User\/([\d.]+)/]
+  },
+  {
+    name: "Claude-SearchBot",
+    brands: [],
+    uaTokens: [/Claude-SearchBot\/([\d.]+)/]
+  },
+  {
+    name: "PerplexityBot",
+    brands: [],
+    uaTokens: [/PerplexityBot\/([\d.]+)/]
+  },
+  {
+    name: "Perplexity-User",
+    brands: [],
+    uaTokens: [/Perplexity-User\/([\d.]+)/]
   },
   {
     name: "Google Chrome",
@@ -2297,7 +2862,14 @@ var BROWSER_SPECS = [
   {
     name: "Chromium",
     brands: [CHROMIUM_PLACEHOLDER],
-    uaTokens: [/Chrome\/([\d.]+)/]
+    /* P2 browser name: a plain `Chrome/<ver>` token belongs to Google Chrome (or
+     * to a higher-precedence fork), NEVER to Chromium. Listing `Chrome/` here made
+     * every "UA says Chrome" payload a latent Chromium match — the Google Chrome
+     * spec happens to mask it today, but any brand/version path that reaches this
+     * spec would mislabel a plain Chrome client. Only a genuine bare `Chromium/<ver>`
+     * token (or an explicit Chromium-only UA-CH brand claim, i.e. Chromium is the
+     * sole real brand) identifies unbranded Chromium. */
+    uaTokens: [/Chromium\/([\d.]+)/]
   },
   {
     name: "Firefox",
@@ -2321,6 +2893,8 @@ var BRAND_PRECEDENCE = [
   "Microsoft Edge",
   "Brave",
   "Opera",
+  "Arc",
+  "Vivaldi",
   "Google Chrome",
   "Chromium",
   "Cursor",
@@ -2369,6 +2943,28 @@ function resolveBrowser(ua, uad, secCh) {
     return { name: "Electron", full: electronVersion, major: majorOf(electronVersion) };
   }
   const rawUadBrands = (uad?.fullVersionList ?? []).filter((b) => !!b);
+  const allBrands = [...rawUadBrands, ...secCh.brands];
+  if (HEADLESS_UA_RE.test(ua) || allBrands.some((b) => HEADLESS_BRAND_RE.test(b.brand))) {
+    const headlessBrand = allBrands.find((b) => HEADLESS_BRAND_RE.test(b.brand));
+    let version = firstMatch(HEADLESS_VERSION_RE, ua) ?? "";
+    if (isPlaceholderVersion(version)) version = "";
+    if (!version && headlessBrand && !isPlaceholderVersion(headlessBrand.version)) {
+      version = headlessBrand.version;
+    }
+    if (!version) {
+      const versionedBrand = allBrands.find(
+        (b) => !GREASE_RE.test(b.brand) && !!b.version && !isPlaceholderVersion(b.version)
+      );
+      version = versionedBrand?.version ?? firstMatch(/CriOS\/([\d.]+)|Chrome\/([\d.]+)/i, ua) ?? "";
+    }
+    if (isPlaceholderVersion(version)) version = "";
+    return {
+      name: "Headless Chrome",
+      full: version,
+      major: majorOf(version),
+      is_headless_brand: true
+    };
+  }
   const uadBrands = filterBrands(rawUadBrands);
   const candidates = [];
   if (uadBrands.length > 0 && hasRealBrand(rawUadBrands)) {
@@ -2480,7 +3076,7 @@ function macVersionFromSafariUa(ua) {
   if (safari === null) return null;
   const safariMajor = parseIntSafe(safari[1] ?? "");
   if (safariMajor === null) return null;
-  const macMajor = safariMajor - 3;
+  const macMajor = safariMajor >= 26 ? safariMajor : safariMajor - 3;
   if (macMajor <= 10) return "10.15";
   return `${macMajor}.0`;
 }
@@ -2500,7 +3096,12 @@ function resolveOs(ua, platformStr, touch, uad, secCh) {
   const formFactors = [...uad?.formFactors ?? [], ...secCh.formFactors];
   const uaIosPhone = /(?:iPhone|iPod)/.test(ua);
   const uaIpad = /iPad/.test(ua);
-  const macTouch = touch >= IPAD_TOUCH_THRESHOLD && (/macintel/i.test(platformStr) || /macintosh/i.test(ua));
+  const safariVersionMatch = /(?:^|[\s;])Version\/(\d+)(?:\.[\d.]+)?.*Safari/.exec(ua);
+  const safariMajorNumber = safariVersionMatch === null ? null : parseIntSafe(safariVersionMatch[1] ?? "");
+  const noTabletFormFactor = !/\btablet\b/i.test(formFactors.join(" "));
+  const explicitMacHint = (uadPlatform.toLowerCase() === "macos" || secCh.platform.toLowerCase() === "macos") && noTabletFormFactor && !(uad?.model ?? "").trim() && !secCh.model;
+  const safari26Mac = safariMajorNumber !== null && safariMajorNumber >= 26 && noTabletFormFactor;
+  const macTouch = touch >= IPAD_TOUCH_THRESHOLD && (/macintel/i.test(platformStr) || /macintosh/i.test(ua)) && !explicitMacHint && !safari26Mac;
   const macTabletFormFactor = touch >= IPAD_TOUCH_THRESHOLD && uadPlatform.toLowerCase() === "macos" && formFactors.map((f) => f.toLowerCase()).indexOf("tablet") !== -1;
   if (uaIosPhone || uaIpad || macTouch || macTabletFormFactor) {
     let osVersion = "";
@@ -2769,13 +3370,14 @@ var BLANK_IDENTITY = {
   architecture: "",
   bitness: "",
   platformFamily: "unknown",
+  headless_mode: null,
   runtime: "unknown",
   host_app: "",
   client_type: "unknown",
   form_factors: [],
   wow64: false
 };
-function normalizeIdentity(input) {
+function normalizeIdentity2(input) {
   try {
     const ua = (input?.userAgent ?? "").toString();
     const platformStr = (input?.platform ?? "").toString();
@@ -2783,6 +3385,7 @@ function normalizeIdentity(input) {
     const touch = typeof rawTouch === "number" && isFinite(rawTouch) ? rawTouch : 0;
     const uad = input?.uaData ?? null;
     const secCh = parseSecCh(input?.secCh);
+    const headlessMode = resolveHeadlessMode(ua, uad, secCh);
     const signals = runtimeSignalsFromInput(input ?? {});
     const runtime = resolveRuntime(ua, signals);
     const osRes = resolveOs(ua, platformStr, touch, uad, secCh);
@@ -2814,6 +3417,7 @@ function normalizeIdentity(input) {
       architecture: archRes.architecture,
       bitness: archRes.bitness,
       platformFamily: osRes.platformFamily,
+      headless_mode: headlessMode,
       runtime: runtime.runtime,
       host_app: runtime.host_app,
       client_type: runtime.client_type,
@@ -2846,6 +3450,7 @@ var BLANK_USER_AGENT = {
   architecture: "",
   bitness: "",
   model: "",
+  headless_mode: null,
   runtime: "unknown",
   host_app: "",
   client_type: "unknown",
@@ -2933,7 +3538,7 @@ function coerceClientHints(hints) {
 function normalizeUserAgent(input) {
   try {
     const { uaData, secCh } = coerceClientHints(input?.clientHints);
-    const identity = normalizeIdentity({
+    const identity = normalizeIdentity2({
       userAgent: input?.userAgent ?? "",
       platform: input?.platform ?? "",
       maxTouchPoints: input?.maxTouchPoints,
@@ -2961,6 +3566,7 @@ function normalizeUserAgent(input) {
       bitness: identity.bitness,
       model: identity.device_model,
       is_headless_brand: identity.is_headless_brand,
+      headless_mode: identity.headless_mode,
       runtime: identity.runtime,
       host_app: identity.host_app,
       client_type: identity.client_type,
@@ -3046,7 +3652,7 @@ var asnRegistry_default = [
     handle: "RELIANCEJIO-IN",
     asn_type: "isp",
     datacenter_result: false,
-    sample_prefixes: ["49.44.63.0/24", "49.44.88.0/22"]
+    sample_prefixes: ["49.32.0.0/13", "49.44.63.0/24", "49.44.88.0/22"]
   },
   {
     asn: 24560,
@@ -3664,8 +4270,8 @@ async function resolveAsnOrganization(asn) {
     source: "none"
   };
   if (number === null) return empty;
-  const cacheKey = `asnorg:${number}`;
-  const cached = cacheGet(cacheKey);
+  const cacheKey2 = `asnorg:${number}`;
+  const cached = cacheGet(cacheKey2);
   if (cached !== void 0 && typeof cached === "object" && cached !== null) {
     return { ...cached };
   }
@@ -3678,7 +4284,7 @@ async function resolveAsnOrganization(asn) {
       datacenter_result: entry.datacenter_result,
       source: "registry"
     };
-    cacheSet(cacheKey, result, ASN_META_TTL_MS);
+    cacheSet(cacheKey2, result, ASN_META_TTL_MS);
     return result;
   }
   try {
@@ -3694,20 +4300,20 @@ async function resolveAsnOrganization(asn) {
           datacenter_result: heuristic.datacenter,
           source: "cymru"
         };
-        cacheSet(cacheKey, result, ASN_META_TTL_MS);
+        cacheSet(cacheKey2, result, ASN_META_TTL_MS);
         return result;
       }
     }
   } catch {
   }
-  cacheSet(cacheKey, empty, NEGATIVE_TTL_MS);
+  cacheSet(cacheKey2, empty, NEGATIVE_TTL_MS);
   return empty;
 }
 async function enrichNetwork(ip, edge = {}) {
   try {
     const ipClean = String(ip ?? "").trim();
-    const cacheKey = `ip:${ipClean}`;
-    const cached = cacheGet(cacheKey);
+    const cacheKey2 = `ip:${ipClean}`;
+    const cached = cacheGet(cacheKey2);
     if (cached !== void 0 && typeof cached === "object" && cached !== null) {
       return cloneResult(cached);
     }
@@ -3724,7 +4330,7 @@ async function enrichNetwork(ip, edge = {}) {
         datacenter_result: entry ? entry.datacenter_result : heuristic?.datacenter ?? false,
         source: "edge"
       };
-      cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+      cacheSet(cacheKey2, result, IP_LOOKUP_TTL_MS);
       return result;
     }
     const prefixMatch = registryEntryForIp(ipClean);
@@ -3737,7 +4343,7 @@ async function enrichNetwork(ip, edge = {}) {
         datacenter_result: prefixMatch.entry.datacenter_result,
         source: "registry"
       };
-      cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+      cacheSet(cacheKey2, result, IP_LOOKUP_TTL_MS);
       return result;
     }
     if (edgeAsn) {
@@ -3751,7 +4357,7 @@ async function enrichNetwork(ip, edge = {}) {
           datacenter_result: entry.datacenter_result,
           source: "registry"
         };
-        cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+        cacheSet(cacheKey2, result, IP_LOOKUP_TTL_MS);
         return result;
       }
       const byAsn = await resolveAsnOrganization(edgeAsn);
@@ -3764,7 +4370,7 @@ async function enrichNetwork(ip, edge = {}) {
           datacenter_result: byAsn.datacenter_result,
           source: byAsn.source
         };
-        cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+        cacheSet(cacheKey2, result, IP_LOOKUP_TTL_MS);
         return result;
       }
     }
@@ -3778,7 +4384,7 @@ async function enrichNetwork(ip, edge = {}) {
         datacenter_result: heuristic.datacenter,
         source: "edge"
       };
-      cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+      cacheSet(cacheKey2, result, IP_LOOKUP_TTL_MS);
       return result;
     }
     const cymru = await lookupCymruByIp(ipClean);
@@ -3804,11 +4410,11 @@ async function enrichNetwork(ip, edge = {}) {
         datacenter_result: datacenter ?? false,
         source: "cymru"
       };
-      cacheSet(cacheKey, result, IP_LOOKUP_TTL_MS);
+      cacheSet(cacheKey2, result, IP_LOOKUP_TTL_MS);
       return result;
     }
     const empty = EMPTY_NETWORK();
-    cacheSet(cacheKey, empty, NEGATIVE_TTL_MS);
+    cacheSet(cacheKey2, empty, NEGATIVE_TTL_MS);
     return empty;
   } catch {
     return EMPTY_NETWORK();
@@ -5700,11 +6306,126 @@ function enforceTamperingInvariant(input) {
   const detected = reasons.length > 0 || hard_spec_violation;
   return { detected, reasons, hard_spec_violation, privacy_hardened: privacy };
 }
-function classifyInspectorState(signals = {}) {
-  if (signals.cdpAttached) return "automation_protocol_attached";
-  if (signals.devtoolsActiveVerified) return "devtools_active_verified";
-  if (signals.viewportContractionNormalized) return "devtools_docked_suspected";
-  return "closed";
+function toInspectorState(state) {
+  switch (state) {
+    case "yes-corroborated":
+      return "yes-corroborated";
+    case "yes-unattributed":
+    case "automation_protocol_attached":
+    case "devtools_docked_suspected":
+    case "devtools_active_verified":
+      return "yes-unattributed";
+    case "no":
+    case "closed":
+    default:
+      return "no";
+  }
+}
+function resolveInspectorState(signals = {}) {
+  const cdp = Boolean(signals.cdpAttached) || Boolean(signals.strongCdpProof);
+  const verifiedUi = Boolean(signals.devtoolsActiveVerified);
+  if (cdp && verifiedUi) return "yes-corroborated";
+  if (cdp) return "yes-unattributed";
+  if (verifiedUi || Boolean(signals.developerTools)) return "devtools_active_verified";
+  if (Boolean(signals.cdpRuntimeLeak) || signals.automationEnvironment === "electron" || signals.automationEnvironment === "ide_webview" || Boolean(signals.viewportContractionNormalized)) {
+    return "devtools_docked_suspected";
+  }
+  return "no";
+}
+function inspectorFlagsForState(state) {
+  switch (state) {
+    case "yes-corroborated":
+      return { cdp_attached: true, developer_tools: true };
+    case "yes-unattributed":
+    case "automation_protocol_attached":
+      return { cdp_attached: true, developer_tools: false };
+    case "devtools_docked_suspected":
+    case "devtools_active_verified":
+      return { cdp_attached: false, developer_tools: true };
+    case "no":
+    case "closed":
+    default:
+      return { cdp_attached: false, developer_tools: false };
+  }
+}
+function permitsHumanVerdict(state) {
+  return toInspectorState(state) === "no";
+}
+function checkInspectorInvariants(input) {
+  const canonical_state = toInspectorState(input.inspector_state);
+  const expected_flags = inspectorFlagsForState(input.inspector_state);
+  const contradictions = [];
+  if (input.cdp_attached !== void 0 && Boolean(input.cdp_attached) !== expected_flags.cdp_attached) {
+    contradictions.push(
+      `cdp_attached=${Boolean(input.cdp_attached)} contradicts inspector_state '${canonical_state}' (expected ${expected_flags.cdp_attached})`
+    );
+  }
+  if (input.developer_tools !== void 0 && Boolean(input.developer_tools) !== expected_flags.developer_tools) {
+    contradictions.push(
+      `developer_tools=${Boolean(input.developer_tools)} contradicts inspector_state '${canonical_state}' (expected ${expected_flags.developer_tools})`
+    );
+  }
+  const permits_human_verdict = permitsHumanVerdict(canonical_state);
+  const tier = typeof input.verdict_tier === "string" ? input.verdict_tier : "";
+  if (!permits_human_verdict && /verified\s+human/i.test(tier)) {
+    contradictions.push(
+      `"Verified Human" verdict is forbidden while inspector_state is '${canonical_state}'`
+    );
+  }
+  return {
+    consistent: contradictions.length === 0,
+    contradictions,
+    canonical_state,
+    expected_flags,
+    permits_human_verdict
+  };
+}
+var INSPECTOR_STATE_VALUES = /* @__PURE__ */ new Set([
+  "no",
+  "yes-unattributed",
+  "yes-corroborated",
+  "closed",
+  "automation_protocol_attached",
+  "devtools_docked_suspected",
+  "devtools_active_verified"
+]);
+function isInspectorStateValue(value) {
+  return typeof value === "string" && INSPECTOR_STATE_VALUES.has(value);
+}
+function canonicalInspectorFlags(input = {}) {
+  try {
+    const source = input && typeof input === "object" ? input : {};
+    const rawState = shadowField(source, "inspector_state");
+    if (isInspectorStateValue(rawState)) {
+      return { ...inspectorFlagsForState(rawState), inspector_state: rawState };
+    }
+    const publishedCdp = shadowBool(source, "cdp_attached");
+    const publishedDevtools = shadowBool(source, "developer_tools");
+    const environment = shadowField(source, "automationEnvironment");
+    const state = resolveInspectorState({
+      cdpAttached: publishedCdp ?? (shadowBool(source, "cdpAttached") === true || shadowBool(source, "strongCdpProof") === true),
+      devtoolsActiveVerified: publishedDevtools ?? (shadowBool(source, "devtoolsActiveVerified") === true || shadowBool(source, "developerTools") === true),
+      viewportContractionNormalized: shadowBool(source, "viewportContractionNormalized"),
+      cdpRuntimeLeak: shadowBool(source, "cdpRuntimeLeak"),
+      automationEnvironment: typeof environment === "string" ? environment : void 0
+    });
+    return { ...inspectorFlagsForState(state), inspector_state: state };
+  } catch {
+    return { cdp_attached: false, developer_tools: false, inspector_state: "no" };
+  }
+}
+function shadowField(record, key) {
+  try {
+    if (record === null || record === void 0) return void 0;
+    if (typeof record !== "object" && typeof record !== "function") return void 0;
+    return record[key];
+  } catch {
+    return void 0;
+  }
+}
+function shadowBool(record, key) {
+  const value = shadowField(record, key);
+  return typeof value === "boolean" ? value : void 0;
 }
 
 // src/lib/riskLedger.ts
@@ -5856,18 +6577,6 @@ function computeHonestRarity(corpusN, observedCount = 1) {
     score_contribution: decision.status === "published" ? 1 : 0
   };
 }
-function computeHonestProximity(input = {}) {
-  const permission = String(input.permission || "").toLowerCase();
-  if (permission !== "granted" || !input.grantedCoordinates) {
-    return { status: permission === "denied" ? "unavailable" : "permission_required" };
-  }
-  const result = { status: "granted" };
-  if (typeof input.accuracyM === "number" && Number.isFinite(input.accuracyM)) {
-    result.accuracy_m = input.accuracyM;
-  }
-  result.coordinates = input.grantedCoordinates;
-  return result;
-}
 var CALIBRATION_MIN_LABELED_PAIRS = 200;
 var CALIBRATION_MAX_ECE = 0.05;
 function isCalibrationEligible(input) {
@@ -5925,7 +6634,10 @@ function computeHonestIdentityConfidence(input) {
     total_anchors: source.totalAnchors,
     distinct_storage_seeds_count: source.distinctStorageSeedsCount,
     browser_family_consensus: source.browserFamilyConsensus,
-    os_family_consensus: source.osFamilyConsensus
+    os_family_consensus: source.osFamilyConsensus,
+    storageHealed: source.storageHealed,
+    visitContinuity: source.visitContinuity,
+    profileAgeDays: source.profileAgeDays
   });
   return {
     confidence_score: score,
@@ -6122,32 +6834,56 @@ function resolveIdentityStage(input = {}) {
 }
 
 // src/lib/verdict.ts
+var STEALTH_SIGNAL_REASON_IDS2 = Object.freeze({
+  runtimeEnableLeak: "stealth.runtime-enable-leak",
+  ipcFloodingProtection: "launch.ipc-flooding-switch",
+  documentInterception: "stealth.document-interception",
+  storagePartitioning: "stealth.storage-partitioning",
+  cdpBindingGlobals: "cdp.runtime.enable",
+  sourceUrlLeak: "cdp.runtime.evaluate.source-url",
+  pwInitScripts: "playwright.init-scripts",
+  exposeFunctionLeak: "bot.playwright-binding",
+  bypassCsp: "stealth.bypass-csp",
+  popupBlocking: "bot.popup-blocking",
+  marionette: "navigator.webdriver",
+  chromeHeadlessShell: "ua.headless-chrome"
+});
+var ACTIVE_CDP_INSPECTION_STATE2 = "automation_protocol_inspection_active";
+var IDLE_CDP_INSPECTION_STATE2 = "automation_protocol_inspection_idle";
+function automationProtocolInspectionState(activeCdpInspection) {
+  return activeCdpInspection === true ? ACTIVE_CDP_INSPECTION_STATE2 : IDLE_CDP_INSPECTION_STATE2;
+}
 function decideVerdictTier(input) {
+  const protocol_inspection_state = automationProtocolInspectionState(input.activeCdpInspection);
   if (input.tamperingDetected) {
     return {
       verdict_tier: "Tampered / Spoofed Environment",
       human_corroboration: 0,
-      label: "Tampered / Spoofed Environment"
+      label: "Tampered / Spoofed Environment",
+      protocol_inspection_state
     };
   }
   if (input.automation === "automated") {
     return {
       verdict_tier: "Verified Automation",
       human_corroboration: 0,
-      label: "Verified Automation"
+      label: "Verified Automation",
+      protocol_inspection_state
     };
   }
   if (input.humanCorroboration === 1 && input.hasInteractionEvidence !== false) {
     return {
       verdict_tier: "Verified Human Interactive Session",
       human_corroboration: 1,
-      label: "Verified Human Interactive Session"
+      label: "Verified Human Interactive Session",
+      protocol_inspection_state
     };
   }
   return {
     verdict_tier: "Unverified / Passive Session",
     human_corroboration: 0,
-    label: "Unverified / Passive Session"
+    label: "Unverified / Passive Session",
+    protocol_inspection_state
   };
 }
 
@@ -10064,27 +10800,22 @@ var PINNED_PREFIXES = {
   ]
 };
 
-// src/lib/wbaVerifier.ts
-var WBA_TRUSTED_SIGNERS = [
-  {
-    agentId: "manus_bot",
-    operator: "Manus",
-    directoryHosts: ["api.manus.im", "manus.im", "manus.ai"],
-    requirePinnedKey: false,
-    directoryUrl: "https://api.manus.im/.well-known/http-message-signatures-directory"
-  },
-  {
-    agentId: "grok_agent",
-    operator: "xAI",
-    directoryHosts: ["cursorusercontent.com"],
-    requirePinnedKey: true,
-    pinnedKeyX: ["STDZXOMW-Cg7paRpv_BtjujEHIQVNbzidfjY9M9w6hc"],
-    pinnedKeyIds: ["Vuxu4khgzIe0b30Nd6hq2envAuVBFMTDqorSNIUb_Oo"],
-    directoryUrl: "https://cursorusercontent.com/.well-known/http-message-signatures-directory"
-  }
-];
+// src/lib/webBotAuth.ts
 var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-var B64URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+var WELL_KNOWN_SUFFIX = "/.well-known/http-message-signatures-directory";
+var ALLOWED_PARAMS = /* @__PURE__ */ new Set(["created", "expires", "keyid", "tag", "alg"]);
+function isAscii(value) {
+  return !/[^\x00-\x7F]/.test(value);
+}
+function unquote3(value) {
+  const v = value.trim();
+  if (v.length < 2 || v[0] !== '"' || v[v.length - 1] !== '"') return null;
+  let inner = v.slice(1, -1);
+  if (/\\/.test(inner) && !/\\(["\\])/.test(inner.replace(/\\\\/g, ""))) return null;
+  inner = inner.replace(/\\(["\\])/g, "$1");
+  if (inner.includes('"') || /[\r\n]/.test(inner)) return null;
+  return inner;
+}
 function splitTopLevel(value, separator) {
   const out = [];
   let start = 0;
@@ -10110,6 +10841,600 @@ function splitTopLevel(value, separator) {
   out.push(value.slice(start).trim());
   return out.filter((part) => part.length > 0);
 }
+function base64ToBytes(input) {
+  const text = input.replace(/[\s\r\n]/g, "");
+  if (!text || text.length % 4 === 1 || !/^[A-Za-z0-9+/]+={0,2}$/.test(text)) return null;
+  const clean = text.replace(/=+$/, "");
+  const out = [];
+  let buffer = 0;
+  let bits = 0;
+  for (let i = 0; i < clean.length; i++) {
+    const idx = B64.indexOf(clean[i]);
+    if (idx < 0) return null;
+    buffer = buffer << 6 | idx;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push(buffer >> bits & 255);
+    }
+  }
+  if (bits > 0 && (buffer & (1 << bits) - 1) !== 0) return null;
+  return new Uint8Array(out);
+}
+function bytesToBase64(bytes) {
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i];
+    const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+    const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    out += B64[b0 >> 2];
+    out += B64[(b0 & 3) << 4 | b1 >> 4];
+    out += i + 1 < bytes.length ? B64[(b1 & 15) << 2 | b2 >> 6] : "=";
+    out += i + 2 < bytes.length ? B64[b2 & 63] : "=";
+  }
+  return out;
+}
+function bytesToBase64Url(bytes) {
+  return bytesToBase64(bytes).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function xBytes(x) {
+  if (!/^[A-Za-z0-9_-]{43}$/.test(x)) return null;
+  return base64ToBytes(x.replace(/-/g, "+").replace(/_/g, "/"));
+}
+function headerText(value) {
+  if (value == null) return null;
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    if (value.length !== 1 || typeof value[0] !== "string") return "__DUPLICATE__";
+    return value[0];
+  }
+  return null;
+}
+function validHttpsUrl(raw) {
+  const candidate = raw.trim();
+  if (!candidate || /\s/.test(candidate)) return false;
+  if (!/^https:\/\//i.test(candidate)) return false;
+  try {
+    const url = new URL(candidate);
+    if (url.protocol.toLowerCase() !== "https:") return false;
+    if (url.username !== "" || url.password !== "" || url.hash !== "") return false;
+    if (!url.hostname) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+function parseAgent(rawAgent) {
+  const none = { agentUrl: null, agentComponentValue: null, agentForm: null, error: null };
+  if (rawAgent === void 0 || rawAgent === null) return none;
+  const head = headerText(rawAgent);
+  if (head === "__DUPLICATE__") return { ...none, error: "duplicate_signature_agent" };
+  const text = (head ?? "").trim();
+  if (!text) return { ...none, error: "missing_signature_agent" };
+  let url = null;
+  let form = "legacy";
+  if (text.startsWith('"') && text.endsWith('"')) {
+    const matches = text.match(/"(?:[^"\\]|\\.)*"/g) ?? [];
+    if (matches.length !== 1 || matches[0] !== text) {
+      return { ...none, error: "ambiguous_signature_agent" };
+    }
+    url = unquote3(text);
+    if (url === null) return { ...none, error: "invalid_signature_agent" };
+  } else {
+    form = "dictionary";
+    const members = splitTopLevel(text, ",");
+    for (const member of members) {
+      const eq = member.indexOf("=");
+      if (eq <= 0) continue;
+      const firstValue = splitTopLevel(member.slice(eq + 1).trim(), ";")[0] ?? "";
+      const candidate = unquote3(firstValue);
+      if (candidate !== null && validHttpsUrl(candidate)) {
+        url = candidate;
+        break;
+      }
+    }
+    if (url === null) return { ...none, error: "invalid_signature_agent" };
+  }
+  if (!validHttpsUrl(url)) return { ...none, error: "invalid_signature_agent_url" };
+  return { agentUrl: url, agentComponentValue: text, agentForm: form, error: null };
+}
+function parseSignatureHeaders(rawSignature, rawInput, rawAgent) {
+  const parsed = {
+    present: false,
+    label: null,
+    rawInputValue: null,
+    covered: [],
+    params: {},
+    signatureBytes: null,
+    agentUrl: null,
+    agentComponentValue: null,
+    agentForm: null,
+    error: null
+  };
+  const sigHead = headerText(rawSignature);
+  const inHead = headerText(rawInput);
+  parsed.present = Boolean(sigHead && sigHead.trim() || inHead && inHead.trim());
+  if (!parsed.present) return parsed;
+  const agent = parseAgent(rawAgent);
+  parsed.agentUrl = agent.agentUrl;
+  parsed.agentComponentValue = agent.agentComponentValue;
+  parsed.agentForm = agent.agentForm;
+  if (sigHead === null || inHead === null) {
+    parsed.error = "missing_signature_header";
+    return parsed;
+  }
+  if (sigHead === "__DUPLICATE__" || inHead === "__DUPLICATE__") {
+    parsed.error = "duplicate_signature_header";
+    return parsed;
+  }
+  if (agent.error && rawAgent !== void 0 && rawAgent !== null) {
+    parsed.error = agent.error;
+    return parsed;
+  }
+  const inputMembers = splitTopLevel(inHead.trim(), ",");
+  if (inputMembers.length !== 1) {
+    parsed.error = inputMembers.length === 0 ? "empty_signature_input" : "duplicate_signature_label";
+    return parsed;
+  }
+  const member = inputMembers[0];
+  const eq = member.indexOf("=");
+  if (eq <= 0) {
+    parsed.error = "invalid_signature_input";
+    return parsed;
+  }
+  const label = member.slice(0, eq).trim();
+  if (!/^[A-Za-z_!#$%&'*+.^_`|~0-9-]+$/.test(label)) {
+    parsed.error = "invalid_signature_label";
+    return parsed;
+  }
+  parsed.label = label;
+  const value = member.slice(eq + 1).trim();
+  if (!value.startsWith("(")) {
+    parsed.error = "invalid_signature_input";
+    return parsed;
+  }
+  const close = value.indexOf(")");
+  if (close < 0) {
+    parsed.error = "invalid_signature_input";
+    return parsed;
+  }
+  parsed.rawInputValue = value;
+  const coveredText = value.slice(1, close);
+  const tokenPattern = /"(?:[^"\\]|\\.)*"/g;
+  let cursor = 0;
+  let tokenMatch;
+  while ((tokenMatch = tokenPattern.exec(coveredText)) !== null) {
+    const token = tokenMatch[0];
+    const gap = coveredText.slice(cursor, tokenMatch.index);
+    if (gap.trim() !== "") {
+      parsed.error = "invalid_covered_component";
+      return parsed;
+    }
+    const name = unquote3(token);
+    if (name === null || !name || !isAscii(name)) {
+      parsed.error = "invalid_covered_component";
+      return parsed;
+    }
+    const lowered = name.toLowerCase();
+    if (lowered === "@signature-params") {
+      parsed.error = "reserved_covered_component";
+      return parsed;
+    }
+    if (parsed.covered.includes(lowered)) {
+      parsed.error = "duplicate_covered_component";
+      return parsed;
+    }
+    parsed.covered.push(lowered);
+    cursor = tokenMatch.index + token.length;
+  }
+  if (coveredText.slice(cursor).trim() !== "" || parsed.covered.length === 0) {
+    parsed.error = "invalid_covered_component";
+    return parsed;
+  }
+  const tail = value.slice(close + 1).trim();
+  if (tail && !tail.startsWith(";")) {
+    parsed.error = "invalid_signature_parameters";
+    return parsed;
+  }
+  const seenParams = /* @__PURE__ */ new Set();
+  for (const part of splitTopLevel(tail.replace(/^;/, ""), ";")) {
+    const pi = part.indexOf("=");
+    if (pi <= 0) {
+      parsed.error = "invalid_signature_parameters";
+      return parsed;
+    }
+    const name = part.slice(0, pi).trim().toLowerCase();
+    const raw = part.slice(pi + 1).trim();
+    if (!ALLOWED_PARAMS.has(name)) {
+      parsed.error = `unknown_signature_param:${name}`;
+      return parsed;
+    }
+    if (seenParams.has(name)) {
+      parsed.error = `duplicate_signature_param:${name}`;
+      return parsed;
+    }
+    seenParams.add(name);
+    if (name === "created" || name === "expires") {
+      if (!/^\d+$/.test(raw)) {
+        parsed.error = `invalid_${name}`;
+        return parsed;
+      }
+      parsed.params[name] = Number(raw);
+    } else {
+      const decoded = unquote3(raw);
+      if (decoded === null || !isAscii(decoded)) {
+        parsed.error = `invalid_${name}`;
+        return parsed;
+      }
+      parsed.params[name] = decoded;
+    }
+  }
+  const sigMembers = splitTopLevel(sigHead.trim(), ",");
+  if (sigMembers.length !== 1) {
+    parsed.error = sigMembers.length === 0 ? "empty_signature" : "duplicate_signature_label";
+    return parsed;
+  }
+  const sigPart = sigMembers[0];
+  const sep = sigPart.indexOf("=");
+  if (sep <= 0) {
+    parsed.error = "invalid_signature";
+    return parsed;
+  }
+  const sigLabel = sigPart.slice(0, sep).trim();
+  if (sigLabel !== label) {
+    parsed.error = "signature_label_mismatch";
+    return parsed;
+  }
+  const sigValue = sigPart.slice(sep + 1).trim();
+  if (sigValue.length < 2 || sigValue[0] !== ":" || sigValue[sigValue.length - 1] !== ":") {
+    parsed.error = "signature_not_byte_sequence";
+    return parsed;
+  }
+  const bytes = base64ToBytes(sigValue.slice(1, -1));
+  if (!bytes) {
+    parsed.error = "invalid_signature_base64";
+    return parsed;
+  }
+  parsed.signatureBytes = bytes;
+  return parsed;
+}
+function buildSignatureBase(input, components) {
+  if (!input || !input.rawInputValue || input.covered.length === 0) return null;
+  if (!components || typeof components !== "object") return null;
+  if (!isAscii(input.rawInputValue)) return null;
+  const lines = [];
+  for (const name of input.covered) {
+    if (!/^[a-z0-9@_-]+$/.test(name) || !isAscii(name)) return null;
+    const value = components[name];
+    if (value === void 0 || value === null || !isAscii(value) || /[\r\n]/.test(value)) return null;
+    lines.push(`"${name}": ${value}`);
+  }
+  lines.push(`"@signature-params": ${input.rawInputValue}`);
+  const base = lines.join("\n");
+  return isAscii(base) ? base : null;
+}
+async function jwkThumbprint(x, subtle) {
+  if (typeof x !== "string" || x.length === 0) throw new Error("invalid_jwk_x");
+  const canonical = '{"crv":"Ed25519","kty":"OKP","x":' + JSON.stringify(x) + "}";
+  const crypto2 = subtle ?? getGlobalSubtle();
+  if (!crypto2) throw new Error("crypto_unavailable");
+  const digest = await crypto2.digest("SHA-256", new TextEncoder().encode(canonical));
+  return bytesToBase64Url(new Uint8Array(digest));
+}
+function enforcePolicy(parsed, nowMs) {
+  if (!parsed || !parsed.present) return { ok: false, reason: "no_signature" };
+  if (parsed.error) return { ok: false, reason: parsed.error };
+  const p = parsed.params;
+  if (p.alg !== "ed25519") return { ok: false, reason: "unsupported_alg" };
+  if (p.tag !== "web-bot-auth") return { ok: false, reason: "invalid_tag" };
+  if (typeof p.created !== "number" || typeof p.expires !== "number" || typeof p.keyid !== "string") {
+    return { ok: false, reason: "missing_required_param" };
+  }
+  if (!/^[A-Za-z0-9_-]{43}$/.test(p.keyid)) return { ok: false, reason: "invalid_keyid_format" };
+  if (!Number.isFinite(nowMs)) return { ok: false, reason: "invalid_now" };
+  if (p.expires < p.created) return { ok: false, reason: "expires_before_created" };
+  const nowSec = Math.floor(nowMs / 1e3);
+  if (!(p.created <= nowSec && nowSec <= p.expires)) return { ok: false, reason: "outside_validity_window" };
+  if (!parsed.covered.includes("@authority") || !parsed.covered.includes("signature-agent")) {
+    return { ok: false, reason: "missing_covered_component" };
+  }
+  if (!parsed.agentUrl) return { ok: false, reason: "invalid_signature_agent" };
+  if (!parsed.signatureBytes || parsed.signatureBytes.length !== 64) {
+    return { ok: false, reason: "invalid_signature_length" };
+  }
+  return { ok: true };
+}
+function resolveOutcome(state) {
+  switch (state.state) {
+    case "absent":
+      return { kind: "NEUTRAL", reason: state.reason ?? "no_signature" };
+    case "unverified":
+      return { kind: "NEUTRAL", reason: state.reason };
+    case "parse_error":
+    case "policy_error":
+    case "signature_mismatch":
+      return { kind: "INVALID", reason: state.reason ?? "signature_mismatch" };
+    case "verified":
+      return {
+        kind: "VALID",
+        keyid: state.keyid,
+        agentUrl: state.agentUrl,
+        directoryUrl: state.directoryUrl,
+        keySource: state.keySource,
+        verifiedAtMs: state.verifiedAtMs
+      };
+  }
+}
+function getGlobalSubtle() {
+  const c = globalThis.crypto;
+  return c && c.subtle ? c.subtle : null;
+}
+function responseHeader(headers, name) {
+  if (!headers) return null;
+  const getter = headers.get;
+  if (typeof getter === "function") return getter.call(headers, name) ?? null;
+  const record = headers;
+  const key = Object.keys(record).find((k) => k.toLowerCase() === name.toLowerCase());
+  return key ? record[key] : null;
+}
+function timeoutSignal(ms) {
+  if (typeof AbortController === "undefined") return { signal: void 0, cancel() {
+  } };
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, cancel: () => clearTimeout(timer) };
+}
+function cacheKey(url, keyid) {
+  return `${url}\0${keyid}`;
+}
+function ttlFromCacheControl(header, nowMs) {
+  const match = /(?:s-maxage|max-age)\s*=\s*"?(\d+)"?/i.exec(header ?? "");
+  const seconds = match ? Number(match[1]) : 300;
+  const ttl = Number.isFinite(seconds) ? Math.min(864e5, Math.max(3e4, seconds * 1e3)) : 3e5;
+  return nowMs + ttl;
+}
+function sanitizeJwk(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw;
+  if (record.kty !== "OKP" || record.crv !== "Ed25519" || typeof record.x !== "string") return null;
+  if (!xBytes(record.x)) return null;
+  return { kty: "OKP", crv: "Ed25519", x: record.x };
+}
+async function verifyEd25519(subtle, jwk, signature, base) {
+  try {
+    const key = await subtle.importKey(
+      "jwk",
+      { kty: jwk.kty, crv: jwk.crv, x: jwk.x },
+      { name: "Ed25519" },
+      false,
+      ["verify"]
+    );
+    const copy = new Uint8Array(signature.length);
+    copy.set(signature);
+    return await subtle.verify("Ed25519", key, copy, new TextEncoder().encode(base));
+  } catch {
+    return false;
+  }
+}
+async function fetchDirectoryKey(url, keyid, opts) {
+  const cache = opts.cache;
+  const ck = cacheKey(url, keyid);
+  const cached = cache?.get(ck);
+  if (cached?.kind === "keys" && cached.expiresAtMs > opts.nowMs) {
+    return { ok: true, jwk: cached.jwk, keySource: "cache" };
+  }
+  if (cached?.kind === "negative" && cached.expiresAtMs > opts.nowMs) {
+    return { ok: false, reason: "directory_negative_cache" };
+  }
+  const { signal, cancel } = timeoutSignal(opts.timeoutMs);
+  try {
+    const fetcher = opts.fetch ?? globalThis.fetch;
+    if (typeof fetcher !== "function") throw new Error("fetch_unavailable");
+    const response = await fetcher(url, { redirect: "error", signal });
+    if (!response || response.ok === false || typeof response.status === "number" && response.status >= 400) {
+      throw new Error("directory_fetch_failed");
+    }
+    const declaredLength = responseHeader(response.headers, "content-length");
+    if (declaredLength && Number(declaredLength) > opts.maxDirectoryBytes) throw new Error("directory_too_large");
+    const body = await response.text();
+    if (new TextEncoder().encode(body).byteLength > opts.maxDirectoryBytes) throw new Error("directory_too_large");
+    const digestHeader = responseHeader(response.headers, "content-digest");
+    if (!digestHeader) throw new Error("missing_content_digest");
+    const bodyDigest = bytesToBase64(new Uint8Array(await opts.subtle.digest("SHA-256", new TextEncoder().encode(body))));
+    const digestMatch = /(?:^|,)\s*sha-256\s*=\s*:([^:]*):/i.exec(digestHeader);
+    if (!digestMatch || digestMatch[1] !== bodyDigest) throw new Error("content_digest_mismatch");
+    let json;
+    try {
+      json = JSON.parse(body);
+    } catch {
+      throw new Error("invalid_directory_json");
+    }
+    const keys = json?.keys;
+    if (!Array.isArray(keys)) throw new Error("invalid_directory_json");
+    if (keys.length > opts.maxDirectoryKeys) throw new Error("too_many_directory_keys");
+    const byKid = /* @__PURE__ */ new Map();
+    for (const raw of keys) {
+      const jwk = sanitizeJwk(raw);
+      if (!jwk) continue;
+      byKid.set(await jwkThumbprint(jwk.x, opts.subtle), jwk);
+    }
+    if (byKid.size === 0) throw new Error("no_valid_directory_keys");
+    const dirSig = responseHeader(response.headers, "signature") ?? "";
+    const dirInput = responseHeader(response.headers, "signature-input") ?? "";
+    const dirParsed = parseSignatureHeaders(dirSig, dirInput, void 0);
+    if (dirParsed.error || !dirParsed.present) throw new Error("missing_directory_signature");
+    if (dirParsed.params.tag !== "http-message-signatures-directory") {
+      throw new Error("invalid_directory_signature_tag");
+    }
+    let authority;
+    try {
+      authority = new URL(url).host;
+    } catch {
+      throw new Error("invalid_directory_url");
+    }
+    const dirBase = buildSignatureBase(dirParsed, { "@authority": authority, "content-digest": digestHeader });
+    if (!dirBase || !dirParsed.signatureBytes) throw new Error("directory_signature_base_unavailable");
+    const claimed = dirParsed.params.keyid;
+    const candidates = claimed && byKid.has(claimed) ? [byKid.get(claimed)] : Array.from(byKid.values());
+    let possessed = false;
+    for (const candidate of candidates) {
+      if (await verifyEd25519(opts.subtle, candidate, dirParsed.signatureBytes, dirBase)) {
+        possessed = true;
+        break;
+      }
+    }
+    if (!possessed) throw new Error("directory_possession_proof_failed");
+    const expiresAtMs = ttlFromCacheControl(responseHeader(response.headers, "cache-control"), opts.nowMs);
+    for (const [kid, jwk] of byKid) {
+      cache?.set(cacheKey(url, kid), { kind: "keys", jwk, fetchedAtMs: opts.nowMs, expiresAtMs });
+    }
+    const wanted = byKid.get(keyid);
+    if (!wanted) return { ok: false, reason: "keyid_not_published" };
+    return { ok: true, jwk: wanted, keySource: "directory" };
+  } catch (error) {
+    const known = /* @__PURE__ */ new Set([
+      "fetch_unavailable",
+      "directory_fetch_failed",
+      "directory_too_large",
+      "missing_content_digest",
+      "content_digest_mismatch",
+      "invalid_directory_json",
+      "too_many_directory_keys",
+      "no_valid_directory_keys",
+      "missing_directory_signature",
+      "invalid_directory_signature_tag",
+      "invalid_directory_url",
+      "directory_signature_base_unavailable",
+      "directory_possession_proof_failed"
+    ]);
+    const message = error instanceof Error ? error.message : "";
+    const reason = known.has(message) ? message : "directory_fetch_failed";
+    if (cached?.kind === "keys" && cached.jwk) {
+      return { ok: true, jwk: cached.jwk, keySource: "cache" };
+    }
+    cache?.set(ck, {
+      kind: "negative",
+      fetchedAtMs: opts.nowMs,
+      expiresAtMs: opts.nowMs + 6e4
+      // negative cache: 1 min (<= 5 min)
+    });
+    return { ok: false, reason };
+  } finally {
+    cancel();
+  }
+}
+function directoryUrlFor(agentUrl) {
+  const url = new URL(agentUrl);
+  const path2 = url.pathname.replace(/\/+$/, "");
+  if (path2 !== WELL_KNOWN_SUFFIX) url.pathname = path2 + WELL_KNOWN_SUFFIX;
+  url.hash = "";
+  return url.toString();
+}
+async function verifyWebBotAuthRequest(opts) {
+  const options = opts ?? {};
+  const nowMs = Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+  try {
+    const parsed = parseSignatureHeaders(options.rawSignature, options.rawInput, options.rawAgent);
+    if (!parsed.present) return resolveOutcome({ state: "absent" });
+    const policy = enforcePolicy(parsed, nowMs);
+    if (!policy.ok) return resolveOutcome({ state: "policy_error", reason: policy.reason ?? "policy_failed" });
+    const subtle = options.subtle ?? getGlobalSubtle();
+    if (!subtle) return resolveOutcome({ state: "unverified", reason: "crypto_unavailable" });
+    const authority = options.authority ?? "";
+    if (!authority || !isAscii(authority)) return resolveOutcome({ state: "policy_error", reason: "invalid_authority" });
+    const base = buildSignatureBase(parsed, {
+      "@authority": authority,
+      "signature-agent": parsed.agentComponentValue
+    });
+    if (!base) return resolveOutcome({ state: "policy_error", reason: "signature_base_unavailable" });
+    const agentUrl = parsed.agentUrl;
+    const keyid = parsed.params.keyid;
+    const directoryUrl = directoryUrlFor(agentUrl);
+    const lookup = await fetchDirectoryKey(directoryUrl, keyid, {
+      nowMs,
+      subtle,
+      fetch: options.fetch,
+      cache: options.cache,
+      timeoutMs: Number.isFinite(options.timeoutMs) ? options.timeoutMs : 5e3,
+      maxDirectoryBytes: Number.isFinite(options.maxDirectoryBytes) ? options.maxDirectoryBytes : 65536,
+      maxDirectoryKeys: Number.isFinite(options.maxDirectoryKeys) ? options.maxDirectoryKeys : 100
+    });
+    if (!lookup.ok) return resolveOutcome({ state: "unverified", reason: lookup.reason });
+    const valid = await verifyEd25519(subtle, lookup.jwk, parsed.signatureBytes, base);
+    if (!valid) return resolveOutcome({ state: "signature_mismatch" });
+    return resolveOutcome({
+      state: "verified",
+      keyid,
+      agentUrl,
+      directoryUrl,
+      keySource: lookup.keySource,
+      verifiedAtMs: nowMs
+    });
+  } catch {
+    return resolveOutcome({ state: "unverified", reason: "verification_error" });
+  }
+}
+
+// src/lib/wbaVerifier.ts
+var WBA_TRUSTED_SIGNERS = [
+  {
+    agentId: "manus_bot",
+    operator: "Manus",
+    directoryHosts: ["api.manus.im", "manus.im", "manus.ai"],
+    category: "ai_agent",
+    requirePinnedKey: false,
+    directoryUrl: "https://api.manus.im/.well-known/http-message-signatures-directory"
+  },
+  {
+    agentId: "grok_agent",
+    operator: "xAI",
+    directoryHosts: ["cursorusercontent.com"],
+    category: "ai_agent",
+    requirePinnedKey: true,
+    pinnedKeyX: ["STDZXOMW-Cg7paRpv_BtjujEHIQVNbzidfjY9M9w6hc"],
+    pinnedKeyIds: ["Vuxu4khgzIe0b30Nd6hq2envAuVBFMTDqorSNIUb_Oo"],
+    directoryUrl: "https://cursorusercontent.com/.well-known/http-message-signatures-directory"
+  },
+  /* --- P0-5 report anchors --- */
+  {
+    agentId: "google_agent",
+    operator: "Google",
+    // Google publishes a bare-origin Signature-Agent (`https://agent.bot.goog`).
+    directoryHosts: ["agent.bot.goog"],
+    directoryHostSuffixes: [".bot.goog"],
+    category: "ai_agent"
+  },
+  {
+    agentId: "openai_agent",
+    operator: "OpenAI",
+    directoryHosts: ["openai.com", "chatgpt.com"],
+    category: "ai_agent"
+  },
+  {
+    agentId: "anthropic_agent",
+    operator: "Anthropic",
+    directoryHosts: ["anthropic.com", "claude.ai"],
+    category: "ai_agent"
+  },
+  {
+    agentId: "cloudflare_agent",
+    operator: "Cloudflare",
+    directoryHosts: ["cloudflare.com"],
+    category: "ai_agent"
+  },
+  {
+    agentId: "perplexity_agent",
+    operator: "Perplexity",
+    directoryHosts: ["perplexity.ai", "perplexity.com", "www.perplexity.com"],
+    category: "ai_agent"
+  },
+  {
+    agentId: "mistral_agent",
+    operator: "Mistral",
+    directoryHosts: ["mistral.ai"],
+    category: "ai_agent"
+  }
+];
 function headerValues(headers, name) {
   const wanted = name.toLowerCase();
   const values = [];
@@ -10124,101 +11449,90 @@ function headerValues(headers, name) {
   }
   return values;
 }
-function stripQuotes(value) {
-  const v = value.trim();
-  if (v.length >= 2 && v[0] === '"' && v[v.length - 1] === '"') {
-    return v.slice(1, -1).replace(/\\(['"\\])/g, "$1");
+function asHeaderValue(values) {
+  if (values.length === 0) return null;
+  if (values.length === 1) return values[0];
+  return values;
+}
+function hostFromAgentUrl(agentUrl) {
+  if (!agentUrl) return null;
+  try {
+    return new URL(agentUrl).hostname.toLowerCase();
+  } catch {
+    return null;
   }
-  return v;
 }
-function base64ToBytes(input) {
-  let text = input.replace(/[\s\r\n]/g, "").replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
-  if (!text) return new Uint8Array(0);
-  if (text.length % 4 === 1 || !/^[A-Za-z0-9+/]+$/.test(text)) return null;
-  const out = [];
-  let buffer = 0;
-  let bits = 0;
-  for (let i = 0; i < text.length; i++) {
-    const idx = B64.indexOf(text[i]);
-    if (idx < 0) return null;
-    buffer = buffer << 6 | idx;
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      out.push(buffer >> bits & 255);
-    }
+function matchesTrustAnchor(signer, host) {
+  const lower = host.toLowerCase();
+  if (signer.directoryHosts.some((candidate) => candidate.toLowerCase() === lower)) return true;
+  return (signer.directoryHostSuffixes ?? []).some(
+    (suffix) => suffix.length > 1 && lower.endsWith(suffix.toLowerCase())
+  );
+}
+function resolveAuthority(opts, headers) {
+  if (typeof opts.authority === "string" && opts.authority.trim()) return opts.authority.trim();
+  for (const name of ["host", ":authority", "x-forwarded-host"]) {
+    const values = headerValues(headers, name);
+    if (!values.length) continue;
+    const authority = values[0].split(",")[0].trim();
+    if (authority) return authority;
   }
-  return new Uint8Array(out);
+  return "";
 }
-function bytesToBase64Url(bytes) {
-  let out = "";
-  for (let i = 0; i < bytes.length; i += 3) {
-    const b0 = bytes[i];
-    const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
-    const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
-    out += B64URL[b0 >> 2];
-    out += B64URL[(b0 & 3) << 4 | b1 >> 4];
-    if (i + 1 < bytes.length) out += B64URL[(b1 & 15) << 2 | b2 >> 6];
-    if (i + 2 < bytes.length) out += B64URL[b2 & 63];
-  }
-  return out;
-}
-function isReservedHost(host) {
-  if (host === "localhost" || host.endsWith(".localhost")) return true;
-  if (/\.(local|internal|test|invalid|example|onion)$/.test(host)) return true;
-  if (host === "metadata" || host === "metadata.google.internal") return true;
-  if (!host.includes(".")) return true;
-  return false;
-}
-function parseAgentIdentity(values) {
-  for (const raw of values) {
-    const text = typeof raw === "string" ? raw : "";
-    const candidates = [];
-    for (const match of text.match(/"(?:[^"\\]|\\.)*"/g) ?? []) candidates.push(stripQuotes(match));
-    for (const match of text.match(/'[^']*'/g) ?? []) candidates.push(match.slice(1, -1));
-    for (const match of text.match(/https:\/\/[^\s,;"'()]+/gi) ?? []) candidates.push(match);
-    for (const candidate of candidates) {
-      const m = /^https:\/\/([^\s/?#]+)/i.exec(candidate);
-      if (!m) continue;
-      const authority = m[1];
-      if (!authority || authority.includes("@") || authority.includes(":")) continue;
-      let host = authority.toLowerCase().replace(/\.$/, "");
-      if (!host || /^\d{1,3}(\.\d{1,3}){3}$/.test(host)) continue;
-      if (host.includes("[") || host.includes("]") || host.includes(":")) continue;
-      if (isReservedHost(host)) continue;
-      return { host, origin: `https://${host}` };
-    }
-  }
-  return { host: null, origin: null };
-}
-async function thumbprintWith(subtle, jwk) {
-  const canonical = '{"crv":' + JSON.stringify(jwk.crv) + ',"kty":' + JSON.stringify(jwk.kty) + ',"x":' + JSON.stringify(jwk.x) + "}";
-  const digest = await subtle.digest("SHA-256", new TextEncoder().encode(canonical));
-  return bytesToBase64Url(new Uint8Array(digest));
-}
-function ttlFromCacheControl(cacheControl) {
-  const DEFAULT_TTL = 36e5;
-  if (!cacheControl) return DEFAULT_TTL;
-  const match = /(?:s-maxage|max-age)\s*=\s*"?(\d+)"?/i.exec(cacheControl);
-  const seconds = match ? Number(match[1]) : DEFAULT_TTL / 1e3;
-  const ttl = Number.isFinite(seconds) ? seconds * 1e3 : DEFAULT_TTL;
-  return Math.min(864e5, Math.max(3e5, ttl));
-}
-var KID_BY_KEY = /* @__PURE__ */ new WeakMap();
-function sanitizeJwk(raw) {
-  if (!raw || typeof raw !== "object") return null;
-  const record = raw;
-  if (typeof record.x !== "string" || record.x.length === 0) return null;
-  const key = {
-    crv: typeof record.crv === "string" && record.crv ? record.crv : "Ed25519",
-    kty: typeof record.kty === "string" && record.kty ? record.kty : "OKP",
-    x: record.x
+function toFetchLike(hook) {
+  if (typeof hook !== "function") return void 0;
+  return async (url) => {
+    const response = await hook(url);
+    if (!response || typeof response.body !== "string") return null;
+    const headers = { ...response.headers ?? {} };
+    if (response.cacheControl && !headers["cache-control"]) headers["cache-control"] = response.cacheControl;
+    return {
+      ok: true,
+      status: 200,
+      headers,
+      text: async () => response.body
+    };
   };
-  if (typeof record.kid === "string" && record.kid) {
-    key.kid = record.kid;
-    KID_BY_KEY.set(key, record.kid);
+}
+var NONCE_CACHE_LIMIT = 2048;
+var NONCE_TTL_UNVERIFIED_MS = 6e4;
+var NONCE_TTL_VERIFIED_MAX_MS = 36e5;
+var nonceCache = /* @__PURE__ */ new Map();
+function fnv1a(text) {
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
   }
-  return key;
+  return hash >>> 0;
+}
+function signatureNonce(headers, authority) {
+  const parts = ["signature", "signature-input", "signature-agent"].map((name) => headerValues(headers, name).join("\0")).join("");
+  const combined = `${authority}${parts}`;
+  return `${fnv1a(combined).toString(36)}.${fnv1a(combined.split("").reverse().join("")).toString(36)}`;
+}
+function cachedResult(nonce, nowMs) {
+  const entry = nonceCache.get(nonce);
+  if (!entry) return null;
+  if (entry.expiresAtMs <= nowMs) {
+    nonceCache.delete(nonce);
+    return null;
+  }
+  return { ...entry.result, evidence: [...entry.result.evidence] };
+}
+function rememberResult(nonce, result, ttlMs, nowMs) {
+  for (const [key, entry] of nonceCache) {
+    if (entry.expiresAtMs <= nowMs) nonceCache.delete(key);
+  }
+  while (nonceCache.size >= NONCE_CACHE_LIMIT) {
+    const oldest = nonceCache.keys().next();
+    if (oldest.done) break;
+    nonceCache.delete(oldest.value);
+  }
+  nonceCache.set(nonce, {
+    result: { ...result, evidence: [...result.evidence] },
+    expiresAtMs: nowMs + Math.max(1, Math.min(ttlMs, NONCE_TTL_VERIFIED_MAX_MS))
+  });
 }
 function parseWbaHeaders(headers) {
   const parsed = {
@@ -10232,116 +11546,55 @@ function parseWbaHeaders(headers) {
     rawSignatureInput: "",
     signatureBytes: null,
     agentHost: null,
-    agentOrigin: null
+    agentOrigin: null,
+    agentComponentValue: null
   };
-  const inputValues = headerValues(headers, "signature-input");
-  const signatureValues = headerValues(headers, "signature");
-  const agentValues = headerValues(headers, "signature-agent");
-  parsed.present = inputValues.some((value2) => typeof value2 === "string" && value2.trim().length > 0);
-  if (!parsed.present) return parsed;
-  const identity = parseAgentIdentity(agentValues);
-  parsed.agentHost = identity.host;
-  parsed.agentOrigin = identity.origin;
-  const inputMembers = splitTopLevel(inputValues[0] ?? "", ",");
-  const signatureText = signatureValues[0] ?? "";
-  const signatureMembers = signatureText.trim() ? splitTopLevel(signatureText, ",") : [];
-  if (inputValues.length !== 1 || signatureValues.length > 1 || inputMembers.length !== 1 || signatureMembers.length > 1) {
-    return parsed;
-  }
-  const member = inputMembers[0];
-  const eq = member.indexOf("=");
-  if (eq > 0) parsed.label = member.slice(0, eq).trim();
-  const value = eq >= 0 ? member.slice(eq + 1).trim() : "";
-  const open = value.indexOf("(");
-  const close = value.lastIndexOf(")");
-  if (open < 0 || close <= open) return parsed;
-  parsed.rawSignatureInput = value;
-  const coveredText = value.slice(open + 1, close);
-  const tokenPattern = /"(?:[^"\\]|\\.)*"|\S+/g;
-  for (const match of coveredText.match(tokenPattern) ?? []) {
-    const name = stripQuotes(match).toLowerCase();
-    if (name && name !== "@signature-params" && !parsed.covered.includes(name)) parsed.covered.push(name);
-  }
-  for (const param of splitTopLevel(value.slice(close + 1), ";")) {
-    const p = param.indexOf("=");
-    if (p < 0) continue;
-    const name = param.slice(0, p).trim().toLowerCase();
-    const rawValue = param.slice(p + 1).trim();
-    if (name === "created" || name === "expires") {
-      const n = Number(rawValue);
-      if (Number.isFinite(n)) parsed[name] = n;
-    } else if (name === "keyid") {
-      parsed.keyId = stripQuotes(rawValue);
-    } else if (name === "tag") {
-      parsed.tag = stripQuotes(rawValue);
-    }
-  }
-  const sigMember = signatureMembers[0] ?? "";
-  const sigEq = sigMember.indexOf("=");
-  const sigValue = sigEq >= 0 ? sigMember.slice(sigEq + 1).trim() : "";
-  if (sigValue.length >= 2 && sigValue[0] === ":" && sigValue[sigValue.length - 1] === ":") {
-    parsed.signatureBytes = base64ToBytes(sigValue.slice(1, -1));
+  try {
+    const bag = headers || {};
+    const helper = parseSignatureHeaders(
+      asHeaderValue(headerValues(bag, "signature")),
+      asHeaderValue(headerValues(bag, "signature-input")),
+      asHeaderValue(headerValues(bag, "signature-agent"))
+    );
+    if (!helper.present) return parsed;
+    parsed.present = true;
+    parsed.label = helper.label ?? "";
+    parsed.keyId = helper.params.keyid ?? "";
+    parsed.tag = helper.params.tag ?? "";
+    parsed.created = typeof helper.params.created === "number" ? helper.params.created : null;
+    parsed.expires = typeof helper.params.expires === "number" ? helper.params.expires : null;
+    parsed.covered = [...helper.covered];
+    parsed.rawSignatureInput = helper.rawInputValue ?? "";
+    parsed.signatureBytes = helper.signatureBytes;
+    parsed.agentHost = hostFromAgentUrl(helper.agentUrl);
+    parsed.agentOrigin = helper.agentUrl ? new URL(helper.agentUrl).origin : null;
+    parsed.agentComponentValue = helper.agentComponentValue;
+  } catch {
   }
   return parsed;
 }
-function buildSignatureBase(parsed, authority) {
-  if (!parsed.agentOrigin) return null;
-  if (!parsed.rawSignatureInput) return null;
-  const lines = [];
-  for (const component of parsed.covered) {
-    if (component === "@authority") {
-      lines.push(`"@authority": ${authority}`);
-    } else if (component === "signature-agent") {
-      lines.push(`"signature-agent": "${parsed.agentOrigin}"`);
-    }
+function mapStatus(outcome) {
+  if (outcome.kind === "VALID") {
+    return { status: "verified", reason: "signed-agent", neutral: false };
   }
-  if (lines.length === 0) return null;
-  lines.push(`"@signature-params": ${parsed.rawSignatureInput}`);
-  return lines.join("\n") + "\n";
-}
-async function fetchDirectoryKeys(url, fetchDirectory) {
-  try {
-    let body;
-    let cacheControl;
-    if (fetchDirectory) {
-      const response = await fetchDirectory(url);
-      if (!response || typeof response.body !== "string") return null;
-      body = response.body;
-      cacheControl = response.cacheControl;
-    } else {
-      const f = globalThis.fetch;
-      if (typeof f !== "function") return null;
-      const response = await f(url, { redirect: "error" });
-      if (!response || response.ok === false || typeof response.status === "number" && response.status >= 400) return null;
-      body = await response.text();
-      cacheControl = response.headers && typeof response.headers.get === "function" ? response.headers.get("cache-control") ?? void 0 : void 0;
-    }
-    if (typeof body !== "string") return null;
-    const json = JSON.parse(body);
-    if (!json || !Array.isArray(json.keys)) return null;
-    const keys = [];
-    for (const raw of json.keys.slice(0, 500)) {
-      const key = sanitizeJwk(raw);
-      if (key) keys.push(key);
-    }
-    return { keys, ttlMs: ttlFromCacheControl(cacheControl) };
-  } catch {
-    return null;
+  const reason = outcome.reason;
+  if (outcome.kind === "NEUTRAL") {
+    if (reason === "no_signature") return { status: "absent", reason, neutral: true };
+    return { status: "unavailable", reason, neutral: true };
   }
-}
-function resolveAuthority(opts, headers) {
-  if (typeof opts.authority === "string" && opts.authority.trim()) return opts.authority.trim();
-  for (const name of ["host", ":authority", "x-forwarded-host"]) {
-    const values = headerValues(headers, name);
-    if (!values.length) continue;
-    const authority = values[0].split(",")[0].trim();
-    if (authority) return authority;
+  if (/(^|_)(expired|outside_validity_window|invalid_created|invalid_expires)$/.test(reason)) {
+    return { status: "expired", reason, neutral: false };
   }
-  return "";
+  if (/unsupported_alg|invalid_tag/.test(reason)) {
+    return { status: "unsupported", reason, neutral: false };
+  }
+  return { status: "invalid", reason, neutral: false };
 }
 async function verifyWebBotAuth(opts) {
-  const options = opts || {};
+  const options = opts ?? {};
   const nowMs = Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+  const headers = options.headers ?? {};
+  const authority = resolveAuthority(options, headers);
   const evidence = [];
   const finish = (status, extra) => ({
     status,
@@ -10351,138 +11604,2132 @@ async function verifyWebBotAuth(opts) {
     signerHost: null,
     keyId: null,
     keySource: null,
+    checkedAtMs: nowMs,
+    identity: status === "verified" ? "signed" : "unknown",
+    verification_method: status === "verified" ? "rfc9421" : "none",
+    reason: null,
+    category: null,
+    outcome: null,
+    directoryUrl: null,
     ...extra,
-    evidence: extra && extra.evidence ? [...evidence, ...extra.evidence] : [...evidence],
-    checkedAtMs: nowMs
+    evidence: [...evidence, ...extra?.evidence ?? []]
   });
   try {
-    const headers = options.headers || {};
-    const parsed = parseWbaHeaders(headers);
-    if (!parsed.present) return finish("absent");
-    if (parsed.tag !== "web-bot-auth") return finish("unsupported");
-    evidence.push("wba.tag:web-bot-auth");
-    const hasAgent = parsed.covered.includes("signature-agent");
-    const hasAuthority = parsed.covered.includes("@authority") || parsed.covered.includes("@target-uri");
-    if (!hasAgent || !hasAuthority) return finish("invalid", { evidence: ["wba.coverage:fail"] });
-    evidence.push("wba.coverage:" + parsed.covered.join("+"));
-    const createdMs = parsed.created === null ? NaN : parsed.created * 1e3;
-    const expiresMs = parsed.expires === null ? NaN : parsed.expires * 1e3;
-    if (!Number.isFinite(createdMs) || !Number.isFinite(expiresMs)) return finish("expired");
-    if (!(createdMs <= nowMs + 5e3 && nowMs + 5e3 <= expiresMs)) return finish("expired");
-    if (expiresMs - createdMs > 864e5) return finish("expired");
-    evidence.push("wba.time:valid");
-    if (!parsed.signatureBytes || parsed.signatureBytes.length === 0 || !parsed.agentHost) {
-      return finish("invalid");
+    const rawSignature = asHeaderValue(headerValues(headers, "signature"));
+    const rawInput = asHeaderValue(headerValues(headers, "signature-input"));
+    const rawAgent = asHeaderValue(headerValues(headers, "signature-agent"));
+    const parsed = parseSignatureHeaders(rawSignature, rawInput, rawAgent);
+    const nonce = signatureNonce(headers, authority);
+    const cached = cachedResult(nonce, nowMs);
+    if (cached) return cached;
+    if (!parsed.present) {
+      return finish("absent", {
+        reason: "no_signature",
+        outcome: "NEUTRAL",
+        evidence: ["wba.absent"]
+      });
     }
-    if (parsed.keyId) evidence.push("wba.keyid:" + parsed.keyId);
+    if (parsed.error || !parsed.agentUrl || !parsed.signatureBytes) {
+      const reason = parsed.error ?? "invalid_signature";
+      return finish("invalid", {
+        reason,
+        outcome: "INVALID",
+        keyId: parsed.params.keyid ?? null,
+        evidence: [`wba.parse:${reason}`]
+      });
+    }
     const trust = options.trust ?? WBA_TRUSTED_SIGNERS;
-    const signer = trust.find(
-      (candidate) => candidate.directoryHosts.some((host) => host.toLowerCase() === parsed.agentHost.toLowerCase())
-    );
-    if (!signer) return finish("unknown_signer");
+    const agentHost = hostFromAgentUrl(parsed.agentUrl);
+    const signer = agentHost ? trust.find((candidate) => matchesTrustAnchor(candidate, agentHost)) : void 0;
+    if (!signer) {
+      return finish("unknown_signer", {
+        reason: "unknown_signer",
+        outcome: "INVALID",
+        signerHost: agentHost,
+        keyId: parsed.params.keyid ?? null,
+        evidence: ["wba.signer:unknown"]
+      });
+    }
+    const subtle = options.subtle ?? (globalThis.crypto && globalThis.crypto.subtle);
+    if (!subtle || typeof subtle.verify !== "function") {
+      return finish("unavailable", {
+        reason: "crypto_unavailable",
+        outcome: "NEUTRAL",
+        signerHost: agentHost,
+        keyId: parsed.params.keyid ?? null,
+        evidence: ["wba.crypto:unavailable"]
+      });
+    }
+    if (!authority) {
+      return finish("invalid", {
+        reason: "invalid_authority",
+        outcome: "INVALID",
+        signerHost: agentHost,
+        evidence: ["wba.authority:missing"]
+      });
+    }
     const baseIdentity = {
       operator: signer.operator,
       agentId: signer.agentId,
-      signerHost: parsed.agentHost,
-      keyId: parsed.keyId || null
+      signerHost: agentHost,
+      keyId: parsed.params.keyid ?? null,
+      category: signer.category ?? null
     };
-    const subtle = options.subtle ?? (globalThis.crypto && globalThis.crypto.subtle);
-    if (!subtle || typeof subtle.verify !== "function" || typeof subtle.importKey !== "function") {
-      return finish("unavailable", { ...baseIdentity, evidence: ["wba.crypto:unavailable"] });
-    }
-    let keys;
-    let keySource;
-    if (!signer.directoryUrl && signer.pinnedKeyX && signer.pinnedKeyX.length > 0) {
-      keys = signer.pinnedKeyX.map((x, i) => {
-        const key = { crv: "Ed25519", kty: "OKP", x };
-        const kid = signer.pinnedKeyIds && signer.pinnedKeyIds[i];
-        if (kid) {
-          key.kid = kid;
-          KID_BY_KEY.set(key, kid);
+    const outcome = await verifyWebBotAuthRequest({
+      rawSignature,
+      rawInput,
+      rawAgent,
+      authority,
+      nowMs,
+      subtle,
+      fetch: toFetchLike(options.fetchDirectory),
+      cache: options.directoryCache ?? /* @__PURE__ */ new Map()
+    });
+    const mapped = mapStatus(outcome);
+    const baseEvidence = [
+      ...parsed.params.tag ? [`wba.tag:${parsed.params.tag}`] : [],
+      `wba.coverage:${parsed.covered.join("+")}`,
+      `wba.keyid:${parsed.params.keyid ?? "none"}`
+    ];
+    if (mapped.status === "verified" && outcome.kind === "VALID") {
+      let keySource = "directory";
+      if (signer.requirePinnedKey) {
+        const pinned = new Set(signer.pinnedKeyIds ?? []);
+        for (const x of signer.pinnedKeyX ?? []) {
+          try {
+            pinned.add(await jwkThumbprint(x, subtle));
+          } catch {
+          }
         }
-        return key;
-      });
-      keySource = "pinned";
-    } else {
-      const url = signer.directoryUrl || `https://${parsed.agentHost}/.well-known/http-message-signatures-directory`;
-      const cache = options.cache;
-      const cached = cache && cache.get(url);
-      if (cached && cached.expiresAtMs > nowMs) {
-        keys = cached.keys;
-      } else {
-        const directory = await fetchDirectoryKeys(url, options.fetchDirectory);
-        if (!directory) {
-          return finish("unavailable", { ...baseIdentity, evidence: ["wba.directory:unavailable"] });
-        }
-        keys = directory.keys;
-        if (cache) {
-          cache.set(url, {
-            keys: keys.map(({ crv, kty, x }) => ({ crv, kty, x })),
-            fetchedAtMs: nowMs,
-            expiresAtMs: nowMs + directory.ttlMs
+        if (!parsed.params.keyid || !pinned.has(parsed.params.keyid)) {
+          const failed2 = finish("unknown_signer", {
+            ...baseIdentity,
+            reason: "wba.pinned:fail",
+            outcome: "INVALID",
+            evidence: [...baseEvidence, "wba.pinned:fail"]
           });
+          rememberResult(nonce, failed2, NONCE_TTL_UNVERIFIED_MS, nowMs);
+          return failed2;
         }
+        keySource = "pinned";
       }
-      keySource = "directory";
+      const verified = finish("verified", {
+        ...baseIdentity,
+        keySource,
+        reason: "signed-agent",
+        identity: "signed",
+        verification_method: "rfc9421",
+        outcome: "VALID",
+        directoryUrl: outcome.directoryUrl ?? directoryUrlFor(parsed.agentUrl),
+        evidence: [...baseEvidence, `wba.verified:${agentHost}`]
+      });
+      const expiresMs = typeof parsed.params.expires === "number" ? parsed.params.expires * 1e3 : nowMs + NONCE_TTL_UNVERIFIED_MS;
+      rememberResult(nonce, verified, Math.min(NONCE_TTL_VERIFIED_MAX_MS, expiresMs - nowMs), nowMs);
+      return verified;
     }
-    if (keys.length === 0) {
-      return finish("unavailable", { ...baseIdentity, keySource, evidence: ["wba.keys:none"] });
-    }
-    const thumbprints = /* @__PURE__ */ new Map();
-    if (typeof subtle.digest === "function") {
-      for (const key of keys) {
-        try {
-          thumbprints.set(key, await thumbprintWith(subtle, key));
-        } catch {
-        }
-      }
-    }
-    let candidates;
-    if (parsed.keyId) {
-      candidates = keys.filter(
-        (key) => key.kid && key.kid === parsed.keyId || thumbprints.get(key) === parsed.keyId
-      );
-      if (candidates.length === 0) {
-        return finish("unavailable", { ...baseIdentity, keySource, evidence: ["wba.keyid:unmatched"] });
+    const failed = finish(mapped.status, {
+      ...baseIdentity,
+      reason: mapped.reason,
+      outcome: outcome.kind,
+      evidence: [...baseEvidence, `wba.${outcome.kind.toLowerCase()}:${mapped.reason}`]
+    });
+    rememberResult(nonce, failed, NONCE_TTL_UNVERIFIED_MS, nowMs);
+    return failed;
+  } catch {
+    return finish("invalid", {
+      reason: "wba.error",
+      outcome: "INVALID",
+      evidence: ["wba.error"]
+    });
+  }
+}
+
+// src/lib/proxyTruth.ts
+var RESIDENTIAL_ASN_TOKENS = [
+  "residential",
+  "residential_rotating",
+  "residential_proxy",
+  "residential_isp",
+  "home",
+  "home_broadband",
+  "broadband",
+  "consumer"
+];
+var DATACENTER_ASN_TOKENS = [
+  "datacenter",
+  "data_center",
+  "data center",
+  "cloud",
+  "cdn",
+  "hosting"
+];
+function normalizeLabel(value) {
+  try {
+    return typeof value === "string" ? value.trim().toLowerCase() : "";
+  } catch {
+    return "";
+  }
+}
+function isResidentialAsnType(value) {
+  const label = normalizeLabel(value);
+  if (!label) return false;
+  return RESIDENTIAL_ASN_TOKENS.some((token) => label === token || label.includes(token));
+}
+function isDatacenterAsnType(value) {
+  const label = normalizeLabel(value);
+  if (!label) return false;
+  return DATACENTER_ASN_TOKENS.some((token) => label.includes(token));
+}
+function usableAsn(value) {
+  try {
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+    return Math.trunc(value);
+  } catch {
+    return null;
+  }
+}
+function resolveProxyDetails(input = {}) {
+  let source;
+  try {
+    source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  } catch {
+    source = {};
+  }
+  let datacenterResult;
+  let verifiedGoodBot;
+  let knownProxyPrefix;
+  let vpn;
+  let asnType;
+  let asn;
+  try {
+    datacenterResult = source.datacenterResult;
+    verifiedGoodBot = source.verifiedGoodBot;
+    knownProxyPrefix = source.knownProxyPrefix;
+    vpn = source.vpn;
+    asnType = source.asnType;
+    asn = source.asn;
+  } catch {
+    datacenterResult = verifiedGoodBot = knownProxyPrefix = vpn = asnType = asn = void 0;
+  }
+  const datacenterEvidence = datacenterResult === true && verifiedGoodBot !== true;
+  const hasKnownProxyPrefix = knownProxyPrefix === true;
+  const residentialAsn = isResidentialAsnType(asnType);
+  const residentialEvidence = hasKnownProxyPrefix || residentialAsn;
+  const vpnEvidence = vpn === true;
+  const reasons = [];
+  let proxyType;
+  let confidence;
+  if (datacenterEvidence) {
+    proxyType = "data_center";
+    confidence = "high";
+    reasons.push("datacenterResult=true with no verified good-bot exemption");
+    const asnValue = usableAsn(asn);
+    if (asnValue !== null) reasons.push(`ASN ${asnValue}`);
+    if (isDatacenterAsnType(asnType)) reasons.push("ASN type is hosting/datacenter");
+  } else if (residentialEvidence) {
+    proxyType = "residential";
+    confidence = hasKnownProxyPrefix ? "high" : "medium";
+    if (hasKnownProxyPrefix) reasons.push("explicit known proxy prefix");
+    if (residentialAsn) reasons.push(`residential ASN type "${normalizeLabel(asnType)}"`);
+    const asnValue = usableAsn(asn);
+    if (asnValue !== null) reasons.push(`ASN ${asnValue}`);
+  } else if (vpnEvidence) {
+    proxyType = null;
+    confidence = "medium";
+    reasons.push("VPN/relay signal present but proxy type is not classifiable");
+  } else {
+    proxyType = null;
+    confidence = "low";
+    reasons.push("no proxy evidence among supplied signals");
+  }
+  if (verifiedGoodBot === true && datacenterResult === true && !datacenterEvidence) {
+    reasons.push("data_center flag suppressed by verified good-bot exemption");
+  }
+  if (datacenterEvidence && residentialEvidence) {
+    reasons.push(hasKnownProxyPrefix ? "residential known-proxy-prefix signal also present (data_center takes precedence)" : `residential ASN type "${normalizeLabel(asnType)}" also present (data_center takes precedence)`);
+  }
+  return {
+    proxy: datacenterEvidence || residentialEvidence || vpnEvidence,
+    proxy_type: proxyType,
+    confidence,
+    reason: reasons.join("; ")
+  };
+}
+
+// src/lib/vpnMethods.ts
+var EMPTY_INPUT = Object.freeze({});
+var EMPTY_PARITY = Object.freeze({});
+var INVALID_COUNTRY_CODES2 = /* @__PURE__ */ new Set(["XX", "T1"]);
+function asObject(value, fallback) {
+  return value !== null && typeof value === "object" ? value : fallback;
+}
+function isTrue(value) {
+  return value === true;
+}
+function verifiedCountryCode(value) {
+  if (typeof value !== "string") return null;
+  const code = value.trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(code)) return null;
+  if (INVALID_COUNTRY_CODES2.has(code)) return null;
+  return code;
+}
+function safeDefaults(note) {
+  return {
+    timezone_mismatch: false,
+    public_vpn: false,
+    relay: false,
+    os_mismatch: false,
+    ml_prediction: false,
+    origin_country: null,
+    reasons: [note]
+  };
+}
+function resolveVpnMethods(input) {
+  try {
+    const src = asObject(input, EMPTY_INPUT);
+    const reasons = [];
+    const browserTz = typeof src.browserTimezone === "string" ? src.browserTimezone : null;
+    const ipTz = typeof src.ipTimezone === "string" ? src.ipTimezone : null;
+    const canonicalBrowser = canonicalTimezone(browserTz);
+    const canonicalIp = canonicalTimezone(ipTz);
+    let timezoneMismatch = false;
+    if (canonicalBrowser !== null && canonicalIp !== null) {
+      timezoneMismatch = !timezonesEquivalent(browserTz, ipTz);
+      if (timezoneMismatch) {
+        reasons.push(
+          `timezone_mismatch=true: canonical identities differ (${canonicalBrowser} vs ${canonicalIp})`
+        );
+      } else {
+        reasons.push(
+          `timezone_mismatch=false: ${canonicalBrowser} and ${canonicalIp} resolve to the same canonical identity`
+        );
       }
     } else {
-      candidates = keys;
-    }
-    if (signer.requirePinnedKey) {
-      const pinnedX = new Set(signer.pinnedKeyX ?? []);
-      const pinnedIds = new Set(signer.pinnedKeyIds ?? []);
-      candidates = candidates.filter(
-        (key) => pinnedX.has(key.x) || (key.kid ? pinnedIds.has(key.kid) : false) || (thumbprints.has(key) ? pinnedIds.has(thumbprints.get(key)) : false)
+      reasons.push(
+        `timezone_mismatch=false: unresolved timezone side (browser=${canonicalBrowser ?? "unresolved"}, ip=${canonicalIp ?? "unresolved"})`
       );
-      if (candidates.length === 0) {
-        return finish("unknown_signer", { ...baseIdentity, keySource, evidence: ["wba.pinned:fail"] });
-      }
     }
-    const authority = resolveAuthority(options, headers);
-    const base = buildSignatureBase(parsed, authority);
-    if (!base) return finish("invalid", { ...baseIdentity, keySource });
-    const message = new TextEncoder().encode(base);
-    const signature = new Uint8Array(parsed.signatureBytes.length);
-    signature.set(parsed.signatureBytes);
-    for (const key of candidates) {
-      try {
-        const cryptoKey = await subtle.importKey(
-          "jwk",
-          { kty: key.kty, crv: key.crv, x: key.x },
-          { name: "Ed25519" },
-          false,
-          ["verify"]
-        );
-        const ok = await subtle.verify("Ed25519", cryptoKey, signature, message);
-        if (!ok) continue;
-        evidence.push("wba.verified:" + parsed.agentHost);
-        return finish("verified", { ...baseIdentity, keySource });
-      } catch {
-      }
+    if (src.canonicalMismatch === true && !timezoneMismatch) {
+      reasons.push(
+        "canonicalMismatch=true hint ignored: canonical timezone resolution did not confirm a mismatch"
+      );
+    } else if (src.canonicalMismatch === false && timezoneMismatch) {
+      reasons.push(
+        "canonicalMismatch=false hint ignored: canonical timezone resolution confirmed a mismatch"
+      );
     }
-    return finish("invalid", { ...baseIdentity, keySource, evidence: ["wba.signature:invalid"] });
+    const publicVpn = isTrue(src.publicVpn);
+    const relay = isTrue(src.relay);
+    const osMismatch = isTrue(src.osMismatch);
+    const mlPrediction = isTrue(src.mlPrediction);
+    if (publicVpn) reasons.push("public_vpn=true from verified publicVpn flag");
+    if (relay) reasons.push("relay=true from verified relay flag");
+    if (osMismatch) reasons.push("os_mismatch=true from verified osMismatch flag");
+    if (mlPrediction) reasons.push("ml_prediction=true from verified mlPrediction flag");
+    const originCountry = verifiedCountryCode(src.ipCountry);
+    if (originCountry !== null) {
+      reasons.push(`origin_country=${originCountry}: taken from the verified ipCountry param`);
+    } else {
+      reasons.push("origin_country=null: no verified ipCountry param (never inferred from timezone)");
+    }
+    return {
+      timezone_mismatch: timezoneMismatch,
+      public_vpn: publicVpn,
+      relay,
+      os_mismatch: osMismatch,
+      ml_prediction: mlPrediction,
+      origin_country: originCountry,
+      reasons
+    };
   } catch {
-    return finish("invalid", { evidence: ["wba.error"] });
+    return safeDefaults("resolveVpnMethods: unexpected input; returning safe defaults");
+  }
+}
+
+// src/lib/zeroTrust.ts
+var FUTURE_SKEW_MS = 3e5;
+var DEFAULT_MAX_AGE_MS = 65e3;
+function finiteNumber2(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+function safeText(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+function parseUrl(value) {
+  if (!value) return null;
+  try {
+    return new URL(value);
+  } catch {
+    return null;
+  }
+}
+function isHttpOrigin(url) {
+  return Boolean(
+    url && (url.protocol === "http:" || url.protocol === "https:") && url.origin !== "null"
+  );
+}
+function refererKey(url) {
+  return `${url.origin}${url.pathname}${url.search}`;
+}
+function refererCompatible(header, client) {
+  if (header.origin !== client.origin) return false;
+  const h = refererKey(header);
+  const c = refererKey(client);
+  if (h === c) return true;
+  if (h === header.origin || h === `${header.origin}/`) return true;
+  if (!c.startsWith(h)) return false;
+  const next = c.charAt(h.length);
+  return next === "" || next === "/" || next === "?" || next === "#";
+}
+function checkStrictOrigin(input) {
+  const bag = input && typeof input === "object" ? input : {};
+  const originText = safeText(bag.origin);
+  const refererText = safeText(bag.referer);
+  const clientUrlText = safeText(bag.clientUrl);
+  const clientReferrerText = safeText(bag.clientReferrer);
+  const notes = [];
+  if (bag.nowMs !== void 0 && finiteNumber2(bag.nowMs) === null) {
+    notes.push("invalid nowMs ignored");
+  }
+  const originUrl = parseUrl(originText);
+  const refererUrl = parseUrl(refererText);
+  const clientUrl = parseUrl(clientUrlText);
+  const clientReferrer = parseUrl(clientReferrerText);
+  if (originText && !isHttpOrigin(originUrl)) notes.push("unusable Origin header ignored");
+  if (refererText && !isHttpOrigin(refererUrl)) notes.push("unusable Referer header ignored");
+  if (clientUrlText && !isHttpOrigin(clientUrl)) notes.push("unusable client url ignored");
+  if (clientReferrerText && !isHttpOrigin(clientReferrer)) {
+    notes.push("unusable client referrer ignored");
+  }
+  const contradictions = [];
+  if (isHttpOrigin(originUrl) && isHttpOrigin(clientUrl) && originUrl.origin !== clientUrl.origin) {
+    contradictions.push(`Origin ${originUrl.origin} contradicts client url ${clientUrl.origin}`);
+  }
+  if (isHttpOrigin(refererUrl) && isHttpOrigin(clientReferrer) && !refererCompatible(refererUrl, clientReferrer)) {
+    contradictions.push(
+      `Referer ${refererKey(refererUrl)} contradicts client referrer ${refererKey(clientReferrer)}`
+    );
+  }
+  const suffix = notes.length ? `; ${notes.join("; ")}` : "";
+  if (contradictions.length > 0) {
+    return { ok: false, reason: `${contradictions.join("; ")}${suffix}` };
+  }
+  const headersPresent = Boolean(originText || refererText);
+  const corroborated = isHttpOrigin(originUrl) && isHttpOrigin(clientUrl) || isHttpOrigin(refererUrl) && isHttpOrigin(clientReferrer);
+  const base = !headersPresent ? "legacy: no Origin/Referer headers; client-reported url/referrer accepted without corroboration" : corroborated ? "Origin/Referer headers corroborate client-reported url/referrer" : "Origin/Referer headers present but not comparable with the client report; no contradiction found";
+  return { ok: true, reason: `${base}${suffix}` };
+}
+function replayWindowStatus(timestampMs, nowMs, seenNonce, maxAgeMs = DEFAULT_MAX_AGE_MS) {
+  const duplicate = typeof seenNonce === "string" && seenNonce.trim().length > 0;
+  const timestamp = finiteNumber2(timestampMs);
+  const now = finiteNumber2(nowMs);
+  const configuredMaxAge = finiteNumber2(maxAgeMs);
+  const maxAge = configuredMaxAge !== null && configuredMaxAge >= 0 ? configuredMaxAge : DEFAULT_MAX_AGE_MS;
+  if (timestamp === null || now === null || timestamp <= 0) {
+    return {
+      fresh: false,
+      duplicate,
+      reason: `invalid timestamp or clock${duplicate ? "; duplicate nonce (replay)" : ""}`
+    };
+  }
+  const age = now - timestamp;
+  const stale = age > maxAge;
+  const future = -age > FUTURE_SKEW_MS;
+  const fresh = !stale && !future;
+  const parts = [];
+  if (stale) parts.push(`stale by ${Math.round(age)}ms (max ${maxAge}ms)`);
+  else if (future) parts.push(`timestamp ${Math.round(-age)}ms in the future (max ${FUTURE_SKEW_MS}ms)`);
+  else parts.push(`within ${maxAge}ms freshness window`);
+  if (duplicate) parts.push("duplicate nonce (replay)");
+  return { fresh, duplicate, reason: parts.join("; ") };
+}
+function ipReplayRate(replayed, total, windowDays = 7) {
+  void windowDays;
+  const countOf = (value) => {
+    const n = finiteNumber2(value);
+    return n !== null && n > 0 ? n : 0;
+  };
+  const replayedCount = countOf(replayed);
+  const totalCount = countOf(total);
+  const ratio = totalCount > 0 ? Math.min(1, replayedCount / totalCount) : 0;
+  return { attack_source: totalCount >= 20 && ratio >= 0.75, ratio };
+}
+
+// src/lib/hexProximity.ts
+var TIER_BANDS = [
+  { upperExclusive: 10, radiusMeters: 10, label: "fine" },
+  { upperExclusive: 75, radiusMeters: 75, label: "high" },
+  { upperExclusive: 200, radiusMeters: 200, label: "medium" },
+  { upperExclusive: 1e3, radiusMeters: 1e3, label: "coarse" },
+  { upperExclusive: Number.POSITIVE_INFINITY, radiusMeters: 5e3, label: "rough" }
+];
+var UNKNOWN_LABEL = "unknown";
+function resolvePrecisionTier(accuracyMeters) {
+  let valid = false;
+  let value = Number.POSITIVE_INFINITY;
+  try {
+    valid = typeof accuracyMeters === "number" && Number.isFinite(accuracyMeters) && accuracyMeters >= 0;
+    if (valid) value = accuracyMeters;
+  } catch {
+    valid = false;
+  }
+  let tier = 4;
+  for (let i = 0; i < TIER_BANDS.length; i += 1) {
+    if (value < TIER_BANDS[i].upperExclusive) {
+      tier = i;
+      break;
+    }
+  }
+  const band = TIER_BANDS[tier];
+  return {
+    tier,
+    radiusMeters: band.radiusMeters,
+    label: valid ? band.label : UNKNOWN_LABEL
+  };
+}
+var EARTH_RADIUS_METERS = 63710088e-1;
+var DEG_TO_RAD = Math.PI / 180;
+var SQRT3_OVER_3 = Math.sqrt(3) / 3;
+function roundAxial(q, r) {
+  const x = q;
+  const z = r;
+  const y = -x - z;
+  let rx = Math.round(x);
+  let ry = Math.round(y);
+  let rz = Math.round(z);
+  const dx = Math.abs(rx - x);
+  const dy = Math.abs(ry - y);
+  const dz = Math.abs(rz - z);
+  if (dx > dy && dx > dz) rx = -ry - rz;
+  else if (dy > dz) ry = -rx - rz;
+  else rz = -rx - ry;
+  return { q: rx, r: rz };
+}
+function axialForPoint(lat, lon, hexSizeMeters) {
+  const y = lat * DEG_TO_RAD * EARTH_RADIUS_METERS;
+  const x = lon * DEG_TO_RAD * EARTH_RADIUS_METERS * Math.cos(lat * DEG_TO_RAD);
+  const q = (SQRT3_OVER_3 * x - y / 3) / hexSizeMeters;
+  const r = 2 / 3 * y / hexSizeMeters;
+  return roundAxial(q, r);
+}
+function safeFiniteNumber(value) {
+  try {
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+function readPoint(point) {
+  try {
+    if (!point || typeof point !== "object") return null;
+    const source = point;
+    const lat = safeFiniteNumber(source.lat);
+    const lon = safeFiniteNumber(source.lon);
+    const accuracyMeters = safeFiniteNumber(source.accuracyMeters);
+    if (lat === null || lon === null || accuracyMeters === null) return null;
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180 || accuracyMeters < 0) return null;
+    return { lat, lon, accuracyMeters };
+  } catch {
+    return null;
+  }
+}
+function safeSalt(salt) {
+  try {
+    return typeof salt === "string" ? salt : String(salt);
+  } catch {
+    return "";
+  }
+}
+function normalizeTier(tier) {
+  try {
+    const numeric = typeof tier === "number" ? tier : Number(tier);
+    if (!Number.isFinite(numeric)) return 4;
+    const integer = Math.trunc(numeric);
+    if (integer <= 0) return 0;
+    if (integer >= 4) return 4;
+    return integer;
+  } catch {
+    return 4;
+  }
+}
+function cellKey(point, tier) {
+  if (!point) return `hex|invalid|${tier}`;
+  const hexSizeMeters = TIER_BANDS[tier].radiusMeters;
+  const { q, r } = axialForPoint(point.lat, point.lon, hexSizeMeters);
+  return `hex|${tier}|${q}|${r}`;
+}
+var FNV_OFFSET_BASIS = 2166136261;
+var FNV_PRIME2 = 16777619;
+function utf8Bytes2(input) {
+  try {
+    if (typeof TextEncoder !== "undefined") {
+      return Array.from(new TextEncoder().encode(input));
+    }
+  } catch {
+  }
+  const bytes = [];
+  for (let i = 0; i < input.length; i += 1) bytes.push(input.charCodeAt(i) & 255);
+  return bytes;
+}
+function fnv1a2(bytes) {
+  let hash = FNV_OFFSET_BASIS >>> 0;
+  for (let i = 0; i < bytes.length; i += 1) {
+    hash ^= bytes[i];
+    hash = Math.imul(hash, FNV_PRIME2) >>> 0;
+  }
+  return hash >>> 0;
+}
+function hmacFnv32(key, message) {
+  const keyBytes = utf8Bytes2(key);
+  const block = new Array(16).fill(0);
+  const keyDigest = fnv1a2(keyBytes);
+  for (let i = 0; i < 4; i += 1) block[i] = keyDigest >>> i * 8 & 255;
+  for (let i = 0; i < keyBytes.length; i += 1) block[i % 16] ^= keyBytes[i];
+  const ipad = block.map((byte) => byte ^ 54);
+  const opad = block.map((byte) => byte ^ 92);
+  const inner = fnv1a2([...ipad, ...utf8Bytes2(message)]);
+  const outer = fnv1a2([...opad, ...utf8Bytes2(inner.toString(16).padStart(8, "0"))]);
+  return outer.toString(16).padStart(8, "0");
+}
+function hmacFnv128(key, message) {
+  let digest = "";
+  for (let i = 0; i < 4; i += 1) digest += hmacFnv32(key, `${i}:${message}`);
+  return digest;
+}
+function formatId(digest) {
+  return `hex_${digest.toLowerCase()}`;
+}
+function hexCellId(point, salt, tier) {
+  const normalizedTier = normalizeTier(tier);
+  const safe = readPoint(point);
+  const key = cellKey(safe, normalizedTier);
+  try {
+    return formatId(hmacFnv128(safeSalt(salt), key));
+  } catch {
+    return formatId(hmacFnv128("fallback", `hex|invalid|${normalizedTier}`));
+  }
+}
+function confidenceFromAccuracy(accuracyMeters) {
+  const raw = 1 / (1 + accuracyMeters / 1e3);
+  if (!Number.isFinite(raw)) return 0;
+  return Math.min(1, Math.max(0, raw));
+}
+function proximityFromGeolocation(point, salt) {
+  const safe = readPoint(point);
+  if (!safe) {
+    const denied = point === null || point === void 0;
+    return {
+      proximity: null,
+      reason: denied ? "geolocation permission denied or position absent; no IP-geolocation fallback used" : "geolocation position invalid; no IP-geolocation fallback used"
+    };
+  }
+  const tierInfo = resolvePrecisionTier(safe.accuracyMeters);
+  try {
+    return {
+      proximity: {
+        id: hexCellId(safe, salt, tierInfo.tier),
+        precision_radius: tierInfo.radiusMeters,
+        confidence: confidenceFromAccuracy(safe.accuracyMeters)
+      },
+      reason: `browser geolocation accepted (${tierInfo.label}, tier ${tierInfo.tier}); no IP-geolocation fallback used`
+    };
+  } catch {
+    return {
+      proximity: null,
+      reason: "geolocation processing failed; no IP-geolocation fallback used"
+    };
+  }
+}
+
+// src/lib/geoProximityBridge.ts
+var REASON_PERMISSION_REQUIRED = "permission_required";
+var REASON_INVALID_FIX = "invalid_fix";
+var REASON_OK = "ok";
+var BRIDGE_SALT = "geoProximityBridge|v1";
+function safeObject(value) {
+  try {
+    if (value === null || value === void 0 || typeof value !== "object") return null;
+    return value;
+  } catch {
+    return null;
+  }
+}
+function safeRead(source, key) {
+  const object = safeObject(source);
+  if (!object) return void 0;
+  try {
+    return object[key];
+  } catch {
+    return void 0;
+  }
+}
+function safeFiniteNumber2(value) {
+  try {
+    return typeof value === "number" && Number.isFinite(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+function isGranted(value) {
+  try {
+    return typeof value === "string" && value === "granted";
+  } catch {
+    return false;
+  }
+}
+function resolveProximity(input) {
+  try {
+    const record = safeObject(input);
+    if (!isGranted(safeRead(record, "permission"))) {
+      return { proximity: null, reason: REASON_PERMISSION_REQUIRED };
+    }
+    const lat = safeFiniteNumber2(safeRead(record, "lat"));
+    const lon = safeFiniteNumber2(safeRead(record, "lon"));
+    const accuracyM = safeFiniteNumber2(safeRead(record, "accuracyM"));
+    if (lat === null || lon === null || accuracyM === null || accuracyM <= 0) {
+      return { proximity: null, reason: REASON_INVALID_FIX };
+    }
+    const delegated = proximityFromGeolocation(
+      { lat, lon, accuracyMeters: accuracyM },
+      BRIDGE_SALT
+    );
+    const core = delegated.proximity;
+    if (!core) {
+      return { proximity: null, reason: REASON_INVALID_FIX };
+    }
+    return {
+      proximity: {
+        id: core.id,
+        precision_radius: core.precision_radius,
+        confidence: core.confidence,
+        accuracy_m: accuracyM
+      },
+      reason: REASON_OK
+    };
+  } catch {
+    return { proximity: null, reason: REASON_INVALID_FIX };
+  }
+}
+
+// src/lib/privacyNoise.ts
+var ACCEPTED_VENDORS = /* @__PURE__ */ new Map([
+  ["brave", "Brave"],
+  ["bravenavigator", "Brave"],
+  ["braveshields", "Brave"],
+  ["firefoxrfp", "Firefox RFP"],
+  ["firefoxresistfingerprinting", "Firefox RFP"],
+  ["rfp", "Firefox RFP"],
+  ["tor", "Tor"],
+  ["torbrowser", "Tor"],
+  ["safariafp", "Safari AFP"],
+  ["safariadvancedfingerprintingprotection", "Safari AFP"],
+  ["afp", "Safari AFP"]
+]);
+var HARD_CONTRADICTION_SCORE = 0.8;
+var EMPTY_INPUT2 = Object.freeze({});
+function asObject2(value) {
+  return value !== null && typeof value === "object" ? value : EMPTY_INPUT2;
+}
+function readField(record, key) {
+  try {
+    return record[key];
+  } catch {
+    return void 0;
+  }
+}
+function isTrue2(record, key) {
+  return readField(record, key) === true;
+}
+function acceptedVendorFamily(value) {
+  if (typeof value !== "string") return null;
+  const key = value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (key.length === 0) return null;
+  return ACCEPTED_VENDORS.get(key) ?? null;
+}
+function safeDefaults2(note) {
+  return {
+    privacy_settings: false,
+    anti_detect_browser: false,
+    anomaly_score: 0,
+    reasons: [note]
+  };
+}
+function classifyPrivacyNoise(input = {}) {
+  try {
+    const src = asObject2(input);
+    const privacyHardened = isTrue2(src, "privacyHardened");
+    const canvasNoise = isTrue2(src, "canvasNoise");
+    const audioNoise = isTrue2(src, "audioNoise");
+    const shaderNoise = isTrue2(src, "shaderNoise");
+    const hardContradiction = isTrue2(src, "hardContradiction");
+    const rawVendor = readField(src, "vendorSignature");
+    const vendorFamily = acceptedVendorFamily(rawVendor);
+    const noiseLabels = [
+      canvasNoise ? "canvas" : "",
+      audioNoise ? "audio" : "",
+      shaderNoise ? "shader" : ""
+    ].filter(Boolean);
+    const noiseCount = noiseLabels.length;
+    const reasons = [];
+    const privacySettings = privacyHardened || vendorFamily !== null;
+    if (vendorFamily !== null) {
+      reasons.push(`Accepted vendor privacy signature: ${vendorFamily}`);
+    } else if (rawVendor !== null && rawVendor !== void 0) {
+      reasons.push(
+        "Unrecognized vendor signature ignored (never a privacy signature or anti-detect evidence)"
+      );
+    }
+    if (privacyHardened) {
+      reasons.push(
+        noiseCount > 0 ? `Privacy-hardened runtime explains ${noiseLabels.join("/")} noise (privacy signature, not anti-detect)` : "Explicit privacy-hardened runtime (privacy signature)"
+      );
+    } else if (noiseCount > 0) {
+      reasons.push(
+        `${noiseLabels.join("/")} noise observed without privacy evidence; abstaining (noise may be an automation artifact)`
+      );
+    }
+    if (!privacySettings && noiseCount === 0 && !hardContradiction) {
+      reasons.push("No explicit privacy signature or contradiction; abstaining (not guessing)");
+    }
+    const antiDetectBrowser = hardContradiction;
+    let rawScore = 0;
+    if (hardContradiction) {
+      rawScore = HARD_CONTRADICTION_SCORE;
+      reasons.push("Hard contradiction present; anti_detect_browser=true and anomaly_score>0");
+      if (privacySettings) {
+        reasons.push("Hard contradiction cannot be explained away by privacy hardening");
+      }
+    }
+    const anomalyScore = Math.max(0, Math.min(1, Number(rawScore.toFixed(4))));
+    return {
+      privacy_settings: privacySettings,
+      anti_detect_browser: antiDetectBrowser,
+      anomaly_score: anomalyScore,
+      reasons
+    };
+  } catch {
+    return safeDefaults2("classifyPrivacyNoise: unexpected input; returning safe defaults");
+  }
+}
+
+// src/lib/antiDetectExemption.ts
+var ACCEPTED_VENDORS2 = /* @__PURE__ */ new Map([
+  ["brave", "Brave"],
+  ["bravenavigator", "Brave"],
+  ["braveshields", "Brave"],
+  ["firefoxrfp", "Firefox RFP"],
+  ["firefoxresistfingerprinting", "Firefox RFP"],
+  ["rfp", "Firefox RFP"],
+  ["tor", "Tor"],
+  ["torbrowser", "Tor"],
+  ["safariafp", "Safari AFP"],
+  ["safariadvancedfingerprintingprotection", "Safari AFP"],
+  ["afp", "Safari AFP"]
+]);
+var HARD_CONTRADICTION_SCORE2 = 0.8;
+var EMPTY_INPUT3 = Object.freeze({});
+function asObject3(value) {
+  return value !== null && typeof value === "object" ? value : EMPTY_INPUT3;
+}
+function readField2(record, key) {
+  try {
+    return record[key];
+  } catch {
+    return void 0;
+  }
+}
+function isTrue3(record, key) {
+  return readField2(record, key) === true;
+}
+function acceptedVendorFamily2(value) {
+  if (value === true) return "explicit vendor signature";
+  if (typeof value !== "string") return null;
+  const key = value.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (key.length === 0) return null;
+  return ACCEPTED_VENDORS2.get(key) ?? null;
+}
+function safeDefaults3(note) {
+  return {
+    anti_detect_browser: false,
+    anomaly_score: 0,
+    suppressPenalty: false,
+    reasons: [note]
+  };
+}
+function resolveAntiDetectExemption(input = {}) {
+  try {
+    const src = asObject3(input);
+    const privacyHardened = isTrue3(src, "privacyHardened");
+    const hardContradiction = isTrue3(src, "hardContradiction");
+    const noiseOnly = isTrue3(src, "noiseOnly");
+    const rawVendor = readField2(src, "vendorSignature");
+    const vendorFamily = acceptedVendorFamily2(rawVendor);
+    const rawAutomation = readField2(src, "automationArtifact");
+    const automationPresent = rawAutomation === true || typeof rawAutomation === "string" && rawAutomation.trim().length > 0;
+    const reasons = [];
+    if (vendorFamily !== null) {
+      reasons.push(`Accepted vendor privacy signature: ${vendorFamily}`);
+    } else if (rawVendor !== null && rawVendor !== void 0 && rawVendor !== false) {
+      reasons.push("Unrecognized vendor signature ignored (never a privacy claim or anti-detect evidence)");
+    }
+    if (privacyHardened) {
+      reasons.push("Explicit privacy-hardened runtime posture present");
+    }
+    if (noiseOnly) {
+      reasons.push("Noise-only condition met: artifacts are explained as privacy farbling");
+    } else {
+      reasons.push("Noise-only condition not met; exemption withheld (abstaining, not guessing)");
+    }
+    if (automationPresent) {
+      reasons.push("Automation artifact present; diagnostic only, never sets anti_detect_browser");
+    }
+    let antiDetectBrowser = false;
+    let rawScore = 0;
+    if (hardContradiction) {
+      antiDetectBrowser = true;
+      rawScore = HARD_CONTRADICTION_SCORE2;
+      reasons.push("Hard contradiction present; anti_detect_browser=true and anomaly_score>0");
+      if (privacyHardened || vendorFamily !== null) {
+        reasons.push("Hard contradiction cannot be explained away by privacy hardening or a vendor signature");
+      }
+    }
+    const exemptionBase = privacyHardened || vendorFamily !== null;
+    const suppressPenalty = exemptionBase && noiseOnly && !hardContradiction;
+    if (suppressPenalty) {
+      reasons.push("Exemption granted: privacy posture/signature with noise-only artifacts; penalty suppressed");
+    } else if (!hardContradiction && exemptionBase && !noiseOnly) {
+      reasons.push("Privacy posture present but noise-only condition missing; no penalty suppression");
+    } else if (!hardContradiction && !exemptionBase && noiseOnly) {
+      reasons.push("Noise alone does not earn the exemption (no privacy posture or vendor signature)");
+    } else if (!hardContradiction && !exemptionBase) {
+      reasons.push("No privacy posture or vendor signature; abstaining (not guessing)");
+    }
+    const anomalyScore = Math.max(0, Math.min(1, Number(rawScore.toFixed(4))));
+    return {
+      anti_detect_browser: antiDetectBrowser,
+      anomaly_score: anomalyScore,
+      suppressPenalty,
+      reasons
+    };
+  } catch {
+    return safeDefaults3("resolveAntiDetectExemption: unexpected input; returning safe defaults");
+  }
+}
+
+// src/lib/confidenceStability.ts
+var STABILITY_QUANTUM = 0.05;
+var NO_PAIR_STABILITY_KEY = "stab:none";
+var FNV_OFFSET2 = 0xcbf29ce484222325n;
+var FNV_PRIME3 = 0x100000001b3n;
+var MASK642 = (1n << 64n) - 1n;
+function safeGet(source, key) {
+  if (source === null || source === void 0) return void 0;
+  const kind = typeof source;
+  if (kind !== "object" && kind !== "function") return void 0;
+  try {
+    return source[key];
+  } catch {
+    return void 0;
+  }
+}
+function asToken(value) {
+  if (typeof value !== "string") return "";
+  const text = value.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!text) return "";
+  return text.length > 256 ? text.slice(0, 256) : text;
+}
+function finiteOrNull(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+function round42(value) {
+  return Math.round(value * 1e4) / 1e4;
+}
+function fnv1a642(input) {
+  let hash = FNV_OFFSET2 & MASK642;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= BigInt(input.charCodeAt(i));
+    hash = hash * FNV_PRIME3 & MASK642;
+  }
+  return hash & MASK642;
+}
+function stabilityKeyFor(visitor, hardware) {
+  const canonical = `confidence-stability|v1|${visitor}|${hardware}`;
+  return `stab:${fnv1a642(canonical).toString(16).padStart(16, "0")}`;
+}
+function nullResult(stabilityKey, reason) {
+  return { score: null, tier: "New/Unobserved", stabilityKey, changed: false, reason };
+}
+function stabilizeConfidence(input) {
+  try {
+    const source = input !== null && input !== void 0 && (typeof input === "object" || typeof input === "function") ? input : {};
+    const visitor = asToken(safeGet(source, "visitorId"));
+    const hardware = asToken(safeGet(source, "hardwareId"));
+    if (!visitor && !hardware) return nullResult(NO_PAIR_STABILITY_KEY, "no_stable_pair");
+    if (!visitor) return nullResult(NO_PAIR_STABILITY_KEY, "no_visitor_id");
+    if (!hardware) return nullResult(NO_PAIR_STABILITY_KEY, "no_hardware_id");
+    const stabilityKey = stabilityKeyFor(visitor, hardware);
+    const raw = finiteOrNull(safeGet(source, "rawScore"));
+    if (raw === null) return nullResult(stabilityKey, "no_finite_raw_score");
+    const normalized = round42(Math.min(1, Math.max(0, raw)));
+    const stabilized = round42(
+      Math.min(1, Math.round(normalized / STABILITY_QUANTUM) * STABILITY_QUANTUM)
+    );
+    const changed = stabilized !== normalized;
+    return {
+      score: stabilized,
+      tier: confidenceBandForScore(stabilized),
+      stabilityKey,
+      changed,
+      reason: changed ? "score_quantized_for_stability" : "score_stable"
+    };
+  } catch {
+    return nullResult(NO_PAIR_STABILITY_KEY, "hostile_input_failed_closed");
+  }
+}
+
+// src/lib/gpuTruth.ts
+var SOFTWARE_RENDERER_PATTERN = /swiftshader|llvmpipe|softpipe|mesa offscreen|software rasterizer|software renderer|basic render driver|microsoft basic render|apple software renderer|virgl|goldfish|ranchu/i;
+var SOFTWARE_VENDOR_PATTERN = /^google\s+inc\.?\s*\(\s*google\s*\)$|^google$|^mesa$/i;
+var HIGH_END_RENDERER_PATTERN = /\brtx\b|\bgtx\b|geforce|radeon\s*(rx|pro)|quadro|\btitan\b|apple\s*m[1-9]\b|arc\s*a[0-9]/i;
+var STEALTH_TEMPLATE_RENDERER_PATTERN = /intel\s+iris\s+opengl\s+engine|intel\s+opengl\s+engine/i;
+var GENERIC_MODEL_PATTERN = /iris\s+opengl\s+engine|opengl\s+engine|\bgeneric\b|\bbasic\b|\bunknown\b|\bstandard\b|\b(na|n\/a)\b/i;
+var HARDWARE_GPU_PATTERN = /nvidia|geforce|quadro|radeon|\bamd\b|\bintel\b|iris|uhd graphics|hd graphics|arc graphics|apple m[1-9]|adreno|mali|powervr|videocore|apple gpu/i;
+var CONSTANT_WEBGL_STRINGS = /* @__PURE__ */ new Set([
+  "webkit webgl",
+  "webkit",
+  "mozilla",
+  "webgl",
+  "standard webgl vendor",
+  "standard webgl renderer",
+  "webgl vendor",
+  "webgl renderer"
+]);
+var MISSING_STRINGS = /* @__PURE__ */ new Set([
+  "unavailable",
+  "n/a",
+  "na",
+  "none",
+  "null",
+  "undefined",
+  "unknown",
+  "err",
+  "error"
+]);
+function readField3(source, key) {
+  try {
+    return source[key];
+  } catch {
+    return void 0;
+  }
+}
+function asString(value) {
+  try {
+    return typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
+  } catch {
+    return "";
+  }
+}
+function normalize(value) {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+function isPresent(value) {
+  const token = normalize(value);
+  return token !== "" && !MISSING_STRINGS.has(token);
+}
+function isConstantWebGLString(value) {
+  return CONSTANT_WEBGL_STRINGS.has(normalize(value));
+}
+function isIntelIncVendor(value) {
+  return /^intel\s+inc\.?$/i.test(value.trim());
+}
+function shaderPrecisionStrength(profile) {
+  const token = normalize(profile);
+  if (!token) return "unknown";
+  if (/^(low|lowp|none|no|0|n\/a|na|err|error|unavailable|unknown)$/.test(token)) return "weak";
+  if (/\blowp?\b/.test(token)) return "weak";
+  if (/\bhighp?\b|\bhigh\b/.test(token)) return "strong";
+  if (/^\d+(?:\|\d+)?$/.test(token)) {
+    const parts = token.split("|").map((part) => Number(part));
+    if (parts.every((part) => part <= 10)) return "weak";
+    if (parts.every((part) => part >= 20)) return "strong";
+  }
+  return "unknown";
+}
+function unique(reasons) {
+  return Array.from(new Set(reasons));
+}
+function resolveGpuTruthState(input = {}) {
+  try {
+    const source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+    const vendor = asString(readField3(source, "vendor"));
+    const renderer = asString(readField3(source, "renderer"));
+    const unmaskedVendor = asString(readField3(source, "unmaskedVendor"));
+    const unmaskedRenderer = asString(readField3(source, "unmaskedRenderer"));
+    const debugExtensionAvailable = readField3(source, "debugExtensionAvailable") === true;
+    const shaderPrecisionProfile = asString(readField3(source, "shaderPrecisionProfile"));
+    const privacyHardened = readField3(source, "privacyHardened") === true;
+    const unmaskedRendererPresent = isPresent(unmaskedRenderer);
+    const unmaskedVendorPresent = isPresent(unmaskedVendor);
+    const effectiveRenderer = unmaskedRendererPresent ? unmaskedRenderer : renderer;
+    const effectiveVendor = unmaskedVendorPresent ? unmaskedVendor : vendor;
+    const signature = `${vendor} ${renderer} ${unmaskedVendor} ${unmaskedRenderer}`;
+    const precision = shaderPrecisionStrength(shaderPrecisionProfile);
+    if (SOFTWARE_RENDERER_PATTERN.test(signature) || SOFTWARE_VENDOR_PATTERN.test(vendor.trim()) || SOFTWARE_VENDOR_PATTERN.test(unmaskedVendor.trim())) {
+      const reasons = [
+        "software-rasteriser-signature-detected",
+        "software-rendering-is-not-a-virtual-machine-verdict"
+      ];
+      if (!debugExtensionAvailable) {
+        reasons.push("software-identified-without-webgl-debug-info");
+      }
+      return { state: "software_renderer", answerUnreliable: false, reasons };
+    }
+    const spoofReasons = [];
+    if (STEALTH_TEMPLATE_RENDERER_PATTERN.test(effectiveRenderer)) {
+      spoofReasons.push("stealth-template-denylist:intel-iris-opengl-engine");
+    }
+    if (isIntelIncVendor(effectiveVendor) && GENERIC_MODEL_PATTERN.test(effectiveRenderer)) {
+      spoofReasons.push("stealth-template-denylist:intel-inc-with-generic-model");
+    }
+    if (isConstantWebGLString(effectiveRenderer) || isConstantWebGLString(effectiveVendor)) {
+      spoofReasons.push("constant-webgl-string-denylist");
+    }
+    const highEndClaim = HIGH_END_RENDERER_PATTERN.test(effectiveRenderer);
+    if (highEndClaim && !unmaskedRendererPresent) {
+      spoofReasons.push("high-end-renderer-claim-without-unmasked-renderer");
+    }
+    if (highEndClaim && precision === "weak") {
+      spoofReasons.push("high-end-renderer-claim-contradicted-by-low-shader-precision");
+    }
+    if (spoofReasons.length > 0) {
+      return { state: "spoofed_suspect", answerUnreliable: true, reasons: unique(spoofReasons) };
+    }
+    if (!debugExtensionAvailable || !unmaskedRendererPresent || !unmaskedVendorPresent) {
+      const reasons = [
+        !debugExtensionAvailable ? "webgl-debug-renderer-info-extension-unavailable" : "unmasked-webgl-strings-unavailable"
+      ];
+      if (privacyHardened) reasons.push("privacy-hardened-runtime-masks-gpu-identity");
+      return { state: "masked", answerUnreliable: true, reasons };
+    }
+    if (HARDWARE_GPU_PATTERN.test(`${effectiveVendor} ${effectiveRenderer}`)) {
+      const reasons = ["real-unmasked-gpu-identifier-present"];
+      if (precision === "strong") {
+        reasons.push("shader-precision-profile-consistent-with-hardware");
+      }
+      return { state: "hardware", answerUnreliable: false, reasons };
+    }
+    return {
+      state: "unknown",
+      answerUnreliable: true,
+      reasons: ["unrecognized-gpu-signature"]
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      state: "unknown",
+      answerUnreliable: true,
+      reasons: [`gpu-truth-resolution-failed: ${message}`]
+    };
+  }
+}
+
+// src/lib/activeCdp.ts
+var ELEVATED_NAME_GETTER_COUNT = 2;
+var ELEVATED_PREPARE_STACK_COUNT = 2;
+function readField4(value, key) {
+  try {
+    if (value === null || typeof value !== "object" && typeof value !== "function") {
+      return void 0;
+    }
+    return value[key];
+  } catch {
+    return void 0;
+  }
+}
+function toCount(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return 0;
+  return Math.floor(value);
+}
+function toBool(value) {
+  return value === true;
+}
+function inert() {
+  return { state: "none", cdp_attached: false, developer_tools: false, reasons: ["none"] };
+}
+function classify(input) {
+  const runtimeEnableCount = toCount(readField4(input, "runtimeEnableCount"));
+  const nameGetterCount = toCount(readField4(input, "nameGetterCount"));
+  const prepareStackTraceCount = toCount(readField4(input, "prepareStackTraceCount"));
+  const secondClientAttached = toBool(readField4(input, "secondClientAttached"));
+  const devtoolsAttached = toBool(readField4(input, "devtoolsAttached"));
+  const cdpClient = runtimeEnableCount >= 1 || secondClientAttached;
+  const activeInspection = secondClientAttached && nameGetterCount >= ELEVATED_NAME_GETTER_COUNT;
+  const devtoolsPresent = devtoolsAttached || prepareStackTraceCount >= ELEVATED_PREPARE_STACK_COUNT;
+  let state;
+  let cdpAttached;
+  let developerTools;
+  if (activeInspection && devtoolsPresent) {
+    state = "corroborated";
+    cdpAttached = true;
+    developerTools = true;
+  } else if (activeInspection) {
+    state = "automation_protocol_inspection_active";
+    cdpAttached = true;
+    developerTools = false;
+  } else if (devtoolsPresent) {
+    state = "docked_devtools";
+    cdpAttached = false;
+    developerTools = true;
+  } else if (cdpClient) {
+    state = "automation_protocol_attached";
+    cdpAttached = true;
+    developerTools = false;
+  } else {
+    return inert();
+  }
+  const reasons = [];
+  if (runtimeEnableCount >= 1) reasons.push("runtime_domain_enabled");
+  if (secondClientAttached) reasons.push("second_cdp_client");
+  if (nameGetterCount >= ELEVATED_NAME_GETTER_COUNT) reasons.push("name_getter_elevated");
+  if (prepareStackTraceCount >= ELEVATED_PREPARE_STACK_COUNT) {
+    reasons.push("prepare_stack_inspection");
+  }
+  if (devtoolsAttached) reasons.push("devtools_attached");
+  reasons.push(state);
+  return { state, cdp_attached: cdpAttached, developer_tools: developerTools, reasons };
+}
+function resolveActiveCdp(input) {
+  try {
+    return classify(input);
+  } catch {
+    return inert();
+  }
+}
+
+// src/lib/identityScope.ts
+var EMPTY_INPUT4 = Object.freeze({});
+function readFlag(src, key, unreadable) {
+  try {
+    return src[key] === true;
+  } catch {
+    unreadable.push(key);
+    return false;
+  }
+}
+function asObject4(value) {
+  return value !== null && typeof value === "object" ? value : EMPTY_INPUT4;
+}
+function boolText(flag) {
+  return flag ? "true" : "false";
+}
+function resolveIdentityScope(input) {
+  try {
+    const src = asObject4(input);
+    const unreadable = [];
+    const incognito = readFlag(src, "incognito", unreadable);
+    const firstPartyStorageSurvived = readFlag(src, "firstPartyStorageSurvived", unreadable);
+    const hardwareAnchorStable = readFlag(src, "hardwareAnchorStable", unreadable);
+    const contextSaltPresent = readFlag(src, "contextSaltPresent", unreadable);
+    let id_scope;
+    let context_isolated;
+    let rule;
+    if (contextSaltPresent) {
+      id_scope = "context";
+      context_isolated = true;
+      rule = "context_salt_present: explicit per-context salt isolates the identity scope";
+    } else {
+      id_scope = "hardware";
+      context_isolated = false;
+      if (incognito && hardwareAnchorStable) {
+        rule = "incognito + stable_hardware_anchor + no_context_salt: hardware scope from explicit metadata; incognito alone never implies privacy isolation and context isolation is NOT assumed";
+      } else if (incognito) {
+        rule = "incognito + no_context_salt: hardware scope from explicit metadata; hardware anchor not confirmed stable and context isolation is NOT assumed";
+      } else if (hardwareAnchorStable) {
+        rule = "no_context_salt: hardware scope on a stable hardware anchor; context isolation is NOT assumed";
+      } else {
+        rule = "no_context_salt: hardware scope fallback; no explicit isolation metadata and context isolation is NOT assumed";
+      }
+    }
+    const metadata = `metadata: incognito=${boolText(incognito)}, first_party_storage_survived=${boolText(firstPartyStorageSurvived)}, hardware_anchor_stable=${boolText(hardwareAnchorStable)}, context_salt_present=${boolText(contextSaltPresent)}`;
+    const notes = [
+      rule,
+      metadata,
+      "first-party storage survival is not isolation metadata",
+      "no identifier was minted"
+    ];
+    if (unreadable.length > 0) notes.push(`unreadable fields ignored (${unreadable.join(", ")})`);
+    return { id_scope, context_isolated, reason: `${notes.join("; ")}.` };
+  } catch {
+    return {
+      id_scope: "hardware",
+      context_isolated: false,
+      reason: "resolveIdentityScope: unexpected input; hardware scope by default, context isolation NOT assumed; no identifier was minted."
+    };
+  }
+}
+
+// src/lib/idbDurabilityTruth.ts
+var STRONG_RAM_RATIO_MAX = 1.4;
+var IDB_PRIVATE_RATIO_MAX = 1.12;
+var IDB_NORMAL_RATIO_MIN = 1.6;
+function bool(value) {
+  return value === true;
+}
+function resolveIdbDurabilityTruth(input = {}) {
+  let source = {};
+  try {
+    if (input && typeof input === "object") source = { ...input };
+  } catch {
+    source = {};
+  }
+  let ratio = null;
+  let highVariance = false;
+  let persistedGrant = false;
+  let isolatedContext = false;
+  let opfsCorroboration = false;
+  try {
+    const raw = source.ratio;
+    if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) ratio = raw;
+    highVariance = bool(source.highVariance);
+    persistedGrant = bool(source.persistedGrant);
+    isolatedContext = bool(source.isolatedContext);
+    opfsCorroboration = bool(source.opfsCorroboration);
+  } catch {
+    ratio = null;
+    highVariance = false;
+    persistedGrant = false;
+    isolatedContext = false;
+    opfsCorroboration = false;
+  }
+  const reasons = [];
+  if (persistedGrant || isolatedContext) {
+    reasons.push(persistedGrant ? "persistent-storage grant veto" : "isolated/partitioned storage context veto");
+    return { incognito: false, confidence: "low", rule: "vetoed", reasons };
+  }
+  if (ratio === null) {
+    reasons.push("no finite IDB durability ratio");
+    return { incognito: false, confidence: "low", rule: "inconclusive", reasons };
+  }
+  if (ratio <= STRONG_RAM_RATIO_MAX) {
+    reasons.push(
+      `strict/relaxed ratio ${ratio} <= ${STRONG_RAM_RATIO_MAX}: RAM-backed off-the-record store`
+    );
+    return { incognito: true, confidence: "high", rule: "strong_ram_signature", reasons };
+  }
+  if (ratio > IDB_NORMAL_RATIO_MIN) {
+    reasons.push(`strict/relaxed ratio ${ratio} > ${IDB_NORMAL_RATIO_MIN}: disk-backed profile`);
+    return { incognito: false, confidence: "high", rule: "disk_backed", reasons };
+  }
+  if (ratio < IDB_PRIVATE_RATIO_MAX && !highVariance && opfsCorroboration) {
+    reasons.push(`ratio ${ratio} below ${IDB_PRIVATE_RATIO_MAX} with independent corroboration`);
+    return { incognito: true, confidence: "high", rule: "corroborated_private", reasons };
+  }
+  reasons.push(
+    `ratio ${ratio} in deadband${highVariance ? " with high variance" : ""} and no decisive corroboration`
+  );
+  return { incognito: false, confidence: "low", rule: "deadband", reasons };
+}
+
+// src/lib/riskEvidenceExtra.ts
+var DETECTORS = [
+  {
+    flag: "spoofedBot",
+    family: "automation",
+    component: "extra.spoofed_bot",
+    label: "Spoofed bot signals",
+    reason: "Informational: self-reported spoofed-bot observation recorded for context; not scored."
+  },
+  {
+    flag: "gpuUnreliable",
+    family: "environment",
+    component: "extra.gpu_unreliable",
+    label: "Unreliable GPU signal",
+    reason: "Informational: GPU / renderer reading flagged unreliable for context; not scored."
+  },
+  {
+    flag: "audioNoisy",
+    family: "environment",
+    component: "extra.audio_noisy",
+    label: "Noisy audio fingerprint",
+    reason: "Informational: audio fingerprint classified as noisy for context; not scored."
+  },
+  {
+    flag: "privacyNoise",
+    family: "tampering",
+    component: "extra.privacy_noise",
+    label: "Privacy-noise signature",
+    reason: "Informational: privacy-hardening noise recorded for context; not scored."
+  },
+  {
+    flag: "proximityDenied",
+    family: "environment",
+    component: "extra.proximity_denied",
+    label: "Proximity permission denied",
+    reason: "Informational: proximity / Bluetooth permission denied for context; not scored."
+  },
+  {
+    flag: "activeCdp",
+    family: "automation",
+    component: "extra.active_cdp",
+    label: "Active CDP inspection",
+    reason: "Informational: active CDP inspection observed for context; not scored."
+  }
+];
+function readFlag2(source, flag) {
+  try {
+    if (source === null || source === void 0) return false;
+    const kind = typeof source;
+    if (kind !== "object" && kind !== "function") return false;
+    return source[flag] === true;
+  } catch {
+    return false;
+  }
+}
+function buildExtraEvidenceLines(input) {
+  const lines = [];
+  for (const detector of DETECTORS) {
+    if (!readFlag2(input, detector.flag)) continue;
+    lines.push({
+      family: detector.family,
+      component: detector.component,
+      points: 0,
+      reason: detector.reason,
+      label: detector.label
+    });
+  }
+  return lines;
+}
+
+// src/lib/rollingPercentile.ts
+var DEFAULT_FLOOR = 16;
+var DEFAULT_MIN_SAMPLES = 100;
+var MAX_ROLLING_WINDOW = 1e3;
+var PERCENTILE_P98 = 0.98;
+var DEGENERATE_MAX_N = 50;
+function finiteNumber3(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+function positiveInt(value, fallback, max) {
+  const parsed = finiteNumber3(value);
+  if (parsed === null || !Number.isInteger(parsed) || parsed < 1) return fallback;
+  return max === void 0 ? parsed : Math.min(parsed, max);
+}
+function resolveFloor(value) {
+  const parsed = finiteNumber3(value);
+  return parsed !== null && parsed >= 0 ? parsed : DEFAULT_FLOOR;
+}
+function failClosed(reason) {
+  return {
+    mode: "fixed_small_corpus",
+    threshold: DEFAULT_FLOOR,
+    n: 0,
+    floor: DEFAULT_FLOOR,
+    reasons: [reason]
+  };
+}
+function nearestRankPercentile(values, p) {
+  try {
+    const rankFraction = finiteNumber3(p);
+    if (rankFraction === null || rankFraction <= 0 || rankFraction > 1) return null;
+    if (!Array.isArray(values)) return null;
+    const clean = [];
+    for (const entry of values) {
+      const value = finiteNumber3(entry);
+      if (value !== null) clean.push(value);
+    }
+    if (clean.length === 0) return null;
+    clean.sort((a, b) => a - b);
+    const rank = Math.max(1, Math.min(clean.length, Math.ceil(rankFraction * clean.length)));
+    return clean[rank - 1];
+  } catch {
+    return null;
+  }
+}
+function resolveHighActivityThreshold(input) {
+  try {
+    const source = input !== null && input !== void 0 && typeof input === "object" ? input : {};
+    const floor = resolveFloor(source["floor"]);
+    const minSamples = positiveInt(source["minSamples"], DEFAULT_MIN_SAMPLES);
+    const windowSize = Math.min(positiveInt(source["windowSize"], MAX_ROLLING_WINDOW), MAX_ROLLING_WINDOW);
+    const rawObservations = source["observations"];
+    const observations = Array.isArray(rawObservations) ? rawObservations : [];
+    const reasons = [];
+    let window2;
+    const timestamps = source["timestamps"];
+    if (Array.isArray(timestamps)) {
+      if (timestamps.length !== observations.length) {
+        window2 = observations.slice(-windowSize);
+        reasons.push("timestamps_ignored_length_mismatch");
+        reasons.push("window_anchored_to_last_observations");
+      } else {
+        const pairs = [];
+        let usable = true;
+        for (let i = 0; i < observations.length; i += 1) {
+          const ts = finiteNumber3(timestamps[i]);
+          if (ts === null) {
+            usable = false;
+            break;
+          }
+          pairs.push({ value: observations[i], ts });
+        }
+        if (usable) {
+          pairs.sort((a, b) => a.ts - b.ts);
+          window2 = pairs.slice(-windowSize).map((pair) => pair.value);
+          reasons.push("window_anchored_by_supplied_timestamps");
+        } else {
+          window2 = observations.slice(-windowSize);
+          reasons.push("timestamps_unusable_window_anchored_to_tail");
+          reasons.push("window_anchored_to_last_observations");
+        }
+      }
+    } else {
+      window2 = observations.slice(-windowSize);
+      if (observations.length > 0) reasons.push("window_anchored_to_last_observations");
+    }
+    if (observations.length > window2.length) {
+      reasons.push(
+        windowSize < MAX_ROLLING_WINDOW ? "window_truncated_to_requested_size" : "window_capped_at_1000"
+      );
+    }
+    const values = [];
+    for (const entry of window2) {
+      const value = finiteNumber3(entry);
+      if (value !== null && value >= 0) values.push(value);
+    }
+    if (values.length < window2.length) reasons.push("hostile_observations_discarded");
+    const n = values.length;
+    const counted = { n, floor };
+    if (n === 0) {
+      return {
+        ...counted,
+        mode: "fixed_small_corpus",
+        threshold: floor,
+        reasons: [...reasons, "no_usable_observations", "fixed_floor_applied"]
+      };
+    }
+    if (n < DEGENERATE_MAX_N) reasons.push("p98_degenerates_to_max_below_50");
+    if (n < minSamples) {
+      return {
+        ...counted,
+        mode: "fixed_small_corpus",
+        threshold: floor,
+        reasons: [...reasons, "cold_start_n_lt_min_samples", "fixed_floor_applied"]
+      };
+    }
+    const p98 = nearestRankPercentile(values, PERCENTILE_P98);
+    if (p98 === null) {
+      return {
+        ...counted,
+        mode: "fixed_small_corpus",
+        threshold: floor,
+        reasons: [...reasons, "percentile_unavailable", "fixed_floor_applied"]
+      };
+    }
+    return {
+      ...counted,
+      mode: "adaptive_p98",
+      threshold: Math.max(floor, p98),
+      reasons: [...reasons, "adaptive_p98_of_rolling_window"]
+    };
+  } catch {
+    return failClosed("hostile_input_failed_closed");
+  }
+}
+
+// src/lib/rarityColdStart.ts
+var LANCZOS = [
+  0.9999999999998099,
+  676.5203681218851,
+  -1259.1392167224028,
+  771.3234287776531,
+  -176.6150291621406,
+  12.507343278686905,
+  -0.13857109526572012,
+  9984369578019572e-21,
+  15056327351493116e-23
+];
+function logGamma(z) {
+  if (z < 0.5) {
+    return Math.log(Math.PI / Math.sin(Math.PI * z)) - logGamma(1 - z);
+  }
+  const shifted = z - 1;
+  let x = LANCZOS[0];
+  for (let i = 1; i < LANCZOS.length; i += 1) {
+    x += LANCZOS[i] / (shifted + i);
+  }
+  const t = shifted + 7.5;
+  return 0.5 * Math.log(2 * Math.PI) + (shifted + 0.5) * Math.log(t) - t + Math.log(x);
+}
+function betaContinuedFraction(a, b, x) {
+  const MAX_ITERATIONS = 200;
+  const EPSILON = 3e-14;
+  const FPMIN = 1e-300;
+  const qab = a + b;
+  const qap = a + 1;
+  const qam = a - 1;
+  let c = 1;
+  let d = 1 - qab * x / qap;
+  if (Math.abs(d) < FPMIN) d = FPMIN;
+  d = 1 / d;
+  let h = d;
+  for (let m = 1; m <= MAX_ITERATIONS; m += 1) {
+    const m2 = 2 * m;
+    let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+    d = 1 + aa * d;
+    if (Math.abs(d) < FPMIN) d = FPMIN;
+    c = 1 + aa / c;
+    if (Math.abs(c) < FPMIN) c = FPMIN;
+    d = 1 / d;
+    h *= d * c;
+    aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+    d = 1 + aa * d;
+    if (Math.abs(d) < FPMIN) d = FPMIN;
+    c = 1 + aa / c;
+    if (Math.abs(c) < FPMIN) c = FPMIN;
+    d = 1 / d;
+    const delta = d * c;
+    h *= delta;
+    if (Math.abs(delta - 1) < EPSILON) break;
+  }
+  return h;
+}
+function regularizedIncompleteBeta(a, b, x) {
+  if (!(x > 0)) return 0;
+  if (!(x < 1)) return 1;
+  const front = Math.exp(
+    logGamma(a + b) - logGamma(a) - logGamma(b) + a * Math.log(x) + b * Math.log1p(-x)
+  );
+  if (x < (a + 1) / (a + b + 2)) {
+    return front * betaContinuedFraction(a, b, x) / a;
+  }
+  return 1 - front * betaContinuedFraction(b, a, 1 - x) / b;
+}
+function betaInverse(target, a, b) {
+  let low = 0;
+  let high = 1;
+  for (let i = 0; i < 100; i += 1) {
+    const mid = (low + high) / 2;
+    if (regularizedIncompleteBeta(a, b, mid) < target) low = mid;
+    else high = mid;
+  }
+  return (low + high) / 2;
+}
+function normalizeAlpha(alpha) {
+  if (typeof alpha !== "number" || !Number.isFinite(alpha)) return 0.05;
+  return Math.max(0, Math.min(1, alpha));
+}
+function oneSidedUpper(k, n, alpha = 0.05) {
+  const a = normalizeAlpha(alpha);
+  if (typeof k !== "number" || !Number.isFinite(k)) return 1;
+  if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return 1;
+  if (a <= 0) return 1;
+  if (a >= 1) return 0;
+  const trials = Math.floor(n);
+  if (trials <= 0) return 1;
+  const hits = Math.max(0, Math.min(trials, Math.floor(k)));
+  if (hits === 0) return -Math.expm1(Math.log(a) / trials);
+  if (hits === trials) return 1;
+  const result = betaInverse(1 - a, hits + 1, trials - hits);
+  if (!Number.isFinite(result)) return 1;
+  return Math.max(0, Math.min(1, result));
+}
+var DEFAULT_RARE_THRESHOLD = 0.01;
+var DEFAULT_MIN_SAMPLES2 = 30;
+var P95_THRESHOLD = 0.05;
+var P99_THRESHOLD = 0.01;
+var P999_THRESHOLD = 1e-3;
+function normalizePositiveNumber(value, fallback) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallback;
+  return value;
+}
+function normalizeCount(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return null;
+  return Math.floor(value);
+}
+function bucketForUpper(pUpper) {
+  if (pUpper < P999_THRESHOLD) return "p99.9+";
+  if (pUpper < P99_THRESHOLD) return "p99";
+  if (pUpper < P95_THRESHOLD) return "p95";
+  return "common";
+}
+function rarityDecision(input) {
+  const source = input && typeof input === "object" ? input : {};
+  const alpha = normalizeAlpha(source.alpha);
+  const deviceCount = Math.max(1, Math.floor(normalizePositiveNumber(source.deviceCount, 1)));
+  const adjustedAlpha = Math.max(0, Math.min(1, alpha / deviceCount));
+  const rareThreshold = normalizePositiveNumber(source.rareThreshold, DEFAULT_RARE_THRESHOLD);
+  const minSamples = Math.max(1, Math.floor(normalizePositiveNumber(source.minSamples, DEFAULT_MIN_SAMPLES2)));
+  const baseReasons = [];
+  if (deviceCount > 1) baseReasons.push(`bonferroni_device_multiplicity:x${deviceCount}`);
+  const rawHits = normalizeCount(source.hits);
+  const rawTotal = normalizeCount(source.total);
+  if (rawHits === null || rawTotal === null || rawTotal === 0) {
+    return {
+      bucket: "insufficient_data",
+      rare: false,
+      p_upper: null,
+      adjustedAlpha,
+      reasons: [...baseReasons, "missing_or_hostile_counts"]
+    };
+  }
+  const total = rawTotal;
+  const hits = Math.min(rawHits, total);
+  if (total < minSamples) {
+    return {
+      bucket: "insufficient_data",
+      rare: false,
+      p_upper: null,
+      adjustedAlpha,
+      reasons: [...baseReasons, `below_hard_sample_floor:${total}<${minSamples}`]
+    };
+  }
+  const pUpper = oneSidedUpper(hits, total, adjustedAlpha);
+  if (hits === 0 && adjustedAlpha > 0) {
+    const zeroHitFloor = Math.ceil(-Math.log(adjustedAlpha) / rareThreshold);
+    if (total < zeroHitFloor) {
+      return {
+        bucket: "not_seen",
+        rare: false,
+        p_upper: pUpper,
+        adjustedAlpha,
+        reasons: [
+          ...baseReasons,
+          "zero_hits_below_sample_floor",
+          `need_total>=${Number.isFinite(zeroHitFloor) ? zeroHitFloor : "Infinity"}`
+        ]
+      };
+    }
+  } else if (hits === 0) {
+    return {
+      bucket: "not_seen",
+      rare: false,
+      p_upper: pUpper,
+      adjustedAlpha,
+      reasons: [...baseReasons, "zero_hits_zero_confidence"]
+    };
+  }
+  const bucket = bucketForUpper(pUpper);
+  const rare = bucket !== "common" && pUpper < rareThreshold;
+  const reasons = [...baseReasons];
+  reasons.push(
+    rare ? `p_upper_below_rare_threshold:${pUpper.toExponential(3)}<${rareThreshold}` : `p_upper_at_or_above_rare_threshold:${pUpper.toExponential(3)}>=${rareThreshold}`
+  );
+  if (hits > 0) reasons.push("nonzero_hits_use_beta_inverse_bound");
+  return { bucket, rare, p_upper: pUpper, adjustedAlpha, reasons };
+}
+
+// src/lib/calibrationCorpus.ts
+var CALIBRATION_BIN_COUNT = 10;
+var INDEPENDENT_LABEL_SOURCES = Object.freeze({
+  // Observed band: deterministic first-party / server identifiers.
+  first_party_cookie: "observed",
+  server_visitor_id: "observed",
+  cookie: "observed",
+  visitor_id: "observed",
+  // Strong band: authenticated, first-party identity authorities.
+  oauth_subject: "strong",
+  crm_id: "strong",
+  login_subject: "strong",
+  authenticated_login: "strong"
+});
+function round43(value) {
+  return Math.round(value * 1e4) / 1e4;
+}
+function finiteNumber4(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+function binRange(index) {
+  const lo = (index / CALIBRATION_BIN_COUNT).toFixed(1);
+  const hi = ((index + 1) / CALIBRATION_BIN_COUNT).toFixed(1);
+  return index === CALIBRATION_BIN_COUNT - 1 ? `[${lo},${hi}]` : `[${lo},${hi})`;
+}
+function emptyBins() {
+  return Array.from({ length: CALIBRATION_BIN_COUNT }, (_, index) => ({
+    range: binRange(index),
+    count: 0,
+    confidence: 0,
+    accuracy: 0
+  }));
+}
+function binIndex(score) {
+  const index = Math.floor(score * CALIBRATION_BIN_COUNT);
+  if (!Number.isFinite(index)) return CALIBRATION_BIN_COUNT - 1;
+  return Math.max(0, Math.min(CALIBRATION_BIN_COUNT - 1, index));
+}
+function autoPartition(visitorId) {
+  let hash = 2166136261;
+  for (let i = 0; i < visitorId.length; i += 1) {
+    hash ^= visitorId.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % 5 === 0 ? "test" : "fit";
+}
+function binaryLabel(value) {
+  if (value === true || value === 1) return 1;
+  if (value === false || value === 0) return 0;
+  return null;
+}
+function emptyRejections() {
+  return {
+    bot: 0,
+    quarantined: 0,
+    badSource: 0,
+    temporalLeak: 0,
+    badScore: 0,
+    badLabel: 0,
+    missingDeterministicId: 0,
+    badVisitor: 0,
+    contradiction: 0,
+    crossPartition: 0
+  };
+}
+function rejectionSummary(counts) {
+  const parts = [];
+  if (counts.bot) parts.push(`${counts.bot} bot`);
+  if (counts.quarantined) parts.push(`${counts.quarantined} quarantined`);
+  if (counts.badSource) parts.push(`${counts.badSource} non-independent label source`);
+  if (counts.temporalLeak) parts.push(`${counts.temporalLeak} pre-freeze label (temporal leak)`);
+  if (counts.badScore) parts.push(`${counts.badScore} invalid frozen score`);
+  if (counts.badLabel) parts.push(`${counts.badLabel} invalid label`);
+  if (counts.missingDeterministicId) parts.push(`${counts.missingDeterministicId} missing deterministic id`);
+  if (counts.badVisitor) parts.push(`${counts.badVisitor} missing visitor_id`);
+  if (counts.contradiction) parts.push(`${counts.contradiction} id contradiction (whole group)`);
+  if (counts.crossPartition) parts.push(`${counts.crossPartition} cross-partition browser (whole group)`);
+  return parts.length ? ` (filtered: ${parts.join(", ")})` : "";
+}
+function buildCalibrationCorpus(records) {
+  try {
+    const warnings = [
+      "INTERPRETATION: low ECE does not imply accuracy; Brier score is reported alongside for context.",
+      "LEAKAGE POLICY: scores frozen at decision time; labels resolved from independent evidence strictly afterwards; partitions grouped by visitor_id; holdout never tuned."
+    ];
+    const rejections = emptyRejections();
+    if (!Array.isArray(records)) {
+      warnings.push("INPUT: records is not an array; treated as an empty corpus.");
+    }
+    const list = Array.isArray(records) ? records : [];
+    const candidates = [];
+    for (let index = 0; index < list.length; index += 1) {
+      const raw = list[index];
+      const record = raw && typeof raw === "object" ? raw : null;
+      const rid = record && typeof record.id === "string" && record.id ? record.id : `record[${index}]`;
+      if (!record) {
+        rejections.badVisitor += 1;
+        warnings.push(`REJECT [${rid}]: not an object; excluded.`);
+        continue;
+      }
+      if (record.isBot === true) {
+        rejections.bot += 1;
+        warnings.push(`REJECT [${rid}]: bot record excluded from calibration corpus.`);
+        continue;
+      }
+      if (record.quarantined === true) {
+        rejections.quarantined += 1;
+        warnings.push(`REJECT [${rid}]: quarantined record excluded from calibration corpus.`);
+        continue;
+      }
+      if (typeof record.visitor_id !== "string" || record.visitor_id.length === 0) {
+        rejections.badVisitor += 1;
+        warnings.push(`REJECT [${rid}]: missing/non-string visitor_id; excluded.`);
+        continue;
+      }
+      const declaredSource = typeof record.labelDerivedFrom === "string" && record.labelDerivedFrom.length > 0 ? record.labelDerivedFrom : record.labelSource;
+      const sourceKey = typeof declaredSource === "string" ? declaredSource.trim().toLowerCase() : "";
+      if (!Object.prototype.hasOwnProperty.call(INDEPENDENT_LABEL_SOURCES, sourceKey)) {
+        rejections.badSource += 1;
+        warnings.push(
+          `LEAKAGE [${rid}]: label source '${String(declaredSource)}' is not an independent evidence source; our own confidence/threshold is forbidden as a label.`
+        );
+        continue;
+      }
+      if (typeof record.deterministicId !== "string" || record.deterministicId.length === 0) {
+        rejections.missingDeterministicId += 1;
+        warnings.push(`LEAKAGE [${rid}]: missing deterministic id from the independent source; excluded.`);
+        continue;
+      }
+      if (!finiteNumber4(record.frozenScore) || record.frozenScore < 0 || record.frozenScore > 1) {
+        rejections.badScore += 1;
+        warnings.push(`REJECT [${rid}]: frozenScore is not a finite number in [0,1]; excluded.`);
+        continue;
+      }
+      const label = binaryLabel(record.label);
+      if (label === null) {
+        rejections.badLabel += 1;
+        warnings.push(`REJECT [${rid}]: label is not binary (0/1/false/true); excluded.`);
+        continue;
+      }
+      if (!finiteNumber4(record.frozenAt) || !finiteNumber4(record.labelResolvedAt) || record.labelResolvedAt <= record.frozenAt) {
+        rejections.temporalLeak += 1;
+        warnings.push(
+          `LEAKAGE [${rid}]: pre-freeze label (temporal leakage) \u2014 label resolved at/before the score freeze (frozenAt=${String(record.frozenAt)}, labelResolvedAt=${String(record.labelResolvedAt)}); excluded.`
+        );
+        continue;
+      }
+      const explicit = record.partition === "fit" || record.partition === "test" ? record.partition : null;
+      candidates.push({ record: { ...record, label }, partition: explicit ?? autoPartition(record.visitor_id) });
+      void sourceKey;
+    }
+    const groups = /* @__PURE__ */ new Map();
+    for (const candidate of candidates) {
+      const key = candidate.record.visitor_id;
+      const group = groups.get(key);
+      if (group) group.push(candidate);
+      else groups.set(key, [candidate]);
+    }
+    const survivors = [];
+    for (const [visitorId, group] of groups) {
+      const ids = new Set(group.map((member) => member.record.deterministicId));
+      if (ids.size > 1) {
+        rejections.contradiction += group.length;
+        warnings.push(
+          `CONTRADICTION [${visitorId}]: conflicting deterministic ids ${JSON.stringify([...ids])}; whole group excluded.`
+        );
+        continue;
+      }
+      const partitions = new Set(group.map((member) => member.partition));
+      if (partitions.has("fit") && partitions.has("test")) {
+        rejections.crossPartition += group.length;
+        warnings.push(
+          `LEAKAGE [${visitorId}]: same browser appears in both fit and test partitions; whole group excluded.`
+        );
+        continue;
+      }
+      for (const member of group) survivors.push(member);
+    }
+    const testRecords = survivors.filter((member) => member.partition === "test").map((member) => member.record);
+    const bins = emptyBins();
+    const scoreSums = new Array(CALIBRATION_BIN_COUNT).fill(0);
+    const labelSums = new Array(CALIBRATION_BIN_COUNT).fill(0);
+    let brierSum = 0;
+    let observedBand = 0;
+    let strongBand = 0;
+    for (const record of testRecords) {
+      const index = binIndex(record.frozenScore);
+      bins[index].count += 1;
+      scoreSums[index] += record.frozenScore;
+      labelSums[index] += binaryLabel(record.label) ?? 0;
+      const y = binaryLabel(record.label) ?? 0;
+      const error = record.frozenScore - y;
+      brierSum += error * error;
+      const source = typeof record.labelDerivedFrom === "string" && record.labelDerivedFrom.length > 0 ? record.labelDerivedFrom : record.labelSource;
+      const sourceKey = typeof source === "string" ? source.trim().toLowerCase() : "";
+      if (INDEPENDENT_LABEL_SOURCES[sourceKey] === "strong") strongBand += 1;
+      else observedBand += 1;
+    }
+    const n = testRecords.length;
+    let rawEce = 0;
+    for (let index = 0; index < CALIBRATION_BIN_COUNT; index += 1) {
+      const count = bins[index].count;
+      if (count === 0) {
+        bins[index].confidence = 0;
+        bins[index].accuracy = 0;
+        continue;
+      }
+      const confidence = scoreSums[index] / count;
+      const accuracy = labelSums[index] / count;
+      bins[index].confidence = round43(confidence);
+      bins[index].accuracy = round43(accuracy);
+      rawEce += count / n * Math.abs(accuracy - confidence);
+    }
+    const ece = round43(rawEce);
+    const brier = n > 0 ? round43(brierSum / n) : 0;
+    const labeledPairs = n;
+    const eligible = isCalibrationEligible({ labeledPairs, heldOutEce: rawEce });
+    warnings.push(
+      `LABEL SOURCES: observed-band=${observedBand}, strong-band=${strongBand}; labels are independent of the frozen score.`
+    );
+    if (labeledPairs < 500) {
+      warnings.push(
+        `SAMPLE SIZE <500: naive 10-bin ECE is unreliable below 500 labeled pairs (current: ${labeledPairs}); treat this estimate as descriptive only.`
+      );
+    }
+    if (labeledPairs < 5e3) {
+      warnings.push(
+        `SAMPLE SIZE 5k-10k: research recommends 5,000-10,000 labeled pairs for a stable calibration estimate (current: ${labeledPairs}); the locked gate of ${CALIBRATION_MIN_LABELED_PAIRS} pairs / ECE<=${CALIBRATION_MAX_ECE} is unchanged.`
+      );
+    }
+    const suffix = rejectionSummary(rejections);
+    let reason;
+    if (eligible) {
+      reason = `gate passed: ${labeledPairs} labeled pairs (>= ${CALIBRATION_MIN_LABELED_PAIRS}) and held-out ECE ${ece} (<= ${CALIBRATION_MAX_ECE})${suffix}`;
+    } else if (labeledPairs < CALIBRATION_MIN_LABELED_PAIRS) {
+      reason = `insufficient labeled pairs: ${labeledPairs} < ${CALIBRATION_MIN_LABELED_PAIRS} required${suffix}`;
+    } else {
+      reason = `held-out ECE ${ece} exceeds ceiling ${CALIBRATION_MAX_ECE}${suffix}`;
+    }
+    return { eligible, labeledPairs, ece, brier, bins, warnings, reason };
+  } catch (error) {
+    return {
+      eligible: false,
+      labeledPairs: 0,
+      ece: 0,
+      brier: 0,
+      bins: emptyBins(),
+      warnings: [
+        `FATAL: corpus builder failed closed: ${error instanceof Error ? error.message : String(error)}`
+      ],
+      reason: "corpus builder failed closed"
+    };
+  }
+}
+
+// src/lib/networkTruthShadow.ts
+var LIGHT_DISTANCE_LABEL = "RTT-based light-distance estimate (approximation; not JA4L)";
+var UNAVAILABLE_TOKENS = /* @__PURE__ */ new Set([
+  "unavailable",
+  "unknown",
+  "n/a",
+  "na",
+  "null",
+  "none",
+  "-",
+  "not available"
+]);
+function isRecord(value) {
+  try {
+    return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+function safeText2(value, maxLength) {
+  try {
+    if (typeof value !== "string") return "";
+    const text = value.trim();
+    if (!text || text.length > maxLength) return "";
+    if (UNAVAILABLE_TOKENS.has(text.toLowerCase())) return "";
+    return text;
+  } catch {
+    return "";
+  }
+}
+function genuineProvider(value) {
+  const text = safeText2(value, 120);
+  return text || void 0;
+}
+function genuineObservationTime(value) {
+  try {
+    if (typeof value === "string") {
+      const text = value.trim();
+      if (!text || text.length > 40) return void 0;
+      if (!/^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))?$/.test(text)) {
+        return void 0;
+      }
+      const ms = Date.parse(text);
+      return Number.isFinite(ms) ? new Date(ms).toISOString() : void 0;
+    }
+    if (typeof value === "number" && Number.isFinite(value) && value > 1e12 && value < 1e14) {
+      return new Date(value).toISOString();
+    }
+  } catch {
+  }
+  return void 0;
+}
+function positiveRtt(value) {
+  try {
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  } catch {
+  }
+  return void 0;
+}
+function buildNetworkTruthShadow(input) {
+  try {
+    if (!isRecord(input)) return void 0;
+    const bag = input;
+    let edgeRaw;
+    let geoRaw;
+    let proxyRaw;
+    let observedRttRaw;
+    try {
+      edgeRaw = bag.edgeTransport;
+      geoRaw = bag.geo;
+      proxyRaw = bag.proxyDetails;
+      observedRttRaw = bag.observedRttMs;
+    } catch {
+      return void 0;
+    }
+    const edge = isRecord(edgeRaw) ? edgeRaw : null;
+    const geo = isRecord(geoRaw) ? geoRaw : null;
+    const proxy = isRecord(proxyRaw) ? proxyRaw : null;
+    let httpProtocol = "";
+    let edgeL4 = "";
+    let colo = "";
+    let tcpRtt;
+    let quicRtt;
+    let tcpRttIsZero = false;
+    try {
+      httpProtocol = safeText2(edge?.httpProtocol, 64);
+      edgeL4 = safeText2(edge?.edgeL4, 32);
+      colo = safeText2(edge?.colo, 16);
+      const rawTcp = edge?.clientTcpRtt;
+      const rawQuic = edge?.clientQuicRtt;
+      tcpRtt = positiveRtt(rawTcp);
+      quicRtt = positiveRtt(rawQuic);
+      tcpRttIsZero = rawTcp === 0;
+    } catch {
+      return void 0;
+    }
+    const isQuic = /HTTP\/3|QUIC/i.test(httpProtocol) || /^quic$/i.test(edgeL4);
+    const observedRtt = positiveRtt(observedRttRaw);
+    let proxyProvider;
+    let proxyObservedAt;
+    if (proxy) {
+      try {
+        proxyProvider = genuineProvider(proxy.provider);
+        proxyObservedAt = genuineObservationTime(proxy.observedAt ?? proxy.observed_at);
+      } catch {
+        proxyProvider = void 0;
+        proxyObservedAt = void 0;
+      }
+    }
+    let edgeTransport;
+    const hasEdgeSignal = Boolean(
+      httpProtocol || edgeL4 || colo || tcpRtt || quicRtt || tcpRttIsZero || observedRtt
+    );
+    if (hasEdgeSignal) {
+      const quicBasis = /HTTP\/3|QUIC/i.test(httpProtocol) ? "httpProtocol" : /^quic$/i.test(edgeL4) ? "edgeL4" : "none";
+      const quicNormalized = {
+        status: isQuic ? "quic_signal_present" : "no_quic_signal",
+        basis: quicBasis,
+        label: isQuic ? `QUIC/HTTP/3 transport signal normalized from edge ${quicBasis}` : "No QUIC/HTTP/3 signal observed in the supplied edge transport fields",
+        ...isQuic && tcpRttIsZero ? { zeroTcpRttNote: "A 0 ms TCP RTT on QUIC is a placeholder, normalized to unavailable" } : {}
+      };
+      const rttSource = quicRtt !== void 0 ? { source: "clientQuicRtt", label: "Positive edge-observed QUIC RTT preferred on HTTP/3" } : tcpRtt !== void 0 ? {
+        source: "clientTcpRtt",
+        label: "Positive edge-observed TCP RTT (no positive QUIC RTT supplied)"
+      } : observedRtt !== void 0 ? {
+        source: "clientReportedRtt",
+        label: "Positive client-reported RTT sample (fallback, not edge-observed)"
+      } : { source: "unavailable", label: "No positive real RTT sample supplied" };
+      edgeTransport = {
+        quicNormalized,
+        effectiveRttSource: rttSource,
+        ...colo ? { colo } : {}
+      };
+    }
+    let lightDistance;
+    let countryLabel;
+    try {
+      countryLabel = geo ? safeText2(geo.countryCode, 80) || safeText2(geo.country, 80) || void 0 : void 0;
+    } catch {
+      countryLabel = void 0;
+    }
+    if (hasEdgeSignal || countryLabel) {
+      const direction = colo && countryLabel ? `client \u2192 edge colo ${colo}; resolved geo ${countryLabel} (descriptive only, no mismatch asserted)` : colo ? `client \u2192 edge colo ${colo} (no resolved geo to compare; direction not independently checked)` : countryLabel ? `client \u2192 resolved geo ${countryLabel} (no edge colo to compare; direction not independently checked)` : "client \u2192 server (single-hop RTT; direction not independently observable)";
+      lightDistance = {
+        label: LIGHT_DISTANCE_LABEL,
+        direction,
+        note: "Descriptive approximation only: no mismatch asserted, no trust claim, never a gate input."
+      };
+    }
+    const shadow = {};
+    if (proxyProvider) shadow.proxyProvider = proxyProvider;
+    if (proxyObservedAt) shadow.proxyObservedAt = proxyObservedAt;
+    if (edgeTransport) shadow.edgeTransport = edgeTransport;
+    if (lightDistance) shadow.lightDistance = lightDistance;
+    return Object.keys(shadow).length > 0 ? shadow : void 0;
+  } catch {
+    return void 0;
   }
 }
 
@@ -10700,7 +13947,26 @@ function prefixesFromNormalizedFeed(normalized, sourceId) {
 }
 dotenv.config();
 var PORT = Number(process.env.PORT) || 3e3;
-var BUILD_SHA = process.env.GIT_SHA || "unknown";
+function resolveBuildSha() {
+  const fromEnv = typeof process.env.GIT_SHA === "string" ? process.env.GIT_SHA.trim() : "";
+  if (/^[0-9a-f]{7,40}$/i.test(fromEnv)) return fromEnv.toLowerCase();
+  try {
+    const gitDir = path.join(process.cwd(), ".git");
+    const headRaw = fs.readFileSync(path.join(gitDir, "HEAD"), "utf8").trim();
+    if (/^[0-9a-f]{40}$/i.test(headRaw)) return headRaw.toLowerCase();
+    const refMatch = /^ref:\s*(.+)$/i.exec(headRaw);
+    if (refMatch?.[1]) {
+      const refPath = path.resolve(gitDir, refMatch[1].trim());
+      if (refPath.startsWith(gitDir)) {
+        const refRaw = fs.readFileSync(refPath, "utf8").trim();
+        if (/^[0-9a-f]{40}$/i.test(refRaw)) return refRaw.toLowerCase();
+      }
+    }
+  } catch {
+  }
+  return "unknown";
+}
+var BUILD_SHA = resolveBuildSha();
 var PARSER_VERSION = process.env.PARSER_VERSION || "tranche-0-1";
 var WORKER_VERSION = process.env.WORKER_VERSION || "tranche-0-1";
 var SESSION_TIMEOUT_MINUTES = 30;
@@ -11846,7 +15112,7 @@ function userAgentsCompatible(headerUserAgent, payloadUserAgent) {
   if (headerOs && payloadOs && headerOs !== payloadOs) return false;
   return true;
 }
-var AUTOMATION_UA_PATTERN = /playwright|puppeteer|selenium|cypress|phantomjs/i;
+var AUTOMATION_UA_PATTERN = /playwright|puppeteer|selenium|cypress|phantomjs|headlesschrome|headless[_-]?shell|chrome-headless-shell/i;
 var DATACENTER_NETWORK_PATTERN = /\b(amazon|amazonaws|aws|google cloud|azure|microsoft azure|digitalocean|hetzner|linode|akamai|ovh|vultr|oracle cloud|alibaba|aliyun|tencent|leaseweb|contabo|m247|choopa|datacamp)\b/i;
 var KNOWN_AI_CRAWLER_REASON = "LLM crawler user-agent signature";
 function classifyBotTraffic(headers, network, client) {
@@ -13786,7 +17052,8 @@ function computeVelocitySignals(db2, visitorId, publicIp, sessionId) {
       distinctIps24h: velocity.distinct_ip["24_hours"],
       distinctSubnets24h,
       distinctDailyHardware,
-      p98Events24h
+      p98Events24h,
+      eventObservations: eventValues
     };
   } catch {
     return {
@@ -13796,7 +17063,8 @@ function computeVelocitySignals(db2, visitorId, publicIp, sessionId) {
       distinctIps24h: 0,
       distinctSubnets24h: 0,
       distinctDailyHardware: 0,
-      p98Events24h: 0
+      p98Events24h: 0,
+      eventObservations: []
     };
   }
 }
@@ -14083,7 +17351,7 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic, options) {
     return trimmed.length > 0 ? trimmed : "Unknown";
   };
   const cleanText = (val) => typeof val === "string" ? val.trim() : "";
-  const finiteNumber2 = (val) => typeof val === "number" && Number.isFinite(val) ? val : null;
+  const finiteNumber5 = (val) => typeof val === "number" && Number.isFinite(val) ? val : null;
   const network = (isp, org, asn, hostile = false) => normalizeIspAndOrg(isp, org, asn, hostile);
   const build = (input) => ({
     publicIp: visitorIp,
@@ -14149,8 +17417,8 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic, options) {
       region: cleanField(data.region),
       country: cleanField(data.country),
       countryCode: cleanText(data.country_code).toUpperCase(),
-      latitude: finiteNumber2(data.latitude),
-      longitude: finiteNumber2(data.longitude),
+      latitude: finiteNumber5(data.latitude),
+      longitude: finiteNumber5(data.longitude),
       isp: net2.isp,
       org: net2.org,
       asn: net2.asn,
@@ -14169,8 +17437,8 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic, options) {
       region: cleanField(data.region),
       country: cleanField(data.country_name || data.country),
       countryCode: cleanText(data.country_code).toUpperCase(),
-      latitude: finiteNumber2(data.latitude),
-      longitude: finiteNumber2(data.longitude),
+      latitude: finiteNumber5(data.latitude),
+      longitude: finiteNumber5(data.longitude),
       isp: net2.isp,
       org: net2.org,
       asn: net2.asn,
@@ -14190,8 +17458,8 @@ async function lookupVerifiedGeolocation(visitorIp, isPublic, options) {
       region: cleanField(data.regionName),
       country: cleanField(data.countryName),
       countryCode: cleanText(data.countryCode).toUpperCase(),
-      latitude: finiteNumber2(data.latitude),
-      longitude: finiteNumber2(data.longitude),
+      latitude: finiteNumber5(data.latitude),
+      longitude: finiteNumber5(data.longitude),
       isp: net2.isp,
       org: net2.org,
       asn: net2.asn,
@@ -14496,6 +17764,9 @@ app.get("/api/intel/geolocation", async (req, res) => {
 });
 app.use(express.json({ limit: "512kb" }));
 app.get("/api/health", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
   let visitorsCount = null;
   let visitsCount = null;
   try {
@@ -14722,17 +17993,19 @@ function assessCorroboratedCdp(args) {
 function isTimezoneMismatchReason(reason) {
   return /\btime[\s_-]?zone\b/i.test(reason);
 }
-function resolveInspectorState(signals) {
-  const inspector_state = classifyInspectorState({
-    cdpAttached: Boolean(signals.strongCdpProof),
+function resolveInspectorState2(signals) {
+  const canonical = canonicalInspectorFlags({
+    strongCdpProof: Boolean(signals.strongCdpProof),
     devtoolsActiveVerified: Boolean(signals.devtoolsActiveVerified),
-    viewportContractionNormalized: Boolean(signals.viewportContractionNormalized)
+    viewportContractionNormalized: Boolean(signals.viewportContractionNormalized),
+    developerTools: Boolean(signals.developerTools),
+    automationEnvironment: signals.automationEnvironment
+    // `cdpRuntimeLeak` is deliberately NOT forwarded: a bare runtime leak is a weak,
+    // engine-dependent artifact and is not evidence of either a CDP binding or a DevTools UI.
   });
-  const cdp_attached = inspector_state === "automation_protocol_attached";
-  const developer_tools = !cdp_attached && Boolean(
-    signals.developerTools || signals.cdpRuntimeLeak || signals.automationEnvironment === "electron" || signals.automationEnvironment === "ide_webview" || signals.devtoolsActiveVerified || signals.viewportContractionNormalized
-  );
-  const detail = cdp_attached ? "CDP protocol attached; no docked DevTools UI" : inspector_state === "devtools_active_verified" ? "Docked DevTools frontend verified active" : inspector_state === "devtools_docked_suspected" ? "Docked DevTools frontend suspected" : developer_tools ? "Developer tools / inspector probe observed (no CDP protocol proof)" : "No inspector / DevTools attachment detected";
+  const inspector_state = canonical.inspector_state === "yes-unattributed" && canonical.cdp_attached ? "automation_protocol_attached" : canonical.inspector_state;
+  const { cdp_attached, developer_tools } = canonical;
+  const detail = inspector_state === "yes-corroborated" ? "CDP protocol binding and DevTools frontend both observed" : cdp_attached ? "CDP protocol attached; no docked DevTools UI" : inspector_state === "devtools_active_verified" ? "Docked DevTools frontend verified active" : inspector_state === "devtools_docked_suspected" ? "Docked DevTools frontend suspected" : developer_tools ? "Developer tools / inspector probe observed (no CDP protocol proof)" : "No inspector / DevTools attachment detected";
   return { inspector_state, cdp_attached, developer_tools, detail };
 }
 function isBotFromVerdict(botVerdict) {
@@ -14793,7 +18066,10 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const cdpDetected = strongCdpProof && Boolean(raw?.cdpDetected);
   const verifiedIsBot = strongCdpProof && Boolean(raw?.isBot);
   const verifiedStealthPlugin = strongCdpProof && Boolean(raw?.stealthPluginDetected);
-  const isHeadless = Boolean(raw?.isHeadless);
+  const serverObservedHeadlessUa = /headlesschrome|headless[_-]?shell|chrome-headless-shell|phantomjs|slimerjs/i.test(
+    requestContext.requestUserAgent ?? ""
+  );
+  const isHeadless = Boolean(raw?.isHeadless) || serverObservedHeadlessUa;
   const rawBotReason = typeof raw?.botReason === "string" && raw.botReason.trim() ? raw.botReason.trim().slice(0, 200) : "";
   const botSignals = safeStrArray(raw?.botSignals);
   const clientAutomationDetected = Boolean(verifiedIsBot || webdriver || cdpDetected);
@@ -14809,13 +18085,14 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const tamperingMlScore = typeof raw?.tamperingMlScore === "number" && Number.isFinite(raw.tamperingMlScore) ? raw.tamperingMlScore : 0;
   const mlTampering = rfpExempt ? false : tamperingMlScore >= 0.5;
   const developerToolsAttached = Boolean(
-    raw?.developerTools || raw?.cdpRuntimeLeak || raw?.automationEnvironment === "electron" || raw?.automationEnvironment === "ide_webview"
+    raw?.developerTools || raw?.automationEnvironment === "electron" || raw?.automationEnvironment === "ide_webview"
   );
+  const headlessAutomationEvidence = serverObservedHeadlessUa && requestContext.botClassification?.subtype !== "ai_agent" && requestContext.botClassification?.subtype !== "good_bot";
   const stealthAutomation = Boolean(
-    verifiedStealthPlugin || antiDetectBrowser || automationTargetedTampering || requestContext.corroboratedCdpEscalation
+    verifiedStealthPlugin || antiDetectBrowser || automationTargetedTampering || requestContext.corroboratedCdpEscalation || headlessAutomationEvidence
   );
   const activeDeception = Boolean(
-    verifiedStealthPlugin || antiDetectBrowser || automationTargetedTampering || requestContext.corroboratedCdpEscalation
+    verifiedStealthPlugin || antiDetectBrowser || automationTargetedTampering || requestContext.corroboratedCdpEscalation || headlessAutomationEvidence
   );
   const hardAutomationReasons = [];
   if (automationTargetedTampering) {
@@ -14834,6 +18111,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   }
   if (mlTampering) {
     hardAutomationReasons.push(`Browser tampering ML score ${tamperingMlScore.toFixed(3)}`);
+  }
+  if (headlessAutomationEvidence) {
+    hardAutomationReasons.push("Headless browser user-agent (server-observed automation runtime)");
   }
   if (requestContext.corroboratedCdpEscalation) {
     hardAutomationReasons.push(
@@ -14912,6 +18192,26 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const commercialVpnProvider = !baseClassification.isConsumerBroadband && baseClassification.networkType === "VPN / Proxy Relay" && VPN_PROXY_PATTERN.test(networkHaystackForVpn) && !HOSTING_EGRESS_PATTERN.test(networkHaystackForVpn);
   const verifiedProxyRelay = detectProxyHeaders(requestContext.headers, location.publicIp).detected;
   const concreteVpnEvidence = commercialVpnProvider || Boolean(requestContext.torExitNode || requestContext.torRelay) || verifiedProxyRelay;
+  const shadowVpnVerdict = resolveVpnMethods({
+    browserTimezone,
+    ipTimezone,
+    canonicalMismatch: hasTzMismatch,
+    ipCountry: location.countryCode,
+    publicVpn: commercialVpnProvider,
+    relay: Boolean(torExitNode),
+    osMismatch: Boolean(raw?.isOsTampered),
+    mlPrediction: Boolean(raw?.vpnSuspected) && concreteVpnEvidence
+  });
+  const rawSignalBagForRtt = raw ?? {};
+  const clientReportedRtt = typeof rawSignalBagForRtt.networkRtt === "number" && Number.isFinite(rawSignalBagForRtt.networkRtt) ? rawSignalBagForRtt.networkRtt : null;
+  const observedRttMs = typeof requestContext.clientTcpRttMs === "number" && Number.isFinite(requestContext.clientTcpRttMs) && requestContext.clientTcpRttMs > 0 ? requestContext.clientTcpRttMs : clientReportedRtt !== null && clientReportedRtt > 0 ? clientReportedRtt : null;
+  const latencyBasis = observedRttMs !== null ? {
+    label: "RTT-based light-distance estimate (approximation)",
+    rtt_ms: Math.round(observedRttMs),
+    estimated_distance_km_low: Math.round(observedRttMs / 2 * 1e3 * 0.206 / 2),
+    estimated_distance_km_high: Math.round(observedRttMs / 2 * 1e3 * 0.206 / 1.5),
+    note: "Approximation from real RTT only; not JA4L; no mismatch asserted without a verified distance reference"
+  } : null;
   const vpnMethods = {
     timezone_mismatch: hasTzMismatch,
     public_vpn: commercialVpnProvider,
@@ -14921,7 +18221,11 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     // A client ML verdict is accepted ONLY when an independent, concrete relay signal
     // corroborates it (provider-owned VPN, Tor relay or verified proxy chain). Never ASN alone,
     // never timezone alone — both are orthogonal axes, not tunnels.
-    ml_prediction: Boolean(raw?.vpnSuspected) && concreteVpnEvidence
+    ml_prediction: Boolean(raw?.vpnSuspected) && concreteVpnEvidence,
+    // Additive shadow fields — never read by the tile score, composite, ledger or tier.
+    origin_country: shadowVpnVerdict.origin_country,
+    reasons: shadowVpnVerdict.reasons,
+    ...latencyBasis ? { latency_distance_mismatch: { mismatch: false, ...latencyBasis } } : {}
   };
   if (vpnMethods.timezone_mismatch !== timezoneMismatch) {
     console.error("[invariant] timezone mismatch parity violation", {
@@ -15099,10 +18403,21 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   const vmReasonVerdict = isVm ? vmReason && !cloudContainerVmReason ? vmReason : hypervisorGpuProof ? "Hypervisor-specific GPU signature detected in the WebGL vendor / renderer" : "Host-level virtualization evidence detected" : "";
   const isTampered = isOsTampered;
   const vmLike = isVm;
-  const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : vmLike ? 6 : isTampered ? 6 : softwareRenderedGpu ? 3 : hasRealUnmaskedGpu ? 0 : 0;
-  let vmStatus = tamperedRequest || replayDetected ? "Tampered / Replayed" : emulatorDetected ? "Mobile Emulator" : vmLike ? "Virtual Machine / VM" : isTampered ? "Spoofed Environment" : softwareRenderedGpu ? "Software-Rendered Graphics (SwiftShader)" : hasRealUnmaskedGpu ? "Physical Hardware" : "GPU Masked / Unavailable";
-  const vmDetail = tamperedRequest || replayDetected ? requestIntegrityReason || "Sealed request envelope failed verification" : emulatorDetected ? emulatorReason || vmReason || "Mobile emulator / simulator runtime detected" : vmLike ? vmReasonVerdict : isTampered ? vmReason || tamperReasons[0] || "Operating-system / User-Agent tampering detected" : softwareRenderedGpu ? "Software-rendered graphics \u2014 virtualization likely, not proven; virtual machine not confirmed" : hasRealUnmaskedGpu ? "Unmasked physical GPU & consistent OS platform verified" : "GPU vendor / renderer unavailable \u2014 physical hardware cannot be verified";
-  if (!isVm && vmStatus === "Virtual Machine / VM" || vmStatus === "Physical Hardware" && gpuTruthState !== "physical_hardware") {
+  const vmScore = tamperedRequest || replayDetected ? 10 : emulatorDetected ? 8 : vmLike ? 6 : isTampered ? 6 : softwareRenderedGpu || isGpuMaskedOrUnavailable ? 3 : hasRealUnmaskedGpu ? 0 : 0;
+  const rawGpuExtras = raw ?? {};
+  const sharedGpuTruth = resolveGpuTruthState({
+    vendor: hardwareSignals.gpuVendor,
+    renderer: hardwareSignals.gpuRenderer,
+    unmaskedVendor: typeof rawGpuExtras.gpuVendorUnmasked === "string" ? rawGpuExtras.gpuVendorUnmasked : typeof rawGpuExtras.unmaskedVendor === "string" ? rawGpuExtras.unmaskedVendor : null,
+    unmaskedRenderer: typeof rawGpuExtras.gpuRendererUnmasked === "string" ? rawGpuExtras.gpuRendererUnmasked : typeof rawGpuExtras.unmaskedRenderer === "string" ? rawGpuExtras.unmaskedRenderer : null,
+    debugExtensionAvailable: rawGpuExtras.debugExtensionAvailable === true,
+    shaderPrecisionProfile: typeof rawGpuExtras.shaderPrecisionProfile === "string" ? rawGpuExtras.shaderPrecisionProfile : null,
+    privacyHardened: Boolean(raw?.privacySettings || raw?.privacy_hardened || raw?.isTorBrowserClient)
+  });
+  const physicalGpuVerified = hasRealUnmaskedGpu && sharedGpuTruth.state === "hardware";
+  let vmStatus = tamperedRequest || replayDetected ? "Tampered / Replayed" : emulatorDetected ? "Mobile Emulator" : vmLike ? "Virtual Machine / VM" : isTampered ? "Spoofed Environment" : softwareRenderedGpu ? "Software-Rendered Graphics (SwiftShader)" : physicalGpuVerified ? "Physical Hardware" : "GPU Masked / Unavailable";
+  const vmDetail = tamperedRequest || replayDetected ? requestIntegrityReason || "Sealed request envelope failed verification" : emulatorDetected ? emulatorReason || vmReason || "Mobile emulator / simulator runtime detected" : vmLike ? vmReasonVerdict : isTampered ? vmReason || tamperReasons[0] || "Operating-system / User-Agent tampering detected" : softwareRenderedGpu ? "Software-rendered graphics \u2014 virtualization likely, not proven; virtual machine not confirmed" : physicalGpuVerified ? "Unmasked physical GPU & consistent OS platform verified" : `GPU truth ${sharedGpuTruth.state}: ${sharedGpuTruth.reasons.join("; ")} \u2014 physical hardware not verified`;
+  if (!isVm && vmStatus === "Virtual Machine / VM" || vmStatus === "Physical Hardware" && !physicalGpuVerified) {
     vmStatus = softwareRenderedGpu ? "Software-Rendered Graphics (SwiftShader)" : "GPU Masked / Unavailable";
   }
   const vmSignal = {
@@ -15161,9 +18476,9 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       `Headless browser environment (+4): ${botReason || "no physical display attached"}`
     );
   }
-  if (torAnonymity) {
+  if (torExitNode) {
     riskFactors.push(
-      `${torExitNode ? "Confirmed Tor exit relay" : "Tor Browser fingerprint"} (+9 card): ${torExitNode ? torOperatorHint ? "exit-operator attribution" : "Tor Project DNSEL / consensus exit list" : "Gecko RFP + letterboxing detected on the client"} ${location.publicIp}`
+      `Confirmed Tor exit relay (+9 card): ${torOperatorHint ? "exit-operator attribution" : "Tor Project DNSEL / consensus exit list"} ${location.publicIp}`
     );
   } else if (torRelayNetwork) {
     riskFactors.push(
@@ -15187,9 +18502,14 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
   if (vmScore > 0) {
     const duplicatesIntegrityReason = integrityViolation && vmSignal.detail === (requestIntegrityReason || "tampered or replayed payload");
     if (!duplicatesIntegrityReason) {
-      riskFactors.push(
-        isTampered ? `Tampered OS (+3): ${vmSignal.detail}` : `Virtual machine / software-rendered environment (+3): ${vmSignal.detail}`
+      const privacyExplainsOs = Boolean(raw?.privacySettings || raw?.privacy_hardened || raw?.isTorBrowserClient) && !Boolean(
+        raw?.hard_spec_violation || Array.isArray(raw?.spec_violations) && raw.spec_violations.length > 0
       );
+      if (!isTampered || !privacyExplainsOs) {
+        riskFactors.push(
+          isTampered ? `Tampered OS (+3): ${vmSignal.detail}` : `Virtual machine / software-rendered environment (+3): ${vmSignal.detail}`
+        );
+      }
     }
   }
   if (isIncognito) {
@@ -15201,6 +18521,15 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
     );
   }
   const proxyAssessment = detectProxyHeaders(requestContext.headers, location.publicIp);
+  const proxyAsnMatch = String(location.asn || "").match(/\d+/);
+  const proxyDetails = resolveProxyDetails({
+    datacenterResult: datacenterAsn,
+    verifiedGoodBot: verifiedGoodCrawler || botSubtype === "good_bot",
+    asnType: datacenterAsn ? "datacenter" : void 0,
+    asn: proxyAsnMatch ? Number.parseInt(proxyAsnMatch[0], 10) : null,
+    vpn: concreteVpnEvidence || proxyAssessment.detected,
+    knownProxyPrefix: false
+  });
   const securitySignalsCore = {
     isBot,
     botSignals,
@@ -15294,6 +18623,8 @@ function sanitizeAndReinforceSecuritySignals(raw, browserDevice, hardwareSignals
       // Phase 5 — explicit proxy relay markers (Via / Forwarded / Proxy-Authorization chains)
       proxyDetected: proxyAssessment.detected,
       proxyReasons: proxyAssessment.reasons,
+      // Additive proxy truth second opinion (never a verdict input).
+      proxy_details: proxyDetails,
       // Phase 3 — mobile emulator / simulator verdict
       emulatorDetected,
       emulatorReason,
@@ -15365,8 +18696,20 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const browserDevice = sanitizeBrowserDevice(rawBrowserDevice);
     const hardwareSignals = sanitizeHardwareSignals(rawHardwareSignals, browserDevice);
     const hardwareId = hardwareSignals.hardwareId;
+    const earlyRequestHeaders = req.headers;
+    const encodedOriginalUa = readRequestHeader(earlyRequestHeaders, "x-intel-original-ua");
+    let headerRequestUserAgent = readRequestHeader(earlyRequestHeaders, "user-agent");
+    if (encodedOriginalUa) {
+      try {
+        headerRequestUserAgent = decodeURIComponent(encodedOriginalUa) || headerRequestUserAgent;
+      } catch {
+      }
+    }
+    const envelopeRequestUserAgent = typeof requestBody.securityEnvelope?.userAgent === "string" ? requestBody.securityEnvelope.userAgent.trim() : "";
+    const headerCarriesBotSignature = Boolean(headerRequestUserAgent) && (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) || GOOD_BOT_UA_RULES2.some((rule) => rule.pattern.test(headerRequestUserAgent)) || AI_AGENT_UA_RULES2.some((rule) => rule.pattern.test(headerRequestUserAgent)));
+    const fullRequestUserAgent = headerCarriesBotSignature ? headerRequestUserAgent : envelopeRequestUserAgent || headerRequestUserAgent;
     const uaIdentity = normalizeUserAgent({
-      userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : "",
+      userAgent: fullRequestUserAgent,
       platform: typeof rawBrowserDevice?.platform === "string" ? rawBrowserDevice.platform : "",
       maxTouchPoints: hardwareSignals.maxTouchPoints,
       clientHints: mergeRequestClientHints(
@@ -15374,10 +18717,10 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         requestBody.clientHints
       )
     });
-    if (uaIdentity.os !== "Unknown" && /^unknown|^$/i.test(browserDevice.os || "")) {
+    if (uaIdentity.os && uaIdentity.os !== "Unknown") {
       browserDevice.os = uaIdentity.os;
     }
-    if (uaIdentity.browserName !== "Unknown" && /^unknown|^$/i.test(browserDevice.browser || "")) {
+    if (uaIdentity.browserName && uaIdentity.browserName !== "Unknown") {
       browserDevice.browser = uaIdentity.browserName;
     }
     let { ip: extractedIp, isPublic } = extractVisitorIp(req);
@@ -15867,6 +19210,14 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const clientReportedIncognito = incognitoConfidenceHigh && Boolean(
       requestBody.incognito || requestBody.isIncognito || requestBody.privateMode || requestBody.browserInfo?.incognito || requestBody.browserInfo?.isIncognito || requestBody.telemetry?.incognito || requestBody.telemetry?.isIncognito || rawSecuritySignals?.isIncognito || rawSecuritySignals?.incognito || rawSecuritySignals?.privateMode || rawSecuritySignals?.incognitoLikely
     );
+    const rawDiagnostics = requestBody.diagnostics;
+    const diagnostics = rawDiagnostics && typeof rawDiagnostics === "object" ? {
+      // Verbatim client pass-through.
+      ...rawDiagnostics,
+      // Server-computed from the existing gate input (read-only; gate unchanged).
+      lowConfidenceVeto,
+      serverWouldVeto: lowConfidenceVeto
+    } : void 0;
     let crossSessionEphemeral = false;
     if (!hadPersistentClientState && !existingHwidVisitor && hardwareId) {
       try {
@@ -15913,19 +19264,106 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const rawSignalExtras = rawSecuritySignals || {};
     const topLevelExtras = requestBody;
     const clientExtras = { ...topLevelExtras, ...rawSignalExtras };
+    const activeCdpInspection = resolveActiveCdp({
+      runtimeEnableCount: typeof clientExtras.runtimeEnableCount === "number" ? clientExtras.runtimeEnableCount : null,
+      nameGetterCount: typeof clientExtras.nameGetterCount === "number" ? clientExtras.nameGetterCount : null,
+      prepareStackTraceCount: typeof clientExtras.prepareStackTraceCount === "number" ? clientExtras.prepareStackTraceCount : null,
+      secondClientAttached: clientExtras.secondClientAttached === true,
+      devtoolsAttached: clientExtras.devtoolsAttached === true
+    });
+    const activeCdpInspectionActive = activeCdpInspection.state === "automation_protocol_inspection_active" || activeCdpInspection.state === "corroborated";
     const claimedHumanCorroboration = clampHumanCorroboration(
       rawSecuritySignals?.humanCorroboration ?? rawSignalExtras.humanCorroboration ?? topLevelExtras.humanCorroboration
     );
+    const keyedEnvelopeAuthenticityAvailable = false;
     const envelopeSignedAndClean = Boolean(
-      requestBody.securityEnvelope && envelopeVerdict.signatureVerified && envelopeVerdict.requestNonce && !envelopeVerdict.tamperedRequest && !envelopeVerdict.replayDetected
+      keyedEnvelopeAuthenticityAvailable && !envelopeVerdict.tamperedRequest && !envelopeVerdict.replayDetected
     );
     const trustedHumanCorroboration = envelopeSignedAndClean ? claimedHumanCorroboration : Math.min(claimedHumanCorroboration, 0.2);
     const earlyInteractionEvidence = Array.isArray(clientExtras.interactionEvidence) ? clientExtras.interactionEvidence.filter(
       (item) => typeof item === "string" && item.trim().length > 0
     ).length : 0;
     const hasTrustedInteractionEvidence = envelopeSignedAndClean && earlyInteractionEvidence > 0;
+    const strictOriginOptIn = process.env.INTEL_STRICT_ORIGIN === "1" || process.env.INTEL_ZERO_TRUST_STRICT_ORIGIN === "1";
+    const firstClientText = (...values) => {
+      for (const value of values) {
+        if (typeof value === "string" && value.trim()) return value.trim();
+      }
+      return null;
+    };
+    const envelopeExtra = requestBody.securityEnvelope ?? {};
+    const strictOriginResult = checkStrictOrigin({
+      origin: readRequestHeader(rawRequestHeaders, "origin"),
+      referer: readRequestHeader(rawRequestHeaders, "referer"),
+      clientUrl: firstClientText(
+        clientExtras.clientUrl,
+        clientExtras.documentUrl,
+        clientExtras.pageUrl,
+        clientExtras.href,
+        envelopeExtra.url
+      ),
+      clientReferrer: firstClientText(
+        clientExtras.clientReferrer,
+        clientExtras.documentReferrer,
+        clientExtras.referrer
+      ),
+      nowMs
+    });
+    const envTimestampRaw = envelopeExtra.timestamp;
+    const envelopeTimestampMs = typeof envTimestampRaw === "number" && Number.isFinite(envTimestampRaw) && envTimestampRaw > 0 ? envTimestampRaw : Number.parseFloat(readRequestHeader(rawRequestHeaders, "x-intel-timestamp"));
+    const replayWindow = replayWindowStatus(
+      envelopeTimestampMs,
+      nowMs,
+      envelopeVerdict.replayDetected ? envelopeVerdict.requestNonce : null,
+      ENVELOPE_MAX_AGE_MS
+    );
+    const ipLedgerReasons = suspiciousIpReasons.get(location.publicIp) ?? [];
+    const replayLedgerReasons = ipLedgerReasons.filter((reason) => /replay/i.test(reason));
+    const replayRate = ipReplayRate(replayLedgerReasons.length, ipLedgerReasons.length, 7);
+    const zeroTrustShadow = {
+      strict_origin: {
+        enabled: strictOriginOptIn,
+        ok: strictOriginResult.ok,
+        reason: strictOriginResult.reason,
+        // Purely additive: never enforced, never changes the existing auth flow.
+        enforced: false
+      },
+      replay_window: {
+        fresh: replayWindow.fresh,
+        duplicate: replayWindow.duplicate,
+        reason: replayWindow.reason
+      },
+      replay_rate: {
+        ...replayRate,
+        replays: replayLedgerReasons.length,
+        observations: ipLedgerReasons.length,
+        window_days: 7,
+        note: "Replay share over the in-process abuse ledger; diagnostic only, never a verdict input"
+      }
+    };
+    const edgeTransportForTrust = readEdgeTransport(req);
+    const networkFingerprintShadow = {
+      // A Worker cannot observe raw wire order and Cloudflare rewrites headers, so an exact
+      // JA4H is never asserted. Keep only the honestly computable, distinctly-labelled value.
+      network_layer_hash: null,
+      network_layer_hash_label: "JA4H-style HTTP-header fingerprint (not exact JA4H: raw wire order is unavailable to Workers and Cloudflare rewrites headers)",
+      // All-plan Cloudflare TLS-lite components: never JA3/JA4, never a JA3/JA4-shaped hash.
+      edge_tls: {
+        label: "edge-derived TLS components",
+        tlsVersion: edgeTransportForTrust.tlsVersion || null,
+        tlsCipher: edgeTransportForTrust.tlsCipher || null,
+        clientTcpRttMs: edgeTransportForTrust.clientTcpRtt,
+        httpProtocol: edgeTransportForTrust.httpProtocol || null,
+        colo: edgeTransportForTrust.colo || null,
+        ja3: edgeTransportForTrust.ja3,
+        ja4t: edgeTransportForTrust.ja4t,
+        // cf.botManagement.ja3Hash / ja4 are Enterprise-only: null-guarded, never claimed on free.
+        cfJa4Enterprise: null,
+        note: "Free-plan TLS-lite components only; Enterprise cf.botManagement hashes are not claimed"
+      }
+    };
     const strongCdpProof = hasStrongCdpProof(rawSecuritySignals, clientExtras);
-    const earlyInspector = resolveInspectorState({
+    const earlyInspector = resolveInspectorState2({
       strongCdpProof,
       developerTools: Boolean(rawSecuritySignals?.developerTools),
       cdpRuntimeLeak: Boolean(rawSecuritySignals?.cdpRuntimeLeak),
@@ -15938,17 +19376,6 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const dockedWithHumanInteraction = Boolean(
       rawSecuritySignals?.developerTools || clientExtras.devtoolsActiveVerified || rawSecuritySignals?.automationEnvironment === "electron" || rawSecuritySignals?.automationEnvironment === "ide_webview" || earlyInspectorState === "devtools_docked_suspected" || earlyInspectorState === "devtools_active_verified"
     ) && (trustedHumanCorroboration >= 0.5 || hasTrustedInteractionEvidence);
-    const encodedOriginalUa = readRequestHeader(rawRequestHeaders, "x-intel-original-ua");
-    let headerRequestUserAgent = readRequestHeader(rawRequestHeaders, "user-agent");
-    if (encodedOriginalUa) {
-      try {
-        headerRequestUserAgent = decodeURIComponent(encodedOriginalUa) || headerRequestUserAgent;
-      } catch {
-      }
-    }
-    const envelopeRequestUserAgent = typeof requestBody.securityEnvelope?.userAgent === "string" ? requestBody.securityEnvelope.userAgent.trim() : "";
-    const headerCarriesBotSignature = Boolean(headerRequestUserAgent) && (AUTOMATION_UA_PATTERN.test(headerRequestUserAgent) || GOOD_BOT_UA_RULES2.some((rule) => rule.pattern.test(headerRequestUserAgent)) || AI_AGENT_UA_RULES2.some((rule) => rule.pattern.test(headerRequestUserAgent)));
-    const fullRequestUserAgent = headerCarriesBotSignature ? headerRequestUserAgent : envelopeRequestUserAgent || headerRequestUserAgent;
     const rfpExemptRequest = isConfirmedTorRfpClient(rawSecuritySignals, {
       clientTorBrowser: Boolean(rawSecuritySignals?.isTorBrowserClient),
       tamperedRequest: envelopeVerdict.tamperedRequest,
@@ -15968,8 +19395,11 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const automationTargetedTampering = strongCdpProof && (handlerAutomationTampering.detected || Boolean(
       rawSecuritySignals?.automationTargetedTampering
     ));
+    const serverHeadlessUaForAutomation = /headlesschrome|headless[_-]?shell|chrome-headless-shell|phantomjs|slimerjs/i.test(
+      fullRequestUserAgent || ""
+    );
     let hardAutomationSignals = (!rfpExemptRequest || automationTargetedTampering) && Boolean(
-      automationTargetedTampering || strongCdpProof && rawSecuritySignals?.stealthPluginDetected || rawSecuritySignals?.tamperingDetails?.anti_detect_browser
+      automationTargetedTampering || serverHeadlessUaForAutomation || strongCdpProof && rawSecuritySignals?.stealthPluginDetected || rawSecuritySignals?.tamperingDetails?.anti_detect_browser
     );
     const decodeEdgeHeader = (name) => {
       const value = readRequestHeader(rawRequestHeaders, name);
@@ -16178,6 +19608,8 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         replayDetected: envelopeVerdict.replayDetected,
         requestIntegrityReason: envelopeVerdict.requestIntegrityReason,
         requestNonce: envelopeVerdict.requestNonce,
+        // Real edge RTT feeds only the labelled RTT-based light-distance estimate in vpn_methods.
+        clientTcpRttMs: edgeTransportForTrust.clientTcpRtt,
         torExitNode,
         torRelay: torStatus.isRelay,
         torVerdict: torStatus.verdict,
@@ -16226,6 +19658,15 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     securitySignals.serverVerifiedOs = serverVerifiedOs;
     securitySignals.headerMismatch = headerMismatch;
     securitySignals.headerMismatchReason = headerMismatch ? `Server headers report ${serverVerifiedBrowser} on ${serverVerifiedOs}, but the client reported ${browserDevice.browser} on ${browserDevice.os}` : "";
+    const osTruthBlock = buildOsTruthBlock({
+      securitySignals,
+      hardware: hardwareSignals,
+      browserDevice,
+      uaBrowser: uaIdentity.browserName && uaIdentity.browserName !== "Unknown" ? uaIdentity.browserName : browserDevice.browser,
+      uaOs: uaIdentity.os && uaIdentity.os !== "Unknown" ? uaIdentity.os : browserDevice.os,
+      clientHints: req.intelClientHints,
+      runtimeOsVerdict
+    });
     const velocityReport = computeVelocitySignals(
       db,
       visitorId,
@@ -16240,6 +19681,20 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const highActivityThresholdMode = velocityReport.distinctDailyHardware < SMALL_CORPUS_DAILY_HARDWARE_LIMIT ? "fixed_small_corpus" : "p98";
     const highActivityThreshold = highActivityThresholdMode === "fixed_small_corpus" ? FIXED_HIGH_ACTIVITY_EVENTS_24H : Math.max(1, velocityReport.p98Events24h);
     const highActivityDevice = highActivityThresholdMode === "fixed_small_corpus" ? velocityReport.events24h >= FIXED_HIGH_ACTIVITY_EVENTS_24H || velocityReport.events1h >= FIXED_HIGH_ACTIVITY_EVENTS_1H || velocityReport.distinctSubnets24h >= FIXED_HIGH_ACTIVITY_DISTINCT_SUBNETS : velocityReport.events24h >= highActivityThreshold;
+    const highActivityMirror = resolveHighActivityThreshold({
+      observations: velocityReport.eventObservations,
+      floor: DEFAULT_FLOOR
+    });
+    const rarityColdStartDecision = rarityDecision({
+      hits: rarityReport.matching,
+      total: rarityReport.sampleSize
+    });
+    const calibrationCorpusResult = buildCalibrationCorpus([]);
+    const calibrationEvidence = {
+      labeledPairs: calibrationCorpusResult.labeledPairs,
+      eligible: calibrationCorpusResult.eligible,
+      reason: calibrationCorpusResult.labeledPairs === 0 ? "no_labeled_corpus" : calibrationCorpusResult.reason
+    };
     const rawTamperingReasons = Array.isArray(rawSecuritySignals?.tamperingDetails?.reasons) ? rawSecuritySignals.tamperingDetails.reasons.filter(
       (reason) => typeof reason === "string" && reason.trim().length > 0
     ) : [];
@@ -16285,6 +19740,10 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       jsHeapSizeLimit: typeof rawExtras.jsHeapSizeLimit === "number" ? rawExtras.jsHeapSizeLimit : null,
       expectedJsHeapSizeLimit: typeof rawExtras.expectedJsHeapSizeLimit === "number" ? rawExtras.expectedJsHeapSizeLimit : null,
       webglRenderer: hardwareSignals.gpuRenderer,
+      // P0-3 — feed the unmasked vendor + capability class so the computed GPU observation
+      // distinguishes privacy masking from an unavailable probe instead of defaulting blind.
+      webglVendor: hardwareSignals.gpuVendor,
+      gpuCapabilityClass: hardwareSignals.gpuClass,
       osFamily: browserDevice.os,
       deviceKind: browserDevice.deviceKind,
       hasPdfFace: typeof rawExtras.pdfViewerEnabled === "boolean" ? rawExtras.pdfViewerEnabled : null,
@@ -16306,6 +19765,44 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         safariAtfp: Boolean(rawExtras.safariAtfp)
       })
     );
+    const rawPrivacySettings = rawSecuritySignals?.privacy_settings;
+    const rawPrivacyHardened = rawSecuritySignals?.privacy_hardened;
+    const rawPrivacySignatureIds = Array.isArray(rawSecuritySignals?.privacy_signature_ids) ? rawSecuritySignals.privacy_signature_ids.filter(
+      (id) => typeof id === "string"
+    ).slice(0, 32) : [];
+    const privacySignaturesMirror = {
+      privacy_settings: rawPrivacySettings ?? privacySettings,
+      privacy_hardened: rawPrivacyHardened ?? privacyHardened,
+      privacy_signature_ids: rawPrivacySignatureIds
+    };
+    const hardPrivacyContradiction = Boolean(
+      specAssessment.hard_spec_violation || specAssessment.hardViolations.length > 0
+    );
+    const claimedPrivacyVendor = (typeof rawExtras.privacyVendorSignature === "string" ? rawExtras.privacyVendorSignature : null) ?? (Boolean(rawExtras.braveShields) ? "Brave" : null) ?? (Boolean(rawExtras.resistFingerprinting) || Boolean(rawExtras.firefoxFpp) ? "Firefox RFP" : null) ?? (Boolean(rawExtras.isTorBrowserClient) || Boolean(rawSecuritySignals?.isTorBrowserClient) ? "Tor" : null) ?? (Boolean(rawExtras.safariAtfp) ? "Safari AFP" : null);
+    const privacyNoiseVerdict = classifyPrivacyNoise({
+      privacyHardened,
+      canvasNoise: Boolean(hardwareSignals.canvasNoise),
+      audioNoise: Boolean(rawExtras.audioNoise || rawExtras.audioSilentBufferNonZero),
+      shaderNoise: Boolean(rawExtras.shaderNoise),
+      hardContradiction: hardPrivacyContradiction,
+      vendorSignature: claimedPrivacyVendor
+    });
+    const antiDetectExemption = resolveAntiDetectExemption({
+      privacyHardened,
+      vendorSignature: claimedPrivacyVendor,
+      hardContradiction: hardPrivacyContradiction,
+      noiseOnly: Boolean(
+        hardwareSignals.canvasNoise || rawExtras.audioNoise || rawExtras.shaderNoise
+      ) && !hardPrivacyContradiction,
+      automationArtifact: Boolean(strongCdpProof || rawSecuritySignals?.cdpDetected)
+    });
+    const reconciledAntiDetectBrowser = Boolean(
+      tamperingAssessment?.details?.anti_detect_browser
+    ) && privacyNoiseVerdict.anti_detect_browser && !antiDetectExemption.suppressPenalty;
+    if (tamperingAssessment?.details) {
+      tamperingAssessment.details.anti_detect_browser = reconciledAntiDetectBrowser;
+      tamperingAssessment.details.anomaly_score = hardPrivacyContradiction ? privacyNoiseVerdict.anomaly_score : 0;
+    }
     const archTruthSource = String(
       hardwareSignals.architectureSource || ""
     ).toLowerCase();
@@ -16400,17 +19897,35 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       velocity: { high: highActivity, extreme: extremeRotation }
     });
     const suspectScore100 = riskLedger.score_0_100;
+    const identifyGpuExtras = hardwareSignals;
+    const identifyGpuTruth = resolveGpuTruthState({
+      vendor: hardwareSignals.gpuVendor,
+      renderer: hardwareSignals.gpuRenderer,
+      unmaskedVendor: typeof identifyGpuExtras.gpuVendorUnmasked === "string" ? identifyGpuExtras.gpuVendorUnmasked : typeof identifyGpuExtras.unmaskedVendor === "string" ? identifyGpuExtras.unmaskedVendor : null,
+      unmaskedRenderer: typeof identifyGpuExtras.gpuRendererUnmasked === "string" ? identifyGpuExtras.gpuRendererUnmasked : typeof identifyGpuExtras.unmaskedRenderer === "string" ? identifyGpuExtras.unmaskedRenderer : null,
+      debugExtensionAvailable: identifyGpuExtras.debugExtensionAvailable === true,
+      shaderPrecisionProfile: typeof identifyGpuExtras.shaderPrecisionProfile === "string" ? identifyGpuExtras.shaderPrecisionProfile : null,
+      privacyHardened
+    });
+    if (identifyGpuTruth.state !== "hardware") {
+      riskLedger.evidence_ledger.push({
+        family: "environment",
+        component: "gpu_truth_unverified",
+        points: 0,
+        reason: `GPU truth ${identifyGpuTruth.state}: ${identifyGpuTruth.reasons.join("; ")} \u2014 unmasked physical GPU not verified (informational, not scored)`
+      });
+    }
     const canonicalScore10 = riskLedger.score10;
     const canonicalRiskLevel = riskLevelFromTier(riskLedger.risk_tier);
+    securitySignals.suspectScore = canonicalScore10;
+    securitySignals.riskLevel = canonicalRiskLevel;
+    securitySignals.riskBadgeText = `${canonicalRiskLevel} Risk \u2022 ${canonicalScore10}/10`;
     assertRiskHeadlineConsistency({
       score10: canonicalScore10,
       risk_tier: riskLedger.risk_tier,
       suspectScore: securitySignals.suspectScore,
       riskLevel: securitySignals.riskLevel
     });
-    securitySignals.suspectScore = canonicalScore10;
-    securitySignals.riskLevel = canonicalRiskLevel;
-    securitySignals.riskBadgeText = `${canonicalRiskLevel} Risk \u2022 ${canonicalScore10}/10`;
     const currentBotName = hardAutomationSignals ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim() : (aiAgent?.detected ? aiAgent.agentName : "") || (effectiveBotClassification.subtype !== "human" ? `${effectiveBotClassification.provider} ${effectiveBotClassification.label}`.trim() : "");
     const visitHistory = rawVisits.map((r) => {
       const storedScore10 = typeof r.score10 === "number" && Number.isFinite(r.score10) ? Math.max(0, Math.min(10, Math.round(r.score10))) : null;
@@ -16489,10 +20004,41 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     let botInfo = null;
     let botType = null;
     let botVerdict = "not_detected";
-    const positiveSpoofExclusion = (aiAgent?.evidence || []).some(
-      (line) => /is not (on|inside)\b/i.test(line)
+    const claimedVerifiedBotUa = /\b(?:googlebot|googleother|gptbot|chatgpt-user|oai-searchbot|claudebot|claude-user|claude-searchbot|perplexitybot|perplexity-user|grokbot|xai-bot|meta-externalagent|meta-externalfetcher|facebookbot|muse|bingbot|duckduckbot|baiduspider|yandexbot)\b/i.test(
+      fullRequestUserAgent || ""
     );
-    if (hardAutomationSignals) {
+    const signedGoodBot = Boolean(
+      aiAgent?.verified && /signed/i.test(String(aiAgent.executionMode || ""))
+    );
+    const botVerifierVerdict = composeBotVerdict({
+      userAgent: fullRequestUserAgent,
+      webBotAuth: effectiveWba,
+      ipInKnownBotCidr: Boolean(aiAgent?.verified),
+      uaLooksLikeBot: Boolean(aiAgent?.detected || registryAgent),
+      category: registryAgent?.category,
+      directory: aiAgent ? {
+        detected: aiAgent.detected,
+        bot_id: aiAgent.agentId,
+        operator: aiAgent.operator,
+        category: registryAgent?.category,
+        identity: aiAgent.verified ? "verified" : "unknown"
+      } : null,
+      // Weight-0 protocol-inspection axis only; never a bad-bot verdict.
+      activeCdpInspection: activeCdpInspectionActive
+    });
+    const verifierSpoofed = botVerifierVerdict.reason === "spoofed-impersonation" || botVerifierVerdict.identity === "spoofed";
+    const verifierSignedGood = !verifierSpoofed && (botVerifierVerdict.reason === "signed-agent" || botVerifierVerdict.reason === "verified-agent" || botVerifierVerdict.identity === "signed" || botVerifierVerdict.identity === "verified");
+    const spoofedVerifiedBotClaim = !verifierSignedGood && (claimedVerifiedBotUa && !signedGoodBot && !aiAgent?.verified || verifierSpoofed);
+    if (verifierSignedGood) {
+      botInfo = {
+        category: registryAgent?.category || "ai_agent",
+        provider: aiAgent?.operator || registryAgent?.provider || effectiveBotClassification.provider || "Unknown",
+        name: botVerifierVerdict.agent_verdict || aiAgent?.agentName || registryAgent?.displayName || "Signed Agent",
+        identity: "signed"
+      };
+      botType = registryAgent?.id || aiAgent?.agentId || "ai_agent";
+      botVerdict = "good";
+    } else if (hardAutomationSignals) {
       botInfo = {
         category: "browser_automation",
         provider: effectiveBotClassification.provider || "Unknown",
@@ -16520,7 +20066,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         category: isImpostor ? "browser_automation" : "ai_agent",
         provider: aiAgent.operator || "Unknown",
         name: aiAgent.agentName,
-        identity: isImpostor ? positiveSpoofExclusion ? "spoofed" : "unknown" : aiAgent.verified ? aiAgent.executionMode === "RFC 9421 Signed Agent" ? "signed" : "verified" : "unknown"
+        identity: isImpostor ? "spoofed" : aiAgent.verified ? aiAgent.executionMode === "RFC 9421 Signed Agent" ? "signed" : "verified" : "unknown"
       };
       botType = "ai_agent";
       botVerdict = "bad";
@@ -16562,11 +20108,36 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       botType = "stealth_automation";
       botVerdict = "bad";
     }
+    if (spoofedVerifiedBotClaim) {
+      const spoofEvidence = `Spoofed verified-bot identity claim: ${String(fullRequestUserAgent || "").slice(0, 120)} \u2014 no RFC 9421 signature or official CIDR / FCrDNS proof`;
+      botInfo = {
+        category: "browser_automation",
+        provider: aiAgent?.operator || effectiveBotClassification.provider || "Unverified",
+        name: aiAgent?.agentName || effectiveBotClassification.label || "Spoofed Verified Bot",
+        identity: "spoofed"
+      };
+      botType = "ai_agent";
+      botVerdict = "bad";
+      securitySignals.botSubtype = "bad_bot";
+      tamperingFactorReasons.push(spoofEvidence);
+      riskLedger.evidence_ledger.push({
+        family: "automation",
+        component: "spoofed_verified_bot_claim",
+        points: 0,
+        reason: spoofEvidence
+      });
+      if (securitySignals.aiAgent) {
+        securitySignals.aiAgent = {
+          ...securitySignals.aiAgent,
+          evidence: Array.from(/* @__PURE__ */ new Set([...securitySignals.aiAgent.evidence, spoofEvidence]))
+        };
+      }
+    }
     const signedAgentIdentity = Boolean(
       aiAgent?.verified && /signed/i.test(String(aiAgent.executionMode || ""))
     );
     const lingeringCloudAgentLabel = aiAgent?.agentId === "gemini" || /google gemini|cloud agent/i.test(botInfo?.name || "");
-    if (lingeringCloudAgentLabel && !signedAgentIdentity && (hardAutomationSignals || botVerdict === "bad" || /stealth|headless|chromium/i.test(String(botType || "")))) {
+    if (lingeringCloudAgentLabel && !signedAgentIdentity && !spoofedVerifiedBotClaim && (hardAutomationSignals || botVerdict === "bad" || /stealth|headless|chromium/i.test(String(botType || "")))) {
       securitySignals.aiAgent = null;
       const headlessVariant = /headless|chromium/i.test(String(botType || ""));
       botInfo = {
@@ -16651,6 +20222,11 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     } catch {
     }
     let visitorFound = Boolean(existingVisitor) || !resolvedIdentity.is_new;
+    const profileAgeDaysForConfidence = (() => {
+      const firstMs = Date.parse(statistics.firstVisitUtc);
+      if (!Number.isFinite(firstMs)) return 0;
+      return Math.max(0, Math.floor((Date.now() - firstMs) / 864e5));
+    })();
     const identityConfidence = scoreConfidence({
       match_mode: resolvedIdentity.match_mode,
       match_score: resolvedIdentity.match_score,
@@ -16660,7 +20236,13 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       firstSeenDesktop: !isReturning,
       consistencyFlags: resolvedIdentity.reasons,
       rfpOrTor: Boolean(securitySignals.torExitNode) || Boolean(securitySignals.isTorBrowserClient),
-      genuineSpoof: botVerdict === "bad" && botInfo?.identity === "spoofed"
+      genuineSpoof: botVerdict === "bad" && botInfo?.identity === "spoofed",
+      // P0-6 continuity corroboration. The scorer's input types are owned by another module;
+      // the cast keeps this call compatible with both the legacy and evidence shapes. The
+      // calibration/publication gate is untouched — only the evidence input is forwarded.
+      storageHealed: Boolean(storageHealed || resolvedIdentity.healed),
+      visitContinuity: statistics.totalVisits,
+      profileAgeDays: profileAgeDaysForConfidence
     });
     const identityConsistencyFlags = Array.from(new Set(resolvedIdentity.reasons));
     const identityConsistency = {
@@ -16693,8 +20275,17 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       developer_tools: earlyInspector.developer_tools
     };
     const inspectorDetail = earlyInspector.detail;
-    if (inspectorFlags.cdp_attached !== (inspectorState === "automation_protocol_attached")) {
-      console.error("[invariant] inspector CDP parity violation", { inspectorState, inspectorFlags });
+    const inspectorInvariant = checkInspectorInvariants({
+      inspector_state: inspectorState,
+      cdp_attached: inspectorFlags.cdp_attached,
+      developer_tools: inspectorFlags.developer_tools
+    });
+    if (!inspectorInvariant.consistent) {
+      console.error("[invariant] inspector CDP parity violation", {
+        inspectorState,
+        inspectorFlags,
+        contradictions: inspectorInvariant.contradictions
+      });
     }
     const automationVerdict = securitySignals.isBot || botVerdict === "bad" || hardAutomationSignals ? "automated" : securitySignals.botSubtype === "human" || botVerdict === "not_detected" ? "human" : "uncertain";
     const humanCorroborationClaim = trustedHumanCorroboration >= 0.5 || hasTrustedInteractionEvidence ? 1 : 0;
@@ -16702,7 +20293,10 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       automation: automationVerdict,
       tamperingDetected: reconciledTampering.detected || Boolean(securitySignals.tamperedRequest),
       humanCorroboration: humanCorroborationClaim,
-      hasInteractionEvidence: collectorInteractionEvidence.length > 0 || trustedHumanCorroboration >= 0.5
+      hasInteractionEvidence: collectorInteractionEvidence.length > 0 || trustedHumanCorroboration >= 0.5,
+      // Weight-0 only: publishes the distinct inspection axis; the four tiers and
+      // human_corroboration are untouched. Never a bad-bot verdict.
+      activeCdpInspection: activeCdpInspectionActive
     });
     const unverifiedAutomationClaim = Boolean(
       verdictState.verdict_tier === "Verified Automation" && botVerdict === "bad" && !hardAutomationSignals && !rfc9421SignedAgent && botInfo?.identity !== "signed" && botInfo?.identity !== "verified"
@@ -16817,11 +20411,6 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       ) ? TOTAL_IDENTITY_ANCHORS : Math.min(TOTAL_IDENTITY_ANCHORS, anchorEvidence.reasons.length);
     }
     const structuralAnchorRatioForConfidence = matchedAnchorsForConfidence / TOTAL_IDENTITY_ANCHORS;
-    const profileAgeDaysForConfidence = (() => {
-      const firstMs = Date.parse(statistics.firstVisitUtc);
-      if (!Number.isFinite(firstMs)) return 0;
-      return Math.max(0, Math.floor((Date.now() - firstMs) / 864e5));
-    })();
     const honestConfidenceInput = {
       labeledPairs: Number(rawExtras.calibrationLabeledPairs ?? 0),
       heldOutEce: Number(rawExtras.calibrationHeldOutEce ?? 1),
@@ -16878,11 +20467,106 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       confidence_label: confidenceLabel(finalIdentityConfidenceScore, false),
       ...downgradeRecognition ? { confidence_tier: "Shared Hardware Class - Ambiguous" } : {}
     };
+    const stabilizedConfidence = stabilizeConfidence({
+      visitorId,
+      hardwareId: hardwareId || identityHardwareFingerprint,
+      rawScore: identityConfidenceHonest.confidence_score,
+      volatileInputs: {
+        bot: botVerdict,
+        audio: hardwareSignals.audioHash,
+        privacy: { privacyHardened, privacySettings },
+        network: { vpnOrRelay, timezoneMismatch }
+      },
+      tier: identityConfidenceHonest.confidence_tier
+    });
+    if (stabilizedConfidence.score !== null) {
+      identityConfidenceHonest.confidence_score = stabilizedConfidence.score;
+      if (!downgradeRecognition) {
+        identityConfidenceHonest.confidence_tier = stabilizedConfidence.tier;
+      }
+      identityConfidenceHonest.confidence_label = confidenceLabel(stabilizedConfidence.score, false);
+    }
+    identityConfidenceHonest.calibration_status = "uncalibrated";
+    const identityScope = resolveIdentityScope({
+      incognito: Boolean(securitySignals.isIncognito),
+      firstPartyStorageSurvived: Boolean(storageValidForConfidence || existingVisitor || verifiedVid),
+      hardwareAnchorStable: Boolean(
+        hardwareMatchForConfidence || hardwareId && (existingVisitor || verifiedVid)
+      ),
+      contextSaltPresent: clientExtras.contextSaltPresent === true || rawExtras.contextSaltPresent === true
+    });
+    if (diagnostics && diagnostics.sessionLockHit === true) {
+      const rawDiag = rawDiagnostics ?? {};
+      const extHw = hardwareSignals;
+      const diagString = (value) => typeof value === "string" && value.trim() ? value.trim().slice(0, 160) : null;
+      if (diagnostics.engine === void 0 || diagnostics.engine === null) {
+        diagnostics.engine = diagString(extHw.engine) ?? diagString(rawDiag.engineId) ?? null;
+      }
+      if (diagnostics.persistedStorageGrant === void 0 || diagnostics.persistedStorageGrant === null) {
+        diagnostics.persistedStorageGrant = hadPersistentClientState;
+      }
+      if (diagnostics.isolatedContextVeto === void 0 || diagnostics.isolatedContextVeto === null) {
+        diagnostics.isolatedContextVeto = identityScope.context_isolated;
+      }
+      if (diagnostics.idbTruthRule === void 0 || diagnostics.idbTruthRule === null) {
+        const ratio = typeof diagnostics.idbDurabilityRatio === "number" && Number.isFinite(diagnostics.idbDurabilityRatio) ? diagnostics.idbDurabilityRatio : null;
+        diagnostics.idbTruthRule = resolveIdbDurabilityTruth({
+          ratio,
+          highVariance: diagnostics.idbHighVariance ?? null,
+          persistedGrant: diagnostics.persistedStorageGrant ?? null,
+          isolatedContext: diagnostics.isolatedContextVeto ?? null
+        }).rule;
+      }
+      const missingEvidence = [];
+      if (typeof diagnostics.idbDurabilityRatio !== "number" || !Number.isFinite(diagnostics.idbDurabilityRatio)) {
+        missingEvidence.push("idbDurabilityRatio");
+      }
+      if (typeof diagnostics.quotaBytes !== "number") missingEvidence.push("quotaBytes");
+      if (typeof diagnostics.opfsFlushMs !== "number") missingEvidence.push("opfsFlushMs");
+      if (!diagnostics.engine) missingEvidence.push("engineId");
+      const confounderActive = rawDiag.webview === true || rawDiag.guest === true || rawDiag.clearedStorage === true || rawDiag.enterprisePolicy === true;
+      const abstainReason = confounderActive ? "CONFOUNDER_PRESENT" : missingEvidence.length > 0 ? `INSUFFICIENT_RAW_EVIDENCE: ${missingEvidence.join(", ")}` : null;
+      Object.assign(diagnostics, {
+        engineId: diagString(rawDiag.engineId) ?? diagString(extHw.engine) ?? null,
+        rawEvidence: {
+          quotaBytes: diagnostics.quotaBytes ?? null,
+          headroomGiB: diagnostics.headroomGiB ?? null,
+          opfsFlushMs: diagnostics.opfsFlushMs ?? null,
+          idbDurabilityRatio: diagnostics.idbDurabilityRatio ?? null,
+          idbHighVariance: diagnostics.idbHighVariance ?? null,
+          // Verbatim collector sample arrays / error strings; absent stays null.
+          idbSamples: Array.isArray(rawDiag.idbSamples) ? rawDiag.idbSamples : null,
+          opfsSamples: Array.isArray(rawDiag.opfsSamples) ? rawDiag.opfsSamples : null,
+          errors: Array.isArray(rawDiag.errors) ? rawDiag.errors : null,
+          confounders: {
+            webview: typeof rawDiag.webview === "boolean" ? rawDiag.webview : null,
+            guest: typeof rawDiag.guest === "boolean" ? rawDiag.guest : null,
+            clearedStorage: typeof rawDiag.clearedStorage === "boolean" ? rawDiag.clearedStorage : null,
+            enterprisePolicy: typeof rawDiag.enterprisePolicy === "boolean" ? rawDiag.enterprisePolicy : null
+          }
+        },
+        verdict: {
+          isPrivate: diagnostics.isPrivate ?? null,
+          confidence: diagnostics.confidence ?? null,
+          lowConfidenceVeto: diagnostics.lowConfidenceVeto ?? null,
+          groundTruth: null
+        },
+        abstainReason,
+        thresholds: Object.freeze({
+          idbStrongRamMax: STRONG_RAM_RATIO_MAX,
+          idbPrivateMax: IDB_PRIVATE_RATIO_MAX,
+          idbNormalMin: IDB_NORMAL_RATIO_MIN,
+          incognitoConfidenceVetoBelow: 0.9,
+          frozenUntilLabeledData: true
+        })
+      });
+    }
     if (downgradeRecognition) {
       isReturning = false;
     }
     const recognitionLabel = downgradeRecognition ? "possible hardware match" : "returning device";
-    const networkOwnership = hostingDatacenter ? "hosting_datacenter" : /cellular|mobile|5g|carrier/i.test(networkTypeLabel) ? "mobile_carrier" : /enterprise|business/i.test(networkTypeLabel) ? "enterprise" : /broadband|residential|consumer/i.test(networkTypeLabel) ? "residential_isp" : "unknown";
+    const residentialIsp = classification.isConsumerBroadband && /broadband|residential|consumer/i.test(networkTypeLabel);
+    const networkOwnership = residentialIsp ? "residential_isp" : hostingDatacenter ? "hosting_datacenter" : /cellular|mobile|5g|carrier/i.test(networkTypeLabel) ? "mobile_carrier" : /enterprise|business/i.test(networkTypeLabel) ? "enterprise" : /broadband|residential|consumer/i.test(networkTypeLabel) ? "residential_isp" : "unknown";
     const vpnConfidence = isTorExit || torStatus.isRelay ? "high" : vpnOrRelay && Array.isArray(securitySignals.vpnReasons) && securitySignals.vpnReasons.length > 1 ? "medium" : vpnOrRelay ? "low" : "low";
     const asnOrg = String(normalizeAsnLabel(location.asn) || location.org || "");
     const cachedRdapOrg = persistRdapNetblockOrg(db, String(location.asn || ""), asnOrg);
@@ -16890,20 +20574,62 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
     const netblockReassignmentMismatch = Boolean(
       rdapNetblockOrg && asnOrg && rdapNetblockOrg.toLowerCase() !== asnOrg.toLowerCase() && !asnOrg.toLowerCase().includes(rdapNetblockOrg.toLowerCase())
     );
-    const geolocationPermission = typeof rawExtras.geolocationPermission === "string" ? rawExtras.geolocationPermission : "prompt";
-    const grantedCoords = rawExtras.grantedGeolocation && typeof rawExtras.grantedGeolocation === "object" && typeof rawExtras.grantedGeolocation.latitude === "number" && typeof rawExtras.grantedGeolocation.longitude === "number" ? rawExtras.grantedGeolocation : null;
-    const honestProximity = computeHonestProximity({
+    const identifyExtras = requestBody;
+    const geolocationPermission = typeof identifyExtras.geolocationPermission === "string" ? identifyExtras.geolocationPermission : typeof rawExtras.geolocationPermission === "string" ? rawExtras.geolocationPermission : "prompt";
+    const grantedGeolocationRaw = identifyExtras.grantedGeolocation ?? rawExtras.grantedGeolocation;
+    const grantedCoordsRecord = grantedGeolocationRaw && typeof grantedGeolocationRaw === "object" ? grantedGeolocationRaw : null;
+    const grantedCoords = grantedCoordsRecord && typeof grantedCoordsRecord.latitude === "number" && typeof grantedCoordsRecord.longitude === "number" ? { latitude: grantedCoordsRecord.latitude, longitude: grantedCoordsRecord.longitude } : null;
+    const geolocationAccuracyM = typeof identifyExtras.geolocationAccuracyM === "number" ? identifyExtras.geolocationAccuracyM : typeof rawExtras.geolocationAccuracyM === "number" ? rawExtras.geolocationAccuracyM : void 0;
+    const proximityResolution = resolveProximity({
       permission: geolocationPermission,
-      accuracyM: typeof rawExtras.geolocationAccuracyM === "number" ? rawExtras.geolocationAccuracyM : void 0,
-      grantedCoordinates: grantedCoords
+      lat: grantedCoords?.latitude,
+      lon: grantedCoords?.longitude,
+      accuracyM: geolocationAccuracyM
     });
-    const rarityDecision = decideRarity(rarityReport.sampleSize, rarityReport.matching);
+    const honestProximity = proximityResolution.proximity;
+    const rarityDecision2 = decideRarity(rarityReport.sampleSize, rarityReport.matching);
     const rarityUpper = clopperPearsonUpperBound(
       rarityReport.matching,
       rarityReport.sampleSize,
       0.05
     );
     const edgeTransport = readEdgeTransport(req);
+    const shadowProxyDetails = securitySignals.proxy_details ?? null;
+    const shadowVpnMethods = securitySignals.vpnMethods ?? null;
+    const networkTruthShadow = diagnostics ? buildNetworkTruthShadow({
+      edgeTransport: {
+        httpProtocol: edgeTransport.httpProtocol,
+        // Server readEdgeTransport drops clientQuicRtt; it is never fabricated here.
+        clientTcpRtt: edgeTransport.clientTcpRtt,
+        colo: edgeTransport.colo
+      },
+      geo: {
+        countryCode: location.countryCode,
+        country: location.country
+      },
+      proxyDetails: shadowProxyDetails
+      // The RTT variable computed inside buildLatencyBasis is scoped elsewhere; the
+      // shadow helper treats an omitted sample as absent and never fabricates one.
+    }) : void 0;
+    const publishedHeadlessMode = typeof rawExtras.headless_mode === "string" && (rawExtras.headless_mode === "shell" || rawExtras.headless_mode === "new") ? rawExtras.headless_mode : uaIdentity.headless_mode ?? null;
+    const publishedGpuObservation = specAssessment.gpu_observation;
+    const publishedGpuTruthState = typeof rawExtras.gpu_truth_state === "string" ? rawExtras.gpu_truth_state : identifyGpuTruth.state;
+    const publishedGpuAnswerUnreliable = typeof rawExtras.gpu_answer_unreliable === "boolean" ? rawExtras.gpu_answer_unreliable : Boolean(
+      tamperingAssessment?.details?.gpu_answer_unreliable
+    );
+    const publishedAudioStabilityClass = hardwareSignals.audioStabilityClass ?? void 0;
+    const publishedConfidenceStabilityKey = typeof identifyExtras.confidence_stability_key === "string" ? identifyExtras.confidence_stability_key : stabilizedConfidence.stabilityKey;
+    const mediaPreferencesMirror = identifyExtras.media_preferences && typeof identifyExtras.media_preferences === "object" ? identifyExtras.media_preferences : rawExtras.media_preferences && typeof rawExtras.media_preferences === "object" ? rawExtras.media_preferences : void 0;
+    for (const extraLine of buildExtraEvidenceLines({
+      spoofedBot: spoofedVerifiedBotClaim,
+      gpuUnreliable: publishedGpuAnswerUnreliable || publishedGpuTruthState !== "hardware",
+      audioNoisy: publishedAudioStabilityClass === "noisy",
+      privacyNoise: privacyNoiseVerdict.privacy_settings,
+      proximityDenied: geolocationPermission === "denied",
+      activeCdp: activeCdpInspectionActive
+    })) {
+      riskLedger.evidence_ledger.push(extraLine);
+    }
     const invariantEnvelope = {
       event_id: eventId,
       identity: {
@@ -16952,11 +20678,15 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         inspector_detail: inspectorDetail,
         // Single resolved value: any DevTools / IDE / docked attach (including a weak runtime
         // leak) sets this true, while a bare CDP protocol binding stays on the cdp_attached axis.
-        developer_tools: inspectorFlags.developer_tools
+        developer_tools: inspectorFlags.developer_tools,
+        // Additive active-CDP inspection state — environment telemetry, never a verdict input.
+        active_cdp_inspection: activeCdpInspection.state,
+        active_cdp_reasons: activeCdpInspection.reasons
       },
       tampering: {
         detected: reconciledTampering.detected || effectiveTamperingDetected,
-        anti_detect_browser: Boolean(rawSecuritySignals?.tamperingDetails?.anti_detect_browser),
+        // Privacy farbling/RFP/Tor/AFP noise can never set this; hard contradictions only.
+        anti_detect_browser: reconciledAntiDetectBrowser,
         privacy_hardened: privacyHardened,
         tampering_confidence: tamperingAssessment?.confidence || "high",
         tampering_ml_score: tamperingAssessment?.mlScore || 0,
@@ -16983,16 +20713,57 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
         ephemeral_storage: ephemeralStorage,
         virtual_machine_label: securitySignals.isVirtualMachine ? securitySignals.vmReason || "Virtual Machine" : null
       },
-      proximity: honestProximity,
+      privacy_signatures: privacySignaturesMirror,
+      /* Additive normalized truth / stability mirrors — copied verbatim from their producers.
+         Informational only: never scored, never an identity seed, never a verdict input. */
+      gpu_truth_state: publishedGpuTruthState,
+      gpu_answer_unreliable: publishedGpuAnswerUnreliable,
+      // P0-3 — verbatim server-computed observation (never re-derived or fabricated).
+      gpuObservation: publishedGpuObservation,
+      headless_mode: publishedHeadlessMode,
+      audio_stability_class: publishedAudioStabilityClass,
+      confidence_stability_key: publishedConfidenceStabilityKey,
+      media_preferences: mediaPreferencesMirror,
+      id_scope: identityScope.id_scope,
+      context_isolated: identityScope.context_isolated,
+      // RS-A additive runtime identity probe (env-first, degrades to 'unknown', never cached).
+      build_sha: BUILD_SHA,
+      worker_version: WORKER_VERSION,
+      // P0-2 — nine first-party truth fields, each {value,status,reason,observations,confidence}.
+      os_truth: osTruthBlock,
+      // Omitted entirely when permission was denied / no valid granted fix. Never IP-derived.
+      ...honestProximity ? { proximity: honestProximity } : {},
       rarity: {
-        corpus_n: rarityDecision.corpus_n,
+        corpus_n: rarityDecision2.corpus_n,
         prevalence_ci95_upper: rarityUpper,
-        percentile: rarityDecision.percentile,
-        status: rarityDecision.status
+        percentile: rarityDecision2.percentile,
+        status: rarityDecision2.status
       },
+      /* Additive diagnostic mirrors — pure-helper outputs, never scored or enforced. */
+      high_activity_threshold_mode: highActivityMirror.mode,
+      high_activity_threshold: highActivityMirror.threshold,
+      rarity_cold_start: {
+        bucket: rarityColdStartDecision.bucket,
+        rare: rarityColdStartDecision.rare,
+        p_upper: rarityColdStartDecision.p_upper,
+        adjusted_alpha: rarityColdStartDecision.adjustedAlpha,
+        reasons: rarityColdStartDecision.reasons
+      },
+      calibration_evidence: calibrationEvidence,
       velocity: velocityReport.velocity,
       risk: riskLedger,
-      verdict_tier: effectiveVerdictTier
+      verdict_tier: effectiveVerdictTier,
+      // Additive incognito diagnostics — verbatim, flag-gated pass-through (never scored).
+      ...diagnostics ? { diagnostics } : {},
+      // Additive network-truth shadow — descriptive only, same flag gate, never scored.
+      ...networkTruthShadow ? { network_truth_shadow: networkTruthShadow } : {},
+      // Additive shadow truth mirrors. proxy_details / vpn_methods match the shapes the
+      // dashboard adapter already reads; the zero-trust and fingerprint blocks are diagnostics
+      // only (strict-origin is opt-in and never enforced here).
+      proxy_details: shadowProxyDetails,
+      vpn_methods: shadowVpnMethods,
+      zero_trust: zeroTrustShadow,
+      network_fingerprint_truth: networkFingerprintShadow
     };
     const payload = {
       visitorId,
@@ -17006,9 +20777,9 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       recognitionLabel,
       recognitionCorroborated,
       location,
-      // Phase 6 — proximity is permission-gated. IP coordinates are never proximity evidence;
-      // the canonical envelope and this mirror share the same honest result.
-      proximity: honestProximity,
+      // Permission-gated proximity only. The canonical envelope and this mirror share the same
+      // bridge result (accuracy_m + accuracy-derived confidence); IP city is never evidence.
+      ...honestProximity ? { proximity: honestProximity } : {},
       // Fix 8 — structured bot & AI agent identification ("Robodex" + BotD).
       bot: botVerdict,
       bot_type: botType,
@@ -17036,6 +20807,10 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       // Top-level mirrors so clients can read the 4-signal verdict without digging.
       isIncognito: securitySignals.isIncognito,
       incognito: securitySignals.isIncognito,
+      // Additive, flag-gated console diagnostics — inert pass-through, never scored.
+      ...diagnostics ? { diagnostics } : {},
+      // Additive network-truth shadow mirror — same flag gate, descriptive only, never scored.
+      ...networkTruthShadow ? { network_truth_shadow: networkTruthShadow } : {},
       suspectScore: securitySignals.suspectScore,
       riskLevel: securitySignals.riskLevel,
       riskBadgeText: securitySignals.riskBadgeText,
@@ -17046,13 +20821,35 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       highActivityDevice,
       highActivityThresholdMode,
       highActivityThreshold,
+      // Additive diagnostic mirrors (RS6/RS7/RS1) — same keys as the envelope fields.
+      // Cast rather than editing types owned by other modules; no scoring/enforcement reads these.
+      ...{
+        high_activity_threshold_mode: highActivityMirror.mode,
+        high_activity_threshold: highActivityMirror.threshold,
+        rarity_cold_start: {
+          bucket: rarityColdStartDecision.bucket,
+          rare: rarityColdStartDecision.rare,
+          p_upper: rarityColdStartDecision.p_upper,
+          adjusted_alpha: rarityColdStartDecision.adjustedAlpha,
+          reasons: rarityColdStartDecision.reasons
+        },
+        calibration_evidence: calibrationEvidence
+      },
       // Single-source-of-truth bot flag + inspector axes mirrored from the canonical envelope.
       isBot: canonicalIsBot,
       cdp_attached: inspectorFlags.cdp_attached,
       inspector_state: inspectorState,
+      // Additive active-CDP inspection state (read-only, never scored or verdict-changing).
+      // The legacy type declared a boolean; the runtime value is the canonical state token.
+      active_cdp_inspection: activeCdpInspection.state,
+      active_cdp_reasons: activeCdpInspection.reasons,
       rareDevice: rarityReport.rareDevice,
       rareDevicePercentileBucket: rarityReport.bucket,
       tampering: effectiveTamperingDetected,
+      // Verbatim collector privacy posture (never derived from privacy noise).
+      privacy_settings: rawPrivacySettings ?? privacySettings,
+      privacy_hardened: rawPrivacyHardened ?? privacyHardened,
+      privacy_signature_ids: rawPrivacySignatureIds,
       tamperingConfidence: tamperingAssessment?.confidence ?? "high",
       tamperingDetails: tamperingFactorReasons.length ? {
         anomaly_score: tamperingAssessment?.details?.anomaly_score ?? 0,
@@ -17106,8 +20903,32 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       replayed: envelopeVerdict.replayDetected,
       tampered: envelopeVerdict.tamperedRequest,
       requestIntegrityReason: envelopeVerdict.requestIntegrityReason,
+      // Additive shadow truth mirrors — the exact same references carried in the envelope.
+      proxy_details: shadowProxyDetails,
+      vpn_methods: shadowVpnMethods,
+      zero_trust: zeroTrustShadow,
+      network_fingerprint_truth: networkFingerprintShadow,
       // Phase 3–6 canonical mirrors. The single envelope above is the source of truth; these
       // top-level mirrors keep existing clients working without any parallel scoring math.
+      gpu_truth_state: publishedGpuTruthState,
+      gpu_answer_unreliable: publishedGpuAnswerUnreliable,
+      // P0-3 — verbatim server-computed observation (never re-derived or fabricated).
+      gpuObservation: publishedGpuObservation,
+      headless_mode: publishedHeadlessMode,
+      audio_stability_class: publishedAudioStabilityClass,
+      confidence_stability_key: publishedConfidenceStabilityKey,
+      media_preferences: mediaPreferencesMirror,
+      id_scope: identityScope.id_scope,
+      context_isolated: identityScope.context_isolated,
+      // RS-A additive build/runtime mirrors — same values as /api/health, verbatim and never
+      // re-derived from client input. The identify route is already `no-store`. Spread through
+      // a cast because the response type is owned by another module; the keys stay on the wire.
+      ...{
+        build_sha: BUILD_SHA,
+        worker_version: WORKER_VERSION,
+        // P0-2 — same first-party block as the envelope; no client-authoritative promotion.
+        os_truth: osTruthBlock
+      },
       envelope: invariantEnvelope,
       verdict_tier: effectiveVerdictTier,
       human_corroboration: verdictState.human_corroboration,
@@ -17207,34 +21028,40 @@ app.get("/api/visitor/history/:visitorId", (req, res) => {
   res.json({ visitorId: requestedVisitorId, visits });
 });
 app.get("/api/intel/identity-ping", (req, res) => {
-  res.setHeader("Cache-Control", "private, max-age=0, must-revalidate");
+  res.setHeader("Cache-Control", "private, no-store, no-cache, must-revalidate, max-age=0");
   const existingVary = res.getHeader("Vary");
   const varyValues = typeof existingVary === "string" ? existingVary.split(",").map((item) => item.trim()).filter(Boolean) : [];
   for (const value of ["Cookie", "Sec-CH-UA*"]) {
     if (!varyValues.some((item) => item.toLowerCase() === value.toLowerCase())) varyValues.push(value);
   }
   res.setHeader("Vary", varyValues.join(", "));
-  const presented = typeof req.headers["if-none-match"] === "string" ? req.headers["if-none-match"] : "";
-  if (presented) {
-    res.setHeader("ETag", presented);
-    res.status(304).end();
-    return;
-  }
   const cookies = req.cookies ?? {};
   const cookieVisitor = typeof cookies["_intel_vid_client"] === "string" && cookies["_intel_vid_client"].trim() || typeof cookies["intel_http_vid"] === "string" && cookies["intel_http_vid"].trim() || "";
+  const cookieToken = typeof cookies["intel_http_token"] === "string" && cookies["intel_http_token"].trim() || "";
   if (!cookieVisitor) {
+    res.setHeader("ETag", '"identity-none"');
     res.status(204).end();
     return;
   }
-  const etag = `"${crypto.createHash("sha256").update(cookieVisitor).digest("base64url")}"`;
+  const loadNonce = typeof req.headers["x-intel-load-nonce"] === "string" ? req.headers["x-intel-load-nonce"].slice(0, 120) : "";
+  const etag = `"${crypto.createHash("sha256").update(`${cookieVisitor}|${cookieToken}|${loadNonce}`).digest("base64url")}"`;
   res.setHeader("ETag", etag);
+  const presented = typeof req.headers["if-none-match"] === "string" ? req.headers["if-none-match"] : "";
+  if (presented && presented === etag) {
+    res.status(304).end();
+    return;
+  }
   res.json({
     identity: {
       visitor_id: cookieVisitor,
       hardware_fingerprint: "",
       browser_fingerprint: "",
-      created_at: (/* @__PURE__ */ new Date()).toISOString()
-    }
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      // Derived from the incoming cookie + HMAC token, never from a cached response.
+      recognition_source: verifyVisitorToken(cookieVisitor, cookieToken) ? "First-Party Cookie" : "Unverified Cookie"
+    },
+    // Handed back so the next conditional request can carry the same per-load nonce.
+    load_nonce: loadNonce
   });
 });
 app.use("/api", (_req, res) => {
@@ -17323,6 +21150,191 @@ function inferRuntimeOsVerdict(input, uaOs) {
       glFamily ? `WebGL backend: ${RUNTIME_OS_LABELS[glFamily]}` : "",
       probeFamily ? `High-confidence runtime probe: ${RUNTIME_OS_LABELS[probeFamily]}` : ""
     ].filter(Boolean)
+  };
+}
+function osObs(tier, source, value) {
+  return {
+    tier,
+    source,
+    value: typeof value === "string" || typeof value === "number" || typeof value === "boolean" ? value : null
+  };
+}
+function osTruthAbsent(reason, observations = []) {
+  return { value: null, status: "ABSENT", reason, observations, confidence: 0 };
+}
+function osTruthIsGrease(value) {
+  if (value === null || value === void 0) return false;
+  const text = String(value).trim();
+  if (!text) return false;
+  if (/\bgrease\b/i.test(text)) return true;
+  return /^(\?|unknown|unavailable|masked|redacted|none|null|n\/a|na|not\s*a\s*\(?\s*brand\s*\)?)$/i.test(
+    text
+  );
+}
+function osTruthField(observations, options = {}) {
+  const all = observations.map((item) => ({ ...item }));
+  const present = all.filter(
+    (item) => item.value !== null && String(item.value).trim().length > 0
+  );
+  const grease = present.find((item) => osTruthIsGrease(item.value));
+  if (grease) {
+    return osTruthAbsent(
+      `GREASE_OR_PLACEHOLDER: ${grease.source} reported ${JSON.stringify(grease.value)}`,
+      all
+    );
+  }
+  if (present.length === 0) return osTruthAbsent("NO_FIRST_PARTY_OBSERVATION", all);
+  if (options.inferredReason) {
+    const value2 = options.valueOverride ?? null;
+    return {
+      value: value2,
+      status: value2 === null ? "ABSENT" : "INFERRED",
+      reason: value2 === null ? "NO_FIRST_PARTY_OBSERVATION" : options.inferredReason,
+      observations: all,
+      confidence: value2 === null ? 0 : 0.5
+    };
+  }
+  const normalize2 = options.normalize ?? ((value2) => String(value2 ?? ""));
+  const byKey = /* @__PURE__ */ new Map();
+  for (const item of present) {
+    const key = normalize2(item.value);
+    if (key && !byKey.has(key)) byKey.set(key, item.value);
+  }
+  if (byKey.size === 0) return osTruthAbsent("NO_FIRST_PARTY_OBSERVATION", all);
+  if (byKey.size > 1) {
+    const candidates = Array.from(byKey.entries()).map(([key, raw]) => `${key} => ${JSON.stringify(raw)}`).join(" | ");
+    return {
+      value: null,
+      status: "CONFLICTED",
+      reason: `CONFLICTING_TIERS (no majority guess): ${candidates}`,
+      observations: all,
+      confidence: 0
+    };
+  }
+  const tiers = Array.from(new Set(present.map((item) => item.tier))).sort();
+  const firstRaw = byKey.values().next().value;
+  const value = options.valueOverride !== void 0 ? options.valueOverride : firstRaw;
+  if (value === null) return osTruthAbsent("NO_FIRST_PARTY_OBSERVATION", all);
+  if (tiers.length >= 2) {
+    return {
+      value,
+      status: "VERIFIED",
+      reason: `Independent tiers agree (${tiers.join(" + ")})`,
+      observations: all,
+      confidence: Math.min(0.99, 0.6 + 0.15 * (tiers.length - 1))
+    };
+  }
+  return {
+    value,
+    status: "REPORTED",
+    reason: `Single tier ${tiers[0]}; not independently corroborated`,
+    observations: all,
+    confidence: 0.4
+  };
+}
+function buildOsTruthBlock(input) {
+  const { securitySignals: signals, hardware, browserDevice, clientHints } = input;
+  const chPlatform = clientHints?.platform || "";
+  const chArch = clientHints?.architecture || "";
+  const chBrand = clientHints?.brands?.[0]?.brand || "";
+  const jsPlatform = browserDevice.platform || "";
+  const osFamily = (value) => osFamilyKey(String(value ?? ""));
+  const browserFamily = (value) => browserFamilyKey(String(value ?? ""));
+  const archFamily = (value) => {
+    const text = String(value ?? "").toLowerCase();
+    if (/arm|aarch64|arm64/.test(text)) return "arm";
+    if (/x86|x86_64|amd64|i[3-6]86|intel|amd/.test(text)) return "x86";
+    return text.replace(/[^a-z0-9]/g, "");
+  };
+  const engineFamily = (value) => {
+    const text = String(value ?? "").toLowerCase();
+    if (/v8|chromium|chrome/.test(text)) return "v8";
+    if (/spidermonkey|gecko|firefox/.test(text)) return "spidermonkey";
+    if (/javascriptcore|jsc|webkit|safari/.test(text)) return "jsc";
+    return "";
+  };
+  const platformFamily = String(chPlatform || input.uaOs || browserDevice.os || "").toLowerCase();
+  const brand = browserFamily(chBrand || input.uaBrowser || browserDevice.browser);
+  const expectedEngine = /iphone|ipad|ipod|ios/.test(platformFamily) ? "jsc" : brand === "firefox" ? "spidermonkey" : brand === "safari" ? "jsc" : brand === "chrome" || brand === "edge" || brand === "opera" ? "v8" : "";
+  const browserObservations = [
+    osObs("UA_CH_HEADER", "sec-ch-ua brand", chBrand),
+    osObs("LEGACY_UA", "HTTP User-Agent browser family", input.uaBrowser || browserDevice.browser)
+  ];
+  const osObservations = [
+    osObs("UA_CH_HEADER", "sec-ch-ua-platform", chPlatform),
+    // Linux-on-Android / Linux-on-ChromeOS navigator.platform spellings are equivalent, not
+    // contradictions; they are omitted rather than reported as a false conflict.
+    ...!/linux/i.test(jsPlatform) || !/android|cros|chrome ?os/i.test(String(chPlatform || input.uaOs || browserDevice.os || "")) ? [osObs("UA_CH_JS", "navigator.platform", jsPlatform)] : [],
+    osObs("LEGACY_UA", "HTTP User-Agent OS family", input.uaOs || browserDevice.os),
+    osObs(
+      "CLIENT_SIGNAL",
+      input.runtimeOsVerdict.evidence.join("; ") || "runtime OS probe",
+      input.runtimeOsVerdict.family ? input.runtimeOsVerdict.label : null
+    )
+  ];
+  const hostOs = hardware.hostOs || "";
+  const architecture = hardware.architecture || "";
+  const architectureSource = hardware.architectureSource || "";
+  const engine = hardware.engine || "";
+  return {
+    // The three first-party server-verified fields.
+    serverVerifiedBrowser: osTruthField(browserObservations, {
+      normalize: browserFamily,
+      valueOverride: signals.serverVerifiedBrowser
+    }),
+    serverVerifiedOs: osTruthField(osObservations, {
+      normalize: osFamily,
+      valueOverride: signals.serverVerifiedOs
+    }),
+    headerMismatch: osTruthField([...osObservations, ...browserObservations], {
+      inferredReason: signals.headerMismatch ? signals.headerMismatchReason || "Header/transport-resolved identity disagrees with the client claim" : "No cross-layer browser/OS disagreement observed",
+      valueOverride: Boolean(signals.headerMismatch)
+    }),
+    // Six first-party runtime truth fields.
+    hostOs: hostOs ? osTruthField(
+      [osObs("CLIENT_SIGNAL", "libm host-OS probe", hostOs), osObs("UA_CH_HEADER", "sec-ch-ua-platform", chPlatform)],
+      { normalize: osFamily, valueOverride: hostOs }
+    ) : osTruthAbsent("NO_HOST_OS_PROBE"),
+    architecture: architecture ? osTruthField(
+      [
+        osObs("CLIENT_SIGNAL", `${architectureSource || "runtime"} architecture`, architecture),
+        osObs("UA_CH_HEADER", "sec-ch-ua-arch", chArch)
+      ],
+      { normalize: archFamily, valueOverride: architecture }
+    ) : osTruthAbsent("NO_ARCHITECTURE_PROBE"),
+    architectureSource: architectureSource ? osTruthField([osObs("CLIENT_SIGNAL", "runtime architecture source", architectureSource)], {
+      inferredReason: "Resolver-reported architecture provenance",
+      valueOverride: architectureSource
+    }) : osTruthAbsent("NO_ARCHITECTURE_SOURCE"),
+    osUaMismatch: osTruthField(
+      [
+        osObs("CLIENT_SIGNAL", "libm host-OS probe", hostOs),
+        osObs("UA_CH_HEADER", "sec-ch-ua-platform", chPlatform),
+        osObs("LEGACY_UA", "HTTP User-Agent OS family", input.uaOs || browserDevice.os)
+      ],
+      {
+        inferredReason: "Cross-layer host-OS vs UA/Sec-CH OS coherence verdict (read-only mirror)",
+        valueOverride: Boolean(hardware.osUaMismatch)
+      }
+    ),
+    archUaMismatch: osTruthField(
+      [
+        osObs("CLIENT_SIGNAL", `${architectureSource || "runtime"} architecture`, architecture),
+        osObs("UA_CH_HEADER", "sec-ch-ua-arch", chArch),
+        osObs("CLIENT_SIGNAL", "claimed architecture", hardware.claimedArchitecture)
+      ],
+      {
+        inferredReason: "Cross-layer silicon architecture vs UA/Sec-CH architecture coherence verdict",
+        valueOverride: Boolean(hardware.archUaMismatch)
+      }
+    ),
+    engine: engine ? osTruthField(
+      [
+        osObs("CLIENT_SIGNAL", "RangeError engine probe", engine),
+        osObs("LEGACY_UA", "brand \u2194 engine coherence", expectedEngine)
+      ],
+      { normalize: engineFamily, valueOverride: engine }
+    ) : osTruthAbsent("NO_ENGINE_PROBE")
   };
 }
 function humanIncognitoMethod(rawMethod, isIncognito, probeInconclusive) {
