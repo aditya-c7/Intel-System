@@ -300,7 +300,7 @@ const chromium156Result = expectIdentity(
   },
   {
     os: 'Linux',
-    browserName: 'Chromium',
+    browserName: 'Google Chrome',
     browserMajorVersion: '156',
     browserFullVersion: '156.0.8078.79',
   },

@@ -24,6 +24,15 @@ import type {
 } from './telemetryContract';
 import { timezonesEquivalent, timezoneMismatchContext } from './timezone';
 
+/**
+ * Defensive object normalization for public entries: an explicit `null`, primitive or other
+ * non-object value becomes an empty record. This preserves every rule and threshold — it only
+ * removes the throw so each helper stays total as documented.
+ */
+function asRecord<T extends object>(value: T | null | undefined): T {
+  return value !== null && typeof value === 'object' ? value : ({} as T);
+}
+
 export type SpecSeverity = 'hard' | 'soft';
 
 export interface SpecViolation {
@@ -61,15 +70,20 @@ export interface PrivacyContext {
 }
 
 export function resolvePrivacyHardened(ctx: PrivacyContext = {}): boolean {
-  return Boolean(
-    ctx.privacyHardened ||
-      ctx.firefoxFpp ||
-      ctx.resistFingerprinting ||
-      ctx.safariAtfp ||
-      ctx.torBrowser ||
-      ctx.braveShields ||
-      isPrivacyHardenedUserAgent(ctx.userAgent || '')
-  );
+  try {
+    const source = asRecord(ctx);
+    return Boolean(
+      source.privacyHardened ||
+        source.firefoxFpp ||
+        source.resistFingerprinting ||
+        source.safariAtfp ||
+        source.torBrowser ||
+        source.braveShields ||
+        isPrivacyHardenedUserAgent(source.userAgent || '')
+    );
+  } catch {
+    return false;
+  }
 }
 
 export function isSwiftShaderRenderer(renderer: string): boolean {
@@ -161,13 +175,18 @@ export function checkGpuObservationInvariants(input: {
   gpu_observation: GpuObservation;
   claimed_hardware_anchor?: boolean;
 }): string[] {
-  const contradictions: string[] = [];
-  if (input.claimed_hardware_anchor === true && !gpuObservationIsHardwareAnchor(input.gpu_observation)) {
-    contradictions.push(
-      `a '${input.gpu_observation}' GPU observation cannot be used as a hardware identity anchor`
-    );
+  try {
+    const source = asRecord(input);
+    const contradictions: string[] = [];
+    if (source.claimed_hardware_anchor === true && !gpuObservationIsHardwareAnchor(source.gpu_observation)) {
+      contradictions.push(
+        `a '${source.gpu_observation}' GPU observation cannot be used as a hardware identity anchor`
+      );
+    }
+    return contradictions;
+  } catch {
+    return [];
   }
-  return contradictions;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -181,42 +200,52 @@ export function checkDeviceMemory(
   value: number | null | undefined,
   context: { privacyHardened?: boolean } = {}
 ): SpecViolation[] {
-  if (value === null || value === undefined) return [];
-  if (!Number.isFinite(value) || !(DEVICE_MEMORY_DOMAIN as readonly number[]).includes(value)) {
-    return [
-      {
-        id: 'spec.device_memory.domain',
-        severity: context.privacyHardened ? 'soft' : 'hard',
-        detail: `navigator.deviceMemory ${String(value)} is outside the power-of-two domain {0.25,0.5,1,2,4,8,16,32}`,
-      },
-    ];
+  try {
+    const source = asRecord(context);
+    if (value === null || value === undefined) return [];
+    if (!Number.isFinite(value) || !(DEVICE_MEMORY_DOMAIN as readonly number[]).includes(value)) {
+      return [
+        {
+          id: 'spec.device_memory.domain',
+          severity: source.privacyHardened ? 'soft' : 'hard',
+          detail: `navigator.deviceMemory ${String(value)} is outside the power-of-two domain {0.25,0.5,1,2,4,8,16,32}`,
+        },
+      ];
+    }
+    // 16 / 32 are allowed everywhere; there is intentionally no 8 GB ceiling.
+    return [];
+  } catch {
+    return [];
   }
-  // 16 / 32 are allowed everywhere; there is intentionally no 8 GB ceiling.
-  return [];
 }
 
 export function checkNetworkRtt(
   rtt: number | null | undefined,
   context: { privacyHardened?: boolean } = {}
 ): SpecViolation[] {
-  if (rtt === null || rtt === undefined) return [];
-  if (!Number.isFinite(rtt) || rtt < 0) {
-    return [
-      { id: 'spec.network_information.rtt_domain', severity: 'hard', detail: `rtt ${String(rtt)} is not a finite non-negative number` },
-    ];
+  try {
+    const source = asRecord(context);
+    if (rtt === null || rtt === undefined) return [];
+    if (!Number.isFinite(rtt) || rtt < 0) {
+      return [
+        { id: 'spec.network_information.rtt_domain', severity: 'hard', detail: `rtt ${String(rtt)} is not a finite non-negative number` },
+      ];
+    }
+    // 0 is explicitly allowed (NetworkInformation reports 0 on fresh connections).
+    if (rtt === 0) return [];
+    if (Math.abs(rtt % 25) > 1e-9) {
+      return [
+        {
+          id: 'spec.network_information.rtt_quantization',
+          severity: source.privacyHardened ? 'soft' : 'hard',
+          detail: `rtt ${rtt} is not a multiple of 25`,
+        },
+      ];
+    }
+    return [];
+  } catch {
+    return [];
   }
-  // 0 is explicitly allowed (NetworkInformation reports 0 on fresh connections).
-  if (rtt === 0) return [];
-  if (Math.abs(rtt % 25) > 1e-9) {
-    return [
-      {
-        id: 'spec.network_information.rtt_quantization',
-        severity: context.privacyHardened ? 'soft' : 'hard',
-        detail: `rtt ${rtt} is not a multiple of 25`,
-      },
-    ];
-  }
-  return [];
 }
 
 export interface BatteryLike {
@@ -295,23 +324,28 @@ export function checkWebglBackendAgainstOs(
   osFamily: string,
   context: { privacyHardened?: boolean } = {}
 ): SpecViolation[] {
-  const backend = classifyWebglBackend(renderer);
-  const os = String(osFamily || '').toLowerCase();
-  if (backend === 'swiftshader' || backend === 'vulkan' || backend === 'unknown') return [];
-  const osMatches =
-    (backend === 'direct3d' && /windows|win32|win64/.test(os)) ||
-    (backend === 'metal' && /macos|mac os|ios|ipad|iphone/.test(os)) ||
-    (backend === 'mesa' && /linux|ubuntu|fedora|debian|chrome ?os/.test(os));
-  if (!osMatches) {
-    return [
-      {
-        id: 'spec.webgl.backend_os_mismatch',
-        severity: context.privacyHardened ? 'soft' : 'hard',
-        detail: `WebGL backend ${backend} is inconsistent with OS ${osFamily || 'unknown'}`,
-      },
-    ];
+  try {
+    const source = asRecord(context);
+    const backend = classifyWebglBackend(renderer);
+    const os = String(osFamily || '').toLowerCase();
+    if (backend === 'swiftshader' || backend === 'vulkan' || backend === 'unknown') return [];
+    const osMatches =
+      (backend === 'direct3d' && /windows|win32|win64/.test(os)) ||
+      (backend === 'metal' && /macos|mac os|ios|ipad|iphone/.test(os)) ||
+      (backend === 'mesa' && /linux|ubuntu|fedora|debian|chrome ?os/.test(os));
+    if (!osMatches) {
+      return [
+        {
+          id: 'spec.webgl.backend_os_mismatch',
+          severity: source.privacyHardened ? 'soft' : 'hard',
+          detail: `WebGL backend ${backend} is inconsistent with OS ${osFamily || 'unknown'}`,
+        },
+      ];
+    }
+    return [];
+  } catch {
+    return [];
   }
-  return [];
 }
 
 /** Desktop Chrome exposes a PDF viewer face; mobile builds do not. Soft: enterprise builds vary. */
@@ -346,30 +380,36 @@ export function checkHttpUaChReconciliation(
   transport: TransportIdentity,
   context: { privacyHardened?: boolean } = {}
 ): SpecViolation[] {
-  const http = String(transport.httpPlatform || '').toLowerCase();
-  const js = String(transport.jsPlatform || '').toLowerCase();
-  if (!http || !js) return [];
-  const family = (value: string): string => {
-    if (/win/.test(value)) return 'windows';
-    if (/mac|iphone|ipad|ipod/.test(value)) return 'apple';
-    if (/android/.test(value)) return 'android';
-    if (/linux|cros|chrome ?os/.test(value)) return 'linux';
-    return '';
-  };
-  const httpFamily = family(http);
-  const jsFamily = family(js);
-  // Windows 11 reports NT 10.0 and a UA-CH platformVersion >= 13; both still map to "windows",
-  // so a Win10 label in JS must not be flagged as a spoof.
-  if (httpFamily && jsFamily && httpFamily !== jsFamily) {
-    return [
-      {
-        id: 'spec.transport.platform_reconciliation',
-        severity: context.privacyHardened ? 'soft' : 'hard',
-        detail: `HTTP/UA-CH platform ${http} disagrees with JS platform ${js}`,
-      },
-    ];
+  try {
+    const source = asRecord(transport);
+    const privacySource = asRecord(context);
+    const http = String(source.httpPlatform || '').toLowerCase();
+    const js = String(source.jsPlatform || '').toLowerCase();
+    if (!http || !js) return [];
+    const family = (value: string): string => {
+      if (/win/.test(value)) return 'windows';
+      if (/mac|iphone|ipad|ipod/.test(value)) return 'apple';
+      if (/android/.test(value)) return 'android';
+      if (/linux|cros|chrome ?os/.test(value)) return 'linux';
+      return '';
+    };
+    const httpFamily = family(http);
+    const jsFamily = family(js);
+    // Windows 11 reports NT 10.0 and a UA-CH platformVersion >= 13; both still map to "windows",
+    // so a Win10 label in JS must not be flagged as a spoof.
+    if (httpFamily && jsFamily && httpFamily !== jsFamily) {
+      return [
+        {
+          id: 'spec.transport.platform_reconciliation',
+          severity: privacySource.privacyHardened ? 'soft' : 'hard',
+          detail: `HTTP/UA-CH platform ${http} disagrees with JS platform ${js}`,
+        },
+      ];
+    }
+    return [];
+  } catch {
+    return [];
   }
-  return [];
 }
 
 export interface HardwareSnapshot {
@@ -386,26 +426,33 @@ export function checkHardwareDrift(
   previous: HardwareSnapshot,
   context: { privacyHardened?: boolean } = {}
 ): SpecViolation[] {
-  if (context.privacyHardened) return [];
-  const violations: SpecViolation[] = [];
-  const compare = (key: keyof HardwareSnapshot, label: string): void => {
-    const a = current[key];
-    const b = previous[key];
-    if (a === undefined || b === undefined || a === null || b === null) return;
-    if (String(a) !== String(b)) {
-      violations.push({
-        id: `spec.hardware_drift.${label}`,
-        severity: 'hard',
-        detail: `${label} drifted from ${String(b)} to ${String(a)} across loads`,
-      });
-    }
-  };
-  compare('gpu', 'gpu');
-  compare('cpuCores', 'cpuCores');
-  compare('memoryGb', 'memoryGb');
-  compare('screen', 'screen');
-  compare('platform', 'platform');
-  return violations;
+  try {
+    const source = asRecord(context);
+    const currentSnapshot = asRecord(current);
+    const previousSnapshot = asRecord(previous);
+    if (source.privacyHardened) return [];
+    const violations: SpecViolation[] = [];
+    const compare = (key: keyof HardwareSnapshot, label: string): void => {
+      const a = currentSnapshot[key];
+      const b = previousSnapshot[key];
+      if (a === undefined || b === undefined || a === null || b === null) return;
+      if (String(a) !== String(b)) {
+        violations.push({
+          id: `spec.hardware_drift.${label}`,
+          severity: 'hard',
+          detail: `${label} drifted from ${String(b)} to ${String(a)} across loads`,
+        });
+      }
+    };
+    compare('gpu', 'gpu');
+    compare('cpuCores', 'cpuCores');
+    compare('memoryGb', 'memoryGb');
+    compare('screen', 'screen');
+    compare('platform', 'platform');
+    return violations;
+  } catch {
+    return [];
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -444,35 +491,49 @@ export interface SpecInvariantResult {
 }
 
 export function evaluateSpecInvariants(input: SpecInvariantInput = {}): SpecInvariantResult {
-  const privacyHardened = resolvePrivacyHardened(input);
-  const softwareRenderer = isSwiftShaderRenderer(input.webglRenderer || '');
-  const gpuObservation = resolveGpuObservation(
-    input.webglVendor,
-    input.webglRenderer,
-    input.gpuCapabilityClass
-  );
-  const violations: SpecViolation[] = [
-    ...checkDeviceMemory(input.deviceMemoryGb, { privacyHardened }),
-    ...checkNetworkRtt(input.networkRtt, { privacyHardened }),
-    ...checkBatteryManager(input.battery),
-    ...checkJsHeapSizeLimit(input.jsHeapSizeLimit, input.expectedJsHeapSizeLimit),
-    ...checkWebglBackendAgainstOs(input.webglRenderer || '', input.osFamily || '', { privacyHardened }),
-    ...checkPdfPluginFace(input.deviceKind || 'unknown', input.hasPdfFace),
-    ...checkHttpUaChReconciliation(input.transport || {}, { privacyHardened }),
-    ...checkHardwareDrift(input.currentHardware || {}, input.previousHardware || {}, { privacyHardened }),
-  ];
-  const hard = violations.filter((v) => v.severity === 'hard');
-  const soft = violations.filter((v) => v.severity === 'soft');
-  return {
-    violations,
-    reasons: violations.map((v) => v.detail),
-    hardViolations: hard.map((v) => v.id),
-    softViolations: soft.map((v) => v.id),
-    hard_spec_violation: hard.length > 0,
-    privacy_hardened: privacyHardened,
-    software_renderer: softwareRenderer,
-    gpu_observation: gpuObservation,
-  };
+  try {
+    const source = asRecord(input);
+    const privacyHardened = resolvePrivacyHardened(source);
+    const softwareRenderer = isSwiftShaderRenderer(source.webglRenderer || '');
+    const gpuObservation = resolveGpuObservation(
+      source.webglVendor,
+      source.webglRenderer,
+      source.gpuCapabilityClass
+    );
+    const violations: SpecViolation[] = [
+      ...checkDeviceMemory(source.deviceMemoryGb, { privacyHardened }),
+      ...checkNetworkRtt(source.networkRtt, { privacyHardened }),
+      ...checkBatteryManager(source.battery),
+      ...checkJsHeapSizeLimit(source.jsHeapSizeLimit, source.expectedJsHeapSizeLimit),
+      ...checkWebglBackendAgainstOs(source.webglRenderer || '', source.osFamily || '', { privacyHardened }),
+      ...checkPdfPluginFace(source.deviceKind || 'unknown', source.hasPdfFace),
+      ...checkHttpUaChReconciliation(source.transport || {}, { privacyHardened }),
+      ...checkHardwareDrift(source.currentHardware || {}, source.previousHardware || {}, { privacyHardened }),
+    ];
+    const hard = violations.filter((v) => v.severity === 'hard');
+    const soft = violations.filter((v) => v.severity === 'soft');
+    return {
+      violations,
+      reasons: violations.map((v) => v.detail),
+      hardViolations: hard.map((v) => v.id),
+      softViolations: soft.map((v) => v.id),
+      hard_spec_violation: hard.length > 0,
+      privacy_hardened: privacyHardened,
+      software_renderer: softwareRenderer,
+      gpu_observation: gpuObservation,
+    };
+  } catch {
+    return {
+      violations: [],
+      reasons: [],
+      hardViolations: [],
+      softViolations: [],
+      hard_spec_violation: false,
+      privacy_hardened: false,
+      software_renderer: false,
+      gpu_observation: 'observation_unavailable',
+    };
+  }
 }
 
 /**
@@ -488,19 +549,24 @@ export function enforceTamperingInvariant(input: {
   privacy_hardened?: boolean;
   software_renderer?: boolean;
 }): Pick<TamperingAxes, 'detected' | 'reasons' | 'hard_spec_violation' | 'privacy_hardened'> {
-  const privacy = Boolean(input.privacy_hardened);
-  const swiftshader = Boolean(input.software_renderer);
-  const rawReasons = (input.reasons || []).filter((r) => typeof r === 'string' && r.trim());
-  const reasons = rawReasons.filter((reason) => {
-    if (privacy && /privacy|rfp|fpp|brave|tor|atfp|fingerprint.?protection/i.test(reason)) return false;
-    if (swiftshader && /swiftshader|software.?render|llvmpipe|mesa offscreen/i.test(reason)) return false;
-    return true;
-  });
-  // A hard spec violation caused solely by a privacy browser is exempt; any independent hard
-  // violation survives.
-  const hard_spec_violation = Boolean(input.hard_spec_violation) && !privacy;
-  const detected = reasons.length > 0 || hard_spec_violation;
-  return { detected, reasons, hard_spec_violation, privacy_hardened: privacy };
+  try {
+    const source = asRecord(input);
+    const privacy = Boolean(source.privacy_hardened);
+    const swiftshader = Boolean(source.software_renderer);
+    const rawReasons = (source.reasons || []).filter((r) => typeof r === 'string' && r.trim());
+    const reasons = rawReasons.filter((reason) => {
+      if (privacy && /privacy|rfp|fpp|brave|tor|atfp|fingerprint.?protection/i.test(reason)) return false;
+      if (swiftshader && /swiftshader|software.?render|llvmpipe|mesa offscreen/i.test(reason)) return false;
+      return true;
+    });
+    // A hard spec violation caused solely by a privacy browser is exempt; any independent hard
+    // violation survives.
+    const hard_spec_violation = Boolean(source.hard_spec_violation) && !privacy;
+    const detected = reasons.length > 0 || hard_spec_violation;
+    return { detected, reasons, hard_spec_violation, privacy_hardened: privacy };
+  } catch {
+    return { detected: false, reasons: [], hard_spec_violation: false, privacy_hardened: false };
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -569,23 +635,28 @@ export function toInspectorState(state: InspectorState | LegacyInspectorState): 
 export function resolveInspectorState(
   signals: InspectorSignals = {}
 ): InspectorState | LegacyInspectorState {
-  // Only a protocol-level binding (cdpAttached / strongCdpProof) is CDP proof. A runtime leak,
-  // an electron / IDE host or a docked layout is DevTools-UI evidence only and can never attach
-  // CDP on its own.
-  const cdp = Boolean(signals.cdpAttached) || Boolean(signals.strongCdpProof);
-  const verifiedUi = Boolean(signals.devtoolsActiveVerified);
-  if (cdp && verifiedUi) return 'yes-corroborated';
-  if (cdp) return 'yes-unattributed';
-  if (verifiedUi || Boolean(signals.developerTools)) return 'devtools_active_verified';
-  if (
-    Boolean(signals.cdpRuntimeLeak) ||
-    signals.automationEnvironment === 'electron' ||
-    signals.automationEnvironment === 'ide_webview' ||
-    Boolean(signals.viewportContractionNormalized)
-  ) {
-    return 'devtools_docked_suspected';
+  try {
+    const source = asRecord(signals);
+    // Only a protocol-level binding (cdpAttached / strongCdpProof) is CDP proof. A runtime leak,
+    // an electron / IDE host or a docked layout is DevTools-UI evidence only and can never attach
+    // CDP on its own.
+    const cdp = Boolean(source.cdpAttached) || Boolean(source.strongCdpProof);
+    const verifiedUi = Boolean(source.devtoolsActiveVerified);
+    if (cdp && verifiedUi) return 'yes-corroborated';
+    if (cdp) return 'yes-unattributed';
+    if (verifiedUi || Boolean(source.developerTools)) return 'devtools_active_verified';
+    if (
+      Boolean(source.cdpRuntimeLeak) ||
+      source.automationEnvironment === 'electron' ||
+      source.automationEnvironment === 'ide_webview' ||
+      Boolean(source.viewportContractionNormalized)
+    ) {
+      return 'devtools_docked_suspected';
+    }
+    return 'no';
+  } catch {
+    return 'no';
   }
-  return 'no';
 }
 
 /**
@@ -624,10 +695,15 @@ export function inspectorFlagsForState(
  * New code should prefer `resolveInspectorState` and then `inspectorFlagsForState`.
  */
 export function classifyInspectorState(signals: InspectorSignals = {}): LegacyInspectorState {
-  if (signals.cdpAttached) return 'automation_protocol_attached';
-  if (signals.devtoolsActiveVerified) return 'devtools_active_verified';
-  if (signals.viewportContractionNormalized) return 'devtools_docked_suspected';
-  return 'closed';
+  try {
+    const source = asRecord(signals);
+    if (source.cdpAttached) return 'automation_protocol_attached';
+    if (source.devtoolsActiveVerified) return 'devtools_active_verified';
+    if (source.viewportContractionNormalized) return 'devtools_docked_suspected';
+    return 'closed';
+  } catch {
+    return 'closed';
+  }
 }
 
 /** A "Verified Human" verdict is permitted only when no inspector was observed at all. */
@@ -657,49 +733,64 @@ export interface InspectorInvariantResult {
  * "Verified Human" verdict can never be rendered while an inspector is present.
  */
 export function checkInspectorInvariants(input: InspectorInvariantInput): InspectorInvariantResult {
-  const canonical_state = toInspectorState(input.inspector_state);
-  // Check the raw spelling: the canonical 3-state value folds bare CDP and docked DevTools into
-  // the same bucket, so normalising first would erase the asymmetric flag mapping.
-  const expected_flags = inspectorFlagsForState(input.inspector_state);
-  const contradictions: string[] = [];
+  try {
+    const source = asRecord(input);
+    const canonical_state = toInspectorState(source.inspector_state);
+    // Check the raw spelling: the canonical 3-state value folds bare CDP and docked DevTools into
+    // the same bucket, so normalising first would erase the asymmetric flag mapping.
+    const expected_flags = inspectorFlagsForState(source.inspector_state);
+    const contradictions: string[] = [];
 
-  if (
-    input.cdp_attached !== undefined &&
-    Boolean(input.cdp_attached) !== expected_flags.cdp_attached
-  ) {
-    contradictions.push(
-      `cdp_attached=${Boolean(input.cdp_attached)} contradicts inspector_state '${canonical_state}' (expected ${expected_flags.cdp_attached})`
-    );
-  }
-  if (
-    input.developer_tools !== undefined &&
-    Boolean(input.developer_tools) !== expected_flags.developer_tools
-  ) {
-    contradictions.push(
-      `developer_tools=${Boolean(input.developer_tools)} contradicts inspector_state '${canonical_state}' (expected ${expected_flags.developer_tools})`
-    );
-  }
+    if (
+      source.cdp_attached !== undefined &&
+      Boolean(source.cdp_attached) !== expected_flags.cdp_attached
+    ) {
+      contradictions.push(
+        `cdp_attached=${Boolean(source.cdp_attached)} contradicts inspector_state '${canonical_state}' (expected ${expected_flags.cdp_attached})`
+      );
+    }
+    if (
+      source.developer_tools !== undefined &&
+      Boolean(source.developer_tools) !== expected_flags.developer_tools
+    ) {
+      contradictions.push(
+        `developer_tools=${Boolean(source.developer_tools)} contradicts inspector_state '${canonical_state}' (expected ${expected_flags.developer_tools})`
+      );
+    }
 
-  const permits_human_verdict = permitsHumanVerdict(canonical_state);
-  const tier = typeof input.verdict_tier === 'string' ? input.verdict_tier : '';
-  if (!permits_human_verdict && /verified\s+human/i.test(tier)) {
-    contradictions.push(
-      `"Verified Human" verdict is forbidden while inspector_state is '${canonical_state}'`
-    );
-  }
+    const permits_human_verdict = permitsHumanVerdict(canonical_state);
+    const tier = typeof source.verdict_tier === 'string' ? source.verdict_tier : '';
+    if (!permits_human_verdict && /verified\s+human/i.test(tier)) {
+      contradictions.push(
+        `"Verified Human" verdict is forbidden while inspector_state is '${canonical_state}'`
+      );
+    }
 
-  return {
-    consistent: contradictions.length === 0,
-    contradictions,
-    canonical_state,
-    expected_flags,
-    permits_human_verdict,
-  };
+    return {
+      consistent: contradictions.length === 0,
+      contradictions,
+      canonical_state,
+      expected_flags,
+      permits_human_verdict,
+    };
+  } catch {
+    return {
+      consistent: true,
+      contradictions: [],
+      canonical_state: 'no',
+      expected_flags: { cdp_attached: false, developer_tools: false },
+      permits_human_verdict: true,
+    };
+  }
 }
 
 /** Boolean convenience wrapper around `checkInspectorInvariants`. */
 export function hasInspectorContradictions(input: InspectorInvariantInput): boolean {
-  return checkInspectorInvariants(input).contradictions.length > 0;
+  try {
+    return checkInspectorInvariants(input).contradictions.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 /* -------------------------------------------------------------------------- */

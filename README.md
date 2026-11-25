@@ -19,13 +19,13 @@
 
 Intel System turns a browser visit into an explainable intelligence profile. It combines first-party identity signals, hardware and rendering fingerprints, network telemetry, privacy indicators, and behavioural context to assess whether a visitor is human, automated, private, proxied, or emulated.
 
-Identity is resolved in three layers: a persistent Visitor ID, a deterministic hardware fingerprint, and a browser fingerprint. The server matches them through exact, hardware, cross-browser, and lenient modes, returns the winning mode with a calibrated confidence score, and records the visit as history.
+Identity is resolved in three layers: a persistent Visitor ID, a deterministic hardware fingerprint, and a browser fingerprint. The server matches them through exact, hardware, cross-browser, and lenient modes, returns the winning mode with an **uncalibrated** match-evidence score, and records the visit as history. Confidence claims require a reviewed, held-out labelled corpus that does not exist yet.
 
-Every analysis runs through a signed first-party API request, is scored across granular signals, and is rendered in a real-time dashboard.
+Every analysis runs through a first-party API request carrying an **unkeyed SHA-256 integrity hash** and nonce (bookkeeping/replay only — not origin authentication), is scored across granular signals, and is rendered in a real-time dashboard.
 
 ## Why it's different
 
-- **First-party and transparent:** visitor signals are collected and processed through your own API, with no third-party tracking dependency.
+- **First-party and transparent:** visitor identity signals are collected and processed through your own API, with no third-party tracking SDK. Optional server-side IP/network enrichment queries external providers; identity and scoring stay first-party.
 - **Tri-layer identity:** a persistent Visitor ID, a hardware-only fingerprint, and a browser-only fingerprint are matched independently, so a visitor is still recognised after a browser change while a genuinely new device stays new.
 - **Multi-layer analysis:** combines browser identity, hardware fingerprints, network intelligence, privacy settings, and behavioural signals.
 - **Explainable scoring:** the canonical 0-100 orthogonal risk ledger (`score_0_100`, `raw_score`, `evidence_ledger`) is the single risk truth, with tiers `Low` / `Elevated` / `High` / `Critical`. The four core cards keep their own explicitly labelled `0/10`–`10/10` per-card scale. The dashboard binds every panel to the one canonical API envelope and never recomputes a score client-side.
@@ -76,7 +76,7 @@ Location is resolved from Cloudflare `request.cf` first, then a provider consens
 
 - **Identity header:** visitor and hardware identity, returning or first-seen state, a categorical confidence tier (with calibration state), the winning match mode, and the consistency verdict.
 - **Risk meter:** the canonical 0-100 ledger score and its `Low` / `Elevated` / `High` / `Critical` tier, next to the four core cards for incognito, automation, network, and virtualisation. Tampering reasons force a `Browser Tampering: Detected` header badge.
-- **Canonical telemetry:** verdict state headline with human corroboration, orthogonal risk families, four separate network provenance axes, permission-gated proximity, corpus-gated rarity, and explicit unavailable states (Active Call, JA3/JA4T, raw TCP SYN os_mismatch). SwiftShader is reported as Software-Rendered Graphics (SwiftShader) — never tampering, never proof of a VM.
+- **Canonical telemetry:** verdict state headline with human corroboration, orthogonal risk families, four separate network provenance axes, permission-gated proximity, corpus-gated rarity, and explicit unavailable states (JA3/JA4T, raw TCP SYN os_mismatch); signals without a measurable browser API (such as Active Call) are omitted from the grid rather than shown as unavailable. SwiftShader is reported as Software-Rendered Graphics (SwiftShader) — never tampering, never proof of a VM.
 - **Visitor overview:** device tiles for browser, OS and device, display, locale and timezone, active session, first and last seen, plus public IP, location, ISP and ASN, recognition source, and phone model when the device exposes one.
 - **Hardware & rendering entropy:** browser, OS, CPU, GPU, memory, display, fonts, emoji metrics, canvas stability, WebGL hashes, and math-vector attributes.
 - **Smart Signals & threat analysis:** deterministic signal rows, four core risk cards, and a granular signal grid.
@@ -159,4 +159,4 @@ Open the [live demo](https://intel.adityahq.me) and select **Analyze my browser*
 
 ## Deployment
 
-Deployment, storage, and cost details are documented in [CLOUDFLARE.md](./CLOUDFLARE.md). Cloudflare Workers is the only deploy target; there is no Vercel deploy path (legacy `vercel.json` is retained untouched as a historical artifact). Only `/api/visitor/*` and `/api/intel/geolocation` reach the Durable Object; `/api/health` and `/api/network/ping` are answered statelessly, so periodic monitors and the 5-second RTT probe never consume row writes.
+Deployment, storage, and cost details are documented in [CLOUDFLARE.md](./CLOUDFLARE.md). Cloudflare Workers is the only deployed target (including https://intel.adityahq.me); the remaining Vercel files are legacy configuration only and are not deployed. Only `/api/visitor/*` and `/api/intel/geolocation` reach the Durable Object; `/api/health` and `/api/network/ping` are answered statelessly, so periodic monitors and the 5-second RTT probe never consume row writes.

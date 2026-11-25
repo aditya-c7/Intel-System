@@ -1,12 +1,13 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "frozen": true,
   "offline": true,
   "generated_on": "2026-11-25",
+  "note": "Schema v2: intentional RTT vocabulary migration to lowercase tcp/quic/unknown to match the Worker and canonical networkTruth contract. Expected values were not weakened; only the transport token casing changed.",
   "cases": [
-    { "id": "NT-01", "name": "HTTP/3 uses QUIC RTT", "input": { "httpProtocol": "HTTP/3", "clientTcpRtt": 40, "clientQuicRtt": 22 }, "expected": { "rtt_ms": 22, "rtt_transport": "QUIC", "rtt_source": "clientQuicRtt", "status": "measured" } },
-    { "id": "NT-02", "name": "QUIC zero TCP placeholder is no-data", "input": { "httpProtocol": "HTTP/3", "clientTcpRtt": 0, "clientQuicRtt": 0 }, "expected": { "rtt_ms": null, "rtt_transport": "QUIC", "status": "no-data" } },
-    { "id": "NT-03", "name": "HTTP/2 uses TCP RTT", "input": { "httpProtocol": "HTTP/2", "clientTcpRtt": 31, "clientQuicRtt": 12 }, "expected": { "rtt_ms": 31, "rtt_transport": "TCP", "rtt_source": "clientTcpRtt", "status": "measured" } },
+    { "id": "NT-01", "name": "HTTP/3 uses QUIC RTT", "input": { "httpProtocol": "HTTP/3", "clientTcpRtt": 40, "clientQuicRtt": 22 }, "expected": { "rtt_ms": 22, "rtt_transport": "quic", "rtt_source": "clientQuicRtt", "status": "measured" } },
+    { "id": "NT-02", "name": "QUIC zero TCP placeholder is no-data", "input": { "httpProtocol": "HTTP/3", "clientTcpRtt": 0, "clientQuicRtt": 0 }, "expected": { "rtt_ms": null, "rtt_transport": "quic", "status": "no-data" } },
+    { "id": "NT-03", "name": "HTTP/2 uses TCP RTT", "input": { "httpProtocol": "HTTP/2", "clientTcpRtt": 31, "clientQuicRtt": 12 }, "expected": { "rtt_ms": 31, "rtt_transport": "tcp", "rtt_source": "clientTcpRtt", "status": "measured" } },
     { "id": "NT-04", "name": "RTT outside sanity range", "input": { "httpProtocol": "HTTP/2", "clientTcpRtt": 2500 }, "expected": { "rtt_ms": null, "status": "invalid" } },
     { "id": "NT-05", "name": "Fresh proxy with provider", "input": { "classification": "vpn", "provider": "ExampleVPN", "last_seen": "2026-11-24", "nowMs": 1795564800000, "source_tier": "privacy_extended", "confidence": 2 }, "expected": { "recency_bucket": "fresh", "status": "observed", "provider": "ExampleVPN" } },
     { "id": "NT-06", "name": "Stale proxy is not current", "input": { "classification": "proxy", "provider": "OldVPN", "last_seen": "2026-01-01", "nowMs": 1795564800000 }, "expected": { "recency_bucket": "stale", "status": "stale" } },

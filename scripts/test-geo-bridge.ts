@@ -304,9 +304,11 @@ function run(): void {
   });
 
   check('C5', 'accuracy_m is the raw reported accuracy, not transformed', () => {
-    for (const accuracyM of [0.001, 0.5, 1, 12, 9999.75]) {
+    for (const accuracyM of [0.001, 0.5, 1, 12, 4999.75]) {
       assert.equal(proxOf(fix({ accuracyM }))!.accuracy_m, accuracyM);
     }
+    // Values above the published precision cap abstain instead of claiming false precision.
+    assert.equal(proxOf(fix({ accuracyM: 9999.75 })), null);
   });
 
   check('C6', 'id is coordinate-free and salted (one-way pseudonym)', () => {
@@ -321,7 +323,7 @@ function run(): void {
 
   check('D1', 'same coordinates + different accuracy -> different confidence (monotone)', () => {
     const tight = proxOf(fix({ accuracyM: 1 }))!;
-    const loose = proxOf(fix({ accuracyM: 10000 }))!;
+    const loose = proxOf(fix({ accuracyM: 1000 }))!;
     assert.ok(tight.confidence > loose.confidence);
     assert.notEqual(tight.confidence, loose.confidence);
   });
@@ -334,12 +336,13 @@ function run(): void {
   });
 
   check('D3', 'confidence is always finite and within [0,1]', () => {
-    for (const accuracyM of [0.001, 1, 12, 1000, 1e9]) {
+    for (const accuracyM of [0.001, 1, 12, 1000, 5000]) {
       const confidence = proxOf(fix({ accuracyM }))!.confidence;
       assert.equal(typeof confidence, 'number');
       assert.ok(Number.isFinite(confidence));
       assert.ok(confidence >= 0 && confidence <= 1, `accuracyM=${accuracyM}`);
     }
+    assert.equal(proxOf(fix({ accuracyM: 1e9 })), null);
   });
 
   check('D4', 'tiny coordinate change shares a coarse cell; distant point does not', () => {

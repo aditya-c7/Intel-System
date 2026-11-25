@@ -7,9 +7,9 @@
  *
  * Design rules (all total / non-throwing / deterministic):
  *  - `privacyHardened` (an explicit posture claim) or an accepted `vendorSignature`,
- *    together with `noiseOnly`, is the ONLY path to `suppressPenalty=true`. Noise by
- *    itself, or a posture claim without the noise-only condition, never earns the
- *    exemption.
+ *    together with `noiseOnly` and no automation artifact, is the ONLY path to
+ *    `suppressPenalty=true`. Noise by itself, a posture claim without the noise-only
+ *    condition, or any automation proof never earns the exemption.
  *  - `automationArtifact` is diagnostic-only: it can NEVER set `anti_detect_browser`,
  *    create a privacy claim, or earn the exemption on its own.
  *  - Only `hardContradiction` — a fact privacy hardening cannot explain away — sets
@@ -26,15 +26,15 @@
 /**
  * All evidence the resolver consumes. Every field is optional and nullable.
  *
- * `vendorSignature` accepts a boolean (`true` = an explicit vendor signature is present)
- * or a vendor-name string resolved through the strict allowlist below. `automationArtifact`
- * likewise accepts a boolean or a diagnostic token string. Only a literal `true` (or an
- * accepted vendor string) is affirmative; truthy junk is ignored.
+ * `vendorSignature` accepts only a vendor-name string resolved through the strict allowlist
+ * below; a bare boolean (including `true`) is never a vendor signature. `automationArtifact`
+ * accepts a boolean or a diagnostic token string, where only a literal `true` or a non-empty
+ * token is affirmative. Truthy junk is ignored.
  */
 export interface AntiDetectExemptionInput {
   /** Explicit privacy-hardened runtime posture (RFP / FPP / AFP / Tor / Shields). */
   privacyHardened?: boolean | null;
-  /** Claimed vendor privacy signature (boolean or allowlisted vendor name). */
+  /** Claimed vendor privacy signature (allowlisted vendor name; booleans are ignored). */
   vendorSignature?: string | boolean | null;
   /** A physical identity contradiction that privacy hardening cannot explain away. */
   hardContradiction?: boolean | null;
@@ -50,7 +50,7 @@ export interface AntiDetectExemptionResult {
   anti_detect_browser: boolean;
   /** Always in [0, 1]; non-zero only for a hard contradiction. */
   anomaly_score: number;
-  /** True only for (privacyHardened or accepted vendorSignature) with noiseOnly and no contradiction. */
+  /** True only for (privacyHardened or accepted vendorSignature) with noiseOnly, no contradiction and no automation artifact. */
   suppressPenalty: boolean;
   /** Human-readable audit trail (never empty on a successfully resolved input). */
   reasons: string[];
@@ -107,11 +107,11 @@ function isTrue(record: object, key: string): boolean {
 }
 
 /**
- * Resolve a vendor signature to a canonical family. A literal `true` counts as an
- * explicit vendor signature; a string must be in the allowlist. Everything else is null.
+ * Resolve a vendor signature to a canonical family. Only a non-empty string that resolves
+ * through the strict allowlist is accepted; a bare boolean (including `true`) is never a
+ * vendor signature. Everything else is null.
  */
 function acceptedVendorFamily(value: unknown): string | null {
-  if (value === true) return 'explicit vendor signature';
   if (typeof value !== 'string') return null;
   const key = value.toLowerCase().replace(/[^a-z0-9]/g, '');
   if (key.length === 0) return null;
@@ -181,11 +181,13 @@ export function resolveAntiDetectExemption(
       }
     }
 
-    /* 2. Suppression: (posture or vendor) AND noise-only AND no hard contradiction. */
+    /* 2. Suppression: (posture or vendor) AND noise-only AND no hard contradiction AND no automation. */
     const exemptionBase = privacyHardened || vendorFamily !== null;
-    const suppressPenalty = exemptionBase && noiseOnly && !hardContradiction;
+    const suppressPenalty = exemptionBase && noiseOnly && !hardContradiction && !automationPresent;
     if (suppressPenalty) {
       reasons.push('Exemption granted: privacy posture/signature with noise-only artifacts; penalty suppressed');
+    } else if (!hardContradiction && exemptionBase && noiseOnly && automationPresent) {
+      reasons.push('Automation artifact present; exemption withheld (automation proof outranks privacy posture/signature)');
     } else if (!hardContradiction && exemptionBase && !noiseOnly) {
       reasons.push('Privacy posture present but noise-only condition missing; no penalty suppression');
     } else if (!hardContradiction && !exemptionBase && noiseOnly) {

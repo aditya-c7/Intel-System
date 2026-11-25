@@ -15,7 +15,14 @@
  * `hexCellId` keeps a synchronous string contract, so it uses a deterministic
  * HMAC-style construction built on FNV-1a (the pure fallback). WebCrypto's HMAC is
  * asynchronous by specification; `hexCellIdAsync` uses `crypto.subtle` when the
- * platform exposes it and transparently falls back to the same FNV construction.
+ * platform exposes it (with real `Uint8Array` BufferSources) and transparently
+ * falls back to the same FNV construction when it does not.
+ *
+ * Longitude is wrapped into [-180,180) and snapped to a whole number of columns
+ * around each parallel, with the antimeridian at the centre of column 0, so
+ * points on either side of the seam share a cell instead of landing at opposite
+ * ends of the projected x axis. Reported accuracy above the largest tier's cap
+ * is rejected rather than published with a false `precision_radius`.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -62,7 +69,9 @@ interface TierBand {
 
 /**
  * Bands are [0,10) [10,75) [75,200) [200,1000) [1000,+inf). The tier's radius is
- * the closed upper bound of its band (the open-ended tier uses a conservative cap).
+ * the closed upper bound of its band; the open-ended tier's radius is a CAP, not
+ * a measurement. `proximityFromGeolocation` rejects accuracies above that cap
+ * instead of publishing a false `precision_radius` for an unbounded fix.
  */
 const TIER_BANDS: readonly TierBand[] = [
   { upperExclusive: 10, radiusMeters: 10, label: 'fine' },
@@ -71,6 +80,9 @@ const TIER_BANDS: readonly TierBand[] = [
   { upperExclusive: 1000, radiusMeters: 1000, label: 'coarse' },
   { upperExclusive: Number.POSITIVE_INFINITY, radiusMeters: 5000, label: 'rough' },
 ];
+
+/** Largest reported accuracy this module is willing to publish as a radius. */
+const MAX_REPORTED_ACCURACY_METERS = TIER_BANDS[TIER_BANDS.length - 1].radiusMeters;
 
 const UNKNOWN_LABEL = 'unknown';
 
@@ -137,10 +149,31 @@ function roundAxial(q: number, r: number): HexCoord {
   return { q: rx, r: rz };
 }
 
-/** Local equirectangular metres -> axial hex coordinates for a given cell size. */
+/** Wraps any longitude into the half-open interval [-180, 180). */
+function normalizeLongitude(lon: number): number {
+  return (((lon + 180) % 360) + 360) % 360 - 180;
+}
+
+/**
+ * Local equirectangular metres -> axial hex coordinates for a given cell size.
+ *
+ * Raw equirectangular x puts +179.999 and -179.999 at opposite ends of the map.
+ * Instead, longitude is wrapped into [-180,180) and snapped to the centre of a
+ * whole number of columns around the parallel. The seam sits at the centre of
+ * column 0, so both sides of the antimeridian collapse to that same column and
+ * therefore to the same cell. Column centres also bound x to the circumference,
+ * keeping the projection from stretching near the seam.
+ */
 function axialForPoint(lat: number, lon: number, hexSizeMeters: number): HexCoord {
-  const y = lat * DEG_TO_RAD * EARTH_RADIUS_METERS;
-  const x = lon * DEG_TO_RAD * EARTH_RADIUS_METERS * Math.cos(lat * DEG_TO_RAD);
+  const latRad = lat * DEG_TO_RAD;
+  const cosLat = Math.cos(latRad);
+  const y = latRad * EARTH_RADIUS_METERS;
+  const circumference = Math.max(1, 2 * Math.PI * EARTH_RADIUS_METERS * cosLat);
+  const columns = Math.max(1, Math.round(circumference / hexSizeMeters));
+  const u = (normalizeLongitude(lon) + 180) / 360; // [0, 1)
+  const column = ((Math.floor(u * columns + 0.5) % columns) + columns) % columns;
+  const seamSafeLon = -180 + ((column + 0.5) * 360) / columns;
+  const x = seamSafeLon * DEG_TO_RAD * EARTH_RADIUS_METERS * cosLat;
   const q = (SQRT3_OVER_3 * x - y / 3) / hexSizeMeters;
   const r = ((2 / 3) * y) / hexSizeMeters;
   return roundAxial(q, r);
@@ -229,6 +262,22 @@ function utf8Bytes(input: string): number[] {
   }
   const bytes: number[] = [];
   for (let i = 0; i < input.length; i += 1) bytes.push(input.charCodeAt(i) & 0xff);
+  return bytes;
+}
+
+/**
+ * WebCrypto accepts only `BufferSource` (ArrayBuffer / typed array), never a
+ * plain `number[]`. Produce a real `Uint8Array`; fall back to a manual byte
+ * buffer only where `TextEncoder` is unavailable.
+ */
+function utf8BufferSource(input: string): Uint8Array {
+  try {
+    if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(input);
+  } catch {
+    // fall through to the manual encoding
+  }
+  const bytes = new Uint8Array(input.length);
+  for (let i = 0; i < input.length; i += 1) bytes[i] = input.charCodeAt(i) & 0xff;
   return bytes;
 }
 
@@ -330,12 +379,12 @@ export async function hexCellIdAsync(
       const subtle = (globalThis as { crypto?: { subtle?: SubtleCryptoLike } }).crypto!.subtle!;
       const cryptoKey = await subtle.importKey(
         'raw',
-        utf8Bytes(saltText),
+        utf8BufferSource(saltText),
         { name: 'HMAC', hash: 'SHA-256' },
         false,
         ['sign']
       );
-      const signature = await subtle.sign('HMAC', cryptoKey, utf8Bytes(key));
+      const signature = await subtle.sign('HMAC', cryptoKey, utf8BufferSource(key));
       const digest = Array.from(new Uint8Array(signature))
         .map((byte) => byte.toString(16).padStart(2, '0'))
         .join('');
@@ -379,6 +428,15 @@ export function proximityFromGeolocation(
     };
   }
 
+  // An unbounded/implausible accuracy cannot justify any finite radius. Reject
+  // the fix outright rather than publishing `precision_radius: 5000` as ±5km.
+  if (safe.accuracyMeters > MAX_REPORTED_ACCURACY_METERS) {
+    return {
+      proximity: null,
+      reason: `geolocation accuracy ${safe.accuracyMeters}m exceeds supported maximum ${MAX_REPORTED_ACCURACY_METERS}m; no IP-geolocation fallback used`,
+    };
+  }
+
   const tierInfo = resolvePrecisionTier(safe.accuracyMeters);
   try {
     return {
@@ -395,4 +453,98 @@ export function proximityFromGeolocation(
       reason: 'geolocation processing failed; no IP-geolocation fallback used',
     };
   }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Shared body-emitter gate                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The exact id encoding emitted by this module: `hex_` + 32 lowercase hex digits.
+ * Both `proximityBodyField` emitters use this so no foreign id scheme is published.
+ */
+export const HEX_PROXIMITY_ID_PATTERN = Object.freeze(/^hex_[0-9a-f]{32}$/);
+
+function safeObject(value: unknown): Record<string, unknown> | null {
+  try {
+    if (!value || typeof value !== 'object') return null;
+    return value as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function safeRead(source: unknown, key: string): unknown {
+  const object = safeObject(source);
+  if (!object) return undefined;
+  try {
+    return object[key];
+  } catch {
+    return undefined;
+  }
+}
+
+/** A freshly copied, validated proximity ready for an additive API body. */
+export interface SanitizedProximityForBody {
+  id: string;
+  precision_radius: number;
+  confidence: number;
+  accuracy_m?: number;
+}
+
+/**
+ * Single validation gate shared by both body emitters. Accepts a raw
+ * `HexProximity` (backward-compatible with existing callers) or a result
+ * envelope `{ proximity, reason }`; an envelope is published only when its
+ * `reason` is EXACTLY `'ok'`. Enforces this module's id scheme, a finite
+ * non-negative radius, and `0 <= confidence <= 1`. `requireAccuracy` makes a
+ * positive finite `accuracy_m` mandatory (bridge); otherwise it is included
+ * only when present and valid (adapter).
+ */
+export function sanitizeProximityForBody(
+  source: unknown,
+  requireAccuracy: boolean
+): SanitizedProximityForBody | null {
+  const envelope = safeObject(source);
+  let isEnvelope = false;
+  try {
+    isEnvelope = Boolean(envelope && ('proximity' in envelope || 'reason' in envelope));
+  } catch {
+    isEnvelope = false;
+  }
+
+  let candidate: unknown = source;
+  if (isEnvelope) {
+    if (safeRead(envelope, 'reason') !== 'ok') return null;
+    candidate = safeRead(envelope, 'proximity');
+  }
+
+  const target = safeObject(candidate);
+  if (!target) return null;
+
+  const id = safeRead(target, 'id');
+  if (typeof id !== 'string' || !HEX_PROXIMITY_ID_PATTERN.test(id)) return null;
+
+  const precisionRadius = safeFiniteNumber(safeRead(target, 'precision_radius'));
+  const confidence = safeFiniteNumber(safeRead(target, 'confidence'));
+  if (
+    precisionRadius === null ||
+    precisionRadius < 0 ||
+    confidence === null ||
+    confidence < 0 ||
+    confidence > 1
+  ) {
+    return null;
+  }
+
+  const rawAccuracy = safeFiniteNumber(safeRead(target, 'accuracy_m'));
+  if (requireAccuracy && (rawAccuracy === null || rawAccuracy <= 0)) return null;
+
+  const sanitized: SanitizedProximityForBody = {
+    id,
+    precision_radius: precisionRadius,
+    confidence,
+  };
+  if (rawAccuracy !== null && rawAccuracy > 0) sanitized.accuracy_m = rawAccuracy;
+  return sanitized;
 }

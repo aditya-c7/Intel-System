@@ -166,8 +166,11 @@ export function stabilizeConfidence(
     const changed = stabilized !== normalized;
 
     return {
+      // The quantized value is published only for display stability. The tier is derived
+      // from the caller's RAW score so quantization can never upgrade the meaning:
+      // e.g. raw 0.83 is 'Medium-High' and must not become 'High' after snapping to 0.85.
+      tier: confidenceBandForScore(raw),
       score: stabilized,
-      tier: confidenceBandForScore(stabilized),
       stabilityKey,
       changed,
       reason: changed ? 'score_quantized_for_stability' : 'score_stable',

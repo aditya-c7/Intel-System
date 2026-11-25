@@ -21,7 +21,7 @@ function check(id: string, name: string, fn: () => void): void {
   }
 }
 
-assert.equal(fixture.schema_version, 1);
+assert.equal(fixture.schema_version, 2);
 assert.equal(fixture.frozen, true);
 
 for (const item of fixture.cases) {

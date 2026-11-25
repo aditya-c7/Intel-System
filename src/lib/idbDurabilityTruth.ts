@@ -8,8 +8,9 @@
  * The old decision required OPFS corroboration for a decisive IDB ratio, but OPFS worker flush
  * is unavailable (`null`) on modern Chromium, so even a clean 0.531 ratio was vetoed. This
  * resolver keeps the hard vetoes and the original deadband, but lets a *strong* RAM signature
- * (ratio <= 0.9) stand on its own, because a disk-backed profile fsyncing `strict` commits
- * cannot produce a ratio below 1 in any observed configuration.
+ * (ratio <= 1.4) stand on its own, because a disk-backed profile fsyncing `strict` commits
+ * cannot produce a ratio below 1 in any observed configuration. Independent OPFS / auxiliary
+ * private-mode corroboration still upgrades an otherwise inconclusive deadband verdict.
  *
  * Pure, total, non-throwing, no side effects. Does not alter the 0-10 risk headline, verdict
  * tiers, bot parity or any existing scoring path.
@@ -43,7 +44,7 @@ export interface IdbDurabilityTruth {
  * profiles measure 2.701-7.464, so 1.40 cleanly separates them with a >2x safety margin.
  */
 export const STRONG_RAM_RATIO_MAX = 1.4;
-/** Original Chromium private-side deadband boundary, still used for corroborated cases. */
+/** Original Chromium private-side deadband boundary, retained as a published threshold constant. */
 export const IDB_PRIVATE_RATIO_MAX = 1.12;
 /** Disk-backed boundary; slightly widened so the 1.40-1.60 band still fails open. */
 export const IDB_NORMAL_RATIO_MIN = 1.6;
@@ -57,25 +58,31 @@ function bool(value: unknown): boolean {
  *
  * A private window keeps its first-party cookie/localStorage for the lifetime of that private
  * session, so every page after the first carries the marker. The veto must not erase a decisive
- * RAM-backed physics verdict in that case. Normal disk-backed profiles (ratio far above 1.1),
- * deadband/inconclusive probes and all hard vetoes keep the original marker behavior.
+ * RAM-backed physics verdict in that case. Normal disk-backed profiles (ratio above the strong
+ * RAM boundary), deadband/inconclusive probes and all hard vetoes keep the original marker
+ * behavior. Total: all reads are guarded and any failure falls back to applying the veto.
  */
 export function shouldApplyMarkerVeto(
   markerPresent: boolean | null | undefined,
   truth: IdbDurabilityTruth,
   ratio: number | null | undefined
 ): boolean {
-  if (markerPresent !== true) return false;
-  if (
-    truth.incognito &&
-    truth.rule === 'strong_ram_signature' &&
-    typeof ratio === 'number' &&
-    Number.isFinite(ratio) &&
-    ratio <= 1.1
-  ) {
-    return false;
+  try {
+    if (markerPresent !== true) return false;
+    if (!truth || typeof truth !== 'object') return true;
+    if (
+      truth.incognito === true &&
+      truth.rule === 'strong_ram_signature' &&
+      typeof ratio === 'number' &&
+      Number.isFinite(ratio) &&
+      ratio <= STRONG_RAM_RATIO_MAX
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return true;
   }
-  return true;
 }
 
 export function resolveIdbDurabilityTruth(input: IdbDurabilityInput = {}): IdbDurabilityTruth {
@@ -124,18 +131,19 @@ export function resolveIdbDurabilityTruth(input: IdbDurabilityInput = {}): IdbDu
     return { incognito: true, confidence: 'high', rule: 'strong_ram_signature', reasons };
   }
 
+  // Independent private-mode corroboration is decisive in the otherwise inconclusive deadband.
+  // Evaluate it before the disk-backed branch so a corroborated private verdict is never
+  // collapsed into disk_backed/high; the strong-RAM branch above already returns above.
+  if (!highVariance && opfsCorroboration && ratio <= IDB_NORMAL_RATIO_MIN) {
+    reasons.push(
+      `ratio ${ratio} in deadband (<= ${IDB_NORMAL_RATIO_MIN}) with independent private-mode corroboration`
+    );
+    return { incognito: true, confidence: 'high', rule: 'corroborated_private', reasons };
+  }
+
   if (ratio > IDB_NORMAL_RATIO_MIN) {
     reasons.push(`strict/relaxed ratio ${ratio} > ${IDB_NORMAL_RATIO_MIN}: disk-backed profile`);
     return { incognito: false, confidence: 'high', rule: 'disk_backed', reasons };
-  }
-
-  if (
-    ratio < IDB_PRIVATE_RATIO_MAX &&
-    !highVariance &&
-    opfsCorroboration
-  ) {
-    reasons.push(`ratio ${ratio} below ${IDB_PRIVATE_RATIO_MAX} with independent corroboration`);
-    return { incognito: true, confidence: 'high', rule: 'corroborated_private', reasons };
   }
 
   reasons.push(

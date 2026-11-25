@@ -100,6 +100,10 @@ const UNTRUSTED_FORWARD_HEADERS = [
   'true-client-ip',
   'x-real-ip',
   'x-client-ip',
+  // The backend falls back to these when cf-connecting-ip is missing; only the Worker may
+  // set them, and only from a validated public cf-connecting-ip (see forwardApiRequest).
+  'x-forwarded-for',
+  'forwarded',
   'x-appengine-user-ip',
   // R3 lookalikes for the sealed edge-transport headers. colo / protocol / client lat-lon /
   // normalized RTT come ONLY from request.cf via the worker-set x-intel-edge-geo header;
@@ -147,6 +151,98 @@ function cfString(value) {
 }
 
 /**
+ * Conservative public-IP check for the one address Cloudflare controls (`cf-connecting-ip`).
+ * A private / reserved / malformed value must never become a forwardable client identity or a
+ * shareable rate-limit bucket key. Both stacks are checked explicitly rather than trusting
+ * a generic "looks like an IP" regex.
+ */
+function isPublicIpv4(value) {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(value);
+  if (!match) return false;
+  const parts = match.slice(1).map(Number);
+  // Reject leading zeros (e.g. 010.0.0.1), which some parsers treat as octal.
+  for (let i = 0; i < parts.length; i += 1) {
+    if (parts[i] < 0 || parts[i] > 255 || String(parts[i]) !== match[i + 1]) return false;
+  }
+  const [a, b, c] = parts;
+  if (a === 0 || a === 10 || a === 127 || a >= 224) return false;
+  if (a === 100 && b >= 64 && b <= 127) return false; // 100.64/10 CGNAT
+  if (a === 169 && b === 254) return false; // link-local
+  if (a === 172 && b >= 16 && b <= 31) return false; // 172.16/12
+  if (a === 192 && b === 168) return false; // 192.168/16
+  if (a === 192 && b === 0 && c === 0) return false; // 192.0.0.0/24
+  if (a === 192 && b === 0 && c === 2) return false; // TEST-NET-1
+  if (a === 192 && b === 88 && c === 99) return false; // deprecated 6to4 relay
+  if (a === 198 && (b === 18 || b === 19)) return false; // benchmarking
+  if (a === 198 && b === 51 && c === 100) return false; // TEST-NET-2
+  if (a === 203 && b === 0 && c === 113) return false; // TEST-NET-3
+  return true;
+}
+
+/** Parses a global IPv6 literal into eight 16-bit groups, or null when reserved/malformed. */
+function publicIpv6Groups(value) {
+  if (typeof value !== 'string' || !/^[0-9a-fA-F:.]+$/.test(value) || value.includes('%')) return null;
+  let text = value.trim();
+  let v4Tail = null;
+  if (text.includes('.')) {
+    const lastColon = text.lastIndexOf(':');
+    if (lastColon < 0) return null;
+    const embedded = text.slice(lastColon + 1);
+    if (!isPublicIpv4(embedded)) return null;
+    const octets = embedded.split('.').map(Number);
+    v4Tail = [(octets[0] << 8) | octets[1], (octets[2] << 8) | octets[3]];
+    text = text.slice(0, lastColon);
+    // `::192.0.2.1` / `1:2::192.0.2.1` lose one colon when the IPv4 tail is split off.
+    if (text.endsWith(':') && !text.includes('::')) text += ':';
+  }
+  let head = text;
+  let tail = '';
+  const compressed = text.includes('::');
+  if (compressed) {
+    if (text.indexOf('::') !== text.lastIndexOf('::')) return null;
+    [head, tail] = text.split('::');
+  }
+  const headGroups = head ? head.split(':') : [];
+  const tailGroups = tail ? tail.split(':') : [];
+  const explicit = headGroups.length + tailGroups.length + (v4Tail ? 2 : 0);
+  if (compressed ? explicit >= 8 : explicit !== 8) return null;
+  const groups = [];
+  for (const token of headGroups) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(token)) return null;
+    groups.push(parseInt(token, 16));
+  }
+  if (compressed) {
+    const missing = 8 - explicit;
+    for (let i = 0; i < missing; i += 1) groups.push(0);
+  }
+  for (const token of tailGroups) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(token)) return null;
+    groups.push(parseInt(token, 16));
+  }
+  if (v4Tail) groups.push(...v4Tail);
+  const [g0, g1, g2, g3] = groups;
+  if (groups.every((group) => group === 0)) return null; // :: and IPv4-compatible space
+  if (g0 === 0) return null; // ::/8 (loopback, unspecified, mapped/compatible)
+  if ((g0 & 0xe000) !== 0x2000) return null; // only 2000::/3 global unicast is public
+  if (g0 === 0x2001 && g1 === 0x0db8) return null; // 2001:db8::/32 documentation
+  if ((g0 & 0xfe00) === 0xfc00) return null; // fc00::/7 unique-local
+  if ((g0 & 0xffc0) === 0xfe80) return null; // fe80::/10 link-local
+  if ((g0 & 0xff00) === 0xff00) return null; // ff00::/8 multicast
+  if (g0 === 0x2001 && g1 <= 0x01ff) return null; // 2001::/23 protocol assignments
+  if (g0 === 0x0064 && g1 === 0xff9b) return null; // NAT64 well-known prefix
+  if (g0 === 0x0100 && g1 === 0 && g2 === 0 && g3 === 0) return null; // 100::/64 discard-only
+  return groups;
+}
+
+/** Returns the trimmed address only when it is a public routable IPv4 or IPv6 literal. */
+function publicClientIp(value) {
+  if (typeof value !== 'string') return '';
+  const text = value.trim();
+  if (!text) return '';
+  return isPublicIpv4(text) || publicIpv6Groups(text) ? text : '';
+}
+
+/**
  * Resolves the three version-attribution values from optional Worker bindings, falling back to
  * the compiled defaults. Binding aliases are accepted so a deployment can wire whichever var
  * its build pipeline already emits without touching this file.
@@ -190,25 +286,74 @@ function lightDistanceKm(rttMs) {
   return { rttMs, estimatedKm: Math.round(km) };
 }
 
+/** Plain-object mirror for request.cf object fields (`edgeL4` / `tlsClientAuth`). */
+function cfObjectValue(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const result = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === 'string' || typeof item === 'boolean' || item === null) result[key] = item;
+    else if (typeof item === 'number' && Number.isFinite(item)) result[key] = item;
+  }
+  return result;
+}
+
+/** request.cf numeric fields arrive as either numbers or decimal strings depending on plan. */
+function finiteNumeric(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+    const parsed = Number(value.trim());
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+/** Mirrors networkTruth.ts hasQuicEdgeHint(): object own-properties (or 'quic'/'h3' string). */
+function hasQuicEdgeHint(value) {
+  try {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return Object.keys(value).length > 0;
+    }
+    if (typeof value === 'string') return /quic|h3/i.test(value);
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 /**
- * R3: the single transport-aware client RTT normalizer. `request.cf` is the only source.
- * HTTP/3 (QUIC) reads `clientQuicRtt`; every other transport reads `clientTcpRtt`. There is
- * deliberately NO cross-transport fallback — a QUIC request never borrows a TCP round trip.
- * Cloudflare's 0 placeholder ("not measured"), negatives, NaN and absent values all become
- * `rtt_ms: null` with `status: 'no-data'`. The value stays in milliseconds (never seconds), and
- * the Server-Timing `cfL4` metric is never consulted here.
+ * R3: the single transport-aware client RTT normalizer, aligned with the canonical
+ * `src/lib/networkTruth.ts` `normalizeRtt()`. `request.cf` is the only source. The transport
+ * is lowercase (`quic` / `tcp` / `unknown`); exactly one source is read, with NO cross-transport
+ * fallback. 0 / negatives / NaN / absent => `no-data`; values outside 1-2000 ms => `invalid`
+ * (always `rtt_ms: null`). Milliseconds only; the Server-Timing `cfL4` metric is never read.
  */
-function normalizedRtt(cf, isHttp3) {
-  const rtt_transport = isHttp3 ? 'quic' : 'tcp';
-  const rtt_source = isHttp3 ? 'clientQuicRtt' : 'clientTcpRtt';
-  const raw = isHttp3 ? cf.clientQuicRtt : cf.clientTcpRtt;
-  const rtt_ms = typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : null;
+function normalizedRtt(cf, transport) {
+  const rtt_transport = transport;
+  const rtt_source =
+    transport === 'quic' ? 'clientQuicRtt' : transport === 'tcp' ? 'clientTcpRtt' : null;
+  const raw =
+    rtt_source === 'clientQuicRtt'
+      ? cf.clientQuicRtt
+      : rtt_source === 'clientTcpRtt'
+        ? cf.clientTcpRtt
+        : null;
+  const positive = typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : null;
+  const invalid = positive !== null && (positive < 1 || positive > 2000);
+  const rtt_ms = invalid ? null : positive;
   return {
-    label: 'normalized edge-observed client RTT (milliseconds; 0/absent = no data)',
+    label: invalid
+      ? 'RTT outside 1-2000 ms sanity range'
+      : positive === null
+        ? transport === 'quic'
+          ? 'QUIC RTT not available (0 is a placeholder, not a measurement)'
+          : transport === 'tcp'
+            ? 'TCP RTT not available'
+            : 'RTT not available (transport unknown; no cross-transport fallback)'
+        : 'edge-derived smoothed RTT (ms)',
     rtt_ms,
     rtt_transport,
     rtt_source,
-    status: rtt_ms === null ? 'no-data' : 'measured',
+    status: invalid ? 'invalid' : positive === null ? 'no-data' : 'measured',
   };
 }
 
@@ -216,13 +361,25 @@ function buildEdgeGeoHeader(request) {
   const cf = request.cf || {};
   const botManagement = cf.botManagement;
   const httpProtocol = cfString(cf.httpProtocol);
-  // HTTP/3 is QUIC — there is no TCP round trip on that path. `edgeL4` is a secondary QUIC
-  // signal for deployments where `httpProtocol` is not populated on request.cf. This is a
-  // request.cf transport hint ONLY: the Server-Timing `cfL4` response metric is never read.
-  const isQuic = /HTTP\/3|QUIC/i.test(httpProtocol) || /^quic$/i.test(cfString(cf.edgeL4));
-  // R3: one transport-normalized RTT from request.cf. HTTP/3 uses clientQuicRtt, all other
-  // transports use clientTcpRtt, with NO cross-transport fallback. 0 => null / 'no-data'.
-  const rtt = normalizedRtt(cf, isQuic);
+  // Protocol is authoritative and lowercase: HTTP/3 / QUIC / h3 select `quic`, explicit
+  // HTTP/1 or HTTP/2 select `tcp`. `edgeL4` is only a fallback hint when the protocol is absent
+  // — it never overrides an explicit TCP protocol. This is a request.cf transport hint ONLY:
+  // the Server-Timing `cfL4` response metric is never read.
+  const isQuicProtocol = /http\/3|quic|h3/i.test(httpProtocol);
+  const isTcpProtocol = /http\/(1|2)/i.test(httpProtocol);
+  const rawEdgeL4 =
+    cf.edgeL4 && typeof cf.edgeL4 === 'object' && !Array.isArray(cf.edgeL4) ? cf.edgeL4 : null;
+  const edgeL4 = cfObjectValue(rawEdgeL4);
+  const transport = isQuicProtocol
+    ? 'quic'
+    : isTcpProtocol
+      ? 'tcp'
+      : hasQuicEdgeHint(cf.edgeL4)
+        ? 'quic'
+        : 'unknown';
+  const isQuic = transport === 'quic';
+  // R3: one transport-normalized RTT from request.cf, with NO cross-transport fallback.
+  const rtt = normalizedRtt(cf, transport);
   // Raw per-transport observations are normalized too (0 => null) so no placeholder can
   // become a fabricated 0 ms "measurement" downstream.
   const observedTcpRtt =
@@ -261,7 +418,7 @@ function buildEdgeGeoHeader(request) {
     httpProtocol,
     // R3 normalized RTT. Sealed inside x-intel-edge-geo; every client-supplied lookalike is
     // stripped before this header is stamped (see UNTRUSTED_FORWARD_HEADERS). Milliseconds
-    // only, 0 => null / 'no-data', and never sourced from Server-Timing `cfL4`.
+    // only; 0 => 'no-data', out-of-range => 'invalid' (both rtt_ms null), never from `cfL4`.
     rtt,
     // Flat aliases for the server's sealed-header reader, carrying the same normalized value.
     clientRttMs: rtt.rtt_ms,
@@ -281,9 +438,9 @@ function buildEdgeGeoHeader(request) {
     rttLightDistance: {
       label: 'RTT-based light-distance estimate (approximation)',
       propagationFactor: LIGHT_DISTANCE_PROPAGATION_FACTOR,
-      // Per-transport fields kept for compatibility. Both are normalized (0 => null), so a
-      // placeholder can never become a fabricated 0 km "measurement".
-      tcp: lightDistanceKm(observedTcpRtt),
+      // Per-transport fields kept for compatibility. A QUIC request has no TCP round trip, so
+      // its TCP estimate is explicitly null; no cross-transport fallback is ever reported.
+      tcp: isQuic ? null : lightDistanceKm(observedTcpRtt),
       quic: lightDistanceKm(observedQuicRtt),
       // Selected estimate: the R3 normalized RTT only — no cross-transport fallback.
       selected: lightDistanceKm(rtt.rtt_ms),
@@ -294,16 +451,16 @@ function buildEdgeGeoHeader(request) {
     // are labelled as such so no downstream surface ever misreports them as a JA3/JA4 hash.
     cfTlsLite: {
       label: 'edge-derived TLS components',
-      tlsClientHelloLength:
-        typeof cf.tlsClientHelloLength === 'number' && Number.isFinite(cf.tlsClientHelloLength)
-          ? cf.tlsClientHelloLength
-          : null,
+      // Cloudflare may deliver the hello length as a decimal string; parse it to a finite
+      // number instead of dropping the field (and never emit NaN / Infinity into the header).
+      tlsClientHelloLength: finiteNumeric(cf.tlsClientHelloLength),
       tlsClientCiphersSha1: cfString(cf.tlsClientCiphersSha1),
       tlsClientExtensionsSha1: cfString(cf.tlsClientExtensionsSha1),
       tlsClientRandom: cfString(cf.tlsClientRandom),
-      tlsClientAuth: cfString(cf.tlsClientAuth),
+      // tlsClientAuth is an object (or null), not a string — keep its shape for downstream.
+      tlsClientAuth: cfObjectValue(cf.tlsClientAuth),
       requestPriority: cfString(cf.requestPriority),
-      edgeL4: cfString(cf.edgeL4),
+      edgeL4,
       // Normalized the same way as the R3 RTT: a 0 placeholder is no data, not a measurement.
       clientQuicRtt: observedQuicRtt,
     },
@@ -588,10 +745,16 @@ async function forwardApiRequest(request) {
     if (value) headers.set(target, encodeURIComponent(value));
   }
 
-  const clientIp = request.headers.get('cf-connecting-ip') || '';
+  // Only Cloudflare can set cf-connecting-ip, but a private / reserved / malformed value must
+  // never be forwarded or treated as a client identity. x-forwarded-for (and RFC7239
+  // `forwarded`) were stripped above, so the backend can no longer fall back to a spoofed IP.
+  const clientIp = publicClientIp(request.headers.get('cf-connecting-ip'));
   if (clientIp) {
     headers.set('cf-connecting-ip', clientIp);
     headers.set('x-forwarded-for', clientIp);
+  } else {
+    headers.delete('cf-connecting-ip');
+    headers.delete('x-forwarded-for');
   }
   headers.set(EDGE_GEO_HEADER, buildEdgeGeoHeader(request));
 
@@ -610,6 +773,20 @@ async function forwardApiRequest(request) {
   return new Request(request, { headers });
 }
 
+/** Merge Vary tokens instead of replacing them (the Express route does the same). */
+function mergeVary(headers, values) {
+  const existing = headers.get('Vary') || '';
+  const tokens = existing
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  for (const value of values) {
+    if (!tokens.some((item) => item.toLowerCase() === value.toLowerCase())) tokens.push(value);
+  }
+  if (tokens.length) headers.set('Vary', tokens.join(', '));
+  else headers.delete('Vary');
+}
+
 /**
  * The single place that applies the client-hint / hardening response headers. Called
  * exactly once per response: API responses go through `apiResponse`, documents and
@@ -619,7 +796,8 @@ function applyClientHintHeaders(response, env, request) {
   const result = new Response(response.body, response);
   result.headers.set('Accept-CH', CLIENT_HINT_ACCEPT_CH);
   result.headers.set('Critical-CH', CLIENT_HINT_CRITICAL_CH);
-  result.headers.set('Vary', CLIENT_HINT_VARY);
+  // Preserve upstream Vary (e.g. Accept-Encoding / Cookie) and add Sec-CH-UA* to it.
+  mergeVary(result.headers, [CLIENT_HINT_VARY]);
   result.headers.set(
     'Permissions-Policy',
     'compute-pressure=*, ch-ua-model=(self), ch-ua-platform-version=(self), ch-ua-arch=(self), ch-ua-form-factors=(self)'
@@ -660,8 +838,9 @@ function apiResponse(response, env, request) {
 
 /**
  * API counterpart of the document branding pass: the same apiResponse() contract plus the
- * additive verdict/JA4H headers. Native routes deliberately bypass this helper so their
- * health / ping / identity-ping contracts stay byte-for-byte unchanged.
+ * additive verdict/JA4H headers. Native routes do NOT bypass apiResponse() — they call
+ * apiResponse()/applyClientHintHeaders() directly and then keep their own route-specific
+ * Cache-Control / body contracts (see nativeHealth, nativePing and nativeIdentityPing).
  */
 async function apiResponseWithVerdict(response, env, request, verdict) {
   const result = apiResponse(response, env, request);
@@ -699,6 +878,48 @@ async function hmacSha256Base64Url(secret, message) {
   );
   const signature = await crypto.subtle.sign('HMAC', key, textEncoder.encode(message));
   return toBase64Url(signature);
+}
+
+/** Hex HMAC matching the Express visitor-token signer (crypto.createHmac(...).digest('hex')). */
+async function hmacSha256Hex(secret, message) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    textEncoder.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, textEncoder.encode(message));
+  return Array.from(new Uint8Array(signature), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/** Length-checked, constant-time comparison for the hex token above. */
+function constantTimeHexEqual(expected, presented) {
+  if (
+    typeof expected !== 'string' ||
+    typeof presented !== 'string' ||
+    expected.length !== presented.length
+  ) {
+    return false;
+  }
+  let difference = 0;
+  for (let i = 0; i < expected.length; i += 1) {
+    difference |= expected.charCodeAt(i) ^ presented.charCodeAt(i);
+  }
+  return difference === 0;
+}
+
+/** Mirrors the Express visitor-token check without its former public fallback secret. */
+async function verifyVisitorToken(visitorId, token, env) {
+  if (!visitorId || !token) return false;
+  const secret = env && typeof env.VISITOR_HMAC_SECRET === 'string' ? env.VISITOR_HMAC_SECRET : '';
+  // No hardcoded/public literal: a missing or short binding means the cookie is unverified.
+  if (secret.length < 32) return false;
+  try {
+    return constantTimeHexEqual(await hmacSha256Hex(secret, visitorId), token);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1099,7 +1320,11 @@ async function handleApi(request, env, pathname, verdict) {
     !verdict.verifiedBot &&
     !verdict.signedAgent
   ) {
-    const key = request.headers.get('cf-connecting-ip') || 'unknown';
+    // Never collapse every unattributed request into one shared 'unknown' bucket: that bucket
+    // would throttle all such clients together (and let one client poison it for everyone).
+    // An unvalidated address instead gets a unique, non-shareable key for this request only.
+    const clientIp = publicClientIp(request.headers.get('cf-connecting-ip'));
+    const key = clientIp || `unkeyed:${crypto.randomUUID()}`;
     try {
       const limitVerdict = await env.IDENTIFY_RATE_LIMIT.limit({ key });
       if (!limitVerdict.success) {
@@ -1210,37 +1435,52 @@ function nativePing(method, request, env) {
 
 /** Native /api/intel/identity-ping: preserves the HTTP-cache identity recovery contract. */
 async function nativeIdentityPing(request, env) {
-  const cookieVisitor = readCookieValue(request.headers.get('cookie'), [
-    '_intel_vid_client',
-    'intel_http_vid',
-  ]);
-  const presented = request.headers.get('if-none-match') || '';
+  const cookieHeader = request.headers.get('cookie');
+  const cookieVisitor = readCookieValue(cookieHeader, ['_intel_vid_client', 'intel_http_vid']);
+  const cookieToken = readCookieValue(cookieHeader, ['intel_http_token']);
   const headers = {};
   let response;
-  if (presented) {
-    headers.ETag = presented;
-    response = new Response(null, { status: 304, headers });
-  } else if (!cookieVisitor) {
-    response = new Response(null, { status: 204 });
+  if (!cookieVisitor) {
+    // A cleared cookie must never revalidate a cached identity: answer 204 BEFORE reading
+    // If-None-Match, exactly as the hardened Express route does.
+    headers.ETag = '"identity-none"';
+    response = new Response(null, { status: 204, headers });
   } else {
-    headers.ETag = `"${await sha256Base64Url(cookieVisitor)}"`;
-    response = Response.json(
-      {
-        identity: {
-          visitor_id: cookieVisitor,
-          hardware_fingerprint: '',
-          browser_fingerprint: '',
-          created_at: new Date().toISOString(),
+    // The per-load nonce resets the ETag on a fresh page load, so a label captured before a
+    // cookie clear can never be revived by a later conditional request.
+    const loadNonce = (request.headers.get('x-intel-load-nonce') || '').slice(0, 120);
+    const etag = `"${await sha256Base64Url(`${cookieVisitor}|${cookieToken}|${loadNonce}`)}"`;
+    headers.ETag = etag;
+    const presented = request.headers.get('if-none-match') || '';
+    // Echoing an arbitrary If-None-Match used to answer 304 for ANY conditional request;
+    // only an exact match against the current cookie / token / nonce may revalidate.
+    if (presented && presented === etag) {
+      response = new Response(null, { status: 304, headers });
+    } else {
+      response = Response.json(
+        {
+          identity: {
+            visitor_id: cookieVisitor,
+            hardware_fingerprint: '',
+            browser_fingerprint: '',
+            created_at: new Date().toISOString(),
+            // Derived from THIS request's cookie + HMAC token, never from a cached response.
+            recognition_source: (await verifyVisitorToken(cookieVisitor, cookieToken, env))
+              ? 'First-Party Cookie'
+              : 'Unverified Cookie',
+          },
+          // Handed back so the next conditional request can carry the same per-load nonce.
+          load_nonce: loadNonce,
         },
-      },
-      { headers }
-    );
+        { headers }
+      );
+    }
   }
   const result = applyClientHintHeaders(response, env, request);
-  // Mirror the Express route: a private, revalidatable cache and a Vary that keeps both
+  // Mirror the Express route: private/no-store revalidation and a Vary that keeps both
   // UA-CH-negotiated and cookie-bound identities isolated in any shared cache.
-  result.headers.set('Cache-Control', 'private, max-age=0, must-revalidate');
-  result.headers.set('Vary', 'Cookie, Sec-CH-UA*');
+  result.headers.set('Cache-Control', 'private, no-store, no-cache, must-revalidate, max-age=0');
+  mergeVary(result.headers, ['Cookie', CLIENT_HINT_VARY]);
   return result;
 }
 

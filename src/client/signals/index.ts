@@ -30,7 +30,7 @@ import { collectMathSignals } from './math';
 import { collectSystemEntropySignals } from './systemEntropy';
 import { collectAutomationSignals, startKinematicsTracker } from './automation';
 import { stableHash32, stableStringify, errorMessage } from './hash';
-import { loadSources, type Component, type Source } from './loader';
+import { loadSources, type Component, type MaybePromise, type Source } from './loader';
 import type {
   AudioSignals,
   AutomationSignals,
@@ -238,6 +238,63 @@ function cacheValue<T>(ctx: SignalSourceOptions, key: string, value: T): T {
   return value;
 }
 
+type SourceLoadResult<T> = T | (() => MaybePromise<T>);
+
+/**
+ * Runs one maybe-async stage under a wall-clock budget. On timeout/error it
+ * resolves to the SAME annotated fallback the legacy `withTimeout` produces
+ * (identical factory + identical `error` marker), so a never-settling stage
+ * can no longer hang the whole collection.
+ */
+function raceWithTimeout<T>(
+  task: () => MaybePromise<T>,
+  timeoutMs: number,
+  fallbackFactory: () => T
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timeout after ${timeoutMs}ms`)), timeoutMs);
+  });
+  return Promise.race([Promise.resolve().then(task), deadline]).then(
+    (value) => {
+      if (timer) clearTimeout(timer);
+      return value;
+    },
+    (error: unknown) => {
+      if (timer) clearTimeout(timer);
+      const fallback = fallbackFactory();
+      const marker = fallback as { error?: string };
+      if (!marker.error) marker.error = errorMessage(error);
+      return fallback;
+    }
+  );
+}
+
+/**
+ * Time-bounds BOTH stages of a source without flattening its shape: a final
+ * value stays a final value, a second-stage getter stays a getter (now bounded
+ * too). The generic timeout lives here in the orchestrator, never in the
+ * FingerprintJS-faithful loader primitives.
+ */
+function withSourceTimeout<TValue>(
+  source: Source<SignalSourceOptions, TValue>,
+  timeoutMs: number,
+  fallbackFactory: () => TValue
+): Source<SignalSourceOptions, TValue> {
+  return (options: SignalSourceOptions) =>
+    raceWithTimeout<SourceLoadResult<TValue>>(
+      () => source(options),
+      timeoutMs,
+      fallbackFactory
+    ).then((loadResult) => {
+      if (typeof loadResult === 'function') {
+        const getter = loadResult as () => MaybePromise<TValue>;
+        return () => raceWithTimeout<TValue>(getter, timeoutMs, fallbackFactory);
+      }
+      return loadResult;
+    });
+}
+
 /**
  * Built-in sources in FIXED DECLARATION ORDER. Async sources come first so
  * they overlap the synchronous ones; the automation source is two-stage and
@@ -292,55 +349,144 @@ function unwrapComponent<T>(component: Component<T> | undefined, fallbackFactory
 }
 
 /**
+ * Whole-payload fallback for the two-phase catch-all. The legacy path never
+ * throws, so a rejected `getComponents()` must still resolve to a full
+ * CollectedSignals whose errors are the REAL error text, not a fabricated one.
+ */
+function allFallbackSignals(error: unknown, started: number): CollectedSignals {
+  const annotate = <T>(fallback: T): T => {
+    const marker = fallback as { error?: string };
+    if (!marker.error) marker.error = errorMessage(error);
+    return fallback;
+  };
+  return {
+    canvas: annotate(fallbackCanvas()),
+    canvasNoise: annotate(fallbackCanvasNoise()),
+    fonts: annotate(fallbackFonts()),
+    fontPreferences: annotate(fallbackFontPreferences()),
+    emoji: annotate(fallbackEmoji()),
+    webglBasics: annotate(fallbackWebglBasics()),
+    webglExtensions: annotate(fallbackWebglExtensions()),
+    webglGpuIdentity: annotate(fallbackWebglGpuIdentity()),
+    audio: annotate(fallbackAudio()),
+    math: annotate(fallbackMath()),
+    systemEntropy: annotate(fallbackSystemEntropy()),
+    automation: annotate(fallbackAutomation()),
+    meta: {
+      collectedAt: new Date().toISOString(),
+      totalDurationMs: Math.round(nowMs() - started),
+      timingsMs: {},
+    },
+  };
+}
+
+/**
  * Phase 1 — start every source (one shared cache) and return `getComponents()`.
  * Phase 2 — `getComponents()` assembles the same `CollectedSignals` shape as
  * `collectAllSignals`, so neither digests nor the payload key set change.
  */
 export function loadAll(options?: CollectAllOptions): () => Promise<CollectedSignals> {
   const started = nowMs();
+  const timeoutMs = options?.timeouts ?? DEFAULT_TIMEOUT_MS;
   const ctx: SignalSourceOptions = {
     cache: {},
     options: options ?? {},
     kinematics: startKinematicsTracker(),
   };
-  const getComponents = loadSources(signalSources, ctx, []);
 
-  return async function getComponentsAsSignals(): Promise<CollectedSignals> {
-    const components = await getComponents();
-    const timingsMs: Record<string, number> = {};
-    for (const key of Object.keys(components) as (keyof typeof components)[]) {
-      timingsMs[key] = components[key].duration;
-    }
+  // Pre-seed the shared cache with the legacy fallbacks. `cacheValue` only
+  // writes on success, so without this a throwing/timeouting font or WebGL
+  // source leaves automation reading `undefined` and re-invoking a failed
+  // probe. Every automation dependency now always has a valid fallback.
+  ctx.cache.canvasGroup = { canvas: fallbackCanvas(), noise: fallbackCanvasNoise() };
+  ctx.cache.fonts = fallbackFonts();
+  ctx.cache.fontPreferences = fallbackFontPreferences();
+  ctx.cache.webglBasics = fallbackWebglBasics();
+  ctx.cache.webglGpuIdentity = fallbackWebglGpuIdentity();
 
-    const canvasGroup = unwrapComponent(components.canvas, () => ({
+  // Every source's load AND second-stage getter is now time-bounded by the
+  // caller's `timeouts` budget (default DEFAULT_TIMEOUT_MS). Declaration
+  // order is preserved so component keys / digests stay identical.
+  const sources = {
+    audio: withSourceTimeout<AudioSignals>(signalSources.audio, timeoutMs, fallbackAudio),
+    canvas: withSourceTimeout<CanvasGroup>(signalSources.canvas, timeoutMs, () => ({
       canvas: fallbackCanvas(),
       noise: fallbackCanvasNoise(),
-    }));
+    })),
+    fonts: withSourceTimeout<FontSignals>(signalSources.fonts, timeoutMs, fallbackFonts),
+    fontPreferences: withSourceTimeout<FontPreferenceSignals>(signalSources.fontPreferences, timeoutMs, fallbackFontPreferences),
+    emoji: withSourceTimeout<EmojiSignals>(signalSources.emoji, timeoutMs, fallbackEmoji),
+    webglBasics: withSourceTimeout<WebglBasics>(signalSources.webglBasics, timeoutMs, fallbackWebglBasics),
+    webglExtensions: withSourceTimeout<WebglExtensions>(signalSources.webglExtensions, timeoutMs, fallbackWebglExtensions),
+    webglGpuIdentity: withSourceTimeout<WebglGpuIdentity>(signalSources.webglGpuIdentity, timeoutMs, fallbackWebglGpuIdentity),
+    math: withSourceTimeout<MathSignals>(signalSources.math, timeoutMs, fallbackMath),
+    systemEntropy: withSourceTimeout<SystemEntropySignals>(signalSources.systemEntropy, timeoutMs, fallbackSystemEntropy),
+    automation: withSourceTimeout<AutomationSignals>(signalSources.automation, timeoutMs, fallbackAutomation),
+  };
+  const getComponents = loadSources(sources, ctx, []);
 
-    const automation = unwrapComponent(components.automation, fallbackAutomation);
-    const kinematicReasons = ctx.kinematics.drain();
-    ctx.kinematics.stop();
-    automation.reasonIds = Array.from(new Set([...automation.reasonIds, ...kinematicReasons]));
+  // Memoize the final promise: a second getter call returns the identical
+  // result instead of draining kinematics again and losing reasons.
+  let memoized: Promise<CollectedSignals> | undefined;
 
-    return {
-      canvas: canvasGroup.canvas,
-      canvasNoise: canvasGroup.noise,
-      fonts: unwrapComponent(components.fonts, fallbackFonts),
-      fontPreferences: unwrapComponent(components.fontPreferences, fallbackFontPreferences),
-      emoji: unwrapComponent(components.emoji, fallbackEmoji),
-      webglBasics: unwrapComponent(components.webglBasics, fallbackWebglBasics),
-      webglExtensions: unwrapComponent(components.webglExtensions, fallbackWebglExtensions),
-      webglGpuIdentity: unwrapComponent(components.webglGpuIdentity, fallbackWebglGpuIdentity),
-      audio: unwrapComponent(components.audio, fallbackAudio),
-      math: unwrapComponent(components.math, fallbackMath),
-      systemEntropy: unwrapComponent(components.systemEntropy, fallbackSystemEntropy),
-      automation,
-      meta: {
-        collectedAt: new Date().toISOString(),
-        totalDurationMs: Math.round(nowMs() - started),
-        timingsMs,
-      },
-    };
+  return function getComponentsAsSignals(): Promise<CollectedSignals> {
+    if (!memoized) {
+      memoized = (async (): Promise<CollectedSignals> => {
+        let result: CollectedSignals | undefined;
+        try {
+          const components = await getComponents();
+          const timingsMs: Record<string, number> = {};
+          for (const key of Object.keys(components) as (keyof typeof components)[]) {
+            timingsMs[key] = components[key].duration;
+          }
+
+          const canvasGroup = unwrapComponent(components.canvas, () => ({
+            canvas: fallbackCanvas(),
+            noise: fallbackCanvasNoise(),
+          }));
+
+          result = {
+            canvas: canvasGroup.canvas,
+            canvasNoise: canvasGroup.noise,
+            fonts: unwrapComponent(components.fonts, fallbackFonts),
+            fontPreferences: unwrapComponent(components.fontPreferences, fallbackFontPreferences),
+            emoji: unwrapComponent(components.emoji, fallbackEmoji),
+            webglBasics: unwrapComponent(components.webglBasics, fallbackWebglBasics),
+            webglExtensions: unwrapComponent(components.webglExtensions, fallbackWebglExtensions),
+            webglGpuIdentity: unwrapComponent(components.webglGpuIdentity, fallbackWebglGpuIdentity),
+            audio: unwrapComponent(components.audio, fallbackAudio),
+            math: unwrapComponent(components.math, fallbackMath),
+            systemEntropy: unwrapComponent(components.systemEntropy, fallbackSystemEntropy),
+            automation: unwrapComponent(components.automation, fallbackAutomation),
+            meta: {
+              collectedAt: new Date().toISOString(),
+              totalDurationMs: Math.round(nowMs() - started),
+              timingsMs,
+            },
+          };
+        } catch (error) {
+          // The legacy path never throws; keep that contract on this path too.
+          result = allFallbackSignals(error, started);
+        } finally {
+          // Always stop/drain kinematics, on success, timeout and catch-all
+          // failure paths alike. Nested finally guarantees stop() even if
+          // drain() itself throws.
+          let reasons: string[] = [];
+          try {
+            reasons = ctx.kinematics.drain();
+          } finally {
+            ctx.kinematics.stop();
+          }
+          if (result) {
+            result.automation.reasonIds = Array.from(
+              new Set([...result.automation.reasonIds, ...reasons])
+            );
+          }
+        }
+        return result!;
+      })();
+    }
+    return memoized;
   };
 }
 
@@ -425,9 +571,14 @@ export async function collectAllSignals(opts?: CollectAllOptions): Promise<Colle
     fallbackAutomation
   );
 
-  // Fold kinematic behavior evidence into the automation reasons.
-  const kinematicReasons = kinematics.drain();
-  kinematics.stop();
+  // Fold kinematic behavior evidence into the automation reasons. Nested
+  // finally guarantees stop() runs even if drain() throws; output is unchanged.
+  let kinematicReasons: string[];
+  try {
+    kinematicReasons = kinematics.drain();
+  } finally {
+    kinematics.stop();
+  }
   automation.reasonIds = Array.from(new Set([...automation.reasonIds, ...kinematicReasons]));
 
   return {

@@ -12,8 +12,9 @@
  *    options/cache object, returning `getComponents()` which assembles the
  *    components in the same declaration order.
  *  - `mapWithBreaks`: synchronous map that releases the event loop every 16ms
- *    through a *fresh* `MessageChannel` (never `setTimeout` — Chrome throttles
- *    timers, which can stall the agent for a long time).
+ *    through a *fresh* `MessageChannel` (preferred: Chrome throttles timers).
+ *    Contexts with no working `MessageChannel` fall back to `setTimeout(0)`
+ *    behind a bounded guard so a missing message can never hang the loader.
  *  - `releaseEventLoop` / `suppressUnhandledRejectionWarning`: the two small
  *    async helpers the loader is built from.
  *  - `transformSource`: map a source's value while preserving its sync/async
@@ -64,21 +65,58 @@ function excludes<T>(list: readonly T[], item: T): boolean {
 }
 
 /**
+ * Bounded guard for the "channel exists but never delivers" case. In browsers
+ * the fresh-channel message normally arrives long before this fires, so the
+ * original (low-latency) behavior is preserved; the timer only matters in
+ * unsupported/broken contexts where it prevents an indefinite hang.
+ */
+const NO_MESSAGE_FALLBACK_MS = 50;
+
+/**
  * Yields one turn of the browser event loop with a *fresh* MessageChannel.
  * `setTimeout` is avoided on purpose: Chrome throttles it in some cases, which
- * can make a long synchronous batch take a very long time to finish.
+ * can make a long synchronous batch take a very long time to finish. Contexts
+ * without a usable MessageChannel fall back to `setTimeout(0)`, and a bounded
+ * guard ensures an undelivered message can never hang the promise.
  */
 export function releaseEventLoop(): Promise<void> {
   return new Promise((resolve) => {
-    const channel = new MessageChannel();
-    channel.port1.onmessage = () => {
-      // A fresh channel per call is required; closing it after delivery also
-      // avoids keeping Node handles alive when this runs under tsx.
-      channel.port1.close();
-      channel.port2.close();
+    // Feature-detect: MessageChannel is missing or unusable in some workers,
+    // sandboxes and older JS runtimes.
+    if (typeof MessageChannel === 'undefined') {
+      setTimeout(resolve, 0);
+      return;
+    }
+
+    let channel: MessageChannel;
+    try {
+      // A fresh channel per call is required (see mapWithBreaks).
+      channel = new MessageChannel();
+    } catch {
+      setTimeout(resolve, 0);
+      return;
+    }
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      // Closing after delivery avoids keeping Node handles alive under tsx.
+      try { channel.port1.close(); } catch { /* already closed */ }
+      try { channel.port2.close(); } catch { /* already closed */ }
       resolve();
     };
-    channel.port2.postMessage(null);
+
+    // Bounded wait so a message that never arrives cannot hang the loader.
+    timer = setTimeout(finish, NO_MESSAGE_FALLBACK_MS);
+    channel.port1.onmessage = finish;
+    try {
+      channel.port2.postMessage(null);
+    } catch {
+      finish();
+    }
   });
 }
 

@@ -21,7 +21,7 @@ import {
   asSupplementaryIdentity,
   buildHighRecallInput,
   resolveSupplementaryFriction,
-  resolveSupplementaryHighRecall,
+  resolveSupplementaryHighRecallId,
   withSupplementaryHighRecall,
   type HighRecallInput,
   type SupplementaryHighRecallResult,
@@ -67,8 +67,23 @@ const byId = (id: string): FixtureCase => {
   assert.ok(found, `fixture case ${id} must exist`);
   return found;
 };
+/** Test-only: recover the pre-hardening tenant scope so the frozen golden ids stay
+ *  reproducible; pass it explicitly as the trusted argument. Never do this in production. */
+function testPepperFor(input: unknown): string {
+  try {
+    if (input === null || typeof input !== 'object') return HIGH_RECALL_DEFAULT_PEPPER;
+    for (const key of ['tenantId', 'tenant', 'instanceId', 'instance', 'pepper', 'keyScope', 'key_scope']) {
+      const value = (input as Record<string, unknown>)[key];
+      if (typeof value === 'string' && value.trim()) return value.trim().toLowerCase();
+    }
+  } catch {
+    // hostile proxy: no trusted pepper -> fail closed
+  }
+  return HIGH_RECALL_DEFAULT_PEPPER;
+}
+
 const derive = (input: unknown): SupplementaryHighRecallResult =>
-  resolveSupplementaryHighRecall(buildHighRecallInput(input));
+  resolveSupplementaryHighRecallId(buildHighRecallInput(input, testPepperFor(input)));
 
 /* -------------------------------------------------------------------------- */
 /* 1. Frozen fixture contract                                                  */
@@ -96,7 +111,7 @@ check('every fixture case resolves to its pinned result', () => {
 check('fixture canonical inputs pin truncation, pepper and key version', () => {
   for (const entry of fixture.cases) {
     if (!entry.expected_input) continue;
-    const built = buildHighRecallInput(entry.input);
+    const built = buildHighRecallInput(entry.input, testPepperFor(entry.input));
     assert.deepEqual(built.values, entry.expected_input.values, `values for ${entry.id}`);
     assert.equal(built.pepper, entry.expected_input.pepper, `pepper for ${entry.id}`);
     assert.equal(built.key_version, entry.expected_input.key_version, `key version for ${entry.id}`);
@@ -246,7 +261,7 @@ check('throwing getters / proxies never escape as exceptions', () => {
     ownKeys() { throw new Error('hostile ownKeys'); },
   });
   assert.doesNotThrow(() => {
-    resolveSupplementaryHighRecall({ values: valuesProxy, pepper: 'p', key_version: HIGH_RECALL_PURPOSE_KEY });
+    resolveSupplementaryHighRecallId({ values: valuesProxy, pepper: 'p', key_version: HIGH_RECALL_PURPOSE_KEY });
   });
 });
 
@@ -320,7 +335,7 @@ check('raw IP never appears in the canonical input or the derived id', () => {
   const built = buildHighRecallInput({ clientIp: '203.0.113.77', tenantId: 'tenant-acme' });
   assert.ok(!JSON.stringify(built).includes('203.0.113.77'));
   assert.ok(!JSON.stringify(built).includes('.77'));
-  const result = resolveSupplementaryHighRecall(built);
+  const result = resolveSupplementaryHighRecallId(built);
   assert.ok(!JSON.stringify(result).includes('203.0.113'));
   assert.equal(built.values.ip_prefix, '203.0.113.0/24');
 });
@@ -355,7 +370,7 @@ check('only one prior key is accepted; older versions are rejected', () => {
   assert.equal(rejected.visitor_id, null);
   assert.equal(rejected.visitor_found, false);
   assert.equal(rejected.reason, 'unsupported_key_version');
-  const forged = resolveSupplementaryHighRecall({ values: { timezone: 'utc' }, key_version: 'high-recall:v-1' });
+  const forged = resolveSupplementaryHighRecallId({ values: { timezone: 'utc' }, key_version: 'high-recall:v-1' });
   assert.equal(forged.visitor_found, false);
 });
 
@@ -368,11 +383,47 @@ check('tenant / instance pepper isolates otherwise identical cohorts', () => {
   assert.equal(fallbackA.visitor_id, fallbackB.visitor_id);
 });
 
+check('resolver re-canonicalizes a raw ip_prefix supplied directly in values', () => {
+  const base = { pepper: 'tenant-acme', key_version: HIGH_RECALL_PURPOSE_KEY };
+  const raw = resolveSupplementaryHighRecallId({ ...base, values: { ip_prefix: '203.0.113.77' } });
+  const canonical = resolveSupplementaryHighRecallId({ ...base, values: { ip_prefix: '203.0.113.0/24' } });
+  assert.equal(raw.visitor_found, true);
+  assert.equal(raw.visitor_id, canonical.visitor_id);
+});
+
+check('out-of-range IPv4 octet (1.2.3.999) is rejected, not hashed', () => {
+  const base = { pepper: 'tenant-acme', key_version: HIGH_RECALL_PURPOSE_KEY };
+  const bad = resolveSupplementaryHighRecallId({ ...base, values: { timezone: 'utc', ip_prefix: '1.2.3.999' } });
+  const clean = resolveSupplementaryHighRecallId({ ...base, values: { timezone: 'utc' } });
+  assert.equal(bad.visitor_id, clean.visitor_id);
+  assert.equal(buildHighRecallInput({ clientIp: '1.2.3.999' }).values.ip_prefix, undefined);
+});
+
+check('::1 and :: are accepted as valid IPv6 prefixes', () => {
+  assert.equal(buildHighRecallInput({ clientIp: '::1' }).values.ip_prefix, '0000:0000:0000::/48');
+  assert.equal(buildHighRecallInput({ clientIp: '::' }).values.ip_prefix, '0000:0000:0000::/48');
+});
+
+check('hex IPv4-mapped / compatible forms are rejected, not hashed', () => {
+  for (const bad of ['::ffff:c000:201', '::c000:201']) {
+    assert.equal(buildHighRecallInput({ clientIp: bad }).values.ip_prefix, undefined, `reject ${bad}`);
+  }
+});
+
+check('a missing pepper fails closed; an explicitly supplied test pepper is accepted', () => {
+  const missing = resolveSupplementaryHighRecallId(buildHighRecallInput(STABLE));
+  assert.equal(missing.visitor_found, false);
+  assert.equal(missing.visitor_id, null);
+  assert.equal(missing.reason, 'missing_trusted_pepper');
+  const compat = resolveSupplementaryHighRecallId(buildHighRecallInput(STABLE, HIGH_RECALL_DEFAULT_PEPPER));
+  assert.equal(compat.visitor_found, true);
+});
+
 check('unsupported input versions degrade without throwing', () => {
   for (const input of [null, 0, 'v1', [], { values: null }]) {
     let result: SupplementaryHighRecallResult | undefined;
     assert.doesNotThrow(() => {
-      result = resolveSupplementaryHighRecall(input);
+      result = resolveSupplementaryHighRecallId(input);
     });
     assert.equal(result?.visitor_found, false);
   }

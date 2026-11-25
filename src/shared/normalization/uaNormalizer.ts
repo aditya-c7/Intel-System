@@ -609,8 +609,9 @@ const BROWSER_SPECS: BrowserSpec[] = [
      * every "UA says Chrome" payload a latent Chromium match — the Google Chrome
      * spec happens to mask it today, but any brand/version path that reaches this
      * spec would mislabel a plain Chrome client. Only a genuine bare `Chromium/<ver>`
-     * token (or an explicit Chromium-only UA-CH brand claim, i.e. Chromium is the
-     * sole real brand) identifies unbranded Chromium. */
+     * token identifies unbranded Chromium; a Chromium-only UA-CH brand list paired
+     * with a plain `Chrome/<ver>` UA token is resolved as Google Chrome instead
+     * (see `isUnbrandedChrome`). */
     uaTokens: [/Chromium\/([\d.]+)/],
   },
   {
@@ -688,6 +689,22 @@ function uaToSpec(ua: string): BrowserSpec | null {
   return null;
 }
 
+/**
+ * G35 — a Chromium-only UA-CH brand list (GREASE is meaningless and the list is
+ * judged as a unit) paired with a plain `Chrome/<major>` UA token and NO bare
+ * `Chromium/<ver>` token describes an unbranded Chrome build, not Chromium.
+ * Requiring Chrome to be the top UA match keeps forks (Edge, Opera, …) intact.
+ */
+function isUnbrandedChrome(brands: BrandEntry[], ua: string): boolean {
+  const real = brands.filter((b) => !!b && !GREASE_RE.test(b.brand));
+  if (real.length === 0 || !real.every((b) => b.brand.toLowerCase() === CHROMIUM_PLACEHOLDER)) {
+    return false;
+  }
+  if (/Chromium\/([\d.]+)/i.test(ua)) return false;
+  if (!/Chrome\/([\d.]+)/i.test(ua)) return false;
+  return uaToSpec(ua)?.name === 'Google Chrome';
+}
+
 /** Every UA token that could carry a version for the given canonical name. */
 function tokensForName(name: string): RegExp[] {
   const spec = BROWSER_SPECS.find((s) => s.name === name);
@@ -699,11 +716,15 @@ function tokensForName(name: string): RegExp[] {
 
 /**
  * Keeps the version with more dotted segments (4-part full version wins over
- * a major-only token). Ties keep `preferred`.
+ * a major-only token). Ties keep `preferred`. A UA token may only backfill a
+ * major-only brand version when its MAJOR matches the brand's: a frozen or
+ * spoofed older UA must never downgrade the authoritative sec-ch-ua major.
  */
 function pickFullerVersion(preferred: string, candidate: string | null): string {
   if (!candidate) return preferred;
   if (!preferred) return candidate;
+  /* Never replace the authoritative brand major with a mismatched UA major. */
+  if (majorOf(candidate) !== majorOf(preferred)) return preferred;
   const a = preferred.split('.').length;
   const b = candidate.split('.').length;
   return b > a ? candidate : preferred;
@@ -722,7 +743,8 @@ interface BrowserResolution {
  *   2. secCh brand headers (full list when present, else major-only).
  *   3. UA-string token scan.
  * When the selected brand version is major-only, the full version is backfilled
- * from the UA token for the same browser when one exists.
+ * from a UA token of the SAME major when one exists (a mismatched-major UA token
+ * is never allowed to downgrade the authoritative brand major).
  */
 function resolveBrowser(
   ua: string,
@@ -803,7 +825,11 @@ function resolveBrowser(
     }
     if (!version) version = findUaVersion(spec, ua) ?? '';
     if (isPlaceholderVersion(version)) version = '';
-    return { name: spec.name, full: version, major: majorOf(version), is_headless_brand: headlessBrand };
+    const name =
+      spec.name === 'Chromium' && isUnbrandedChrome(candidate.brands, ua)
+        ? 'Google Chrome'
+        : spec.name;
+    return { name, full: version, major: majorOf(version), is_headless_brand: headlessBrand };
   }
 
   /* No usable brand lists — UA token scan. */
@@ -1280,6 +1306,31 @@ interface RuntimeResolution {
 }
 
 /**
+ * Corroboration for client-supplied flat aliases. A flat alias may override a
+ * header/UA-derived identity only when the same signal is also present in a
+ * matching UA token or in the trusted (in-process) nested `runtime` bag.
+ */
+interface AliasEvidence {
+  electron: boolean;
+  node: boolean;
+  hostApp: boolean;
+  ideShell: boolean;
+  webView: boolean;
+}
+
+/** `RuntimeSignals` plus which flat aliases are safe to use. */
+interface EffectiveRuntimeSignals extends RuntimeSignals {
+  aliasEvidence: AliasEvidence;
+}
+
+/** Case/alias-insensitive comparison of two host / IDE shell names. */
+function sameShellName(a: string, b: string): boolean {
+  const na = normalizeShellName(a.trim()).toLowerCase();
+  const nb = normalizeShellName(b.trim()).toLowerCase();
+  return na.length > 0 && na === nb;
+}
+
+/**
  * Runtime ladder (first match wins):
  *   1. `Electron/<ver>` UA token or `process.versions.electron`
  *   2. `process.versions.node` / nodeVersion
@@ -1291,21 +1342,34 @@ interface RuntimeResolution {
  * Device/OS resolution is deliberately NOT touched here: `device: Desktop` keeps
  * coming from hardware truth (platform / touch points / UA), never from the runtime.
  */
-function resolveRuntime(ua: string, signals: RuntimeSignals): RuntimeResolution {
-  const electronVersion =
-    signals.electronVersion ||
-    String(signals.processVersions?.electron ?? '') ||
-    firstMatch(/Electron\/([\d.]+)/i, ua) ||
-    '';
-  const nodeVersion = signals.nodeVersion || String(signals.processVersions?.node ?? '');
-  const hostSpec = explicitHost(signals.hostApp ?? '', false) || hostAppFromUa(ua, false);
-  const ideSpec = explicitHost(signals.ideShell ?? '', true) || hostAppFromUa(ua, true);
-  const webview = signals.webView === true || WEBVIEW_UA_RE.test(ua);
+function resolveRuntime(ua: string, signals: EffectiveRuntimeSignals): RuntimeResolution {
+  const ev = signals.aliasEvidence;
+  /* UA tokens are server-observed evidence and always usable. Flat aliases are
+   * client-supplied: use them only when corroborated by a matching UA token or
+   * by the trusted nested `runtime` bag. Never let one flip the runtime alone. */
+  const uaElectronToken = firstMatch(/Electron\/([\d.]+)/i, ua) ?? '';
+  const aliasElectron = ev.electron ? signals.electronVersion : '';
+  const pvElectron = ev.electron ? String(signals.processVersions?.electron ?? '') : '';
+  const electronVersion = uaElectronToken || aliasElectron || pvElectron || '';
+
+  const aliasNode = ev.node ? signals.nodeVersion : '';
+  const pvNode = ev.node ? String(signals.processVersions?.node ?? '') : '';
+  const nodeVersion = aliasNode || pvNode || '';
+
+  /* An explicit host/IDE alias may only become a spec — and therefore a
+   * preferredBrowserName — when corroborated. Otherwise only UA-token evidence
+   * decides, or the client remains a plain browser. */
+  const hostSpec =
+    (ev.hostApp ? explicitHost(signals.hostApp ?? '', false) : null) || hostAppFromUa(ua, false);
+  const ideSpec =
+    (ev.ideShell ? explicitHost(signals.ideShell ?? '', true) : null) || hostAppFromUa(ua, true);
+  const trustedHost = ev.hostApp ? signals.hostApp ?? '' : '';
+  const webview = (ev.webView && signals.webView === true) || WEBVIEW_UA_RE.test(ua);
 
   if (electronVersion) {
     return {
       runtime: 'electron',
-      host_app: hostSpec?.name || signals.hostApp || '',
+      host_app: hostSpec?.name || trustedHost || '',
       client_type: 'desktop_app',
       preferredBrowserName: 'Electron',
     };
@@ -1313,7 +1377,7 @@ function resolveRuntime(ua: string, signals: RuntimeSignals): RuntimeResolution 
   if (nodeVersion) {
     return {
       runtime: 'node',
-      host_app: hostSpec?.name || signals.hostApp || '',
+      host_app: hostSpec?.name || trustedHost || '',
       client_type: 'node',
       preferredBrowserName: 'Node.js',
     };
@@ -1329,7 +1393,7 @@ function resolveRuntime(ua: string, signals: RuntimeSignals): RuntimeResolution 
   if (webview) {
     return {
       runtime: 'webview',
-      host_app: hostSpec?.name || signals.hostApp || '',
+      host_app: hostSpec?.name || trustedHost || '',
       client_type: 'webview',
       preferredBrowserName: hostSpec?.name || 'WebView',
     };
@@ -1354,9 +1418,39 @@ function isGenericBrowserName(name: string): boolean {
 /** Collects runtime signals from the flat aliases and the nested `runtime` bag. */
 function runtimeSignalsFromInput(
   input: NormalizeIdentityInput | NormalizeUserAgentInput,
-): RuntimeSignals {
+): EffectiveRuntimeSignals {
   const runtime = input.runtime ?? null;
   const processVersions = input.processVersions ?? runtime?.processVersions ?? null;
+  const ua = String(input.userAgent ?? '');
+  const trustedPv = runtime?.processVersions ?? null;
+
+  /* UA tokens and the nested `runtime` bag (collected in-process) are evidence.
+   * Flat aliases — including a flat `processVersions` — are client-supplied and
+   * do not corroborate themselves. */
+  const uaElectron = /Electron\/([\d.]+)/i.test(ua);
+  const uaWebView = WEBVIEW_UA_RE.test(ua);
+  const uaHost = hostAppFromUa(ua, false);
+  const uaIde = hostAppFromUa(ua, true);
+  const trustedElectron = Boolean(runtime?.electronVersion) || Boolean(trustedPv?.electron);
+  const trustedNode = Boolean(runtime?.nodeVersion) || Boolean(trustedPv?.node);
+  const trustedHost = runtime?.hostApp ?? '';
+  const trustedIde = runtime?.ideShell ?? '';
+  const trustedWebView = runtime?.webView === true;
+
+  const flatHost = input.hostApp ?? '';
+  const flatIde = input.ideShell ?? '';
+  /* A flat host alias is corroborated when the trusted collector reported the
+   * same host or the UA carries that host's token. With no flat alias, any
+   * value present already came from the trusted nested runtime bag. */
+  const hostCorroborated = flatHost.trim()
+    ? sameShellName(flatHost, trustedHost) ||
+      (uaHost !== null && sameShellName(flatHost, uaHost.name))
+    : Boolean(trustedHost.trim());
+  const ideCorroborated = flatIde.trim()
+    ? sameShellName(flatIde, trustedIde) ||
+      (uaIde !== null && sameShellName(flatIde, uaIde.name))
+    : Boolean(trustedIde.trim());
+
   return {
     electronVersion: input.electronVersion ?? runtime?.electronVersion ?? processVersions?.electron ?? '',
     nodeVersion: input.nodeVersion ?? runtime?.nodeVersion ?? processVersions?.node ?? '',
@@ -1364,6 +1458,13 @@ function runtimeSignalsFromInput(
     hostApp: input.hostApp ?? runtime?.hostApp ?? '',
     ideShell: input.ideShell ?? runtime?.ideShell ?? '',
     webView: input.webView ?? runtime?.webView ?? false,
+    aliasEvidence: {
+      electron: uaElectron || trustedElectron,
+      node: trustedNode,
+      hostApp: hostCorroborated,
+      ideShell: ideCorroborated,
+      webView: uaWebView || trustedWebView,
+    },
   };
 }
 
@@ -1418,17 +1519,22 @@ export function normalizeIdentity(input: NormalizeIdentityInput): NormalizedIden
     const browser = resolveBrowser(ua, uad, secCh);
     const archRes = resolveArchitecture(ua, platformStr, uad, secCh);
 
-    /* When the runtime comes from `process.versions` (no UA token), keep the
-     * version aligned with the runtime instead of the embedded engine's UA. */
+    /* When the runtime comes from a corroborated `process.versions` / alias (no
+     * UA token), keep the version aligned with the runtime instead of the
+     * embedded engine's UA. An uncorroborated flat alias must never overwrite
+     * a server-observed browser name/version. */
     if (runtime.runtime === 'electron' && !firstMatch(/Electron\/([\d.]+)/i, ua)) {
-      const v =
-        signals.electronVersion || String(signals.processVersions?.electron ?? '');
+      const v = signals.aliasEvidence.electron
+        ? signals.electronVersion || String(signals.processVersions?.electron ?? '')
+        : '';
       if (v.trim()) {
         browser.full = v.trim();
         browser.major = majorOf(v.trim());
       }
     } else if (runtime.runtime === 'node') {
-      const v = signals.nodeVersion || String(signals.processVersions?.node ?? '');
+      const v = signals.aliasEvidence.node
+        ? signals.nodeVersion || String(signals.processVersions?.node ?? '')
+        : '';
       if (v.trim()) {
         browser.full = v.trim();
         browser.major = majorOf(v.trim());
@@ -1735,15 +1841,28 @@ export function normalizeUserAgent(input: NormalizeUserAgentInput): NormalizedUs
   }
 }
 
+/** Property read that degrades to `undefined` when a getter throws (hostile proxy). */
+function safeGet(bag: Record<string, unknown>, key: string): unknown {
+  try {
+    return bag[key];
+  } catch {
+    return undefined;
+  }
+}
+
 /** Accepts either the camelCase or the snake_case identity shape. */
 function readIdentityField(
   value: NormalizedUserAgent | NormalizedIdentity,
   camel: keyof NormalizedUserAgent,
   snake: keyof NormalizedIdentity,
 ): string {
-  const bag = value as unknown as Record<string, unknown>;
-  const raw = bag[camel] ?? bag[snake];
-  return typeof raw === 'string' ? raw.trim() : '';
+  try {
+    const bag = value as unknown as Record<string, unknown>;
+    const raw = safeGet(bag, camel) ?? safeGet(bag, snake);
+    return typeof raw === 'string' ? raw.trim() : '';
+  } catch {
+    return '';
+  }
 }
 
 /**
@@ -1758,23 +1877,28 @@ export function validateUserAgentNormalization(
   value: NormalizedUserAgent | NormalizedIdentity,
 ): string[] {
   const issues: string[] = [];
-  if (!value || typeof value !== 'object') return ['identity must be a non-null object'];
+  try {
+    if (!value || typeof value !== 'object') return ['identity must be a non-null object'];
 
-  const os = readIdentityField(value, 'os', 'os');
-  const osVersion = readIdentityField(value, 'osVersion', 'os_version');
-  const major = readIdentityField(value, 'browserMajorVersion', 'browser_major_version');
-  const full = readIdentityField(value, 'browserFullVersion', 'browser_full_version');
+    const os = readIdentityField(value, 'os', 'os');
+    const osVersion = readIdentityField(value, 'osVersion', 'os_version');
+    const major = readIdentityField(value, 'browserMajorVersion', 'browser_major_version');
+    const full = readIdentityField(value, 'browserFullVersion', 'browser_full_version');
 
-  if (os && /\d/.test(os)) {
-    issues.push(`os "${os}" contains digits — os must be the family only`);
-  }
-  if (os && osVersion && os === osVersion) {
-    issues.push(`os_version "${osVersion}" must not equal os`);
-  }
-  if (full && !major) {
-    issues.push(`browser_major_version is empty while browser_full_version "${full}" is known`);
-  } else if (major && !/^\d+$/.test(major)) {
-    issues.push(`browser_major_version "${major}" is not a numeric string`);
+    if (os && /\d/.test(os)) {
+      issues.push(`os "${os}" contains digits — os must be the family only`);
+    }
+    if (os && osVersion && os === osVersion) {
+      issues.push(`os_version "${osVersion}" must not equal os`);
+    }
+    if (full && !major) {
+      issues.push(`browser_major_version is empty while browser_full_version "${full}" is known`);
+    } else if (major && !/^\d+$/.test(major)) {
+      issues.push(`browser_major_version "${major}" is not a numeric string`);
+    }
+  } catch {
+    /* Keep the validator total even for a proxy that throws on property access. */
+    return ['identity could not be read (throwing getter or proxy)'];
   }
 
   return issues;

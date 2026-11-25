@@ -14,13 +14,14 @@
  *      stored profile is healed forward only (a strictly newer browser major may
  *      replace the stored one; rendering hashes may drift only on the same or a
  *      newer major — never backwards).
- *   4. Fresh identity — nobody matched: mint a new visitor id (WebCrypto, with a
- *      deterministic LCG fallback for runtimes without it), persist the profile
- *      and its blocking keys.
+ *   4. Fresh identity — nobody matched: mint a new visitor id with WebCrypto
+ *      rejection sampling, persist the profile and its blocking keys. Runtimes
+ *      without `getRandomValues` hard-fail rather than mint a guessable id.
  *
- * Every failure path degrades silently: the resolver NEVER throws. A broken
- * adapter, a malformed profile or an engine error yields a fresh visitor id with
- * `degraded: true` so the request pipeline can continue.
+ * Ordinary failure paths degrade silently: a broken adapter, a malformed profile
+ * or an engine error yields a fresh visitor id with `degraded: true` so the
+ * request pipeline can continue. The single deliberate exception is secure id
+ * generation — a missing CSPRNG throws instead of fabricating a predictable id.
  */
 
 import { bestMode, compareFingerprints, type ComparisonInput } from '../../shared/matching/compareFingerprints';
@@ -92,6 +93,10 @@ export interface ResolveVisitorInput {
   storageVisitorId?: string | null;
   /** Mobile iOS flag — lowers the first-visit confidence tier in the scorer. */
   isMobileIos?: boolean;
+  /** Actual distinct first-party storage-seed count for the matched hardware. */
+  distinctStorageSeedsCount?: number | null;
+  /** snake_case alias of `distinctStorageSeedsCount` (scorer/ledger spelling). */
+  distinct_storage_seeds_count?: number | null;
 }
 
 /** Auxiliary identity link for cross-browser stitches. */
@@ -141,6 +146,47 @@ function parseMajor(value: unknown): number | null {
   return match ? Number.parseInt(match[1], 10) : null;
 }
 
+/** Validated distinct-storage-seed count: non-negative integer, else unavailable. */
+function effectiveSeedCount(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && Number.isInteger(value) && value >= 0 ? value : null;
+  }
+  if (typeof value === 'string' && value.trim()) {
+    const num = Number(value);
+    return Number.isFinite(num) && Number.isInteger(num) && num >= 0 ? num : null;
+  }
+  return null;
+}
+
+/**
+ * Distinct-storage-seed consensus required before a bare hardware-equality hit
+ * may be treated as an authoritative exact re-identification. The documented
+ * guard (`src/lib/identityEngine.ts:282`: `exactHardwareId && (input.distinctStorageSeedsCount ?? 0) >= 2`)
+ * gates `exact_hardware` on TWO OR MORE distinct storage seeds: a single seed
+ * must NOT authorize an exact hardware merge. A missing or invalid count
+ * abstains — it never fabricates a positive visitor claim.
+ */
+function hasHardwareMergeConsensus(seedCount: number | null): boolean {
+  return seedCount !== null && seedCount >= 2;
+}
+
+/** Best-effort anchor-table read; absence (Workers / no table) is never consensus. */
+function distinctSeedsFromDb(db: AIBotDatabase, hardwareValues: string[]): number | null {
+  for (const hardware of hardwareValues) {
+    if (!hardware) continue;
+    try {
+      const row = db
+        .prepare('SELECT MAX(distinct_storage_seeds_count) AS seeds FROM hardware_anchors WHERE hardware_id = ?')
+        .get(hardware) as { seeds?: unknown } | undefined;
+      const count = row ? effectiveSeedCount(row.seeds) : null;
+      if (count !== null) return count;
+    } catch {
+      // Anchor table is optional in this schema; try the next spelling.
+    }
+  }
+  return null;
+}
+
 function clampScore(score: unknown): number {
   const num = typeof score === 'number' ? score : Number(score);
   if (!Number.isFinite(num)) return 0;
@@ -171,16 +217,27 @@ const EXACT_PRIORITY = 4;
  * Engine `MatchMode` → resolver tier. `exact` requires the engine's perfect
  * score; `strict` rides the lenient tier (its ≥92 score outranks other lenient
  * candidates by score); `engine-only` is the cross-browser rendering signal.
- * Unknown engine modes fall back to the score-derived tier.
+ * Unknown engine modes fall back to the score-derived tier. The map is
+ * null-prototype: `engineMode` is untrusted, so `__proto__` / `constructor`
+ * must never resolve to an inherited object.
  */
-const ENGINE_MODE_TIERS: Record<string, MatchTier> = {
-  exact: { mode: 'exact', min: 100, priority: EXACT_PRIORITY },
-  strict: { mode: 'lenient', min: 82, priority: 1 },
-  lenient: { mode: 'lenient', min: 82, priority: 1 },
-  'cross-browser': { mode: 'cross_browser', min: 85, priority: 2 },
-  'hardware-only': { mode: 'hardware', min: 88, priority: 3 },
-  'engine-only': { mode: 'cross_browser', min: 85, priority: 2 },
-};
+const ENGINE_MODE_TIERS: Record<string, MatchTier> = Object.assign(
+  Object.create(null) as Record<string, MatchTier>,
+  {
+    exact: { mode: 'exact', min: 100, priority: EXACT_PRIORITY },
+    strict: { mode: 'lenient', min: 82, priority: 1 },
+    lenient: { mode: 'lenient', min: 82, priority: 1 },
+    'cross-browser': { mode: 'cross_browser', min: 85, priority: 2 },
+    'hardware-only': { mode: 'hardware', min: 88, priority: 3 },
+    'engine-only': { mode: 'cross_browser', min: 85, priority: 2 },
+  }
+);
+
+/** Prototype-safe lookup — unknown / inherited keys are never treated as tiers. */
+function tierForEngineMode(mode: string | null): MatchTier | null {
+  if (!mode || !Object.prototype.hasOwnProperty.call(ENGINE_MODE_TIERS, mode)) return null;
+  return ENGINE_MODE_TIERS[mode] ?? null;
+}
 
 function tierForScore(score: number): MatchTier | null {
   for (const tier of LADDER_TIERS) {
@@ -285,26 +342,23 @@ async function runEngine(incoming: ResolverProfile, stored: BlockKeyProfile | nu
 const ID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const ID_LENGTH = 20;
 
-/** WebCrypto path: rejection sampling below 248 keeps `byte % 62` uniform. */
-function randomIdByte(): number | null {
+/**
+ * CSPRNG-only: rejection sampling below 248 (= 4 × 62) keeps `byte % 62` uniform.
+ * There is deliberately NO time/seed fallback — a guessable visitor id is worse
+ * than a hard failure, so a missing or broken `getRandomValues` throws.
+ */
+function randomIdByte(): number {
   const cryptoRef = (globalThis as { crypto?: { getRandomValues?: (a: Uint8Array) => Uint8Array } }).crypto;
-  if (typeof cryptoRef?.getRandomValues !== 'function') return null;
+  if (typeof cryptoRef?.getRandomValues !== 'function') {
+    throw new Error('secure visitor id generation unavailable: WebCrypto getRandomValues is missing');
+  }
   const buffer = new Uint8Array(1);
   for (let attempt = 0; attempt < 32; attempt += 1) {
     cryptoRef.getRandomValues(buffer);
     const byte = buffer[0];
     if (byte < 248) return byte;
   }
-  return null;
-}
-
-/** Deterministic LCG fallback for runtimes without WebCrypto. */
-function createLcgBytes(): () => number {
-  let seed = (Date.now() ^ Math.floor(Math.random() * 0xffffffff)) >>> 0;
-  return () => {
-    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
-    return (seed >>> 16) & 0xff;
-  };
+  throw new Error('secure visitor id generation unavailable: rejection sampling did not converge');
 }
 
 function idFromByte(byte: number): string {
@@ -312,19 +366,19 @@ function idFromByte(byte: number): string {
 }
 
 function mintVisitorId(): string {
-  const lcg = createLcgBytes();
   let id = '';
   while (id.length < ID_LENGTH) {
-    const byte = randomIdByte() ?? lcg();
-    id += idFromByte(byte);
+    id += idFromByte(randomIdByte());
   }
   return id;
 }
 
 /**
  * Generates a 20-char [A-Za-z0-9] visitor id and, when a database is provided,
- * retries against `visitor_profiles` (3 uniqueness retries). Falls back to a
- * time-seeded LCG suffix if every attempt collides (astronomically unlikely).
+ * retries against `visitor_profiles` (3 uniqueness retries). Every candidate —
+ * including the post-collision one — comes from the same CSPRNG rejection
+ * sampler; no time-seeded or Math.random suffix is ever minted. Throws when
+ * WebCrypto is unavailable rather than returning a guessable id.
  */
 export function generateVisitorId(db?: AIBotDatabase): string {
   const attempts = 4;
@@ -340,7 +394,8 @@ export function generateVisitorId(db?: AIBotDatabase): string {
       return candidate;
     }
   }
-  return (mintVisitorId() + Date.now().toString(36).slice(-4)).slice(0, ID_LENGTH);
+  // All candidates collided: mint one more CSPRNG id, never a predictable suffix.
+  return mintVisitorId();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -444,7 +499,9 @@ function healStoredProfile(
 
   const incomingMajor = browserMajorOf(incoming);
   const storedMajor = browserMajorOf(storedProfile as BlockKeyProfile);
-  const driftAllowed = incomingMajor === null || storedMajor === null || incomingMajor >= storedMajor;
+  // Forward-only: a missing major on EITHER side is unknown, not permission to
+  // heal. Only a comparable, non-regressing pair may drift rendering hashes.
+  const driftAllowed = incomingMajor !== null && storedMajor !== null && incomingMajor >= storedMajor;
 
   if (incomingMajor !== null && storedMajor !== null && incomingMajor > storedMajor) {
     const storedBrowser = (storedProfile as BlockKeyProfile).browser ?? {};
@@ -554,6 +611,12 @@ export async function resolveVisitor(db: AIBotDatabase, input: ResolveVisitorInp
     const incomingHw = normalizeText(profile.hardwareFingerprint);
     const storageVisitorId = normalizeText(input.storageVisitorId) || '';
     const keys = blockKeysFor(profile);
+    // Caller-supplied seed consensus wins; the DB anchor table is only a
+    // best-effort source when the caller did not supply a validated count.
+    const providedSeeds =
+      effectiveSeedCount(input.distinctStorageSeedsCount) ??
+      effectiveSeedCount(input.distinct_storage_seeds_count);
+    const rawHardware = typeof profile.hardwareFingerprint === 'string' ? profile.hardwareFingerprint.trim() : '';
 
     /* ---- 1. Storage path — verified id with a compatible hardware fingerprint. */
     if (storageVisitorId) {
@@ -604,22 +667,32 @@ export async function resolveVisitor(db: AIBotDatabase, input: ResolveVisitorInp
         normalizeText(stored.hardware_fingerprint) ||
         normalizeText((stored.profile as BlockKeyProfile | null)?.hardwareFingerprint);
 
-      // Hardware-equality shortcut — the strongest non-storage signal.
+      // Hardware-equality shortcut — the strongest non-storage signal, but only
+      // authoritative with >=2 distinct storage seeds (exact_hardware gate).
+      // Without that consensus the signal is non-authoritative and downgrades
+      // to 'none': this candidate is never claimed as a positive visitor hit,
+      // by this shortcut or the engine ladder below.
       if (incomingHw && storedHw && incomingHw === storedHw) {
-        best = {
-          id: candidateId,
-          stored,
-          mode: 'exact',
-          score: 100,
-          violations: [],
-          priority: EXACT_PRIORITY,
-        };
-        break;
+        const seedCount =
+          providedSeeds ?? distinctSeedsFromDb(db, [rawHardware, incomingHw, storedHw]);
+        if (hasHardwareMergeConsensus(seedCount)) {
+          best = {
+            id: candidateId,
+            stored,
+            mode: 'exact',
+            score: 100,
+            violations: [],
+            priority: EXACT_PRIORITY,
+          };
+          break;
+        }
+        // Missing/invalid count or fewer than two distinct seeds: downgrade, abstain.
+        continue;
       }
 
       const { score, violations, engineMode } = await runEngine(profile, stored.profile);
       if (violations.includes('version_downgrade_anomaly')) continue;
-      const tier = (engineMode && ENGINE_MODE_TIERS[engineMode]) || tierForScore(score);
+      const tier = tierForEngineMode(engineMode) || tierForScore(score);
       if (!tier || score < tier.min) continue;
       if (!best || tier.priority > best.priority || (tier.priority === best.priority && score > best.score)) {
         best = { id: candidateId, stored, mode: tier.mode, score, violations, priority: tier.priority };

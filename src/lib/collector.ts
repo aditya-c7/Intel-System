@@ -1358,12 +1358,20 @@ async function computeWebAudioSignature(): Promise<AudioSignatureResult> {
     if (first === null) return empty('timeout');
     const second = await renderOnce();
     const renderSums = [first.sum, ...(second ? [second.sum] : [])];
+    // Resolved privacy context is telemetry only: it changes `tamperingInconclusive`,
+    // never stability/noise, the audio signature or any hardware-id seed input.
+    let audioUa = '';
+    try {
+      audioUa = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+    } catch {
+      audioUa = '';
+    }
     const verdict = classifyAudioStability({
       renderSums,
       getChannelDataWrapped,
       copyFromChannelMatches: first.copyMatches && (second ? second.copyMatches : true),
       silentBufferNonZero: false,
-      privacyHardened: false,
+      privacyHardened: isPrivacyHardenedRuntime(audioUa, false),
     });
     const noise = verdict.stability === 'noisy';
     const fullHex = await sha256Hex(`${String(first.sum)}|${first.fingerprint}`);
@@ -1389,23 +1397,24 @@ async function computeWebAudioSignature(): Promise<AudioSignatureResult> {
 /* FP_SHARED_PROBES — opt-in bridge to the single shared probe implementations. */
 /*                                                                            */
 /* The legacy probes above remain the default and are byte-for-byte unchanged  */
-/* while the flag is off. When a caller explicitly opts in, the equivalent      */
-/* implementations exported by `src/client/signals` (the public barrel that also */
-/* re-exports the shared loader) are used INSTEAD, but only when they are       */
-/* present AND return the same contract. A missing, malformed or throwing       */
-/* shared implementation always falls back to the legacy probe — never a       */
-/* verdict, digest or payload change. All routing metadata below is additive    */
-/* telemetry: it is never read by a score, verdict, threshold or identity hash. */
+/* while the flag is off. The bridge below is retained for future unification,   */
+/* but `src/client/signals` and its loader do NOT export any of the probed      */
+/* names today, so routing never happens. Telemetry is therefore deliberately   */
+/* honest: `source: 'legacy'`, `available: false`, and `routed` all false.       */
+/* No score, verdict, threshold or identity hash reads any of this metadata.    */
 /* -------------------------------------------------------------------------- */
 
 export interface SharedProbeTelemetry {
   /** FP_SHARED_PROBES state at resolution time. */
   enabled: boolean;
-  /** True when at least one usable shared implementation was exported. */
+  /** True when at least one usable shared implementation was exported (false today). */
   available: boolean;
-  /** Which probes were actually served by a shared implementation. */
+  /**
+   * Which probes were actually served by a shared implementation. Reserved for a future
+   * unified probe set; no shared implementation is exported today, so this stays all-false.
+   */
   routed: { webgl: boolean; canvas: boolean; audio: boolean };
-  /** Where the shared implementations came from, or 'legacy'. */
+  /** Where the shared implementations came from, or 'legacy' (always today). */
   source: string;
   /** Non-decision diagnostics explaining any fallback (never a verdict input). */
   reasons: string[];
@@ -1425,10 +1434,14 @@ let lastSharedProbeTelemetry: SharedProbeTelemetry = {
   reasons: [],
 };
 
-/** Read-only copy of the additive shared-probe routing telemetry. Never throws. */
-export function getSharedProbeTelemetry(): SharedProbeTelemetry {
+/**
+ * Read-only copy of the additive shared-probe routing telemetry. Never throws.
+ * `enabled` is taken from the caller's per-identify snapshot (when supplied), never
+ * latched from a probe side effect, so it matches the flag value used for that call.
+ */
+export function getSharedProbeTelemetry(enabledSnapshot?: boolean): SharedProbeTelemetry {
   return {
-    enabled: lastSharedProbeTelemetry.enabled,
+    enabled: enabledSnapshot ?? lastSharedProbeTelemetry.enabled,
     available: lastSharedProbeTelemetry.available,
     routed: { ...lastSharedProbeTelemetry.routed },
     source: lastSharedProbeTelemetry.source,
@@ -1436,14 +1449,34 @@ export function getSharedProbeTelemetry(): SharedProbeTelemetry {
   };
 }
 
+/**
+ * Starts a fresh per-identify telemetry record. The flag is snapshotted once by the
+ * caller and applied here; reasons are cleared for every call instead of latching.
+ */
+function beginSharedProbeTelemetry(enabledSnapshot: boolean): void {
+  lastSharedProbeTelemetry = {
+    enabled: enabledSnapshot,
+    available: false,
+    routed: { webgl: false, canvas: false, audio: false },
+    source: 'legacy',
+    reasons: [],
+  };
+  if (enabledSnapshot) {
+    // Resolution is cached per page, so restate the deterministic fallback reason on
+    // every call after clearing; telemetry stays honest without re-running the resolver.
+    recordSharedProbeReason('no shared probe implementations are exported; legacy probes in use');
+  }
+}
+
 type SharedProbeFn = () => unknown;
 type UnknownRecord = Record<string, unknown>;
 
 /**
- * FP_SHARED_PROBES — default OFF. Opt in through a `globalThis.FP_SHARED_PROBES`
- * truthy value, a `?FP_SHARED_PROBES=1` URL token, a `FP_SHARED_PROBES=1`
- * sessionStorage key, or a process env var in Node. Any hostile/inaccessible
- * scope means "off" — the default everywhere. Never throws.
+ * FP_SHARED_PROBES — default OFF, and configurable ONLY at build/import time:
+ * a `globalThis.FP_SHARED_PROBES` value or a `process.env.FP_SHARED_PROBES`
+ * value in Node. The URL (including a bare `?FP_SHARED_PROBES`) and
+ * sessionStorage are visitor-controlled and are NEVER consulted. Any
+ * hostile/inaccessible scope means "off" — the default everywhere. Never throws.
  */
 export function isSharedProbesEnabled(): boolean {
   const truthy = (value: unknown): boolean =>
@@ -1458,24 +1491,6 @@ export function isSharedProbesEnabled(): boolean {
   } catch {
     // Hostile global scope — stay off.
   }
-  try {
-    if (typeof window !== 'undefined' && window.location) {
-      const search = window.location.search;
-      if (typeof search === 'string' && /(?:^|[?&])FP_SHARED_PROBES(?:=[^&]*)?/i.test(search)) {
-        const token = search.match(/[?&]FP_SHARED_PROBES=([^&]*)/i);
-        if (!token || truthy(token[1])) return true;
-      }
-    }
-  } catch {
-    // Hostile location — stay off.
-  }
-  try {
-    if (typeof sessionStorage !== 'undefined' && truthy(sessionStorage.getItem('FP_SHARED_PROBES'))) {
-      return true;
-    }
-  } catch {
-    // Storage blocked — stay off.
-  }
   return false;
 }
 
@@ -1483,10 +1498,6 @@ function recordSharedProbeReason(reason: string): void {
   if (!lastSharedProbeTelemetry.reasons.includes(reason)) {
     lastSharedProbeTelemetry.reasons.push(reason);
   }
-}
-
-function markSharedProbeRouted(probe: 'webgl' | 'canvas' | 'audio'): void {
-  lastSharedProbeTelemetry.routed[probe] = true;
 }
 
 function asUnknownRecord(value: unknown): UnknownRecord | null {
@@ -1584,12 +1595,16 @@ async function resolveSharedProbes(): Promise<ResolvedSharedProbes> {
         audio,
         source: webgl || canvas || audio ? 'client/signals' : 'legacy',
       };
-      lastSharedProbeTelemetry.enabled = true;
+      // No shared probe names are exported today: report legacy/available:false explicitly.
+      // `enabled` is NEVER latched here — it belongs to the caller's per-identify snapshot.
       lastSharedProbeTelemetry.source = resolved.source;
       lastSharedProbeTelemetry.available = Boolean(webgl || canvas || audio);
       if (!webgl) recordSharedProbeReason('webgl: no shared implementation exported; using legacy probe');
       if (!canvas) recordSharedProbeReason('canvas: no shared implementation exported; using legacy probe');
       if (!audio) recordSharedProbeReason('audio: no shared implementation exported; using legacy probe');
+      if (!webgl && !canvas && !audio) {
+        recordSharedProbeReason('no shared probe implementations are exported; legacy probes in use');
+      }
       return resolved;
     })();
   }
@@ -1667,9 +1682,19 @@ function coerceSharedAudio(value: unknown): AudioSignatureResult | null {
 
 let effectiveWebGlProbePromise: Promise<SharedWebGlProbe> | null = null;
 
-/** Legacy probe when the flag is off; shared probe (cached once) when opted in. */
-async function effectiveWebGlProbe(): Promise<SharedWebGlProbe> {
-  if (!isSharedProbesEnabled()) return getSharedWebGlProbe();
+/**
+ * Drops the cached WebGL probe result. Canvas/audio re-run on every identify, so a manual
+ * refresh must see current WebGL output too instead of the first result frozen for the page.
+ */
+function invalidateSharedProbeCache(): void {
+  effectiveWebGlProbePromise = null;
+}
+
+/** Legacy probe when the flag is off; shared probe (cached until a manual refresh) when opted in. */
+async function effectiveWebGlProbe(
+  enabledSnapshot: boolean = isSharedProbesEnabled()
+): Promise<SharedWebGlProbe> {
+  if (!enabledSnapshot) return getSharedWebGlProbe();
   const shared = await resolveSharedProbes();
   if (!effectiveWebGlProbePromise) {
     if (!shared.webgl) {
@@ -1684,7 +1709,6 @@ async function effectiveWebGlProbe(): Promise<SharedWebGlProbe> {
             recordSharedProbeReason('webgl: shared payload failed contract validation; using legacy probe');
             return getSharedWebGlProbe();
           }
-          markSharedProbeRouted('webgl');
           return valid;
         })
         .catch(() => {
@@ -1697,8 +1721,10 @@ async function effectiveWebGlProbe(): Promise<SharedWebGlProbe> {
 }
 
 /** Legacy canvas probe when the flag is off; shared probe when opted in and valid. */
-async function effectiveCanvas2dSignature(): Promise<CanvasSignatureResult> {
-  if (!isSharedProbesEnabled()) return computeCanvas2dSignature();
+async function effectiveCanvas2dSignature(
+  enabledSnapshot: boolean = isSharedProbesEnabled()
+): Promise<CanvasSignatureResult> {
+  if (!enabledSnapshot) return computeCanvas2dSignature();
   const shared = await resolveSharedProbes();
   if (!shared.canvas) return computeCanvas2dSignature();
   try {
@@ -1707,7 +1733,6 @@ async function effectiveCanvas2dSignature(): Promise<CanvasSignatureResult> {
       recordSharedProbeReason('canvas: shared payload failed contract validation; using legacy probe');
       return computeCanvas2dSignature();
     }
-    markSharedProbeRouted('canvas');
     return valid;
   } catch {
     recordSharedProbeReason('canvas: shared probe threw; using legacy probe');
@@ -1716,8 +1741,10 @@ async function effectiveCanvas2dSignature(): Promise<CanvasSignatureResult> {
 }
 
 /** Legacy audio probe when the flag is off; shared probe when opted in and valid. */
-async function effectiveWebAudioSignature(): Promise<AudioSignatureResult> {
-  if (!isSharedProbesEnabled()) return computeWebAudioSignature();
+async function effectiveWebAudioSignature(
+  enabledSnapshot: boolean = isSharedProbesEnabled()
+): Promise<AudioSignatureResult> {
+  if (!enabledSnapshot) return computeWebAudioSignature();
   const shared = await resolveSharedProbes();
   if (!shared.audio) return computeWebAudioSignature();
   try {
@@ -1726,7 +1753,6 @@ async function effectiveWebAudioSignature(): Promise<AudioSignatureResult> {
       recordSharedProbeReason('audio: shared payload failed contract validation; using legacy probe');
       return computeWebAudioSignature();
     }
-    markSharedProbeRouted('audio');
     return valid;
   } catch {
     recordSharedProbeReason('audio: shared probe threw; using legacy probe');
@@ -1965,7 +1991,10 @@ function coherentMaxTouchPoints(raw: number | null | undefined): number {
   return value;
 }
 
-export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & ClientRuntimeSignals> {
+export async function collectBrowserDeviceInfo(
+  sharedProbesEnabled?: boolean,
+  uaChSnapshot: UaChContradiction = activeUaChContradiction
+): Promise<BrowserDeviceInfo & ClientRuntimeSignals> {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
   const runtimeFacts = detectRuntimeFacts(ua);
   // The `(-1).toFixed(-1)` RangeError length is the deterministic engine oracle (51 = V8).
@@ -2017,8 +2046,12 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & Cl
   // The same forged-major filter used for the published UA-CH mirror runs here, so an
   // implausible brand version can never become the human-readable browser label either.
   const versionList =
-    sanitizeUaChBrands(highEntropy?.fullVersionList || uaData?.brands || [], ua, 'browserDevice') ||
-    [];
+    sanitizeUaChBrands(
+      highEntropy?.fullVersionList || uaData?.brands || [],
+      ua,
+      'browserDevice',
+      uaChSnapshot
+    ) || [];
 
   let isBrave = false;
   try {
@@ -2179,8 +2212,9 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & Cl
   const viewportWidth =
     typeof window !== 'undefined' ? Number(window.innerWidth) || 0 : 0;
   // FP_SHARED_PROBES off (default) calls the exact legacy probe; opt-in routes through
-  // the single shared implementation. The gate reads the same shape either way.
-  const gpuProbe = await effectiveWebGlProbe();
+  // the single shared implementation. The gate reads the same shape either way, using
+  // the flag snapshot taken once by the caller for this identify.
+  const gpuProbe = await effectiveWebGlProbe(sharedProbesEnabled);
   const pcLock = getPcLock();
 
   const deviceGate: DeviceGateResult = classifyGenuineDevice({
@@ -2316,6 +2350,7 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & Cl
   // Attach the storage-physics verdict to the device-info object as well, so any
   // consumer that only reads browserDevice still sees the incognito aliases.
   const incognitoVerdict = await detectIncognitoMode();
+  const emittedIncognitoDiagnostics = diagnosticsForEmission(incognitoVerdict);
 
   return {
     browser,
@@ -2345,7 +2380,7 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & Cl
     incognitoMethod: incognitoVerdict.method,
     idbDurabilityRatio: incognitoVerdict.idbDurabilityRatio,
     opfsFlushMs: incognitoVerdict.opfsFlushMs,
-    ...(incognitoVerdict.diagnostics ? { diagnostics: incognitoVerdict.diagnostics } : {}),
+    ...(emittedIncognitoDiagnostics ? { diagnostics: emittedIncognitoDiagnostics } : {}),
   };
 }
 
@@ -2370,8 +2405,12 @@ export interface ClientHintsPayload {
 }
 
 let clientHintsInFlight: Promise<ClientHintsPayload | null> | null = null;
+/** Snapshot that produced the cached hints, carried forward on a manual refresh. */
+let clientHintsContradiction: UaChContradiction | null = null;
 
-async function collectClientHintsUncached(): Promise<ClientHintsPayload | null> {
+async function collectClientHintsUncached(
+  uaChSnapshot: UaChContradiction
+): Promise<ClientHintsPayload | null> {
   if (typeof navigator === 'undefined') return null;
   const uaData = (navigator as unknown as { userAgentData?: NavigatorUAData }).userAgentData;
   if (!uaData) return null;
@@ -2388,7 +2427,8 @@ async function collectClientHintsUncached(): Promise<ClientHintsPayload | null> 
         ? uaData.brands.map((entry) => ({ brand: entry.brand, version: entry.version }))
         : undefined,
       jsUa,
-      'brands'
+      'brands',
+      uaChSnapshot
     ),
     mobile: typeof uaData.mobile === 'boolean' ? uaData.mobile : undefined,
     platform: typeof uaData.platform === 'string' ? uaData.platform : undefined,
@@ -2423,7 +2463,8 @@ async function collectClientHintsUncached(): Promise<ClientHintsPayload | null> 
             }))
           : undefined,
         jsUa,
-        'fullVersionList'
+        'fullVersionList',
+        uaChSnapshot
       ),
       platform: highEntropy.platform || lowEntropy.platform,
       platformVersion: highEntropy.platformVersion || undefined,
@@ -2440,9 +2481,19 @@ async function collectClientHintsUncached(): Promise<ClientHintsPayload | null> 
  * Shared, cached UA-CH probe. The same promise backs the identify payload and any
  * later caller, so a single identify never asks the browser twice.
  */
-export function collectClientHints(): Promise<ClientHintsPayload | null> {
+export function collectClientHints(
+  uaChSnapshot: UaChContradiction = activeUaChContradiction
+): Promise<ClientHintsPayload | null> {
   if (!clientHintsInFlight) {
-    clientHintsInFlight = collectClientHintsUncached().catch(() => null);
+    clientHintsContradiction = uaChSnapshot;
+    clientHintsInFlight = collectClientHintsUncached(uaChSnapshot).catch(() => null);
+  } else if (clientHintsContradiction && clientHintsContradiction !== uaChSnapshot) {
+    // The cached hint values are reused by this identify, so their observation belongs
+    // to this call's snapshot. No stale state survives into a later, different snapshot.
+    for (const reason of clientHintsContradiction.reasons) {
+      if (!uaChSnapshot.reasons.includes(reason)) uaChSnapshot.reasons.push(reason);
+    }
+    if (clientHintsContradiction.detected) uaChSnapshot.detected = true;
   }
   return clientHintsInFlight;
 }
@@ -2475,25 +2526,34 @@ function uaChBrandIsForged(brand: string, version: string, ua: string): boolean 
   return uaMajor !== null && major > uaMajor + UA_MAJOR_TOLERANCE;
 }
 
-/** Contradiction state remembered when a forged UA-CH brand is observed. */
-const uaChContradictionState: { detected: boolean; reasons: string[] } = {
-  detected: false,
-  reasons: [],
-};
+/** Per-identify contradiction snapshot — never carried over into a manual refresh. */
+interface UaChContradiction {
+  detected: boolean;
+  reasons: string[];
+}
+
+function newUaChContradictionSnapshot(): UaChContradiction {
+  return { detected: false, reasons: [] };
+}
+
+/** The snapshot belonging to the current identify call (read-only mirror consumers). */
+let activeUaChContradiction: UaChContradiction = newUaChContradictionSnapshot();
 
 export function getUaChContradiction(): { detected: boolean; reasons: string[] } {
-  return { detected: uaChContradictionState.detected, reasons: [...uaChContradictionState.reasons] };
+  return { detected: activeUaChContradiction.detected, reasons: [...activeUaChContradiction.reasons] };
 }
 
 /**
  * Drops implausible UA-CH brand entries before they can be published as a trusted
  * `browser_details` version. The dropped claim is recorded as an existing tampering /
  * contradiction reason instead. Never throws; an empty list becomes `undefined`.
+ * The snapshot argument scopes observations to ONE identify call.
  */
 function sanitizeUaChBrands<T extends { brand: string; version: string }>(
   list: T[] | undefined | null,
   ua: string,
-  source: string
+  source: string,
+  snapshot: UaChContradiction = activeUaChContradiction
 ): T[] | undefined {
   if (!Array.isArray(list)) return undefined;
   const kept: T[] = [];
@@ -2501,10 +2561,10 @@ function sanitizeUaChBrands<T extends { brand: string; version: string }>(
     if (!entry || typeof entry.brand !== 'string' || typeof entry.version !== 'string') continue;
     if (uaChBrandIsForged(entry.brand, entry.version, ua)) {
       const reason = `UA-CH ${entry.brand}/${entry.version} contradicts the JS User-Agent (${source})`;
-      if (!uaChContradictionState.reasons.includes(reason)) {
-        uaChContradictionState.reasons.push(reason);
+      if (!snapshot.reasons.includes(reason)) {
+        snapshot.reasons.push(reason);
       }
-      uaChContradictionState.detected = true;
+      snapshot.detected = true;
       continue;
     }
     kept.push(entry);
@@ -2552,7 +2612,8 @@ function stableStructuralAnchors(): { fontMetric: string; mathAnchor: string } {
  * Hardware ID (`hwid_<20_hex_chars>`) using SHA-256.
  */
 export async function collectHardwareSignals(
-  browserDevice: BrowserDeviceInfo
+  browserDevice: BrowserDeviceInfo,
+  sharedProbesEnabledSnapshot?: boolean
 ): Promise<
   HardwareSignals & {
     gpuClass: string;
@@ -2564,6 +2625,11 @@ export async function collectHardwareSignals(
     sharedProbeTelemetry?: SharedProbeTelemetry;
   }
 > {
+  // Snapshot the flag ONCE for this call: probes, telemetry `enabled` and the emission gate
+  // all use the same value. Reasons start empty for every identify (no latching).
+  const sharedProbesEnabled =
+    sharedProbesEnabledSnapshot ?? isSharedProbesEnabled();
+  beginSharedProbeTelemetry(sharedProbesEnabled);
   const [
     {
       gpuVendor,
@@ -2583,9 +2649,9 @@ export async function collectHardwareSignals(
     audio,
   ] =
     await Promise.all([
-      effectiveWebGlProbe(),
-      effectiveCanvas2dSignature(),
-      effectiveWebAudioSignature(),
+      effectiveWebGlProbe(sharedProbesEnabled),
+      effectiveCanvas2dSignature(sharedProbesEnabled),
+      effectiveWebAudioSignature(sharedProbesEnabled),
     ]);
   const canvasHash = canvas.signature;
   const audioHash = audio.signature;
@@ -2806,9 +2872,12 @@ export async function collectHardwareSignals(
     audioUsableForIdentity: audio.usableForIdentity,
     audioNoiseReasons: audio.noiseReasons,
     audioTamperingInconclusive: audio.tamperingInconclusive,
-    // Additive telemetry ONLY, and only present when FP_SHARED_PROBES is opted in, so the
-    // default-off payload (keys, digests, scores, verdicts) remains byte-identical.
-    ...(isSharedProbesEnabled() ? { sharedProbeTelemetry: getSharedProbeTelemetry() } : {}),
+    // Additive telemetry ONLY, keyed off the snapshot taken at the start of this call, so
+    // the default-off payload (keys, digests, scores, verdicts) remains byte-identical and
+    // `enabled` can never latch true or be re-read after the probes ran.
+    ...(sharedProbesEnabled
+      ? { sharedProbeTelemetry: getSharedProbeTelemetry(sharedProbesEnabled) }
+      : {}),
   };
 }
 
@@ -3084,6 +3153,16 @@ export function isIncognitoDiagnosticsEnabled(): boolean {
     // Storage blocked — diagnostics stay off.
   }
   return false;
+}
+
+/**
+ * Emission gate. A verdict may have been computed (or read from a legacy lock) while
+ * `intelDiag=1` was on; recompute the flag NOW so diagnostics are never published after
+ * it is switched off. Never feeds a verdict, score or digest.
+ */
+function diagnosticsForEmission(result: IncognitoDetectionResult): IncognitoDiagnostics | undefined {
+  if (!result.diagnostics || !isIncognitoDiagnosticsEnabled()) return undefined;
+  return { ...result.diagnostics, enabled: true };
 }
 
 export interface IncognitoDetectionResult {
@@ -3554,6 +3633,8 @@ interface InteractionCounters {
   touchPositions: Array<{ x: number; y: number }>;
   /** Trusted intervals between successive touchstarts — human tap cadence. */
   touchIntervalsMs: number[];
+  /** Trusted intervals between ANY successive deduped input events — human rhythm across phases. */
+  inputIntervalsMs: number[];
   scrolls: number;
   keyDowns: number;
   keyIntervalsMs: number[];
@@ -3572,6 +3653,7 @@ const interactionCounters: InteractionCounters = {
   touchEnds: 0,
   touchPositions: [],
   touchIntervalsMs: [],
+  inputIntervalsMs: [],
   scrolls: 0,
   keyDowns: 0,
   keyIntervalsMs: [],
@@ -3636,46 +3718,52 @@ export function getInteractionEvidence(): string[] {
 
 /**
  * True only for GENUINE human input. All counters below are fed exclusively by
- * `isTrusted` events, and CDP-dispatched synthetic Playwright input additionally trips the
- * mark-target / framework-global guards, so a driven runtime can never earn human credit.
- * Geometry, languages, a visible document and a hardware GPU are deliberately absent —
- * a headless browser with a normal desktop UA manufactures all of them.
+ * `isTrusted` events, but CDP `Input.dispatch*` events are `isTrusted:true` too — so a
+ * single trusted scroll, tap or pointer trail must NOT earn human credit. We now require
+ * multi-signal kinetics: real movement, a trusted human cadence, and at least two distinct
+ * interaction phases. CDP-dispatched Playwright input additionally trips the mark-target /
+ * framework-global guards. Geometry, languages, a visible document and a hardware GPU are
+ * deliberately absent — a headless browser with a normal desktop UA manufactures all of them.
  */
 export function hasGenuineHumanInput(): boolean {
   const c = interactionCounters;
   // An injected automation library is present: any input seen this session is attributable
   // to the driver, not to a person, regardless of how natural its cadence looked.
   if (c.frameworkGlobals.length > 0 || c.playwrightMarkTargets > 0) return false;
-  // Trusted touch input is genuine on a phone exactly as pointer/keyboard input is on a
-  // desktop. A completed tap (touchstart -> touchend), a drag with realistic movement, a
-  // human tap cadence, or even a single in-flight trusted touchstart all count. CDP-
-  // dispatched synthetic touch is excluded by the framework/mark-target guard above, so a
-  // real person is never asked to "prove" their touch with desktop-only pointer trails.
-  if (c.touchStarts > 0 || c.touchEnds > 0) return true;
-  if (c.touchMoves >= 2 && c.touchPositions.length >= 2) {
-    const first = c.touchPositions[0];
-    const last = c.touchPositions[c.touchPositions.length - 1];
+
+  // (1) Movement: a trusted trail with a real displacement or >=3 distinct positions.
+  const hasTrail = (positions: Array<{ x: number; y: number }>): boolean => {
+    if (positions.length < 3) return false;
+    const first = positions[0];
+    const last = positions[positions.length - 1];
     if (Math.abs(first.x - last.x) + Math.abs(first.y - last.y) >= 12) return true;
-    const distinct = new Set(
-      c.touchPositions.map((p) => `${Math.round(p.x / 4)}:${Math.round(p.y / 4)}`)
-    ).size;
-    if (distinct >= 3) return true;
-  }
-  const humanTouchIntervals = c.touchIntervalsMs.filter((ms) => ms >= 40 && ms < 1500);
-  if (humanTouchIntervals.length >= 1) return true;
-  if (c.scrolls > 0) return true;
-  const humanIntervals = c.keyIntervalsMs.filter((ms) => ms >= 40 && ms < 1500);
-  if (c.keyDowns >= 3 && humanIntervals.length >= 2) return true;
-  if (c.pointerMoves >= 3 && c.pointerPositions.length >= 3) {
-    const first = c.pointerPositions[0];
-    const last = c.pointerPositions[c.pointerPositions.length - 1];
-    if (Math.abs(first.x - last.x) + Math.abs(first.y - last.y) >= 12) return true;
-    const distinct = new Set(
-      c.pointerPositions.map((p) => `${Math.round(p.x / 4)}:${Math.round(p.y / 4)}`)
-    ).size;
-    if (distinct >= 3) return true;
-  }
-  return false;
+    return (
+      new Set(positions.map((p) => `${Math.round(p.x / 4)}:${Math.round(p.y / 4)}`)).size >= 3
+    );
+  };
+  const movement =
+    (c.pointerMoves >= 3 && hasTrail(c.pointerPositions)) ||
+    (c.touchMoves >= 2 && hasTrail(c.touchPositions));
+  if (!movement) return false;
+
+  // (2) Cadence: at least two trusted, human-plausible intervals across the input phases.
+  const plausible = (ms: number): boolean => ms >= 40 && ms < 1500;
+  const cadence =
+    c.inputIntervalsMs.filter(plausible).length >= 2 ||
+    c.touchIntervalsMs.filter(plausible).length >= 2 ||
+    c.keyIntervalsMs.filter(plausible).length >= 2;
+  if (!cadence) return false;
+
+  // (3) Phases: at least two distinct kinds of interaction, not one repeated synthetic event.
+  const phases =
+    (c.touchStarts > 0 ? 1 : 0) +
+    (c.touchMoves > 0 ? 1 : 0) +
+    (c.touchEnds > 0 ? 1 : 0) +
+    (c.pointerDowns > 0 ? 1 : 0) +
+    (c.pointerMoves > 0 ? 1 : 0) +
+    (c.keyDowns > 0 ? 1 : 0) +
+    (c.scrolls > 0 ? 1 : 0);
+  return phases >= 2;
 }
 
 /** Shape of the fresh human-corroboration measurement returned by `measureHumanCorroboration`. */
@@ -3866,6 +3954,15 @@ export function installTrustedInputTracker(): void {
   const options: AddEventListenerOptions = { capture: true, passive: true };
   const stamp = (): number => {
     const now = Date.now();
+    if (lastTrustedInputAt > 0) {
+      const interval = now - lastTrustedInputAt;
+      if (interval > 0 && interval < 2000) {
+        interactionCounters.inputIntervalsMs.push(interval);
+        if (interactionCounters.inputIntervalsMs.length > 64) {
+          interactionCounters.inputIntervalsMs.shift();
+        }
+      }
+    }
     if (interactionCounters.firstInteractionAt === 0) interactionCounters.firstInteractionAt = now;
     interactionCounters.lastInteractionAt = now;
     lastTrustedInputAt = now;
@@ -3994,6 +4091,10 @@ export function installTrustedInputTracker(): void {
     // A blocked listener is not evidence.
   }
 }
+
+// Install at module load, before App mount and before the first identify, so genuine
+// pre-identify input is visible. The function itself is a no-op without a window.
+if (typeof window !== 'undefined') installTrustedInputTracker();
 
 /**
  * Human-corroboration score in [0, 1].
@@ -4364,6 +4465,8 @@ export function detectBotAndAutomation(
      * the low-level detector keeps its legacy hard-flag contract for direct callers.
      */
     bareWebdriverIsSoft?: boolean;
+    /** This identify's UA-CH contradiction snapshot (never a sticky module-level state). */
+    uaChContradiction?: UaChContradiction;
   }
 ): BotAutomationSignals {
   const nav = typeof navigator !== 'undefined' ? navigator : undefined;
@@ -4460,8 +4563,16 @@ export function detectBotAndAutomation(
   // docked layout (large outer/inner viewport delta) counts as real DevTools evidence here.
   const dockedDevToolsLayout = hasDockedDevToolsLayout();
   const developerTools = runtimeHost.environment === 'ide_webview' || dockedDevToolsLayout;
+  // A real docked DevTools layout or a known embedded host is always weight 0, even before
+  // the person has interacted — a fresh IDE / Electron / DevTools load must never be branded
+  // a bot. A headless stealth runtime has no docked layout, so it cannot hide behind this.
+  const exemptHost = dockedDevToolsLayout || runtimeHost.electron || runtimeHost.ideWebview;
+  const dwellSatisfied =
+    options?.dwellAwaited === true || Date.now() - PAGE_SESSION_STARTED_AT >= CDP_CORROBORATION_DWELL_MS;
   const headlessShapedCdp =
     stealth.cdpRuntimeProof &&
+    dwellSatisfied &&
+    !exemptHost &&
     human.score < 0.34 &&
     !privacyHardenedRuntime &&
     (zeroGeometry || emptyLanguages || softwareGpu);
@@ -4477,12 +4588,6 @@ export function detectBotAndAutomation(
   // Privacy-hardened runtimes (Tor / RFP / Firefox / Safari / Brave) keep their exemption;
   // a software GPU is NOT bridge evidence (SwiftShader on its own remains exempt).
   const bridgeEvidence = collectCdpBridgeEvidence(stealth, ua);
-  // A real docked DevTools layout or a known embedded host is always weight 0, even before
-  // the person has interacted — a fresh IDE / Electron / DevTools load must never be branded
-  // a bot. A headless stealth runtime has no docked layout, so it cannot hide behind this.
-  const exemptHost = dockedDevToolsLayout || runtimeHost.electron || runtimeHost.ideWebview;
-  const dwellSatisfied =
-    options?.dwellAwaited === true || Date.now() - PAGE_SESSION_STARTED_AT >= CDP_CORROBORATION_DWELL_MS;
   const corroboratedCdpBot =
     bridgeEvidence.length > 0 &&
     dwellSatisfied &&
@@ -5683,7 +5788,16 @@ function readIncognitoSessionLock(): IncognitoDetectionResult | null {
       // "inconclusive"/"normal" entries must NEVER pin a tab: a fresh run with
       // decisive private-storage evidence has to be able to override them.
       if (parsed.confidence !== 'high') return null;
-      return { ...parsed, isPrivate: Boolean(parsed.isPrivate) };
+      // Never trust persisted diagnostics: strip them on read, then re-enable only when
+      // the flag is on right now (old locks from a diagnostics-enabled session included).
+      const restored: IncognitoDetectionResult = { ...parsed };
+      const persistedDiagnostics = restored.diagnostics;
+      delete restored.diagnostics;
+      restored.isPrivate = Boolean(parsed.isPrivate);
+      if (isIncognitoDiagnosticsEnabled() && persistedDiagnostics) {
+        restored.diagnostics = { ...persistedDiagnostics, enabled: true };
+      }
+      return restored;
     }
   } catch {
     // Storage blocked or a corrupt entry: ignore and re-probe.
@@ -5721,9 +5835,13 @@ function writeIncognitoSessionLock(result: IncognitoDetectionResult): void {
   try {
     if (typeof sessionStorage === 'undefined') return;
     if (result.confidence !== 'high') return;
+    // Diagnostics are flag-gated telemetry, never verdict state: strip before persisting so
+    // a `?intelDiag=1` session cannot leak them into later loads after the flag is off.
+    const lockResult: IncognitoDetectionResult = { ...result };
+    delete lockResult.diagnostics;
     sessionStorage.setItem(
       INCOGNITO_SESSION_LOCK_KEY,
-      JSON.stringify({ ...result, lockVersion: INCOGNITO_LOCK_VERSION })
+      JSON.stringify({ ...lockResult, lockVersion: INCOGNITO_LOCK_VERSION })
     );
   } catch {
     // Storage blocked: the in-memory cache still serves this page load.
@@ -6769,7 +6887,8 @@ export async function evaluateSecuritySignals(
   browserDevice: BrowserDeviceInfo,
   hardwareSignals: CollectedHardwareSignals,
   clientGeoHint: ClientGeoHint | null,
-  hasStoredIdentity: boolean
+  hasStoredIdentity: boolean,
+  options?: { uaChContradiction?: UaChContradiction }
 ): Promise<SecuritySignalsWithProvenance> {
   // 1. Automation & Headless Bot Detection (CDP bindings, native prototype checks).
   // Snapshot the CDP bridge once, up front, so the dwell decision and the authoritative
@@ -6801,6 +6920,7 @@ export async function evaluateSecuritySignals(
     // Bare webdriver / bare CDP Runtime leaks are developer-tools telemetry on CDP-driven
     // headful Chrome. Only corroborated bridge / stealth / anti-detect evidence may escalate.
     bareWebdriverIsSoft: true,
+    uaChContradiction: options?.uaChContradiction,
   });
   const botSignals: string[] = botAssessment.isBot
     ? (botAssessment.botSignals && botAssessment.botSignals.length > 0
@@ -6967,6 +7087,7 @@ export async function evaluateSecuritySignals(
 
   // 4. Private Mode / Incognito Inspection (multi-engine physics)
   const incognito = await detectIncognitoMode();
+  const emittedIncognitoDiagnostics = diagnosticsForEmission(incognito);
   const persistentStorageGrant = await hasPersistedStorageGrant();
   // The per-tab session lock is authoritative and already carries the first-party
   // persistent-marker veto (applied once, when the lock was first computed). Do NOT
@@ -7070,7 +7191,7 @@ export async function evaluateSecuritySignals(
   // through the existing tampering / contradiction state instead of silently trusting it:
   // the reason is exposed on both the tamper list and the tampering details, but does not
   // become a second bot verdict or change the 0-10 score on its own.
-  const uaChContradiction = getUaChContradiction();
+  const uaChContradiction = options?.uaChContradiction ?? getUaChContradiction();
   if (uaChContradiction.detected) {
     for (const reason of uaChContradiction.reasons) {
       if (!tamperReasons.includes(reason)) tamperReasons.push(reason);
@@ -7447,7 +7568,7 @@ export async function evaluateSecuritySignals(
     idbDurabilityRatio: incognito.idbDurabilityRatio,
     opfsFlushMs: incognito.opfsFlushMs,
     // Additive, flag-gated incognito diagnostics — never a verdict or scoring input.
-    ...(incognito.diagnostics ? { diagnostics: incognito.diagnostics } : {}),
+    ...(emittedIncognitoDiagnostics ? { diagnostics: emittedIncognitoDiagnostics } : {}),
     storageQuotaMb,
     persistenceMode,
     suspectScore,
@@ -8860,10 +8981,16 @@ export async function identifyCurrentVisitor(options?: {
   }
 
   const execute = async (): Promise<IntelVisitorResponse> => {
+    // One flag snapshot and one UA-CH contradiction snapshot per identify call. Neither
+    // telemetry latch nor a stale observation can leak into a manual refresh.
+    const sharedProbesEnabled = isSharedProbesEnabled();
+    const uaChSnapshot = newUaChContradictionSnapshot();
+    activeUaChContradiction = uaChSnapshot;
+    if (options?.manualRefresh) invalidateSharedProbeCache();
     const [browserDevice, clientGeoHint, clientHints, grantedGeolocation] = await Promise.all([
-      collectBrowserDeviceInfo(),
+      collectBrowserDeviceInfo(sharedProbesEnabled, uaChSnapshot),
       collectClientGeoHint(),
-      collectClientHints(),
+      collectClientHints(uaChSnapshot),
       collectGrantedGeolocation(),
     ]);
     const stored = getFirstPartyStorage();
@@ -8874,7 +9001,7 @@ export async function identifyCurrentVisitor(options?: {
       browserDevice.browser
     );
     const [hardwareSignals, collectedSignals, storedIdentity] = await Promise.all([
-      collectHardwareSignals(browserDevice),
+      collectHardwareSignals(browserDevice, sharedProbesEnabled),
       collectAllSignals({ timeouts: 1200, browserHints: browserCanvasHints }).catch(() => null),
       loadStoredIdentity().catch(() => ({ identity: null, sources: [], storage_healed: false })),
     ]);
@@ -8883,7 +9010,8 @@ export async function identifyCurrentVisitor(options?: {
       browserDevice,
       hardwareSignals,
       clientGeoHint,
-      Boolean(stored.visitorId && stored.visitorToken)
+      Boolean(stored.visitorId && stored.visitorToken),
+      { uaChContradiction: uaChSnapshot }
     );
 
     const pageLoadId = options?.manualRefresh
@@ -8896,6 +9024,9 @@ export async function identifyCurrentVisitor(options?: {
     // persistent-marker veto was already folded into the lock when it was first computed.
     const incog = await detectIncognitoMode();
     const incognitoVerified = incog.isPrivate;
+    // Recompute the diagnostics flag at emit time: a verdict computed under ?intelDiag=1
+    // must not publish diagnostics once the flag is switched off.
+    const emittedDiagnostics = diagnosticsForEmission(incog);
 
     // Phase 4 — sealed request envelope: one-time nonce + SHA-256 over the canonical
     // string the server recomputes. Crypto failures degrade to an empty signature
@@ -9025,11 +9156,11 @@ export async function identifyCurrentVisitor(options?: {
     // Additive, flag-gated timing shadow. Computed ONLY when diagnostics are on: the default
     // path calls no helper, reads no clock and allocates no shadow object. `load_get_timing`
     // above is built from the same recorded timings and is left byte-for-byte untouched.
-    const timingShadow = incog.diagnostics ? buildTimingShadow(recordedTimings) : undefined;
+    const timingShadow = emittedDiagnostics ? buildTimingShadow(recordedTimings) : undefined;
 
     // Additive, flag-gated FJS-v5 parity snapshot. Pure and descriptive only: it reads the
     // already-collected signal objects and never probes, hashes into an identity, or scores.
-    const fjsV5ParityShadow = incog.diagnostics
+    const fjsV5ParityShadow = emittedDiagnostics
       ? buildFjsV5ParitySnapshot({
           fonts: collectedSignals?.fonts,
           fontPreferences: collectedSignals?.fontPreferences,
@@ -9079,7 +9210,7 @@ export async function identifyCurrentVisitor(options?: {
         hardwareSignals,
         securitySignals,
         // The flag-gated diagnostic mirror is emitted once, here, additively.
-        ...(incog.diagnostics ? { diagnostics: incog.diagnostics } : {}),
+        ...(emittedDiagnostics ? { diagnostics: emittedDiagnostics } : {}),
         identityProfile,
         // Additive entropy/timing mirrors — informational only, never a verdict or rank input.
         ...(additiveEntropy ? { entropyTelemetry: additiveEntropy } : {}),
@@ -9158,8 +9289,8 @@ export async function identifyCurrentVisitor(options?: {
         idbDurabilityRatio: incog.idbDurabilityRatio,
         opfsFlushMs: incog.opfsFlushMs,
         // Additive, flag-gated diagnostics — absent unless intelDiag=1 or the session
-        // key is set. Never consumed by any verdict or risk path.
-        ...(incog.diagnostics ? { diagnostics: incog.diagnostics } : {}),
+        // key is set NOW. Never consumed by any verdict or risk path.
+        ...(emittedDiagnostics ? { diagnostics: emittedDiagnostics } : {}),
       }),
     });
 
@@ -9196,5 +9327,5 @@ export async function identifyCurrentVisitor(options?: {
 // Start the storage-physics probe as soon as the module loads — before App mounts, so the
 // main-thread timing is not skewed by the first paint and initial network activity.
 if (typeof window !== 'undefined' && typeof indexedDB !== 'undefined') {
-  void detectIncognitoMode();
+  void detectIncognitoMode().catch(() => undefined);
 }

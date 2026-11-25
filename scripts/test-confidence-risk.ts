@@ -359,18 +359,18 @@ check('NaN / Infinity / wrong-type evidence never throws and never fabricates a 
   assert.equal(componentOf(components, 'structural_anchor_ratio').contribution, 0);
   assert.equal(componentOf(components, 'browser_family_consensus').contribution, 0);
   assert.equal(componentOf(components, 'os_family_consensus').contribution, 0);
-  // A PRESENT but invalid seed count is defensively one corroborating seed, never a collision.
+  // A PRESENT but invalid seed count is unavailable evidence, never a fabricated corroborating seed.
   const seeds = componentOf(components, 'distinct_storage_seeds');
-  assert.equal(seeds.evidence, 1);
-  assert.equal(seeds.weight, 0.1);
-  assert.equal(seeds.contribution, 0.1);
-  assert.match(seeds.detail, /defaulted to 1/);
-  // lsh_fuzzy base 0.20 + the single seed 0.10 = 0.30; no fabricated collision penalty.
-  assert.equal(evidenceScore(input), 0.3);
+  assert.equal(seeds.evidence, 0);
+  assert.equal(seeds.weight, 0);
+  assert.equal(seeds.contribution, 0);
+  assert.match(seeds.detail, /invalid\/unavailable; zero weight/);
+  // lsh_fuzzy base 0.20 only; no fabricated single-seed bonus.
+  assert.equal(evidenceScore(input), 0.2);
   assert.doesNotThrow(() => scoreConfidence(input));
 });
 
-check('malformed seed variants default to +0.10 while missing seeds stay at zero', () => {
+check('malformed seed variants stay at zero while missing seeds stay at zero', () => {
   const base = {
     match_tier: 'lsh_fuzzy' as const,
     match_score: 100,
@@ -383,9 +383,9 @@ check('malformed seed variants default to +0.10 while missing seeds stay at zero
   for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5, 'abc']) {
     const input = { ...base, distinct_storage_seeds_count: bad as unknown as number };
     const component = componentOf(scoreConfidenceBreakdown(input), 'distinct_storage_seeds');
-    assert.equal(component.weight, 0.1, `bad seed ${String(bad)} must not be a collision`);
-    assert.equal(component.contribution, 0.1, `bad seed ${String(bad)} contribution`);
-    assert.equal(evidenceScore(input), 0.7, `bad seed ${String(bad)} score`);
+    assert.equal(component.weight, 0, `bad seed ${String(bad)} must carry no weight`);
+    assert.equal(component.contribution, 0, `bad seed ${String(bad)} contribution`);
+    assert.equal(evidenceScore(input), 0.6, `bad seed ${String(bad)} score`);
   }
 });
 

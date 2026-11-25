@@ -355,8 +355,10 @@ export function resolveIdentityStage(input: IdentityResolutionInput = {}): Ident
  *     key insertion order cannot change the result.
  *   - The purpose key is VERSIONED (`high-recall:v1`). Exactly one prior key
  *     (`high-recall:v0`) is accepted during a rotation; anything older is rejected.
- *   - The HMAC key is tenant/instance scoped via a caller-supplied pepper; a default
- *     `instance-local` scope keeps the helper total for offline / single-tenant callers.
+ *   - The HMAC key is scoped by an explicitly caller-supplied pepper. It is never inferred
+ *     from the untrusted resolved bundle nor silently defaulted: without a pepper the resolver
+ *     reports `visitor_found: false`. `instance-local` is only a compatibility/test value;
+ *     production callers must not use it as their scope.
  *   - Collision risk is BOUNDED by the coarse cohort width of the resolved signals, not by
  *     the 20-char output: many visitors may share an HR id, which is why it is a hint only.
  *   - `visitor_found` means "a stable HR candidate was derived" (coverage), NOT that a
@@ -371,6 +373,9 @@ export const HIGH_RECALL_PRIOR_PURPOSE_KEY = 'high-recall:v0';
 export const HIGH_RECALL_ID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 export const HIGH_RECALL_ID_LENGTH = 20;
 export const HIGH_RECALL_MAX_ID_LENGTH = 25;
+/** Public, NON-SECRET compatibility/test pepper (frozen golden fixtures use this value).
+ *  It is never defaulted or inferred from the resolved bundle; production callers must NOT
+ *  use it as a scope because it is guessable. An explicit caller decision is sufficient. */
 export const HIGH_RECALL_DEFAULT_PEPPER = 'instance-local';
 /** Only these canonical fields may enter the HMAC message. */
 export const HIGH_RECALL_STABLE_FIELDS: readonly string[] = [
@@ -384,14 +389,15 @@ export const HIGH_RECALL_STABLE_FIELDS: readonly string[] = [
 ];
 
 /** Canonical, PII-minimized input built by `buildHighRecallInput`. Contains only resolved
- *  stable tokens plus the tenant scope and purpose-key version. */
+ *  stable tokens plus the trusted caller scope and purpose-key version. */
 export interface HighRecallInput {
   readonly values: Readonly<Record<string, string>>;
+  /** Trusted, caller-supplied scope. Empty means "no trusted pepper" — no id is minted. */
   readonly pepper: string;
   readonly key_version: string;
 }
 
-/** Pure result of `resolveSupplementaryHighRecall` — four fields, NO confidence score. */
+/** Pure result of `resolveSupplementaryHighRecallId` — four fields, NO confidence score. */
 export interface SupplementaryHighRecallResult {
   visitor_id: string | null;
   visitor_found: boolean;
@@ -463,45 +469,69 @@ function hrPlainString(value: unknown): string {
   return text.length > 256 ? text.slice(0, 256).trim() : text;
 }
 
-/** IPv4 -> first three octets + .0/24. Rejects non-octal, out-of-range and hostile input. */
+/** IPv4 -> first three octets + .0/24. Rejects leading-zero octets, out-of-range octets
+ *  (including the fourth one, which is not part of the output), bad prefix lengths and
+ *  hostile input. */
 function hrTruncateIpv4(value: string): string {
-  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:\/\d{1,2})?$/.exec(value);
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:\/(\d{1,2}))?$/.exec(value);
   if (!match) return '';
-  const octets = [match[1], match[2], match[3]].map((part) => Number(part));
+  const parts = [match[1], match[2], match[3], match[4]];
+  // Leading zeros are ambiguous/octal-looking; only the literal '0' is canonical.
+  if (parts.some((part) => part.length > 1 && part.startsWith('0'))) return '';
+  const octets = parts.map((part) => Number(part));
   if (octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return '';
-  return `${octets.join('.')}.0/24`;
+  if (match[5] !== undefined) {
+    const prefix = Number(match[5]);
+    if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return '';
+  }
+  return `${octets.slice(0, 3).join('.')}.0/24`;
 }
 
-/** IPv6 -> first three (zero-padded) hextets + ::/48. Handles `::` compression and a
- *  trailing prefix length. Embedded-IPv4 forms are rejected rather than guessed. */
+/** IPv6 -> first three (zero-padded) hextets + ::/48. Handles `::`, `::1`, trailing `::`
+ *  and a trailing prefix length. Embedded IPv4 (dotted or hex-mapped/compatible) and
+ *  over-long forms are rejected rather than guessed. */
 function hrTruncateIpv6(value: string): string {
   let text = value.trim().toLowerCase();
   if (text.startsWith('[')) {
     const end = text.indexOf(']');
-    if (end > 0) text = text.slice(1, end);
+    if (end < 0) return '';
+    text = text.slice(1, end);
   }
   text = text.split('%')[0]; // strip zone id
-  if (text.includes('.')) return ''; // embedded IPv4 is deliberately unsupported
+  if (text.includes('.')) return ''; // embedded IPv4 in dotted form is unsupported
   if (text.includes('/')) text = text.slice(0, text.indexOf('/'));
+  if (!text) return '';
 
   let groups: string[];
   if (text.includes('::')) {
     const halves = text.split('::');
-    if (halves.length !== 2) return '';
-    // `2001:::1` has an empty group between colons and must be rejected, not repaired.
-    if (halves[0].split(':').some((part) => part === '')) return '';
-    if (halves[1].split(':').some((part) => part === '')) return '';
+    if (halves.length !== 2) return ''; // more than one compression is invalid
+    // An empty half is legal only at the very start/end (`::1`, `2001:db8::`); an empty
+    // group inside a half (`2001:::1`) is not.
     const left = halves[0] ? halves[0].split(':') : [];
     const right = halves[1] ? halves[1].split(':') : [];
+    if (left.some((part) => !part) || right.some((part) => !part)) return '';
+    // `::` must stand in for at least one all-zero hextet: eight explicit groups plus
+    // `::` (e.g. `1:2:3:4:5:6:7:8::`) is over-long.
     const missing = 8 - left.length - right.length;
-    if (missing < 0) return '';
+    if (missing < 1) return '';
     groups = [...left, ...new Array<string>(missing).fill('0'), ...right];
   } else {
-    groups = text.split(':').filter(Boolean);
+    const parts = text.split(':');
+    if (parts.some((part) => !part)) return ''; // stray leading/trailing/double colon
+    groups = parts;
   }
   if (groups.length !== 8) return '';
-  for (const group of groups) if (!/^[0-9a-f]{1,4}$/.test(group)) return '';
-  const head = groups.slice(0, 3).map((group) => group.padStart(4, '0'));
+  const expanded = groups.map((group) => group.padStart(4, '0'));
+  for (const group of expanded) if (!/^[0-9a-f]{1,4}$/.test(group)) return '';
+
+  // Reject embedded IPv4 written in hex: IPv4-mapped (`::ffff:c000:201`) and
+  // IPv4-compatible (`::c000:201`) forms. `::` and `::1` stay valid.
+  const ipv4Mapped = expanded.slice(0, 5).every((group) => group === '0000') && expanded[5] === 'ffff';
+  const ipv4Compatible = expanded.slice(0, 6).every((group) => group === '0000') && expanded[6] !== '0000';
+  if (ipv4Mapped || ipv4Compatible) return '';
+
+  const head = expanded.slice(0, 3);
   return `${head.join(':')}::/48`;
 }
 
@@ -525,6 +555,19 @@ function hrNormalizedUa(source: unknown): string {
     hrFirstToken(details, ['os_version', 'osVersion']),
   ].filter(Boolean);
   return parts.join(' ');
+}
+
+/**
+ * Re-canonicalize a caller-supplied `ua` value to the resolved/normalized shape that
+ * `hrNormalizedUa` produces from a bundle: a short, lowercase token sequence. A raw UA
+ * string (`Mozilla/5.0 (...) AppleWebKit/...`) carries host-specific detail and is rejected
+ * rather than hashed when it arrives directly in a `values` map.
+ */
+function hrCanonicalUa(value: unknown): string {
+  const token = hrToken(value);
+  if (!token) return '';
+  if (/\bmozilla\/|\bapplewebkit\/|\(khtml|\bgecko\b|\(|\)|;/.test(token)) return '';
+  return token;
 }
 
 function hrLanguage(source: unknown): string {
@@ -654,10 +697,11 @@ function hrBase62(bytes: Uint8Array, length: number): string {
 /**
  * Build the canonical, PII-minimized HR input from an ALREADY RESOLVED signal bundle.
  * Only whitelisted stable fields are read; raw PII (full IP / raw UA) never leaves here.
- * Total over hostile input — a malformed bundle yields an empty `values` map, which the
- * resolver reports as `visitor_found: false` instead of minting an id.
+ * `trustedPepper` is a caller-supplied scope and must NOT come from `resolved`, which is
+ * untrusted. When it is absent the returned `pepper` is empty and the resolver refuses to
+ * mint an id. Total over hostile input — a malformed bundle yields an empty `values` map.
  */
-export function buildHighRecallInput(resolved: unknown): HighRecallInput {
+export function buildHighRecallInput(resolved: unknown, trustedPepper?: string): HighRecallInput {
   try {
     const values: Record<string, string> = {};
     const add = (key: string, value: string): void => {
@@ -678,11 +722,11 @@ export function buildHighRecallInput(resolved: unknown): HighRecallInput {
     const details = hrSafeGet(resolved, 'browser_details') ?? hrSafeGet(resolved, 'browserDetails');
     add('browser', hrFirstToken(resolved, ['browserFamily', 'browserName']) || hrFirstToken(details, ['browser_name']));
 
-    // The pepper is a tenant / instance SCOPE, never a personal signal. Callers should
-    // supply one; the constant fallback keeps single-tenant offline use deterministic.
-    const pepper =
-      hrFirstToken(resolved, ['tenantId', 'tenant', 'instanceId', 'instance', 'pepper', 'keyScope', 'key_scope']) ||
-      HIGH_RECALL_DEFAULT_PEPPER;
+    // The pepper is a trusted SCOPE supplied by the caller, never a signal read from the
+    // untrusted resolved bundle (tenantId / instanceId / pepper / keyScope are all untrusted
+    // here). An absent pepper stays empty so the resolver fails closed instead of deriving
+    // an id with a guessable key.
+    const pepper = hrToken(trustedPepper);
     const keyVersion =
       hrFirstToken(resolved, ['highRecallKeyVersion', 'key_version', 'keyVersion']) || HIGH_RECALL_PURPOSE_KEY;
 
@@ -690,19 +734,21 @@ export function buildHighRecallInput(resolved: unknown): HighRecallInput {
     for (const key of Object.keys(values).sort()) sortedValues[key] = values[key];
     return { values: sortedValues, pepper, key_version: keyVersion };
   } catch {
-    return { values: {}, pepper: HIGH_RECALL_DEFAULT_PEPPER, key_version: HIGH_RECALL_PURPOSE_KEY };
+    return { values: {}, pepper: '', key_version: HIGH_RECALL_PURPOSE_KEY };
   }
 }
 
 /**
  * Derive the supplementary high-recall id. Pure, synchronous, non-throwing, no IO.
  * The message is `key=value` pairs sorted by key and joined with `|`; the HMAC key is
- * `purposeKey \0 tenantScope`. Exactly one prior purpose key is accepted on rotation.
+ * `purposeKey \0 trustedPepper`. Exactly one prior purpose key is accepted on rotation.
+ * Caller-supplied `values` are re-canonicalized here so no whitelisted key can smuggle raw
+ * PII into the message. A trusted pepper is mandatory; without one no id is minted.
  *
  * `visitor_found: true` means a candidate was DERIVED (coverage), not that a visitor was
  * confirmed by storage or hardware. There is intentionally no confidence score.
  */
-export function resolveSupplementaryHighRecall(input: unknown): SupplementaryHighRecallResult {
+export function resolveSupplementaryHighRecallId(input: unknown): SupplementaryHighRecallResult {
   try {
     const source = input !== null && typeof input === 'object' ? (input as Record<string, unknown>) : null;
     if (!source) {
@@ -714,7 +760,14 @@ export function resolveSupplementaryHighRecall(input: unknown): SupplementaryHig
     if (rawValues !== null && typeof rawValues === 'object') {
       for (const key of Object.keys(rawValues).sort()) {
         if (!HIGH_RECALL_STABLE_FIELDS.includes(key)) continue;
-        const canonical = hrToken(hrSafeGet(rawValues, key));
+        const raw = hrSafeGet(rawValues, key);
+        // Callers may supply `values` directly, bypassing buildHighRecallInput. Re-apply the
+        // builder's PII-minimizing canonicalization: a raw full IP or raw UA must never enter
+        // the HMAC message. Invalid values are dropped rather than hashed.
+        const canonical =
+          key === 'ip_prefix' ? hrIpPrefix(raw)
+          : key === 'ua' ? hrCanonicalUa(raw)
+          : hrToken(raw);
         if (canonical) values[key] = canonical;
       }
     }
@@ -723,10 +776,18 @@ export function resolveSupplementaryHighRecall(input: unknown): SupplementaryHig
       return { visitor_id: null, visitor_found: false, reason: 'insufficient_resolved_signals', key_version: HIGH_RECALL_PURPOSE_KEY };
     }
 
-    const pepper = hrToken(hrSafeGet(source, 'pepper')) || HIGH_RECALL_DEFAULT_PEPPER;
     const keyVersion = hrToken(hrSafeGet(source, 'key_version')) || HIGH_RECALL_PURPOSE_KEY;
     if (keyVersion !== HIGH_RECALL_PURPOSE_KEY && keyVersion !== HIGH_RECALL_PRIOR_PURPOSE_KEY) {
       return { visitor_id: null, visitor_found: false, reason: 'unsupported_key_version', key_version: keyVersion };
+    }
+
+    // The pepper MUST be supplied explicitly by the caller. There is deliberately no fallback
+    // to an untrusted bundle field and no silent default. Any non-empty value is accepted,
+    // including the public `instance-local` compatibility/test value: production callers must
+    // not use it, but the resolver does not bake that literal into its logic.
+    const pepper = hrToken(hrSafeGet(source, 'pepper'));
+    if (!pepper) {
+      return { visitor_id: null, visitor_found: false, reason: 'missing_trusted_pepper', key_version: keyVersion };
     }
 
     const seed = keys.map((key) => `${key}=${values[key]}`).join('|');

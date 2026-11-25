@@ -15,7 +15,7 @@ import { countryAnchor, isCoordinateConsistentWithCountry } from './countryGeo';
 
 export type EdgeHeaderBag = Record<string, string | string[] | undefined>;
 
-export type EdgeGeoSource = 'vercel' | 'cloudflare' | 'none';
+export type EdgeGeoSource = 'vercel' | 'cloudflare' | 'none' | 'unverified';
 
 export interface EdgeGeoHeaders {
   city: string;
@@ -52,8 +52,14 @@ export interface EdgeGeoHeaders {
   asnNetwork: string;
   /** Cloudflare reports `T1` for requests that arrive over the Tor network. */
   isTorNetwork: boolean;
-  /** True when the values came from the Worker-signed header, not a raw client header. */
+  /**
+   * True ONLY when `x-intel-edge-geo` carried a signature that the caller-supplied verifier
+   * accepted. A raw platform header (Vercel / Cloudflare) or an unverified signed header is
+   * always false: `trusted` is the single flag downstream code must gate any verification
+   * claim (`isIpVerified` / `isLocationVerified`) on.
+   */
   trusted: boolean;
+  /** `unverified` means a signed header was present but could not be authenticated. */
   source: EdgeGeoSource;
 }
 
@@ -319,11 +325,105 @@ interface EdgeGeoPayload {
 }
 
 /**
- * Decodes the Worker-signed `x-intel-edge-geo` header. Returns null for anything that is
- * not a well-formed payload, so a malformed header degrades to the ordinary header path.
+ * Injection point for the edge header's MAC check. The server owns the secret and the HMAC
+ * implementation; this dependency-free module only calls the supplied function.
+ *
+ * `payload` is the exact JSON text that was signed (the envelope with the signature field
+ * removed) and `signature` is the value read from that field. Return a strict boolean.
+ * The Worker must sign `JSON.stringify(payload)` BEFORE inserting the signature field, with
+ * the same key order, so the reconstruction below reproduces the signed bytes.
  */
-function parseEdgeGeoPayload(raw: string): EdgeGeoPayload | null {
+export type EdgeGeoVerifier = (payload: string, signature: string) => boolean;
+
+/**
+ * Reserved envelope field(s) holding the Worker's HMAC. `sig` is canonical; the aliases are
+ * accepted so a deployment that named the field differently still verifies. Whichever field
+ * is found is the one removed before the payload text handed to the verifier is rebuilt.
+ */
+const EDGE_GEO_SIGNATURE_FIELDS = ['sig', 'signature', 'hmac', 'mac'] as const;
+
+export interface VerifiedEdgeGeoPayload {
+  /** True only when `verify` accepted the MAC over the reconstructed payload bytes. */
+  verified: boolean;
+  /**
+   * The decoded envelope with the signature field removed. Callers MUST gate all use of this
+   * on `verified === true`; on a verification failure it is attacker-controlled data.
+   */
+  payload: EdgeGeoPayload | null;
+}
+
+/**
+ * Verifies the `x-intel-edge-geo` envelope without any network I/O or crypto dependency.
+ * Parses the URI-encoded JSON, extracts the HMAC field, rebuilds the exact signed payload
+ * text, and calls `verify(payload, signature)`. This is pure and NEVER throws on hostile
+ * input: malformed encoding, non-object JSON and missing/invalid signatures yield
+ * `{ verified: false, payload: null }`; a rejected or throwing verifier yields
+ * `{ verified: false, payload: <decoded envelope> }`, which callers MUST ignore.
+ */
+export function verifyEdgeGeoPayload(
+  rawHeader: string,
+  verify: EdgeGeoVerifier
+): VerifiedEdgeGeoPayload {
+  const invalid: VerifiedEdgeGeoPayload = { verified: false, payload: null };
+  if (typeof rawHeader !== 'string' || !rawHeader || typeof verify !== 'function') return invalid;
+
+  let envelope: Record<string, unknown>;
+  try {
+    const decoded = decodeURIComponent(rawHeader);
+    const parsed = JSON.parse(decoded) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return invalid;
+    envelope = parsed as Record<string, unknown>;
+  } catch {
+    return invalid;
+  }
+
+  let signatureField = '';
+  let signature = '';
+  for (const name of EDGE_GEO_SIGNATURE_FIELDS) {
+    const value = envelope[name];
+    if (typeof value === 'string' && value.trim()) {
+      signatureField = name;
+      signature = value.trim();
+      break;
+    }
+  }
+  // No signature field means this header is an unsigned lookalike, not a signed payload.
+  if (!signatureField || !signature) return invalid;
+
+  let unsigned: Record<string, unknown>;
+  let signedPayloadText: string;
+  try {
+    unsigned = { ...envelope };
+    delete unsigned[signatureField];
+    signedPayloadText = JSON.stringify(unsigned);
+  } catch {
+    return invalid;
+  }
+
+  let verified = false;
+  try {
+    verified = verify(signedPayloadText, signature) === true;
+  } catch {
+    verified = false;
+  }
+  return { verified, payload: unsigned as EdgeGeoPayload };
+}
+
+/**
+ * Decodes the `x-intel-edge-geo` header.
+ *
+ * SECURITY / BACKWARD COMPATIBILITY WARNING: when `verify` is OMITTED this function only
+ * JSON-decodes the header — it performs NO authentication whatsoever. On Node/Vercel ingress
+ * any client can set this header, so the unauthenticated form is unsafe for production. It is
+ * retained ONLY so legacy callers keep working; new code must pass the verifier (or call
+ * `verifyEdgeGeoPayload` directly) and must gate every downstream trust claim on `verified`.
+ */
+function parseEdgeGeoPayload(raw: string, verify?: EdgeGeoVerifier): EdgeGeoPayload | null {
   if (!raw) return null;
+  if (typeof verify === 'function') {
+    const result = verifyEdgeGeoPayload(raw, verify);
+    return result.verified ? result.payload : null;
+  }
   try {
     const decoded = JSON.parse(decodeURIComponent(raw)) as unknown;
     if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) return null;
@@ -354,49 +454,90 @@ function payloadAccuracyRadius(payload: EdgeGeoPayload): number | null {
 }
 
 /**
- * Reads edge geolocation. The Worker-signed `x-intel-edge-geo` header wins because it is
- * built from `request.cf`, which a client cannot forge. Raw Vercel / Cloudflare headers are
- * still supported for local development and for deployments that do not use the Worker.
+ * Result for a `x-intel-edge-geo` header that could not be authenticated. Every value is
+ * blanked so neither this module's merge nor a caller's direct reads of `edgeGeo.*` can be
+ * influenced by a client-forged country, coordinate, ASN or Tor flag.
  */
-export function readEdgeGeoHeaders(headers: EdgeHeaderBag): EdgeGeoHeaders {
-  const signedPayload = parseEdgeGeoPayload(headerValue(headers, ['x-intel-edge-geo']));
-  if (signedPayload) {
-    const rawCountry = payloadText(signedPayload, 'country');
-    const isTorNetwork = /^t1$/i.test(rawCountry);
-    const countryCode = normalizeCountryCode(rawCountry);
-    const city = decodeCity(payloadText(signedPayload, 'city'));
-    const region = payloadText(signedPayload, 'region');
-    const regionCode = payloadAnyText(signedPayload, ['regionCode', 'region_code']);
-    const continent = payloadAnyText(signedPayload, [
-      'continent',
-      'continentCode',
-      'continent_code',
-    ]);
-    const timezone = payloadText(signedPayload, 'timezone');
-    const postalCode = payloadAnyText(signedPayload, ['postalCode', 'postal_code']);
-    const accuracyRadius = payloadAccuracyRadius(signedPayload);
-    const asnNetwork = parseAsnNetwork(
-      payloadAnyText(signedPayload, ['asnNetwork', 'asn_network'])
-    );
-    return {
-      city: isMissingGeoValue(city) ? '' : city,
-      region: isMissingGeoValue(region) ? '' : region,
-      country: countryNameFromCode(countryCode),
-      countryCode,
-      timezone: isMissingGeoValue(timezone) ? '' : timezone,
-      latitude: parseLat(payloadText(signedPayload, 'latitude')),
-      longitude: parseLng(payloadText(signedPayload, 'longitude')),
-      asn: normalizeAsnLabel(payloadText(signedPayload, 'asn')),
-      organization: payloadText(signedPayload, 'organization'),
-      postalCode: isMissingGeoValue(postalCode) ? '' : postalCode,
-      regionCode: isMissingGeoValue(regionCode) ? '' : regionCode,
-      continent: isMissingGeoValue(continent) ? '' : continent,
-      accuracyRadius,
-      asnNetwork,
-      isTorNetwork,
-      trusted: true,
-      source: 'cloudflare',
-    };
+function unverifiedEdgeGeo(): EdgeGeoHeaders {
+  return {
+    city: '',
+    region: '',
+    country: '',
+    countryCode: '',
+    timezone: '',
+    latitude: null,
+    longitude: null,
+    asn: '',
+    organization: '',
+    postalCode: '',
+    regionCode: '',
+    continent: '',
+    accuracyRadius: null,
+    asnNetwork: '',
+    isTorNetwork: false,
+    trusted: false,
+    source: 'unverified',
+  };
+}
+
+/**
+ * Reads edge geolocation.
+ *
+ * SECURITY: `x-intel-edge-geo` is documented as Worker-signed, but on Node/Vercel ingress a
+ * client can set that header itself. `trusted: true` is granted ONLY when the caller-supplied
+ * `verify` accepts the header's MAC. A present-but-unverified (or unverifiable, including
+ * when no verifier was supplied) header is discarded wholesale — all fields blank, source
+ * `unverified` — so no forged value is published or persisted. A missing header still falls
+ * through to the raw Vercel / Cloudflare headers exactly as before. Production callers MUST
+ * pass a verifier; see `EdgeGeoVerifier` / `verifyEdgeGeoPayload`.
+ */
+export function readEdgeGeoHeaders(
+  headers: EdgeHeaderBag,
+  verify?: EdgeGeoVerifier
+): EdgeGeoHeaders {
+  const rawSigned = headerValue(headers, ['x-intel-edge-geo']);
+  if (rawSigned) {
+    const signedPayload = verify ? parseEdgeGeoPayload(rawSigned, verify) : null;
+    if (signedPayload) {
+      const rawCountry = payloadText(signedPayload, 'country');
+      const isTorNetwork = /^t1$/i.test(rawCountry);
+      const countryCode = normalizeCountryCode(rawCountry);
+      const city = decodeCity(payloadText(signedPayload, 'city'));
+      const region = payloadText(signedPayload, 'region');
+      const regionCode = payloadAnyText(signedPayload, ['regionCode', 'region_code']);
+      const continent = payloadAnyText(signedPayload, [
+        'continent',
+        'continentCode',
+        'continent_code',
+      ]);
+      const timezone = payloadText(signedPayload, 'timezone');
+      const postalCode = payloadAnyText(signedPayload, ['postalCode', 'postal_code']);
+      const accuracyRadius = payloadAccuracyRadius(signedPayload);
+      const asnNetwork = parseAsnNetwork(
+        payloadAnyText(signedPayload, ['asnNetwork', 'asn_network'])
+      );
+      return {
+        city: isMissingGeoValue(city) ? '' : city,
+        region: isMissingGeoValue(region) ? '' : region,
+        country: countryNameFromCode(countryCode),
+        countryCode,
+        timezone: isMissingGeoValue(timezone) ? '' : timezone,
+        latitude: parseLat(payloadText(signedPayload, 'latitude')),
+        longitude: parseLng(payloadText(signedPayload, 'longitude')),
+        asn: normalizeAsnLabel(payloadText(signedPayload, 'asn')),
+        organization: payloadText(signedPayload, 'organization'),
+        postalCode: isMissingGeoValue(postalCode) ? '' : postalCode,
+        regionCode: isMissingGeoValue(regionCode) ? '' : regionCode,
+        continent: isMissingGeoValue(continent) ? '' : continent,
+        accuracyRadius,
+        asnNetwork,
+        isTorNetwork,
+        trusted: true,
+        source: 'cloudflare',
+      };
+    }
+    // Present but unverified: fail closed. No field from this header may escape.
+    return unverifiedEdgeGeo();
   }
 
   const vercelCountryCode = headerValue(headers, [
@@ -569,13 +710,37 @@ export type MergedLocationInfo = LocationInfo & {
  * client cannot forge, so it always wins. Provider city/region/coordinates are only kept
  * when they agree with that country; a coordinate that falls outside the reported country
  * is discarded rather than plotted.
+ *
+ * A `x-intel-edge-geo` header whose MAC was not verified is reported with source
+ * `unverified` and blank fields. Every edge-derived value is ignored in that case — there is
+ * no partial merge. Verified Worker payloads and the raw platform-header fallback keep their
+ * exact prior merge behavior.
  */
 export function mergeLocationWithEdge(
   location: LocationInfo,
   edge: EdgeGeoHeaders
 ): MergedLocationInfo {
   const extras = location as LocationInfo & ProviderGeoExtras;
-  const edgeCountryCode = normalizeCountryCode(edge.countryCode);
+  // Verified Worker payloads are `trusted: true`; raw Vercel / Cloudflare fallback headers
+  // keep their historical merge role. Only the explicit `unverified` source — a forged or
+  // unauthenticated signed header — is discarded in full.
+  const edgeUsable = edge.trusted === true || edge.source !== 'unverified';
+  const edgeCountryCode = edgeUsable ? normalizeCountryCode(edge.countryCode) : '';
+  const edgeCountry = edgeUsable ? edge.country : '';
+  const edgeAsn = edgeUsable ? edge.asn : '';
+  const edgeOrganization = edgeUsable ? edge.organization : '';
+  const edgeLatitude = edgeUsable ? edge.latitude : null;
+  const edgeLongitude = edgeUsable ? edge.longitude : null;
+  const edgeCity = edgeUsable ? edge.city : '';
+  const edgeRegion = edgeUsable ? edge.region : '';
+  const edgeTimezone = edgeUsable ? edge.timezone : '';
+  const edgeContinent = edgeUsable ? edge.continent : '';
+  const edgeRegionCode = edgeUsable ? edge.regionCode : '';
+  const edgePostalCode = edgeUsable ? edge.postalCode : '';
+  const edgeAccuracyRadius = edgeUsable ? edge.accuracyRadius : null;
+  const edgeAsnNetwork = edgeUsable ? edge.asnNetwork : '';
+  const edgeIsTorNetwork = edgeUsable && edge.isTorNetwork;
+
   const providerCountryCode = normalizeCountryCode(location.countryCode);
   const countryCode = edgeCountryCode || providerCountryCode;
 
@@ -585,14 +750,14 @@ export function mergeLocationWithEdge(
   const country =
     countryNameFromCode(countryCode) ||
     (providerCountryAgrees && meaningful(location.country) ? location.country : '') ||
-    edge.country ||
+    edgeCountry ||
     countryNameFromCode(location.country) ||
     'Unknown';
 
-  const asn = edge.asn || normalizeAsnLabel(location.asn);
-  const edgeOrg = meaningful(edge.organization)
-    ? edge.organization
-    : cloudProviderOrgForAsn(edge.asn);
+  const asn = edgeAsn || normalizeAsnLabel(location.asn);
+  const edgeOrg = meaningful(edgeOrganization)
+    ? edgeOrganization
+    : cloudProviderOrgForAsn(edgeAsn);
   const providerIspUsable = providerCountryAgrees && meaningful(location.isp);
   const isp = providerIspUsable
     ? location.isp
@@ -624,14 +789,17 @@ export function mergeLocationWithEdge(
     longitude = null;
   }
 
+  // Edge coordinates are applied only when the edge evidence is usable: a verified Worker
+  // payload or the historical raw-platform fallback. Forged signed headers are blanked by
+  // readEdgeGeoHeaders() and excluded by `edgeUsable` above, so nothing partially merges.
   if (
     latitude === null &&
-    edge.latitude !== null &&
-    edge.longitude !== null &&
-    (!countryCode || isCoordinateConsistentWithCountry(edge.latitude, edge.longitude, countryCode))
+    edgeLatitude !== null &&
+    edgeLongitude !== null &&
+    (!countryCode || isCoordinateConsistentWithCountry(edgeLatitude, edgeLongitude, countryCode))
   ) {
-    latitude = edge.latitude;
-    longitude = edge.longitude;
+    latitude = edgeLatitude;
+    longitude = edgeLongitude;
   }
 
   // A city is only as trustworthy as the country and coordinates it arrived with. When the
@@ -644,13 +812,13 @@ export function mergeLocationWithEdge(
 
   const city = providerLocationTrusted && meaningful(location.city)
     ? location.city
-    : edge.city || 'Unknown';
+    : edgeCity || 'Unknown';
   const region = providerLocationTrusted && meaningful(location.region)
     ? location.region
-    : edge.region || 'Unknown';
+    : edgeRegion || 'Unknown';
   const timezone = meaningful(location.timezone)
     ? location.timezone
-    : edge.timezone || undefined;
+    : edgeTimezone || undefined;
 
   /*
    * Additional free fields are merged individually, with the same evidence rule as above:
@@ -658,7 +826,7 @@ export function mergeLocationWithEdge(
    * while any provider value is only accepted when its country agrees with that edge country.
    * Unavailable values stay null — no code, continent, prefix or radius is ever invented.
    */
-  const edgeContinent = parseContinentValue(edge.continent);
+  const edgeContinentParsed = parseContinentValue(edgeContinent);
   const providerContinent = providerCountryAgrees
     ? parseContinentValue(
         firstMeaningful(
@@ -670,8 +838,8 @@ export function mergeLocationWithEdge(
         )
       )
     : { code: '', name: '' };
-  const continentCode = edgeContinent.code || providerContinent.code;
-  const continentName = edgeContinent.name || providerContinent.name;
+  const continentCode = edgeContinentParsed.code || providerContinent.code;
+  const continentName = edgeContinentParsed.name || providerContinent.name;
 
   // The edge subdivision is a real ISO-3166-2 code; a provider code is only a fallback.
   const providerSubdivision = providerCountryAgrees
@@ -682,12 +850,12 @@ export function mergeLocationWithEdge(
         extras.region_code
       )
     : '';
-  const subdivisionIso = firstMeaningful(edge.regionCode, providerSubdivision) || null;
+  const subdivisionIso = firstMeaningful(edgeRegionCode, providerSubdivision) || null;
 
   const providerPostal = providerCountryAgrees
     ? firstMeaningful(extras.postalCode, extras.postal_code, extras.postal)
     : '';
-  const postalCode = firstMeaningful(edge.postalCode, providerPostal) || null;
+  const postalCode = firstMeaningful(edgePostalCode, providerPostal) || null;
 
   // A radius is only surfaced when an actual value was reported (never a constant fallback).
   // A provider value is trusted only alongside an agreeing country; edge values are already
@@ -695,13 +863,13 @@ export function mergeLocationWithEdge(
   const accuracyRadius =
     (providerCountryAgrees
       ? parseAccuracyRadius(extras.accuracyRadius ?? extras.accuracy_radius)
-      : null) ?? edge.accuracyRadius ?? null;
+      : null) ?? edgeAccuracyRadius ?? null;
 
   // The routed prefix is a BGP fact (registry / Team Cymru), independent of the country
   // claim. Prefer a validated enrichment prefix, then one on the signed edge payload.
   const asnNetwork =
     parseAsnNetwork(firstMeaningful(extras.asnNetwork, extras.asn_network)) ||
-    parseAsnNetwork(edge.asnNetwork) ||
+    parseAsnNetwork(edgeAsnNetwork) ||
     null;
 
   const locationPrecision =
@@ -727,8 +895,8 @@ export function mergeLocationWithEdge(
     isp,
     org,
     asn,
-    isTor: Boolean(location.isTor) || edge.isTorNetwork,
-    isTorExit: Boolean(location.isTorExit) || edge.isTorNetwork,
+    isTor: Boolean(location.isTor) || edgeIsTorNetwork,
+    isTorExit: Boolean(location.isTorExit) || edgeIsTorNetwork,
     locationSource: edgeCountryCode ? 'edge' : location.locationSource ?? 'provider',
     locationPrecision,
     isLocationVerified: hasCountry,
