@@ -598,10 +598,19 @@ function unverifiedEdgeGeo() {
     source: "unverified"
   };
 }
+function hasEdgeGeoSignature(payload) {
+  const record = payload;
+  return EDGE_GEO_SIGNATURE_FIELDS.some(
+    (name) => typeof record[name] === "string" && String(record[name]).trim().length > 0
+  );
+}
 function readEdgeGeoHeaders(headers, verify) {
   const rawSigned = headerValue(headers, ["x-intel-edge-geo"]);
   if (rawSigned) {
-    const signedPayload = verify ? parseEdgeGeoPayload(rawSigned, verify) : null;
+    const plainPayload = parseEdgeGeoPayload(rawSigned);
+    const signedEnvelope = plainPayload ? hasEdgeGeoSignature(plainPayload) : false;
+    const signedPayload = signedEnvelope ? verify ? parseEdgeGeoPayload(rawSigned, verify) : null : plainPayload;
+    if (signedEnvelope && !signedPayload) return unverifiedEdgeGeo();
     if (signedPayload) {
       const rawCountry = payloadText(signedPayload, "country");
       const isTorNetwork2 = /^t1$/i.test(rawCountry);
@@ -640,7 +649,6 @@ function readEdgeGeoHeaders(headers, verify) {
         source: "cloudflare"
       };
     }
-    return unverifiedEdgeGeo();
   }
   const vercelCountryCode = headerValue(headers, [
     "x-vercel-ip-country",
