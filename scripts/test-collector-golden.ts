@@ -39,8 +39,17 @@ import type { CollectedSignals } from '../src/client/signals/index.ts';
 // touch those APIs at module-evaluation time, so top-level order is sufficient.
 process.env.TZ = 'UTC';
 
+// V8's Math.pow result differs in the last digit between Node 22 (CI) and Node 24
+// (local). Normalize to 15 significant digits inside this harness only, so golden
+// bytes are host-independent. Production collectors are untouched.
+const ORIGINAL_MATH_POW = Math.pow;
+Math.pow = (base: number, exponent: number): number => {
+  const value = ORIGINAL_MATH_POW(base, exponent);
+  return Number.isFinite(value) ? Number(value.toPrecision(15)) : value;
+};
+
 const FIXTURE_URL = new URL('./fixtures/collector-golden.json', import.meta.url);
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const GOLDEN_TIMEOUT_MS = 50;
 const CONTRACT_GETS = 8;
 
