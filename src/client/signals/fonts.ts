@@ -241,3 +241,188 @@ export function collectFontSignals(): FontSignals {
 
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// FingerprintJS v5 font probe — additive research surface
+//
+// The block above is the legacy collector and is intentionally left untouched:
+// `installed`, `fontHash` and `platformClassGuess` (the hardware-digest inputs)
+// are byte-identical. Everything below mirrors FPJS v5 `src/sources/fonts.ts`
+// and is exposed only through NEW exports so no existing digest can change.
+// ---------------------------------------------------------------------------
+
+/**
+ * v5 probe string: `m`/`w` maximise width, `LLi` separates matching fonts.
+ * NOTE: the task brief said `mmMwWLliI0&1`; the actual FPJS v5 source
+ * (src/sources/fonts.ts on master, and v4) uses `mmMwWLliI0O&1` with an extra
+ * capital `O` before `&`. This is the researched exact value; change this
+ * single constant if the brief's spelling is required instead.
+ */
+export const FONTS_V5_TEST_STRING = 'mmMwWLliI0O&1';
+/** v5 renders at 48px by setting the iframe BODY font-size (spans inherit it). */
+export const FONTS_V5_TEXT_SIZE = '48px';
+/** v5 generic fallback families, compared in this order. */
+export const FONTS_V5_BASE_FONTS = ['monospace', 'sans-serif', 'serif'] as const;
+
+/** Exact 52-name FingerprintJS v5 font list, in source order. */
+export const FONTS_V5_FONT_LIST = [
+  'sans-serif-thin',
+  'ARNO PRO',
+  'Agency FB',
+  'Arabic Typesetting',
+  'Arial Unicode MS',
+  'AvantGarde Bk BT',
+  'BankGothic Md BT',
+  'Batang',
+  'Bitstream Vera Sans Mono',
+  'Calibri',
+  'Century',
+  'Century Gothic',
+  'Clarendon',
+  'EUROSTILE',
+  'Franklin Gothic',
+  'Futura Bk BT',
+  'Futura Md BT',
+  'GOTHAM',
+  'Gill Sans',
+  'HELV',
+  'Haettenschweiler',
+  'Helvetica Neue',
+  'Humanst521 BT',
+  'Leelawadee',
+  'Letter Gothic',
+  'Levenim MT',
+  'Lucida Bright',
+  'Lucida Sans',
+  'Menlo',
+  'MS Mincho',
+  'MS Outlook',
+  'MS Reference Specialty',
+  'MS UI Gothic',
+  'MT Extra',
+  'MYRIAD PRO',
+  'Marlett',
+  'Meiryo UI',
+  'Microsoft Uighur',
+  'Minion Pro',
+  'Monotype Corsiva',
+  'PMingLiU',
+  'Pristina',
+  'SCRIPTINA',
+  'Segoe UI Light',
+  'Serifa',
+  'SimHei',
+  'Small Fonts',
+  'Staccato222 BT',
+  'TRAJAN PRO',
+  'Univers CE 55 Medium',
+  'Vrinda',
+  'ZWAdobeF',
+] as const;
+
+/** Result of the FingerprintJS v5 font probe. */
+export interface FontSignalsV5 {
+  /** Installed fonts in FONTS_V5_FONT_LIST order (FPJS does not sort). */
+  installedV5: string[];
+  /** Hash of `installedV5` (stable for cross-session comparison only). */
+  fontHashV5: string;
+  error?: string;
+}
+
+/**
+ * FPJS `withIframe`: a layout-capable (`display:block !important`) hidden
+ * iframe. Unlike the legacy probe this is async so the iframe document is
+ * fully loaded before any offsetWidth/offsetHeight read.
+ */
+async function withV5FontsIframe<T>(action: (doc: Document, body: HTMLElement) => T): Promise<T | null> {
+  if (typeof document === 'undefined' || !document.body) return null;
+  const iframe = document.createElement('iframe');
+  try {
+    await new Promise<void>((resolve, reject) => {
+      iframe.onload = () => resolve();
+      iframe.onerror = () => reject(new Error('v5 font iframe failed to load'));
+      const style = iframe.style;
+      style.setProperty('display', 'block', 'important'); // required for layout
+      style.position = 'absolute';
+      style.top = '0';
+      style.left = '0';
+      style.visibility = 'hidden';
+      iframe.src = 'about:blank';
+      document.body.appendChild(iframe);
+    });
+    const doc = iframe.contentDocument ?? iframe.contentWindow?.document ?? null;
+    const body = doc?.body ?? null;
+    if (!doc || !body) return null;
+    return action(doc, body);
+  } finally {
+    try {
+      iframe.remove();
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+/**
+ * FingerprintJS v5 `getFonts()` as a PURE ADDITIVE helper.
+ *
+ * Differences from the legacy collector: 48px body font-size (not 72px on the
+ * span), candidate family string `'${font}',${base}` (single quotes, no
+ * space), the exact 52-name v5 list, and results preserved in fontList order.
+ * A candidate is installed iff ANY base gives a different width OR height.
+ */
+export async function collectFontSignalsV5(): Promise<FontSignalsV5> {
+  const result: FontSignalsV5 = { installedV5: [], fontHashV5: '' };
+  try {
+    const installed = await withV5FontsIframe((doc, holder) => {
+      holder.style.fontSize = FONTS_V5_TEXT_SIZE;
+
+      const spansContainer = doc.createElement('div');
+      spansContainer.style.setProperty('visibility', 'hidden', 'important');
+
+      const createSpan = (fontFamily: string): HTMLSpanElement => {
+        const span = doc.createElement('span');
+        const { style } = span;
+        style.position = 'absolute';
+        style.top = '0';
+        style.left = '0';
+        style.fontFamily = fontFamily;
+        span.textContent = FONTS_V5_TEST_STRING;
+        spansContainer.appendChild(span);
+        return span;
+      };
+
+      const baseSpans = FONTS_V5_BASE_FONTS.map((base) => createSpan(base));
+      const fontSpans: Record<string, HTMLSpanElement[]> = {};
+      for (const font of FONTS_V5_FONT_LIST) {
+        fontSpans[font] = FONTS_V5_BASE_FONTS.map((base) => createSpan(`'${font}',${base}`));
+      }
+
+      holder.appendChild(spansContainer);
+
+      const defaultWidth: Record<string, number> = {};
+      const defaultHeight: Record<string, number> = {};
+      for (let index = 0; index < FONTS_V5_BASE_FONTS.length; index++) {
+        defaultWidth[FONTS_V5_BASE_FONTS[index]] = baseSpans[index].offsetWidth;
+        defaultHeight[FONTS_V5_BASE_FONTS[index]] = baseSpans[index].offsetHeight;
+      }
+
+      return FONTS_V5_FONT_LIST.filter((font) =>
+        FONTS_V5_BASE_FONTS.some(
+          (base, baseFontIndex) =>
+            fontSpans[font][baseFontIndex].offsetWidth !== defaultWidth[base] ||
+            fontSpans[font][baseFontIndex].offsetHeight !== defaultHeight[base]
+        )
+      );
+    });
+    if (!installed) {
+      result.error = 'v5 font measurement iframe unavailable';
+      return result;
+    }
+    result.installedV5 = [...installed];
+    result.fontHashV5 = hashStrings(result.installedV5);
+  } catch (err) {
+    result.error = errorMessage(err);
+  }
+  return result;
+}

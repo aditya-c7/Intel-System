@@ -4,7 +4,6 @@ import type {
   IntelVisitorResponse,
   LocationInfo,
   NetworkType,
-  RiskLevel,
   SecuritySignals,
   SmartSignal,
   SmartSignals,
@@ -32,6 +31,8 @@ import {
   quarantineAttributes,
   isSwiftShader,
   SWIFTSHADER_LABEL,
+  confidenceLabelOrNull,
+  gpuTruthIsVerified,
 } from './components/canonical';
 import {
   Copy,
@@ -406,23 +407,6 @@ function formatCleanGpuName(rawRenderer: string | undefined, rawVendor?: string)
 }
 
 /**
- * Maps legacy 0..100 suspect scores to the current 0..10 scale.
- */
-function normalizeLegacyScore(score: number | null | undefined): number {
-  const s = typeof score === 'number' && Number.isFinite(score) ? score : 0;
-  return s > 10 ? Math.round(s / 10) : s;
-}
-
-/**
- * Derives the risk tier from a normalized 0..10 score.
- */
-function resolveRiskTier(score: number): RiskLevel {
-  if (score >= 7) return 'High';
-  if (score >= 3) return 'Medium';
-  return 'Low';
-}
-
-/**
  * Subtle Swiss-technical badge classes per retail network type.
  */
 const NETWORK_TYPE_BADGE_CLASS: Record<NetworkType, string> = {
@@ -437,56 +421,46 @@ const NETWORK_TYPE_BADGE_CLASS: Record<NetworkType, string> = {
   'Standard Network': 'bg-slate-100 text-slate-600 border border-slate-200',
 };
 
-type SignalTone = 'ok' | 'warn' | 'bad';
+type SignalTone = 'ok' | 'warn' | 'bad' | 'unavailable';
 
 const TONE_DOT_CLASS: Record<SignalTone, string> = {
   ok: 'bg-emerald-500',
   warn: 'bg-amber-500',
   bad: 'bg-rose-500',
+  unavailable: 'bg-slate-400',
 };
 
 const TONE_TEXT_CLASS: Record<SignalTone, string> = {
   ok: 'text-emerald-700',
   warn: 'text-amber-700',
   bad: 'text-rose-700',
+  unavailable: 'text-slate-500',
 };
-
-/**
- * Maps a 0..10 per-signal severity onto the shared risk tier scale.
- */
-function resolveSignalRiskTier(severity: number): RiskLevel {
-  if (severity >= 7) return 'High';
-  if (severity >= 3) return 'Medium';
-  return 'Low';
-}
 
 interface SignalRowModel {
   key: string;
-  dotClass: string;
+  /** Cosmetic colour only — read from the server's own label, never a derived tier. */
+  tone: SignalTone;
   title: string;
   caption: string;
   statusLabel: string;
   tooltip: string;
-  riskScore: number;
-  /** Server-provided `${Tier} Risk • ${score}/10` line, preferred when present. */
-  riskLabel?: string;
+  /** Verbatim server mirror; null when the server omitted it. */
+  riskScore: number | null;
+  /** Server-provided `${Tier} Risk • ${score}/10` line, printed verbatim when present. */
+  riskLabel?: string | null;
 }
 
-function toneForScore(score: number): SignalTone {
-  const tier = resolveSignalRiskTier(score);
-  return tier === 'High' ? 'bad' : tier === 'Medium' ? 'warn' : 'ok';
-}
-
-function createSignalRow(
-  params: Omit<SignalRowModel, 'dotClass'> & {
-    tone: SignalTone;
-  }
-): SignalRowModel {
-  const { tone, ...rest } = params;
-  return {
-    ...rest,
-    dotClass: TONE_DOT_CLASS[tone],
-  };
+/**
+ * Cosmetic colour from the SERVER's own risk wording. No tier or score is derived here —
+ * a missing / placeholder label is simply neutral rather than a fabricated green "Low".
+ */
+function toneFromServerRiskLabel(label: string | null | undefined): SignalTone {
+  const text = (label ?? '').trim().toLowerCase();
+  if (/^(critical|high)\b/.test(text)) return 'bad';
+  if (/^(elevated|medium|moderate)\b/.test(text)) return 'warn';
+  if (/^low\b/.test(text)) return 'ok';
+  return 'unavailable';
 }
 
 /**
@@ -496,20 +470,20 @@ function createSignalRow(
 function smartSignalToRow(signal: SmartSignal, incognito?: IncognitoVerdict): SignalRowModel {
   // Incognito is the one tile whose raw server status must be mapped onto the canonical
   // verdict instead of echoed: a stale "Standard Window" status must never read
-  // "Not detected" when the server's boolean says private. Every other signal keeps the
-  // server's exact status/detail verbatim (including the bot's exact agent name).
+  // "Not detected" when the server's boolean says private. Ratings are NEVER mapped: the
+  // incognito tile mirrors `signal.scoreOutOf10` / `signal.riskLabel` verbatim, without the
+  // old verdict-derived 3/0 overwrite.
   const verdict = signal.id === 'incognito' ? incognito : undefined;
   const statusLabel = verdict?.status ?? signal.status;
   const caption = verdict?.detail ?? signal.detail;
-  // Mirror the same canonical verdict on the 0..10 axis (3 private / 0 normal). The server
-  // grid already carries these values; this only heals a stale mirror.
-  const riskScore = verdict ? (verdict.isIncognito ? 3 : 0) : signal.scoreOutOf10;
-  const riskLabel = verdict
-    ? `${resolveSignalRiskTier(riskScore)} Risk • ${riskScore}/10`
-    : signal.riskLabel;
+  const riskScore =
+    typeof signal.scoreOutOf10 === 'number' && Number.isFinite(signal.scoreOutOf10)
+      ? signal.scoreOutOf10
+      : null;
+  const riskLabel = signal.riskLabel ?? null;
   return {
     key: signal.id,
-    dotClass: TONE_DOT_CLASS[toneForScore(riskScore)],
+    tone: toneFromServerRiskLabel(riskLabel),
     title: signal.title,
     caption,
     statusLabel,
@@ -523,10 +497,6 @@ function smartSignalToRow(signal: SmartSignal, incognito?: IncognitoVerdict): Si
  * Single Swiss technical tile for the Smart Signals core grid.
  */
 function SignalRow(row: SignalRowModel & { className?: string }) {
-  const riskTier = resolveSignalRiskTier(row.riskScore);
-  const riskTone: SignalTone =
-    riskTier === 'High' ? 'bad' : riskTier === 'Medium' ? 'warn' : 'ok';
-
   return (
     <div
       className={`p-3.5 sm:p-4 min-h-[96px] flex flex-col justify-between gap-2 min-w-0 ${row.className ?? ''}`}
@@ -537,7 +507,7 @@ function SignalRow(row: SignalRowModel & { className?: string }) {
       </span>
 
       <span className="flex items-center gap-1.5 min-w-0">
-        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${row.dotClass}`} />
+        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${TONE_DOT_CLASS[row.tone]}`} />
         <span className="text-[11px] font-mono font-semibold text-[#111827] truncate">
           {row.statusLabel}
         </span>
@@ -548,9 +518,9 @@ function SignalRow(row: SignalRowModel & { className?: string }) {
       </span>
 
       <span
-        className={`text-[11px] font-mono font-semibold tabular-nums ${TONE_TEXT_CLASS[riskTone]}`}
+        className={`text-[11px] font-mono font-semibold tabular-nums ${TONE_TEXT_CLASS[row.tone]}`}
       >
-        {row.riskLabel ?? `${riskTier} Risk • ${row.riskScore}/10`}
+        {row.riskLabel ?? (row.riskScore !== null ? `${row.riskScore}/10` : 'Unavailable')}
       </span>
     </div>
   );
@@ -598,18 +568,16 @@ function buildSignalRows(
     ? [serverSignals.incognito, serverSignals.bot, serverSignals.vpn, serverSignals.vm].map(
         (signal) => smartSignalToRow(signal, incognito)
       )
-    : UNAVAILABLE_CARD_TITLES.map((title) =>
-        createSignalRow({
-          key: title,
-          tone: 'ok',
-          title,
-          caption: 'Awaiting canonical signal grid from the Worker',
-          statusLabel: 'Unavailable',
-          tooltip: 'Server-computed signal grid not present in this response',
-          riskScore: 0,
-          riskLabel: 'Unavailable',
-        })
-      );
+    : UNAVAILABLE_CARD_TITLES.map((title) => ({
+        key: title,
+        tone: 'unavailable' as SignalTone,
+        title,
+        caption: 'Awaiting canonical signal grid from the Worker',
+        statusLabel: 'Unavailable',
+        tooltip: 'Server-computed signal grid not present in this response',
+        riskScore: null,
+        riskLabel: null,
+      }));
 
   // Mirror the server's canonical bot status verbatim. When the server explicitly says there is
   // no bot, keep `Not detected` / `Verified Human` — never let a stale name replace it with a
@@ -1160,8 +1128,16 @@ export default function App() {
       ? activeVisit.longitude
       : data?.location.longitude ?? null;
 
+  // The single canonical envelope. Every panel and the Event JSON below read this object —
+  // no client code recomputes a composite score, tier, verdict or quarantine decision.
+  const canonical = useMemo(() => resolveCanonical(data), [data]);
+
   const swiftShader = isSwiftShader(data?.hardwareSignals?.gpuRenderer);
   const rawGpuRenderer = data?.hardwareSignals?.gpuRenderer;
+  // A raw WebGL renderer is spoofable output. It only reads as hardware truth when EVERY
+  // server GPU truth axis independently confirms it; otherwise a visible qualifier is shown
+  // beside every renderer-derived string.
+  const gpuUnverifiedSuffix = gpuTruthIsVerified(canonical) ? '' : 'unverified';
   // A real, unmasked WebGL renderer is the GPU line's single source of truth. Masked /
   // unavailable placeholders are never printed as if they were a measured renderer, and the
   // VM tile's software/masked verdict never overwrites an actual reported renderer.
@@ -1177,15 +1153,14 @@ export default function App() {
     ? SWIFTSHADER_LABEL
     : formatCleanGpuName(rawGpuRenderer, data.hardwareSignals.gpuVendor);
   const rawGpuTooltip = data?.hardwareSignals && hasUnmaskedGpuRenderer
-    ? `${data.hardwareSignals.gpuVendor} • ${(rawGpuRenderer as string).trim()}`
+    ? `${data.hardwareSignals.gpuVendor} • ${(rawGpuRenderer as string).trim()}${
+        gpuUnverifiedSuffix ? ` (${gpuUnverifiedSuffix})` : ''
+      }`
     : '';
   // Anti-spoof integrity. A "Spoofed / Unverified" tag or a raw-attribute quarantine is only
   // honest when the SERVER has authoritatively declared the session tampered. Stealth / bot
   // artifacts are never enough on their own — a clean device must keep its real attributes.
   const tamperingMlScore = data?.securitySignals?.tamperingMlScore;
-  // The single canonical envelope. Every panel and the Event JSON below read this object —
-  // no client code recomputes a composite score, tier, verdict or quarantine decision.
-  const canonical = useMemo(() => resolveCanonical(data), [data]);
   // The server's canonical bot tile is authoritative for "is this a bot". When it explicitly
   // reports no bot, stale bot_type / bot_info mirrors must never resurrect a stealth label in
   // the banner, the cursor pill or the Event JSON.
@@ -1359,24 +1334,30 @@ export default function App() {
   const signalRows = buildSignalRows(serverSmartSignals, exactBotName, incognitoVerdict);
 
   // The headline risk is the server-canonical 0..10 ledger value and its tier — never a
-  // client-normalized legacy suspectScore. Tier vocabulary is Low / Elevated / High / Critical.
+  // client-normalized legacy suspectScore. A missing score10 mirror stays "Risk unavailable":
+  // no default 0, no derived tier and no green risk meter.
   type DisplayRiskTier = 'Low' | 'Elevated' | 'High' | 'Critical';
-  const canonicalScore10Raw = canonical.riskScore10 as unknown as number | undefined;
-  const displayedRiskScore10 =
+  const canonicalScore10Raw = canonical.riskScore10;
+  const displayedRiskScore10: number | null =
     typeof canonicalScore10Raw === 'number' && Number.isFinite(canonicalScore10Raw)
       ? canonicalScore10Raw
-      : 0;
-  const canonicalTierRaw = canonical.riskTier as unknown as DisplayRiskTier | undefined;
-  const riskTier: DisplayRiskTier =
-    canonicalTierRaw === 'Elevated' ||
-    canonicalTierRaw === 'High' ||
-    canonicalTierRaw === 'Critical'
-      ? canonicalTierRaw
-      : 'Low';
+      : null;
+  const hasRiskScore10 = displayedRiskScore10 !== null;
+  // canonical.ts already validates the tier against the canonical vocabulary; no tier is
+  // derived here from the score.
+  const riskTier = canonical.riskTier as unknown as DisplayRiskTier | null;
   const riskIsHigh = riskTier === 'High' || riskTier === 'Critical';
   const riskIsElevated = riskTier === 'Elevated';
-  const riskTone = riskIsHigh ? 'text-rose-700' : riskIsElevated ? 'text-amber-700' : 'text-emerald-700';
-  const riskBadgeText = `${riskTier} Risk • ${displayedRiskScore10}/10`;
+  const riskTone = !hasRiskScore10
+    ? 'text-slate-500'
+    : riskIsHigh
+    ? 'text-rose-700'
+    : riskIsElevated
+    ? 'text-amber-700'
+    : 'text-emerald-700';
+  const riskBadgeText = !hasRiskScore10
+    ? 'Risk unavailable'
+    : `${riskTier ?? 'Unavailable'} Risk • ${displayedRiskScore10}/10`;
 
   // Whenever the canonical tampering axis reports reasons, the header must say so.
   const tamperingDetected = canonical.tamperingReasons.length > 0;
@@ -1764,9 +1745,13 @@ export default function App() {
           confidence_tier: canonical.confidenceTier,
           confidence_score: canonical.confidenceScore,
           calibration_status: canonical.calibrationStatus,
-          ...(canonical.confidence_label != null
-            ? { confidence_label: canonical.confidence_label }
-            : {}),
+          ...(() => {
+            // Placeholder "unavailable" labels are absence, not evidence — omit them.
+            const label = confidenceLabelOrNull(
+              canonical.confidence_label ?? canonical.confidenceLabel
+            );
+            return label !== null ? { confidence_label: label } : {};
+          })(),
         },
         network: {
           hosting_asn: (() => {
@@ -1887,9 +1872,13 @@ export default function App() {
         : {}),
       ...(canonical.build_sha != null ? { build_sha: canonical.build_sha } : {}),
       ...(canonical.worker_version != null ? { worker_version: canonical.worker_version } : {}),
-      ...(canonical.confidence_label != null
-        ? { confidence_label: canonical.confidence_label }
-        : {}),
+      ...(() => {
+        // Same server copy as the header pill: unavailable placeholders publish no evidence.
+        const label = confidenceLabelOrNull(
+          canonical.confidence_label ?? canonical.confidenceLabel
+        );
+        return label !== null ? { confidence_label: label } : {};
+      })(),
     };
   }, [
     data,
@@ -2043,33 +2032,38 @@ export default function App() {
           <div className="mt-2 flex flex-wrap items-center justify-center gap-2">
             <span
               className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold ${
-                riskIsHigh
+                !hasRiskScore10
+                  ? 'border-dashed border-slate-400 bg-slate-100 text-slate-600'
+                  : riskIsHigh
                   ? 'bg-[#FCE8E6] border-[#D93025]/40 text-[#D93025]'
                   : riskIsElevated
                   ? 'bg-[#FEF7E0] border-[#F9AB00]/50 text-[#B06000]'
                   : 'bg-[#E6F4EA] border-[#81C995] text-[#137333]'
               }`}
             >
-              {riskIsHigh ? (
-                <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
-              ) : (
-                <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-              )}
+              {hasRiskScore10 &&
+                (riskIsHigh ? (
+                  <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
+                ) : (
+                  <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                ))}
               {riskBadgeText}
             </span>
           </div>
-          <div className="w-full max-w-md h-2.5 bg-slate-200 rounded-full overflow-hidden mt-3">
-            <div
-              className={`h-full transition-all duration-300 ${
-                riskIsHigh
-                  ? 'bg-[#D93025]'
-                  : riskIsElevated
-                  ? 'bg-[#F9AB00]'
-                  : 'bg-[#81C995]'
-              }`}
-              style={{ width: `${Math.max(2, displayedRiskScore10 * 10)}%` }}
-            />
-          </div>
+          {displayedRiskScore10 !== null && (
+            <div className="w-full max-w-md h-2.5 bg-slate-200 rounded-full overflow-hidden mt-3">
+              <div
+                className={`h-full transition-all duration-300 ${
+                  riskIsHigh
+                    ? 'bg-[#D93025]'
+                    : riskIsElevated
+                    ? 'bg-[#F9AB00]'
+                    : 'bg-[#81C995]'
+                }`}
+                style={{ width: `${Math.max(2, displayedRiskScore10 * 10)}%` }}
+              />
+            </div>
+          )}
           <div className="mt-3 flex items-center justify-center gap-3">
             <button
               type="button"
@@ -2099,9 +2093,15 @@ export default function App() {
             aria-live="polite"
             className="bg-white border border-red-300 rounded-xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
           >
-            <div className="flex items-center gap-2.5 text-xs text-red-700">
+            <div className="flex flex-wrap items-center gap-2.5 text-xs text-red-700">
               <AlertCircle className="w-4 h-4 shrink-0" />
               <span>{error}</span>
+              {/* A failed refresh never clears `data`: make the retained view explicit. */}
+              {data && (
+                <span className="inline-flex items-center rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[11px] font-semibold text-amber-800">
+                  Showing previous result
+                </span>
+              )}
             </div>
             <button
               type="button"
@@ -2297,14 +2297,12 @@ export default function App() {
                   <div className="mt-2 flex items-center gap-1.5 flex-wrap">
                     {(() => {
                       // Observable match evidence, NOT a calibrated probability. The copy is
-                      // bound verbatim to the server's `confidence_label`. A null / absent label
-                      // stays null through to display: a dash + hatch + explicit "unavailable"
-                      // legend, NEVER a fabricated 0% (which would claim a measured empty match).
-                      const serverLabel =
-                        typeof canonical?.confidenceLabel === 'string' &&
-                        canonical.confidenceLabel.trim()
-                          ? canonical.confidenceLabel.trim()
-                          : null;
+                      // bound verbatim to the server's `confidence_label`. The shared helper
+                      // also treats the literal "Match evidence unavailable" (and friends) as
+                      // absence, so the dashed unavailable affordance applies — never a 0%.
+                      const serverLabel = confidenceLabelOrNull(
+                        canonical?.confidenceLabel ?? canonical?.confidence_label
+                      );
                       return (
                         <>
                           <div
@@ -2910,9 +2908,19 @@ export default function App() {
                           </span>
                         )}
                       </div>
-                      <span className="block text-xs sm:text-sm font-semibold text-[#111827] truncate mt-0.5">
-                        {cleanGpuName}
-                      </span>
+                      <div className="flex items-baseline gap-1 min-w-0 mt-0.5">
+                        <span className="text-xs sm:text-sm font-semibold text-[#111827] truncate min-w-0">
+                          {cleanGpuName}
+                        </span>
+                        {gpuUnverifiedSuffix && (
+                          <span
+                            className="shrink-0 text-[10px] font-medium text-amber-600"
+                            title="Renderer reported by the browser, not verified by the server"
+                          >
+                            ({gpuUnverifiedSuffix})
+                          </span>
+                        )}
+                      </div>
                     </div>
                   </div>
 
@@ -2989,7 +2997,11 @@ export default function App() {
                 </div>
 
                 <div className="mt-2 p-2.5 rounded-lg bg-slate-50 border border-[#E5E7EB] text-[11px] font-mono text-slate-600 break-all">
-                  {hasUnmaskedGpuRenderer ? (rawGpuRenderer as string).trim() : 'Unavailable'}
+                  {hasUnmaskedGpuRenderer
+                    ? `${(rawGpuRenderer as string).trim()}${
+                        gpuUnverifiedSuffix ? ` (${gpuUnverifiedSuffix})` : ''
+                      }`
+                    : 'Unavailable'}
                 </div>
               </div>
             </div>
@@ -3165,31 +3177,53 @@ export default function App() {
                       canonicalBrand || rowOrg,
                       rowAsn
                     );
-                    const rowScore = normalizeLegacyScore(visit.suspectScore);
-                    const rowRisk: RiskLevel =
-                      visit.riskLevel === 'High' ||
-                      visit.riskLevel === 'Medium' ||
-                      visit.riskLevel === 'Low'
-                        ? visit.riskLevel
-                        : resolveRiskTier(rowScore);
-                    const rowRiskLabel = `${rowRisk === 'Medium' ? 'Med' : rowRisk} • ${rowScore}/10`;
+                    // Verbatim server mirrors only: no legacy score normalization and no
+                    // tier derivation. A missing mirror reads "Unavailable".
+                    const rowScore =
+                      typeof visit.score10 === 'number' && Number.isFinite(visit.score10)
+                        ? visit.score10
+                        : null;
+                    const rowRiskRaw: string =
+                      typeof visit.riskLevel === 'string' ? (visit.riskLevel as string) : '';
+                    const rowRisk = rowRiskRaw.trim() !== '' && rowRiskRaw !== 'Unavailable' ? rowRiskRaw : null;
+                    const rowRiskLabel =
+                      rowRisk !== null && rowScore !== null
+                        ? `${rowRisk} • ${rowScore}/10`
+                        : rowRisk !== null
+                        ? rowRisk
+                        : rowScore !== null
+                        ? `${rowScore}/10`
+                        : 'Unavailable';
                     const rowRiskDotClass =
-                      rowRisk === 'High'
+                      rowRisk === 'High' || rowRisk === 'Critical'
                         ? 'bg-rose-500'
-                        : rowRisk === 'Medium'
+                        : rowRisk === 'Medium' || rowRisk === 'Elevated'
                         ? 'bg-amber-500'
-                        : 'bg-emerald-500';
+                        : rowRisk === 'Low'
+                        ? 'bg-emerald-500'
+                        : 'bg-slate-400';
                     const rowRiskTextClass =
-                      rowRisk === 'High'
+                      rowRisk === 'High' || rowRisk === 'Critical'
                         ? 'text-rose-700'
-                        : rowRisk === 'Medium'
+                        : rowRisk === 'Medium' || rowRisk === 'Elevated'
                         ? 'text-amber-700'
-                        : 'text-emerald-700';
+                        : rowRisk === 'Low'
+                        ? 'text-emerald-700'
+                        : 'text-slate-500';
                     return (
                       <tr
                         key={visit.visitId}
                         onClick={() => setSelectedVisitIndex(index)}
-                        className={`cursor-pointer transition-colors ${
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar') {
+                            event.preventDefault();
+                            setSelectedVisitIndex(index);
+                          }
+                        }}
+                        tabIndex={0}
+                        role="button"
+                        aria-current={selectedVisitIndex === index ? 'true' : undefined}
+                        className={`cursor-pointer transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-[#F05A28]/40 ${
                           selectedVisitIndex === index
                             ? 'bg-orange-50/60'
                             : 'hover:bg-slate-50/80'

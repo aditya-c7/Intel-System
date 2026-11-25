@@ -1,0 +1,401 @@
+{
+  "schema_version": 2,
+  "title": "Collector golden master — stableStringify / fingerprints / collectAllSignals",
+  "frozen": true,
+  "offline": true,
+  "generated_on": "2026-11-25",
+  "note": "Schema v2: Math.pow is normalized to 15 significant digits inside the harness so COL-01 bytes are identical on Node 22 (CI) and Node 24 (local). This is a deliberate host-portability contract change, not a weakening of an assertion: all other cases and flag-off parity remain byte-identical. Versioned inputs + expected raw bytes + SHA-256 + verdict label. CI must not write goldens; regenerate locally with GOLDEN_UPDATE=1 only after review.",
+  "determinism": {
+    "timezone": "UTC",
+    "navigator": {
+      "platform": "GoldenPlatform",
+      "hardwareConcurrency": 8,
+      "deviceMemory": 8,
+      "maxTouchPoints": 0
+    },
+    "screen": {
+      "width": 1920,
+      "height": 1080,
+      "availWidth": 1920,
+      "availHeight": 1040,
+      "colorDepth": 24
+    },
+    "window": {
+      "outerWidth": 1920,
+      "outerHeight": 1080,
+      "innerWidth": 1900,
+      "innerHeight": 1000,
+      "devicePixelRatio": 1
+    },
+    "collectAllSignalsTimeoutMs": 50,
+    "removedGlobals": [
+      "document",
+      "OfflineAudioContext",
+      "AudioContext",
+      "RTCPeerConnection",
+      "localStorage",
+      "sessionStorage",
+      "indexedDB"
+    ]
+  },
+  "flags": {
+    "default": "off",
+    "on_names": [
+      "additiveDiagnostics",
+      "explicitEmptyOptions"
+    ],
+    "expected_golden_diffs": 0,
+    "note": "Flag-on passes explicit empty browserHints/secChBrands and additive diagnostics; canonical bytes must be unchanged."
+  },
+  "inputs": {
+    "signals": {
+      "canvas": {
+        "winding": true,
+        "geometry": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "text": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "geometryUnstable": false,
+        "textUnstable": null,
+        "geometryDataUrl": null,
+        "textDataUrl": null
+      },
+      "canvasNoise": {
+        "classification": "clean",
+        "maxChannelDelta": 0,
+        "stabilizedGeometryHash": "cccccccccccccccccccccccccccccccc",
+        "flags": []
+      },
+      "fonts": {
+        "installed": [
+          "Arial",
+          "Helvetica",
+          "Segoe UI",
+          "🚀 Font"
+        ],
+        "fontHash": "dddddddddddddddddddddddddddddddd",
+        "platformClassGuess": "windows"
+      },
+      "fontPreferences": {
+        "widths": {
+          "default": 16,
+          "apple": 16,
+          "serif": 16,
+          "sans": 16,
+          "mono": 13,
+          "min": 8,
+          "system": 16
+        },
+        "widthsExactIntegers": true
+      },
+      "emoji": {
+        "font": "sans-serif",
+        "width": 16,
+        "height": 18,
+        "top": 0,
+        "bottom": 0,
+        "left": 0,
+        "right": 16,
+        "x": 0,
+        "y": 0
+      },
+      "webglBasics": {
+        "version": "WebGL 2.0",
+        "vendor": "WebKit",
+        "renderer": "WebKit WebGL",
+        "shadingLanguageVersion": "WebGL GLSL ES 3.00",
+        "vendorUnmasked": "GoldenVendor",
+        "rendererUnmasked": "Golden GPU 4090"
+      },
+      "webglExtensions": {
+        "contextAttributes": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "parameters": "ffffffffffffffffffffffffffffffff",
+        "shaderPrecisions": "00000000000000000000000000000000",
+        "extensions": "11111111111111111111111111111111",
+        "extensionParameters": "22222222222222222222222222222222",
+        "supportedExtensions": [
+          "EXT_a",
+          "EXT_b"
+        ],
+        "unsupportedExtensions": [
+          "EXT_z"
+        ]
+      },
+      "webglGpuIdentity": {
+        "normalizedGpu": "Golden GPU 4090",
+        "normalizedGpuHash": "33333333333333333333333333333333",
+        "invariantLimits": {
+          "maxTextureSize": 16384,
+          "maxCubeMapTextureSize": 16384,
+          "maxRenderbufferSize": 16384,
+          "maxViewportDims": [
+            16384,
+            16384
+          ],
+          "max3dTextureSize": 2048,
+          "maxArrayTextureLayers": 2048,
+          "aliasedPointSizeRange": [
+            1,
+            1024
+          ]
+        }
+      },
+      "audio": {
+        "sum": 123.456,
+        "code": 0,
+        "audioBaseLatency": 0.01,
+        "listenerForwardXMaxValue": 1,
+        "biquadGainMaxValue": 1,
+        "compressorAttackDefault": 0.003,
+        "oscillatorDetuneMax": 1200
+      },
+      "math": {
+        "values": {
+          "sin": "0.84",
+          "cos": "0.53",
+          "tan": "1.58"
+        },
+        "mathHash": "44444444444444444444444444444444",
+        "errorStackFunctions": [
+          "message",
+          "stack"
+        ],
+        "errorStackHash": "55555555555555555555555555555555"
+      },
+      "systemEntropy": {
+        "timezone": "UTC",
+        "timezoneOffset": 0,
+        "deviceMemory": 8,
+        "hardwareConcurrency": 8,
+        "screen": {
+          "width": 1920,
+          "height": 1080,
+          "colorDepth": 24,
+          "pixelRatio": 1,
+          "maxTouchPoints": 0
+        },
+        "mediaDeviceCounts": {
+          "audioinput": 1,
+          "audiooutput": 1,
+          "videoinput": 1
+        },
+        "storageQuota": {
+          "usage": 1024,
+          "quota": 2048
+        },
+        "applePayAvailable": false,
+        "speechVoicesCount": 3,
+        "permissions": {
+          "geolocation": "prompt",
+          "notifications": "prompt",
+          "camera": "prompt",
+          "microphone": "prompt"
+        }
+      },
+      "automation": {
+        "reasonIds": [
+          "C",
+          "V"
+        ],
+        "weakReasonIds": [
+          "launch.no-speech-voices"
+        ],
+        "agentName": null,
+        "shapes": [
+          "chrome"
+        ]
+      },
+      "meta": {
+        "collectedAt": "2026-11-24T00:00:00.000Z",
+        "totalDurationMs": 12,
+        "timingsMs": {
+          "canvas": 1,
+          "fonts": 2
+        }
+      }
+    }
+  },
+  "cases": [
+    {
+      "id": "SS-N01",
+      "name": "stableStringify: top-level null",
+      "kind": "stableStringify",
+      "verdict": "stable",
+      "input": null,
+      "expected": {
+        "raw_bytes": "null",
+        "sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+        "digest": "74234e98afe7498fb5daf1f36ac2d78a"
+      }
+    },
+    {
+      "id": "SS-N02",
+      "name": "stableStringify: nested null / dropped undefined",
+      "kind": "stableStringify",
+      "verdict": "stable",
+      "input": {
+        "z": null,
+        "a": [
+          null,
+          {
+            "y": null,
+            "x": 1
+          }
+        ],
+        "drop": {
+          "$undefined": true
+        }
+      },
+      "expected": {
+        "raw_bytes": "{\"a\":[null,{\"x\":1,\"y\":null}],\"z\":null}",
+        "sha256": "6a49edc7dadd21b28c0f2a42ef95c739441ef893a54b0b927c8e87d32ca2b79e",
+        "digest": "6a49edc7dadd21b28c0f2a42ef95c739"
+      }
+    },
+    {
+      "id": "SS-U01",
+      "name": "stableStringify: unicode (emoji, CJK, combining, U+2028)",
+      "kind": "stableStringify",
+      "verdict": "stable",
+      "input": {
+        "label": "café 🚀 日本語 é line",
+        "emoji": "👍🏽",
+        "quote": "a\"b\\c"
+      },
+      "expected": {
+        "raw_bytes": "{\"emoji\":\"👍🏽\",\"label\":\"café 🚀 日本語 é line\",\"quote\":\"a\\\"b\\\\c\"}",
+        "sha256": "5338c566ace84b6e8ba9a399f239626ec10d24e00f1ba9581c5e0fc777b40993",
+        "digest": "5338c566ace84b6e8ba9a399f239626e"
+      }
+    },
+    {
+      "id": "SS-Z01",
+      "name": "stableStringify: negative zero",
+      "kind": "stableStringify",
+      "verdict": "stable",
+      "input": {
+        "zero": 0,
+        "neg": {
+          "$negZero": true
+        },
+        "arr": [
+          {
+            "$negZero": true
+          },
+          -1,
+          0
+        ]
+      },
+      "expected": {
+        "raw_bytes": "{\"arr\":[0,-1,0],\"neg\":0,\"zero\":0}",
+        "sha256": "67cd49dcec7880e7a174be3f48c5f7fda5bff284440351d33292113c602087eb",
+        "digest": "67cd49dcec7880e7a174be3f48c5f7fd"
+      }
+    },
+    {
+      "id": "SS-D01",
+      "name": "stableStringify: duplicate JSON keys (last wins)",
+      "kind": "stableStringify",
+      "verdict": "stable",
+      "input": {
+        "$raw_json": "{\"b\":1,\"a\":2,\"a\":3,\"b\":4}"
+      },
+      "expected": {
+        "raw_bytes": "{\"a\":3,\"b\":4}",
+        "sha256": "6d15d5b9d7596737a14770f5d8761108e4d92ae5107a6335f9c876523f7c9f07",
+        "digest": "6d15d5b9d7596737a14770f5d8761108"
+      }
+    },
+    {
+      "id": "SS-K01",
+      "name": "stableStringify: equal/colliding sort keys (UTF-16 order)",
+      "kind": "stableStringify",
+      "verdict": "stable-sort",
+      "input": {
+        "2": 6,
+        "10": 5,
+        "A": 1,
+        "a": 2,
+        "é": 3,
+        "é": 4,
+        "á": 7
+      },
+      "expected": {
+        "raw_bytes": "{\"10\":5,\"2\":6,\"A\":1,\"a\":2,\"é\":4,\"á\":7,\"é\":3}",
+        "sha256": "dd8c895d215a1d10df0dd09760fea05bfd7de8394ee021672714eba8d192159c",
+        "digest": "dd8c895d215a1d10df0dd09760fea05b"
+      }
+    },
+    {
+      "id": "SS-A01",
+      "name": "stableStringify: long array (512 elements)",
+      "kind": "stableStringify",
+      "verdict": "stable",
+      "input": {
+        "$range": 512
+      },
+      "expected": {
+        "raw_bytes": "[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255,256,257,258,259,260,261,262,263,264,265,266,267,268,269,270,271,272,273,274,275,276,277,278,279,280,281,282,283,284,285,286,287,288,289,290,291,292,293,294,295,296,297,298,299,300,301,302,303,304,305,306,307,308,309,310,311,312,313,314,315,316,317,318,319,320,321,322,323,324,325,326,327,328,329,330,331,332,333,334,335,336,337,338,339,340,341,342,343,344,345,346,347,348,349,350,351,352,353,354,355,356,357,358,359,360,361,362,363,364,365,366,367,368,369,370,371,372,373,374,375,376,377,378,379,380,381,382,383,384,385,386,387,388,389,390,391,392,393,394,395,396,397,398,399,400,401,402,403,404,405,406,407,408,409,410,411,412,413,414,415,416,417,418,419,420,421,422,423,424,425,426,427,428,429,430,431,432,433,434,435,436,437,438,439,440,441,442,443,444,445,446,447,448,449,450,451,452,453,454,455,456,457,458,459,460,461,462,463,464,465,466,467,468,469,470,471,472,473,474,475,476,477,478,479,480,481,482,483,484,485,486,487,488,489,490,491,492,493,494,495,496,497,498,499,500,501,502,503,504,505,506,507,508,509,510,511]",
+        "sha256": "61f3f6fd3aa109e05aa31cc4d74f333d17c8f73ced22284db2209e96a39884af",
+        "digest": "61f3f6fd3aa109e05aa31cc4d74f333d"
+      }
+    },
+    {
+      "id": "SS-S01",
+      "name": "stableStringify: sorted object keys",
+      "kind": "stableStringify",
+      "verdict": "stable-sort",
+      "input": {
+        "zeta": 1,
+        "alpha": 2,
+        "mid": 3,
+        "beta": 4
+      },
+      "expected": {
+        "raw_bytes": "{\"alpha\":2,\"beta\":4,\"mid\":3,\"zeta\":1}",
+        "sha256": "ab0b8f6232fc52cb23c928a5200b2d4f13e157008590c6794d8269fc0db19828",
+        "digest": "ab0b8f6232fc52cb23c928a5200b2d4f"
+      }
+    },
+    {
+      "id": "FP-HW-01",
+      "name": "computeHardwareFingerprint (hardware-bound)",
+      "kind": "hardwareFingerprint",
+      "verdict": "hardware-bound",
+      "input": {
+        "$inputRef": "signals"
+      },
+      "expected": {
+        "raw_bytes": "{\"audio\":{\"audioBaseLatency\":0.01,\"biquadGainMaxValue\":1,\"code\":0,\"compressorAttackDefault\":0.003,\"listenerForwardXMaxValue\":1,\"oscillatorDetuneMax\":1200,\"sum\":123.456},\"automation\":{\"agentName\":null,\"reasonIds\":[\"C\",\"V\"],\"shapes\":[\"chrome\"],\"weakReasonIds\":[\"launch.no-speech-voices\"]},\"canvas\":{\"geometry\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"geometryDataUrl\":null,\"geometryUnstable\":false,\"text\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"textDataUrl\":null,\"textUnstable\":null,\"winding\":true},\"canvasNoise\":{\"classification\":\"clean\",\"flags\":[],\"maxChannelDelta\":0,\"stabilizedGeometryHash\":\"cccccccccccccccccccccccccccccccc\"},\"emoji\":{\"bottom\":0,\"font\":\"sans-serif\",\"height\":18,\"left\":0,\"right\":16,\"top\":0,\"width\":16,\"x\":0,\"y\":0},\"fontPreferences\":{\"widths\":{\"apple\":16,\"default\":16,\"min\":8,\"mono\":13,\"sans\":16,\"serif\":16,\"system\":16},\"widthsExactIntegers\":true},\"fonts\":{\"fontHash\":\"dddddddddddddddddddddddddddddddd\",\"installed\":[\"Arial\",\"Helvetica\",\"Segoe UI\",\"🚀 Font\"],\"platformClassGuess\":\"windows\"},\"math\":{\"errorStackFunctions\":[\"message\",\"stack\"],\"errorStackHash\":\"55555555555555555555555555555555\",\"mathHash\":\"44444444444444444444444444444444\",\"values\":{\"cos\":\"0.53\",\"sin\":\"0.84\",\"tan\":\"1.58\"}},\"meta\":{\"collectedAt\":\"2026-11-24T00:00:00.000Z\",\"timingsMs\":{\"canvas\":1,\"fonts\":2},\"totalDurationMs\":12},\"systemEntropy\":{\"applePayAvailable\":false,\"deviceMemory\":8,\"hardwareConcurrency\":8,\"mediaDeviceCounts\":{\"audioinput\":1,\"audiooutput\":1,\"videoinput\":1},\"permissions\":{\"camera\":\"prompt\",\"geolocation\":\"prompt\",\"microphone\":\"prompt\",\"notifications\":\"prompt\"},\"screen\":{\"colorDepth\":24,\"height\":1080,\"maxTouchPoints\":0,\"pixelRatio\":1,\"width\":1920},\"speechVoicesCount\":3,\"storageQuota\":{\"quota\":2048,\"usage\":1024},\"timezone\":\"UTC\",\"timezoneOffset\":0},\"webglBasics\":{\"renderer\":\"WebKit WebGL\",\"rendererUnmasked\":\"Golden GPU 4090\",\"shadingLanguageVersion\":\"WebGL GLSL ES 3.00\",\"vendor\":\"WebKit\",\"vendorUnmasked\":\"GoldenVendor\",\"version\":\"WebGL 2.0\"},\"webglExtensions\":{\"contextAttributes\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"extensionParameters\":\"22222222222222222222222222222222\",\"extensions\":\"11111111111111111111111111111111\",\"parameters\":\"ffffffffffffffffffffffffffffffff\",\"shaderPrecisions\":\"00000000000000000000000000000000\",\"supportedExtensions\":[\"EXT_a\",\"EXT_b\"],\"unsupportedExtensions\":[\"EXT_z\"]},\"webglGpuIdentity\":{\"invariantLimits\":{\"aliasedPointSizeRange\":[1,1024],\"max3dTextureSize\":2048,\"maxArrayTextureLayers\":2048,\"maxCubeMapTextureSize\":16384,\"maxRenderbufferSize\":16384,\"maxTextureSize\":16384,\"maxViewportDims\":[16384,16384]},\"normalizedGpu\":\"Golden GPU 4090\",\"normalizedGpuHash\":\"33333333333333333333333333333333\"}}",
+        "sha256": "c031d50ae49da867f34d03e85b43a7ea0e02bb369a1b0f5530e09d0cdf1cdd3d",
+        "digest": "1d1e63bc7e18a2c353fda29d5035c6b6"
+      }
+    },
+    {
+      "id": "FP-BR-01",
+      "name": "computeBrowserFingerprint (engine-bound)",
+      "kind": "browserFingerprint",
+      "verdict": "engine-bound",
+      "input": {
+        "$inputRef": "signals"
+      },
+      "expected": {
+        "raw_bytes": "{\"audio\":{\"audioBaseLatency\":0.01,\"biquadGainMaxValue\":1,\"code\":0,\"compressorAttackDefault\":0.003,\"listenerForwardXMaxValue\":1,\"oscillatorDetuneMax\":1200,\"sum\":123.456},\"automation\":{\"agentName\":null,\"reasonIds\":[\"C\",\"V\"],\"shapes\":[\"chrome\"],\"weakReasonIds\":[\"launch.no-speech-voices\"]},\"canvas\":{\"geometry\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"geometryDataUrl\":null,\"geometryUnstable\":false,\"text\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"textDataUrl\":null,\"textUnstable\":null,\"winding\":true},\"canvasNoise\":{\"classification\":\"clean\",\"flags\":[],\"maxChannelDelta\":0,\"stabilizedGeometryHash\":\"cccccccccccccccccccccccccccccccc\"},\"emoji\":{\"bottom\":0,\"font\":\"sans-serif\",\"height\":18,\"left\":0,\"right\":16,\"top\":0,\"width\":16,\"x\":0,\"y\":0},\"fontPreferences\":{\"widths\":{\"apple\":16,\"default\":16,\"min\":8,\"mono\":13,\"sans\":16,\"serif\":16,\"system\":16},\"widthsExactIntegers\":true},\"fonts\":{\"fontHash\":\"dddddddddddddddddddddddddddddddd\",\"installed\":[\"Arial\",\"Helvetica\",\"Segoe UI\",\"🚀 Font\"],\"platformClassGuess\":\"windows\"},\"math\":{\"errorStackFunctions\":[\"message\",\"stack\"],\"errorStackHash\":\"55555555555555555555555555555555\",\"mathHash\":\"44444444444444444444444444444444\",\"values\":{\"cos\":\"0.53\",\"sin\":\"0.84\",\"tan\":\"1.58\"}},\"meta\":{\"collectedAt\":\"2026-11-24T00:00:00.000Z\",\"timingsMs\":{\"canvas\":1,\"fonts\":2},\"totalDurationMs\":12},\"systemEntropy\":{\"applePayAvailable\":false,\"deviceMemory\":8,\"hardwareConcurrency\":8,\"mediaDeviceCounts\":{\"audioinput\":1,\"audiooutput\":1,\"videoinput\":1},\"permissions\":{\"camera\":\"prompt\",\"geolocation\":\"prompt\",\"microphone\":\"prompt\",\"notifications\":\"prompt\"},\"screen\":{\"colorDepth\":24,\"height\":1080,\"maxTouchPoints\":0,\"pixelRatio\":1,\"width\":1920},\"speechVoicesCount\":3,\"storageQuota\":{\"quota\":2048,\"usage\":1024},\"timezone\":\"UTC\",\"timezoneOffset\":0},\"webglBasics\":{\"renderer\":\"WebKit WebGL\",\"rendererUnmasked\":\"Golden GPU 4090\",\"shadingLanguageVersion\":\"WebGL GLSL ES 3.00\",\"vendor\":\"WebKit\",\"vendorUnmasked\":\"GoldenVendor\",\"version\":\"WebGL 2.0\"},\"webglExtensions\":{\"contextAttributes\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"extensionParameters\":\"22222222222222222222222222222222\",\"extensions\":\"11111111111111111111111111111111\",\"parameters\":\"ffffffffffffffffffffffffffffffff\",\"shaderPrecisions\":\"00000000000000000000000000000000\",\"supportedExtensions\":[\"EXT_a\",\"EXT_b\"],\"unsupportedExtensions\":[\"EXT_z\"]},\"webglGpuIdentity\":{\"invariantLimits\":{\"aliasedPointSizeRange\":[1,1024],\"max3dTextureSize\":2048,\"maxArrayTextureLayers\":2048,\"maxCubeMapTextureSize\":16384,\"maxRenderbufferSize\":16384,\"maxTextureSize\":16384,\"maxViewportDims\":[16384,16384]},\"normalizedGpu\":\"Golden GPU 4090\",\"normalizedGpuHash\":\"33333333333333333333333333333333\"}}",
+        "sha256": "c031d50ae49da867f34d03e85b43a7ea0e02bb369a1b0f5530e09d0cdf1cdd3d",
+        "digest": "f565df434667b5faf75e6aaf5dfa76eb"
+      }
+    },
+    {
+      "id": "COL-01",
+      "name": "collectAllSignals minus volatile meta",
+      "kind": "collectAllSignals",
+      "verdict": "stable-no-meta",
+      "input": {
+        "timeouts": 50
+      },
+      "expected": {
+        "raw_bytes": "{\"audio\":{\"audioBaseLatency\":null,\"biquadGainMaxValue\":null,\"code\":-2,\"compressorAttackDefault\":null,\"error\":\"OfflineAudioContext unsupported\",\"listenerForwardXMaxValue\":null,\"oscillatorDetuneMax\":null,\"sum\":null},\"automation\":{\"agentName\":null,\"error\":\"timeout after 50ms\",\"reasonIds\":[],\"shapes\":[],\"weakReasonIds\":[]},\"canvas\":{\"error\":\"canvas 2d context unavailable\",\"geometry\":\"\",\"geometryDataUrl\":null,\"geometryUnstable\":null,\"text\":\"\",\"textDataUrl\":null,\"textUnstable\":null,\"winding\":null},\"canvasNoise\":{\"classification\":\"unknown\",\"error\":\"canvas 2d context unavailable\",\"flags\":[],\"maxChannelDelta\":null,\"stabilizedGeometryHash\":null},\"emoji\":{\"bottom\":null,\"error\":\"document is not defined\",\"font\":null,\"height\":null,\"left\":null,\"right\":null,\"top\":null,\"width\":null,\"x\":null,\"y\":null},\"fontPreferences\":{\"error\":\"isolated 16px font iframe unavailable\",\"widths\":{\"apple\":null,\"default\":null,\"min\":null,\"mono\":null,\"sans\":null,\"serif\":null,\"system\":null},\"widthsExactIntegers\":false},\"fonts\":{\"error\":\"font measurement iframe unavailable\",\"fontHash\":\"\",\"installed\":[],\"platformClassGuess\":\"unknown\"},\"math\":{\"errorStackFunctions\":[\"message\",\"stack\"],\"errorStackHash\":\"4ffd600897506ad3787ebced8439dd81\",\"mathHash\":\"f5f74f076411c606f9e078e80bf19653\",\"mathV5\":{\"mathHashV5\":\"f6173d4705d9847f0052bcae244beea1\",\"valuesV5\":{\"acos\":1.4473588658278522,\"acosh\":709.889355822726,\"acoshPf\":355.291251501643,\"asin\":0.12343746096704435,\"asinh\":0.881373587019543,\"asinhPf\":0.8813735870195429,\"atan\":0.4636476090008061,\"atanh\":0.5493061443340548,\"atanhPf\":0.5493061443340548,\"cos\":-0.8390715290095377,\"cosh\":1.5430806348152437,\"coshPf\":1.5430806348152437,\"exp\":2.718281828459045,\"expm1\":1.718281828459045,\"expm1Pf\":1.718281828459045,\"log1p\":2.3978952727983707,\"log1pPf\":2.3978952727983707,\"powPI\":1.92758141605602e-50,\"sin\":0.8178819121159085,\"sinh\":1.1752011936438014,\"sinhPf\":2.534342107873324,\"tan\":-1.4214488238747245,\"tanh\":0.7615941559557649,\"tanhPf\":0.7615941559557649}},\"values\":{\"acos\":\"1.4473588658278522\",\"acosh\":\"709.889355822726\",\"acoshPf\":\"Infinity\",\"asin\":\"0.12343746096704435\",\"asinh\":\"0.881373587019543\",\"asinhPf\":\"0.8813735870195429\",\"atan\":\"1.1071487177940904\",\"atanh\":\"0.5493061443340548\",\"atanhPf\":\"0.5493061443340548\",\"cos\":\"-0.8390715290095377\",\"cosh\":\"1.5430806348152437\",\"coshPf\":\"1.5430806348152437\",\"exp\":\"2.718281828459045\",\"expm1\":\"1.718281828459045\",\"expm1Pf\":\"2.3504023872876028\",\"log1p\":\"2.3978952727983707\",\"log1pPf\":\"2.3978952727983707\",\"pow\":\"1.92758141605602e-50\",\"sin\":\"0.8178819121159085\",\"sinh\":\"1.1752011936438014\",\"sinhPf\":\"2.3504023872876028\",\"tan\":\"-1.4214488238747245\",\"tanh\":\"0.7615941559557649\",\"tanhPf\":\"0.7615941559557649\"}},\"systemEntropy\":{\"applePayAvailable\":false,\"battery\":{\"charging\":null,\"chargingTime\":null,\"dischargingTime\":null,\"level\":null,\"supported\":false,\"timePrecisionHint\":null},\"deviceMemory\":8,\"geolocation\":{\"available\":false,\"coords\":null,\"errorCode\":null,\"errorMessage\":null,\"permission\":\"prompt\",\"timestamp\":null},\"hardwareConcurrency\":8,\"keyboardStatic\":{\"hasKeyQ\":null,\"layoutEmpty\":null,\"mapSize\":null,\"supported\":false},\"mediaDeviceCounts\":{\"audioinput\":1,\"audiooutput\":1,\"videoinput\":1},\"permissions\":{\"camera\":\"prompt\",\"geolocation\":\"prompt\",\"microphone\":\"prompt\",\"notifications\":\"prompt\"},\"screen\":{\"colorDepth\":24,\"height\":1080,\"maxTouchPoints\":0,\"pixelRatio\":1,\"width\":1920},\"speechVoicesCount\":0,\"storageQuota\":{\"quota\":2048,\"usage\":1024},\"timezone\":\"UTC\",\"timezoneOffset\":0},\"webglBasics\":{\"error\":\"webgl context unavailable\",\"renderer\":null,\"rendererUnmasked\":null,\"shadingLanguageVersion\":null,\"vendor\":null,\"vendorUnmasked\":null,\"version\":null},\"webglExtensions\":{\"contextAttributes\":null,\"error\":\"webgl context unavailable\",\"extensionParameters\":null,\"extensions\":null,\"parameters\":null,\"shaderPrecisions\":null,\"supportedExtensions\":[],\"unsupportedExtensions\":[]},\"webglGpuIdentity\":{\"error\":\"webgl context unavailable\",\"invariantLimits\":null,\"normalizedGpu\":null,\"normalizedGpuHash\":null}}",
+        "sha256": "f8886f58d4d9eadf58a4f828a2422d7fc781f901376d7ad549252d707e2c3006",
+        "digest": "f8886f58d4d9eadf58a4f828a2422d7f"
+      }
+    }
+  ]
+}

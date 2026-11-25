@@ -541,9 +541,50 @@ const IS_SERVERLESS_RUNTIME = Boolean(
     process.env.NETLIFY
 );
 
-const HMAC_SECRET =
-  process.env.VISITOR_HMAC_SECRET ||
-  'intel-system-first-party-hmac-secret-2026';
+/**
+ * Visitor HMAC key ring (rotation-safe). `VISITOR_HMAC_SECRET` is the current signing key;
+ * `VISITOR_HMAC_SECRET_PREVIOUS` is verification-only during rotation. There is deliberately
+ * NO public fallback literal: a missing/short key fails closed (503 on /api/* except health/ping)
+ * unless dev/test is explicitly opted in, in which case a random per-process key is minted.
+ * Secrets are read verbatim (NO trimming) so they stay byte-identical to the Worker's env when it
+ * signs WBA cookies — configure them WITHOUT leading/trailing whitespace.
+ */
+function resolveVisitorHmacKeyRing(): { keys: string[]; misconfigured: boolean } {
+  // Ephemeral keys are an EXPLICIT dev/test opt-in only. `NODE_ENV` unset or any other value is
+  // treated as production-like: silently switching to a per-process key would invalidate every
+  // stored `visitors.hmac_token` on restart.
+  const ephemeralOptIn =
+    process.env.NODE_ENV === 'test' || process.env.INTEL_ALLOW_EPHEMERAL_HMAC === '1';
+  const strict =
+    process.env.NODE_ENV === 'production' ||
+    process.env.INTEL_STRICT_SECRET === '1' ||
+    !ephemeralOptIn;
+  const readSecret = (name: string): string =>
+    typeof process.env[name] === 'string' ? process.env[name] : '';
+  const MIN_KEY_LENGTH = 32;
+  // Enforce the minimum on EVERY key: a short `VISITOR_HMAC_SECRET_PREVIOUS` is ignored entirely
+  // (never used to sign or verify), and a short current key cannot activate signing either.
+  const current = readSecret('VISITOR_HMAC_SECRET');
+  const previous = readSecret('VISITOR_HMAC_SECRET_PREVIOUS');
+  const currentKey = current.length >= MIN_KEY_LENGTH ? current : '';
+  const previousKey = previous.length >= MIN_KEY_LENGTH ? previous : '';
+  const misconfigured = strict && !currentKey;
+  if (misconfigured) {
+    console.error(
+      'VISITOR_HMAC_SECRET (>=32 chars) is required here; /api/* is failing closed.'
+    );
+  }
+  const keys = Array.from(
+    new Set(
+      [currentKey || crypto.randomBytes(MIN_KEY_LENGTH).toString('hex'), previousKey].filter(Boolean)
+    )
+  );
+  return { keys, misconfigured };
+}
+const { keys: VISITOR_HMAC_KEYS, misconfigured: VISITOR_HMAC_MISCONFIGURED } =
+  resolveVisitorHmacKeyRing();
+// Current signing key; verification helpers below walk the whole ring.
+const HMAC_SECRET = VISITOR_HMAC_KEYS[0];
 
 interface VisitorRow {
   visitor_id: string;
@@ -705,6 +746,21 @@ function createInMemoryDbAdapter(): DatabaseAdapter {
                 .map((v) => v.hardware_id)
             );
             return { n: activeHardware.size };
+          }
+          if (normalized.includes('intel:devicehardware')) {
+            // Mirror the canonical hardware_anchors JOIN for the in-memory adapter.
+            const cutoff = String(params[0] || '');
+            const activeHardware = new Set(
+              Array.from(hardwareAnchorsMap.values())
+                .filter(
+                  (anchor) =>
+                    anchor.updated_at_utc >= cutoff &&
+                    anchor.hardware_id &&
+                    visitorsMap.has(anchor.visitor_id)
+                )
+                .map((anchor) => anchor.hardware_id)
+            );
+            return { total: activeHardware.size };
           }
           if (normalized.includes('FROM hardware_anchors WHERE hardware_id = ?')) {
             return hardwareAnchorsMap.get(String(params[0] || ''));
@@ -1280,16 +1336,25 @@ function verifyVisitorToken(visitorId: string | undefined | null, token: string 
   if (!visitorId || !token || typeof visitorId !== 'string' || typeof token !== 'string') {
     return false;
   }
-  const expected = signVisitorId(visitorId);
-  if (expected.length !== token.length) return false;
-  try {
-    return crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(token, 'hex'));
-  } catch {
-    return false;
+  let matched = false;
+  // Rotation: accept both the current and previous key. Every comparison stays constant-time and
+  // we walk the whole ring (no early break) so a hit on the first key cannot leak via timing.
+  for (const key of VISITOR_HMAC_KEYS) {
+    const expected = crypto.createHmac('sha256', key).update(visitorId).digest('hex');
+    if (expected.length !== token.length) continue;
+    try {
+      const equal = crypto.timingSafeEqual(Buffer.from(expected, 'hex'), Buffer.from(token, 'hex'));
+      matched = matched || equal;
+    } catch {
+      // Malformed hex token — not a match.
+    }
   }
+  return matched;
 }
 
-function computeHistoryBackupSignature(
+/** Signature for an explicit key — used by verification to try every key in the ring. */
+function computeHistoryBackupSignatureWithKey(
+  secret: string,
   visitorId: string,
   totalVisits: number,
   totalSessions: number,
@@ -1307,7 +1372,27 @@ function computeHistoryBackupSignature(
     )
     .join('|');
   const payload = `hist:${visitorId}:${totalVisits}:${totalSessions}:${firstVisitUtc}:${visitDigest}`;
-  return crypto.createHmac('sha256', HMAC_SECRET).update(payload).digest('hex');
+  return crypto.createHmac('sha256', secret).update(payload).digest('hex');
+}
+
+function computeHistoryBackupSignature(
+  visitorId: string,
+  totalVisits: number,
+  totalSessions: number,
+  firstVisitUtc: string,
+  visits: VisitHistoryRecord[],
+  legacyDigest = false
+): string {
+  // New backups are always minted with the current key.
+  return computeHistoryBackupSignatureWithKey(
+    HMAC_SECRET,
+    visitorId,
+    totalVisits,
+    totalSessions,
+    firstVisitUtc,
+    visits,
+    legacyDigest
+  );
 }
 
 function createSignedHistoryBackup(
@@ -1353,35 +1438,36 @@ function verifySignedHistoryBackup(
   ) {
     return false;
   }
-  const expectedSig = computeHistoryBackupSignature(
-    backup.visitorId,
-    backup.totalVisits,
-    backup.totalSessions,
-    backup.firstVisitUtc,
-    backup.visits
-  );
-  // Backups minted before score persistence used the shorter digest. Accept either so an
-  // existing visitor is never dropped after deploying this change.
-  const legacySig = computeHistoryBackupSignature(
-    backup.visitorId,
-    backup.totalVisits,
-    backup.totalSessions,
-    backup.firstVisitUtc,
-    backup.visits,
-    true
-  );
-  const matches = [expectedSig, legacySig].some((candidate) => {
-    if (candidate.length !== backup.signature.length) return false;
-    try {
-      return crypto.timingSafeEqual(
-        Buffer.from(candidate, 'hex'),
-        Buffer.from(backup.signature, 'hex')
+  // 2 keys (current + previous) × 2 digest shapes (current + pre-score-persistence legacy) = 4
+  // candidates. Iterate ALL of them: a nested `.some()` would short-circuit on a match and leak
+  // which key/digest won via timing. Cap to the mint-time 35 visits BEFORE hashing so a 512 KB
+  // body cannot force oversized HMAC work.
+  const visits = backup.visits.slice(0, 35);
+  let matched = false;
+  for (const key of VISITOR_HMAC_KEYS) {
+    for (const legacyDigest of [false, true]) {
+      const candidate = computeHistoryBackupSignatureWithKey(
+        key,
+        backup.visitorId,
+        backup.totalVisits,
+        backup.totalSessions,
+        backup.firstVisitUtc,
+        visits,
+        legacyDigest
       );
-    } catch {
-      return false;
+      if (candidate.length !== backup.signature.length) continue;
+      try {
+        const equal = crypto.timingSafeEqual(
+          Buffer.from(candidate, 'hex'),
+          Buffer.from(backup.signature, 'hex')
+        );
+        matched = matched || equal;
+      } catch {
+        // Malformed signature — not a match.
+      }
     }
-  });
-  return matches;
+  }
+  return matched;
 }
 
 function generateVisitorId(): string {
@@ -2621,15 +2707,25 @@ function verifyPageAttestation(
   publicIp: string
 ): WbaVerification | null {
   try {
-    const secret = process.env.VISITOR_HMAC_SECRET;
-    if (!secret || secret.length < 32) return null;
     const cookie = readRequestHeader(headers, 'cookie');
     const match = /(?:^|;\s*)intel_wba=([^;]+)/.exec(cookie);
     if (!match) return null;
     const parts = match[1].split('.');
     if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
-    const expected = crypto.createHmac('sha256', secret).update(parts[0]).digest('base64url');
-    if (expected !== parts[1]) return null;
+    // The Worker signs with the current key; during rotation the previous key must still replay.
+    let signatureValid = false;
+    for (const secret of VISITOR_HMAC_KEYS) {
+      if (secret.length < 32) continue;
+      const expected = crypto.createHmac('sha256', secret).update(parts[0]).digest('base64url');
+      if (expected.length !== parts[1].length) continue;
+      try {
+        const equal = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(parts[1]));
+        signatureValid = signatureValid || equal;
+      } catch {
+        // Malformed base64url — not a match.
+      }
+    }
+    if (!signatureValid) return null;
     const payload = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')) as {
       op?: string; agentId?: string; host?: string;
       uaHash?: string; ipHash?: string; exp?: number;
@@ -2657,16 +2753,35 @@ function verifyPageAttestation(
   }
 }
 
+/**
+ * SSRF boundary for the client-controlled Signature-Agent URL. Only first-party WBA trust
+ * anchors (and their declared first-party suffixes) may be fetched, and never a numeric IP
+ * literal — that blocks loopback / link-local / private targets without changing verified
+ * requests, whose agent URL is already a trust-anchor host.
+ */
+function isTrustedWbaDirectoryHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host || net.isIP(host)) return false;
+  return WBA_TRUSTED_SIGNERS.some(
+    (signer) =>
+      signer.directoryHosts.some((trusted) => trusted.toLowerCase() === host) ||
+      (signer.directoryHostSuffixes ?? []).some((suffix) => host.endsWith(suffix.toLowerCase()))
+  );
+}
+
 /** Best-effort client-name / trigger lookup from the agent's signature directory (1 h cache). */
 async function fetchWebBotAuthDirectory(
   agentUrl: string
 ): Promise<{ clientName: string; trigger: string | null } | null> {
-  let origin = '';
+  let parsed: URL;
   try {
-    origin = new URL(agentUrl).origin;
+    parsed = new URL(agentUrl);
   } catch {
     return null;
   }
+  // Untrusted / non-HTTPS signers are never fetched.
+  if (parsed.protocol !== 'https:' || !isTrustedWbaDirectoryHost(parsed.hostname)) return null;
+  const origin = parsed.origin;
   const nowMs = Date.now();
   const cached = aiAuthDirectoryCache.get(origin);
   if (cached && cached.expiresAtMs > nowMs) {
@@ -5017,11 +5132,14 @@ function computeDeviceRarity(
     // Corpus size must be distinct hardware profiles, not raw visits, or a single active
     // visitor inflates N into a false p95/p99 claim. Screen/browser strings are volatile
     // and must not define the rarity cohort.
+    // `visits` has no hardware_id column — the canonical hardware profile lives on
+    // `hardware_anchors` (joined to `visitors` for the live / recently updated cohort).
     const row = db
       .prepare(
-        `SELECT COUNT(DISTINCT hardware_id) AS total
-         FROM visits
-         WHERE visited_at_utc >= ? AND hardware_id IS NOT NULL AND hardware_id != ''`
+        `/* intel:devicehardware */ SELECT COUNT(DISTINCT ha.hardware_id) AS total
+         FROM hardware_anchors ha
+         JOIN visitors v ON v.visitor_id = ha.visitor_id
+         WHERE ha.updated_at_utc >= ? AND ha.hardware_id IS NOT NULL AND ha.hardware_id != ''`
       )
       .get(cutoff) as Record<string, unknown> | undefined;
     const total = Number(row?.total) || 0;
@@ -6010,6 +6128,21 @@ function detectServerRegion(req?: express.Request): {
 export const app = express();
 app.set('trust proxy', true);
 app.use(cookieParser());
+
+// Fail closed when no usable (>=32 char) visitor HMAC key is configured outside an explicit
+// dev/test opt-in: without one, no token can be authenticated across restarts. Health and network
+// ping stay answerable so probes still work; other /api routes return 503 instead of serving
+// forgeable identity.
+if (VISITOR_HMAC_MISCONFIGURED) {
+  app.use('/api', (req, res, next) => {
+    const probe = req.path.toLowerCase();
+    if (probe === '/health' || probe === '/network/ping' || probe === '/ping') {
+      next();
+      return;
+    }
+    res.status(503).json({ error: 'Visitor HMAC secret not configured.' });
+  });
+}
 
 // Advertise Accept-CH / Critical-CH and parse every incoming `sec-ch-ua*` hint into
 // `(req as any).intelClientHints` for the shared UA normalizer. Critical-CH makes the
@@ -10482,9 +10615,9 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       botVerdict = 'good';
     }
 
-    if (automationTargetedTampering) {
-      // Final authority: automation-targeted tampering always pins the bad / stealth verdict
-      // and a zero human corroboration, regardless of any directory / agent attribution.
+    if (automationTargetedTampering && !verifierSignedGood) {
+      // Final authority: automation-targeted tampering pins the bad / stealth verdict, EXCEPT for
+      // a verifier-signed good agent, which must keep its authoritative good attribution.
       botInfo = {
         category: 'browser_automation',
         provider: effectiveBotClassification.provider || 'Stealth Automation',
@@ -10500,9 +10633,8 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       // generic classifier labelled it a good crawler or an automation branch reported "unknown".
       // Signed-good agents are excluded above, so only unproven claims reach this override. The
       // evidence line is mirrored onto every surface (tampering reasons, risk ledger, aiAgent).
-      const spoofEvidence =
-        `Spoofed verified-bot identity claim: ${String(fullRequestUserAgent || '').slice(0, 120)}` +
-        ' — no RFC 9421 signature or official CIDR / FCrDNS proof';
+      // Fixed text only: the raw client User-Agent is never persisted or returned as evidence.
+      const spoofEvidence = 'Spoofed verified-bot identity claim (raw UA withheld)';
       botInfo = {
         category: 'browser_automation',
         provider: aiAgent?.operator || effectiveBotClassification.provider || 'Unverified',
@@ -10538,6 +10670,7 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       aiAgent?.agentId === 'gemini' || /google gemini|cloud agent/i.test(botInfo?.name || '');
     if (
       lingeringCloudAgentLabel &&
+      !verifierSignedGood &&
       !signedAgentIdentity &&
       !spoofedVerifiedBotClaim &&
       (hardAutomationSignals ||
@@ -10701,13 +10834,11 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       rfpOrTor:
         Boolean(securitySignals.torExitNode) || Boolean(securitySignals.isTorBrowserClient),
       genuineSpoof: botVerdict === 'bad' && botInfo?.identity === 'spoofed',
-      // P0-6 continuity corroboration. The scorer's input types are owned by another module;
-      // the cast keeps this call compatible with both the legacy and evidence shapes. The
-      // calibration/publication gate is untouched — only the evidence input is forwarded.
-      storageHealed: Boolean(storageHealed || resolvedIdentity.healed),
-      visitContinuity: statistics.totalVisits,
-      profileAgeDays: profileAgeDaysForConfidence,
-    } as Parameters<typeof scoreConfidence>[0]);
+      // Continuity keys are intentionally NOT forwarded here: this legacy call has no
+      // `match_tier`, so a scorer dispatching on those keys alone would return a bare number
+      // where a ConfidenceResult is expected (NaN). They are consumed below by rarityHonesty /
+      // computeHonestIdentityConfidence.
+    });
     const identityConsistencyFlags = Array.from(new Set(resolvedIdentity.reasons));
     const identityConsistency = {
       score: Math.max(
@@ -11058,7 +11189,7 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       // strength, never a probability. The human-facing label says "Match evidence", not
       // "Confidence"/probability.
       calibration_status: 'uncalibrated' as const,
-      confidence_label: confidenceLabel(finalIdentityConfidenceScore, false),
+      confidence_label: confidenceLabel(finalIdentityConfidenceScore, false, capsAtZeroSix),
       ...(downgradeRecognition
         ? { confidence_tier: 'Shared Hardware Class - Ambiguous' as const }
         : {}),
@@ -11087,7 +11218,7 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       if (!downgradeRecognition) {
         identityConfidenceHonest.confidence_tier = stabilizedConfidence.tier;
       }
-      identityConfidenceHonest.confidence_label = confidenceLabel(stabilizedConfidence.score, false);
+      identityConfidenceHonest.confidence_label = confidenceLabel(stabilizedConfidence.score, false, capsAtZeroSix);
     }
     identityConfidenceHonest.calibration_status = 'uncalibrated';
 
@@ -11799,6 +11930,18 @@ app.post('/api/visitor/corroborate', identifyRateLimit, (req, res) => {
 });
 
 app.get('/api/visitor/history/:visitorId', (req, res) => {
+  // Per-visitor, token/cookie-authorized data: never cache it and key any cache on those inputs.
+  res.setHeader('Cache-Control', 'private, no-store');
+  const existingVary = res.getHeader('Vary');
+  const varyValues =
+    typeof existingVary === 'string'
+      ? existingVary.split(',').map((item) => item.trim()).filter(Boolean)
+      : [];
+  for (const value of ['Cookie', 'X-Visitor-Token']) {
+    if (!varyValues.some((item) => item.toLowerCase() === value.toLowerCase())) varyValues.push(value);
+  }
+  res.setHeader('Vary', varyValues.join(', '));
+
   const requestedVisitorId = req.params.visitorId;
   const headerToken = req.headers['x-visitor-token'] as string | undefined;
   const cookieVid = req.cookies?.intel_http_vid as string | undefined;

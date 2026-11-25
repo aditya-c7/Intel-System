@@ -187,3 +187,190 @@ export function collectFontPreferenceSignals(): FontPreferenceSignals {
 
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// FingerprintJS v5 font-preferences probe — additive research surface
+//
+// The legacy collector above is deliberately untouched: the object it returns
+// is fed WHOLE into the browser digest (`font_preferences`), so no new key may
+// be added to it. Everything below is exposed only through NEW exports.
+// ---------------------------------------------------------------------------
+
+/** v5 default probe text (m/w widest, plus ligatures). */
+export const FONT_PREFERENCES_V5_TEST_STRING = 'mmMwWLliI0fiflO&1';
+/** v5 `withNaturalFonts` container width — wide enough for Android font scaling. */
+export const FONT_PREFERENCES_V5_CONTAINER_WIDTH_PX = 4000;
+
+export type FontPreferencePresetV5 = 'default' | 'apple' | 'serif' | 'sans' | 'mono' | 'min' | 'system';
+
+/** Writable subset of CSS styles used by the v5 presets. */
+export interface FontPreferenceV5PresetStyle {
+  font?: string;
+  fontFamily?: string;
+  fontSize?: string;
+}
+
+/** Exact FPJS v5 preset styles (random but persistent keys). */
+export const FONT_PREFERENCES_V5_PRESETS: Readonly<
+  Record<FontPreferencePresetV5, Readonly<FontPreferenceV5PresetStyle>>
+> = {
+  default: {},
+  apple: { font: '-apple-system-body' },
+  serif: { fontFamily: 'serif' },
+  sans: { fontFamily: 'sans-serif' },
+  mono: { fontFamily: 'monospace' },
+  min: { fontSize: '1px' },
+  system: { fontFamily: 'system-ui' },
+};
+
+/** Result of the FingerprintJS v5 font-preferences probe. */
+export interface FontPreferenceSignalsV5 {
+  /** `getBoundingClientRect().width` per preset (V5-normalized where applicable). */
+  widths: Record<FontPreferencePresetV5, number | null>;
+  error?: string;
+}
+
+interface V5BrowserHints {
+  isAndroid: boolean;
+  isChromium: boolean;
+  isChromium128OrNewer: boolean;
+  isWebKit: boolean;
+}
+
+/** Best-effort UA equivalent of the FPJS `utils/browser` checks used by v5. */
+function readV5BrowserHints(): V5BrowserHints {
+  const ua = typeof navigator === 'undefined' ? '' : navigator.userAgent;
+  const isAndroid = /Android/i.test(ua);
+  const chromiumMatch = /(?:Chrome|Chromium|CriOS)\/(\d+)/i.exec(ua);
+  const isChromium = chromiumMatch !== null;
+  const isChromium128OrNewer = isChromium && Number(chromiumMatch![1]) >= 128;
+  const isWebKit = !isChromium && /AppleWebKit/i.test(ua);
+  return { isAndroid, isChromium, isChromium128OrNewer, isWebKit };
+}
+
+/** FPJS `normalizeFontMeasurement`: Android rounds to whole numbers, else floor to 3dp. */
+export function normalizeFontMeasurementV5(value: number, isAndroid: boolean): number {
+  const decimals = isAndroid ? 0 : 3;
+  const pow = Math.pow(10, decimals);
+  return Math.floor(value * pow) / pow;
+}
+
+/**
+ * FPJS `withNaturalFonts`: a wide, zoom-independent, srcdoc iframe so Android
+ * system fonts and desktop zoom modes cannot change the measured widths.
+ */
+async function withV5NaturalFontsIframe<T>(
+  action: (doc: Document, body: HTMLElement, iframeWindow: Window) => T,
+  containerWidthPx = FONT_PREFERENCES_V5_CONTAINER_WIDTH_PX
+): Promise<T | null> {
+  if (typeof document === 'undefined' || !document.body) return null;
+  const iframe = document.createElement('iframe');
+  const hints = readV5BrowserHints();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      iframe.onload = () => resolve();
+      iframe.onerror = () => reject(new Error('v5 natural-fonts iframe failed to load'));
+      const style = iframe.style;
+      style.setProperty('display', 'block', 'important');
+      style.position = 'absolute';
+      style.top = '0';
+      style.left = '0';
+      style.visibility = 'hidden';
+      // srcdoc is required to set the viewport meta on Android Firefox.
+      iframe.srcdoc =
+        '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">';
+      document.body.appendChild(iframe);
+    });
+    const iframeWindow = iframe.contentWindow as Window | null;
+    const doc = iframeWindow?.document ?? null;
+    const body = doc?.body ?? null;
+    if (!iframeWindow || !doc || !body) return null;
+
+    const bodyStyle = body.style;
+    bodyStyle.width = `${containerWidthPx}px`;
+    bodyStyle.setProperty('text-size-adjust', 'none');
+    bodyStyle.setProperty('-webkit-text-size-adjust', 'none');
+
+    if (hints.isChromium) {
+      const dpr = iframeWindow.devicePixelRatio || 1;
+      bodyStyle.zoom = `${1 / dpr}`;
+    } else if (hints.isWebKit) {
+      bodyStyle.zoom = 'reset';
+    }
+
+    const linesOfText = doc.createElement('div');
+    linesOfText.textContent = [...Array((containerWidthPx / 20) << 0)].map(() => 'word').join(' ');
+    body.appendChild(linesOfText);
+
+    return action(doc, body, iframeWindow);
+  } finally {
+    try {
+      iframe.remove();
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+/**
+ * FingerprintJS v5 `getFontPreferences()` as a PURE ADDITIVE helper.
+ *
+ * Uses `getBoundingClientRect().width` only (never offsetWidth, never height),
+ * the exact 7 v5 presets, and FPJS zoom normalization: Chromium 128+ multiplies
+ * by devicePixelRatio and floors (Android: whole numbers, else 3 decimals);
+ * all other engines use the raw width.
+ */
+export async function collectFontPreferenceSignalsV5(): Promise<FontPreferenceSignalsV5> {
+  const result: FontPreferenceSignalsV5 = {
+    widths: {
+      default: null,
+      apple: null,
+      serif: null,
+      sans: null,
+      mono: null,
+      min: null,
+      system: null,
+    },
+  };
+  try {
+    const hints = readV5BrowserHints();
+    const presets = Object.keys(FONT_PREFERENCES_V5_PRESETS) as FontPreferencePresetV5[];
+    const sizes = await withV5NaturalFontsIframe((doc, body, iframeWindow) => {
+      const elements: Record<string, HTMLElement> = {};
+      // Create every element first: interleaving DOM writes and layout reads is slow.
+      for (const key of presets) {
+        const presetStyle = FONT_PREFERENCES_V5_PRESETS[key];
+        const element = doc.createElement('span');
+        element.textContent = FONT_PREFERENCES_V5_TEST_STRING;
+        element.style.whiteSpace = 'nowrap';
+        if (presetStyle.font !== undefined) element.style.font = presetStyle.font;
+        if (presetStyle.fontFamily !== undefined) element.style.fontFamily = presetStyle.fontFamily;
+        if (presetStyle.fontSize !== undefined) element.style.fontSize = presetStyle.fontSize;
+        elements[key] = element;
+        body.appendChild(doc.createElement('br'));
+        body.appendChild(element);
+      }
+
+      const measured: Partial<Record<FontPreferencePresetV5, number>> = {};
+      for (const key of presets) {
+        const rawWidth = elements[key].getBoundingClientRect().width;
+        measured[key] =
+          hints.isChromium && hints.isChromium128OrNewer
+            ? normalizeFontMeasurementV5(rawWidth * iframeWindow.devicePixelRatio, hints.isAndroid)
+            : rawWidth;
+      }
+      return measured;
+    });
+    if (!sizes) {
+      result.error = 'v5 natural-fonts iframe unavailable';
+      return result;
+    }
+    for (const key of presets) {
+      const value = sizes[key];
+      result.widths[key] = typeof value === 'number' && Number.isFinite(value) ? value : null;
+    }
+  } catch (err) {
+    result.error = errorMessage(err);
+  }
+  return result;
+}

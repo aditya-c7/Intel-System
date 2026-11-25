@@ -27,19 +27,19 @@ If the existing site is a Cloudflare Pages project, create a Workers application
 
 Visitor and health routes use the SQLite-backed `VisitorStore` Durable Object. Only `/api/visitor/*` and `/api/intel/geolocation` reach the Durable Object; `/api/health` and `/api/network/ping` are answered statelessly. Network RTT monitoring calls GET/HEAD `/api/network/ping`, which does not touch SQLite or Durable Objects.
 
-The build-time adapter reads server.ts, reuses its schema and route logic, and substitutes request-scoped SQLite storage only in the Worker bundle. It fails if expected source markers change. Cloudflare Workers is the only deployment target: there is no Vercel deploy path (legacy `vercel.json` is retained only as an untouched historical artifact). Express is bundled using Node package resolution so browser mappings do not disable its stream dependencies. Native better-sqlite3 is not executed by the Worker.
+The build-time adapter reads server.ts, reuses its schema and route logic, and substitutes request-scoped SQLite storage only in the Worker bundle. It fails if expected source markers change. Cloudflare Workers is the only deployed target (including https://intel.adityahq.me); the remaining Vercel files are legacy configuration only and are not deployed anywhere. Express is bundled using Node package resolution so browser mappings do not disable its stream dependencies. Native better-sqlite3 is not executed by the Worker.
 
 ## Edge routing, SSR injection, and pass-through paths
 
-`wrangler.jsonc` sets `assets.run_worker_first = true` together with `not_found_handling: single-page-application`. The Worker must run **before** the asset layer:
+`wrangler.jsonc` sets `assets.run_worker_first` to a selective array (`["/*", "!/assets/*", "!/robots.txt", "!/llms.txt", "!/agents.md", "!/sitemap.xml"]`) together with `not_found_handling: single-page-application`. The Worker runs **before** the asset layer for documents and API paths:
 
 - It injects the SSR bot verdict into every HTML document: the `intel:verdict` / `intel:bot-type` meta tags, the `#intel-initial-verdict` inline JSON, the `X-Intel-Bot-Verdict` / `-Agent` / `-Identity` headers, removal of stale cache validators, and — for verified Web Bot Auth traffic — a 60-second `intel_wba` cookie.
 - It routes `/api` and `/api/*` to the Express app (and the Durable Object where needed). With SPA not-found handling, serving assets first would return `index.html` for API paths instead of JSON.
 - It performs canonical redirects (`www` → apex, HTTP → HTTPS) and Web Bot Auth verification before producing a response.
 
-Because the Worker runs first, files that must not be rewritten are forwarded straight to the `ASSETS` binding: hashed bundles under `/assets/*` and the crawler/LLM metadata files `/robots.txt`, `/llms.txt`, `/agents.md`, and `/sitemap.xml`. These **pass-through paths** keep the asset layer's own caching and are never UA-branded, but they still pass through the Worker.
+Hashed bundles under `/assets/*` and the crawler/LLM metadata files `/robots.txt`, `/llms.txt`, `/agents.md`, and `/sitemap.xml` are excluded from Worker-first routing by the negative patterns and are served directly by the `ASSETS` binding. These **pass-through paths** keep the asset layer's own caching, are never UA-branded, and do not consume a Worker invocation. All other paths — including deep links — still go through the Worker so SSR verdict injection and API routing remain correct.
 
-**Cost tradeoff:** with `run_worker_first: true`, the Worker is invoked for *every* request, including static assets. Unlike an asset-first setup, asset requests do consume Worker invocations and CPU here. That is the price of correct SSR verdict injection and API routing; do **not** set it to `false`, which breaks SSR injection.
+**Cost tradeoff:** the Worker runs on documents and API paths but not on the excluded pass-through paths. Do not replace the selective array with a bare `false` or remove the positive `/*` pattern: both break SSR verdict injection and API routing.
 
 ## Rate limits, Web Bot Auth, and secrets
 

@@ -105,13 +105,13 @@ export interface CanonicalView {
   present: boolean;
   source: 'canonical' | 'legacy' | 'empty';
   eventId: string | null;
-  risk: OrthogonalRiskLedger;
+  risk: CanonicalRiskLedger;
   /** Verbatim mirror of `risk.evidence_ledger` for the UI / Event JSON (never re-derived). */
   evidenceLedger: OrthogonalRiskLedger['evidence_ledger'];
   /** 0-10 headline mirrored verbatim from the canonical risk ledger (never re-derived). */
-  riskScore10: number;
+  riskScore10: number | null | undefined;
   /** Risk tier mirrored verbatim from the canonical risk ledger. */
-  riskTier: RiskTier;
+  riskTier: RiskTier | null;
   verdictTier: VerdictTier | null;
   humanCorroboration: 0 | 1 | null;
   identity: IdentityAxes | null;
@@ -119,7 +119,8 @@ export interface CanonicalView {
   tampering: TamperingAxes | null;
   network: NetworkAxes | null;
   environment: EnvironmentAxes | null;
-  confidenceTier: string;
+  /** Server identity tier only — null when the identity axis is absent (never fabricated). */
+  confidenceTier: string | null;
   confidenceScore: number | null;
   calibrationStatus: 'uncalibrated' | 'calibrated';
   tamperingReasons: string[];
@@ -231,6 +232,64 @@ export interface CanonicalView {
   official_bot_feed_match?: string[] | null;
   webgpu_research_disclosure?: string | null;
   benchmark_policy?: BenchmarkPolicyMirror | null;
+}
+
+/**
+ * The server risk ledger with honest absence. A response that omits `score_0_100`, `raw_score`
+ * or the tier mirrors must keep them absent (null) — the client never fills them with a
+ * fabricated zero or a derived tier.
+ */
+export type CanonicalRiskLedger = Omit<
+  OrthogonalRiskLedger,
+  'raw_score' | 'score_0_100' | 'tier' | 'score10' | 'risk_tier'
+> & {
+  raw_score: number | null;
+  score_0_100: number | null;
+  tier: RiskTier | null;
+  score10?: number | null;
+  risk_tier?: RiskTier | null;
+};
+
+const CANONICAL_RISK_TIERS: readonly string[] = ['Low', 'Elevated', 'High', 'Critical'];
+
+/** Accept only a server tier from the canonical vocabulary; anything else stays absent. */
+function canonicalRiskTier(value: unknown): RiskTier | null {
+  return typeof value === 'string' && CANONICAL_RISK_TIERS.includes(value)
+    ? (value as RiskTier)
+    : null;
+}
+
+/**
+ * The server-authored match-evidence copy, or null when no evidence label was supplied.
+ * Placeholder "unavailable" strings are treated as absence so the UI's dashed unavailable
+ * treatment applies; no confidence percentage is ever generated on the client.
+ */
+export function confidenceLabelOrNull(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (/^(match evidence unavailable|confidence unavailable|unavailable)$/i.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+/**
+ * True only when EVERY server GPU truth axis independently confirms a physical renderer.
+ * A raw WebGL renderer string is spoofable output; it is never hardware proof on its own.
+ */
+export function gpuTruthIsVerified(view: CanonicalView): boolean {
+  const truth =
+    typeof view.gpu_truth_state === 'string' ? view.gpu_truth_state.trim().toLowerCase() : '';
+  const observation = view.gpuObservation;
+  return (
+    (truth === 'hardware' || truth === 'physical_hardware') &&
+    view.gpu_answer_unreliable !== true &&
+    view.renderer_reported_unverified !== true &&
+    view.rendererReportedUnverified !== true &&
+    observation !== 'masked_by_privacy' &&
+    observation !== 'observation_unavailable'
+  );
 }
 
 /** Resolve the one canonical envelope from every supported response shape. */
@@ -524,39 +583,46 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
 
   // The 0-100 ledger is canonical. Before it lands, the server's own
   // `suspectScore100` is the only acceptable server-provided fallback — never a
-  // client-side recomputation of the card scores.
-  const legacyScore =
-    typeof data?.suspectScore100 === 'number' ? finiteNumber(data.suspectScore100) : 0;
-  const canonicalScore = riskRaw
-    ? finiteNumber(riskRaw.score_0_100)
+  // client-side recomputation of the card scores. Missing stays null: no finiteNumber(…)=0.
+  const score100Raw = (riskRaw
+    ? riskRaw.score_0_100
     : riskRoot
-    ? finiteNumber(riskRoot.score_0_100)
-    : legacyScore;
-  const score = clampScore(canonicalScore);
+    ? riskRoot.score_0_100
+    : data?.suspectScore100) as unknown;
+  const score: number | null =
+    typeof score100Raw === 'number' && Number.isFinite(score100Raw)
+      ? clampScore(score100Raw)
+      : null;
 
   // The canonical risk ledger itself is the single source for the 0-10 headline, its tier
   // mirror and the evidence lines. Every value below is an `as unknown as` pass-through from
   // that server axis: the client never rounds a score, derives a tier from the family cards,
-  // or tier-shifts a server-supplied value.
+  // or tier-shifts a server-supplied value. An absent mirror stays absent; an out-of-vocabulary
+  // tier is dropped rather than invented.
   const canonicalRisk = (riskRaw ?? riskRoot) as unknown as OrthogonalRiskLedger | null;
-  const riskScore10 = canonicalRisk?.score10 as unknown as number;
-  const riskTier = (canonicalRisk?.risk_tier ?? canonicalRisk?.tier) as unknown as RiskTier;
+  const riskScore10 = canonicalRisk?.score10 as unknown as number | null | undefined;
+  const tier = canonicalRiskTier(canonicalRisk?.tier);
+  const riskTier = canonicalRiskTier(canonicalRisk?.risk_tier) ?? tier;
   const evidenceLedger: OrthogonalRiskLedger['evidence_ledger'] = Array.isArray(
     riskRaw?.evidence_ledger ?? riskRoot?.evidence_ledger
   )
     ? ((riskRaw?.evidence_ledger ??
         riskRoot?.evidence_ledger) as unknown as OrthogonalRiskLedger['evidence_ledger'])
     : [];
+  // `??` (never `||`): a server-reported raw_score of 0 is a real value, not an absence.
+  const rawScoreRaw = (riskRaw?.raw_score ?? riskRoot?.raw_score) as unknown;
+  const rawScore: number | null =
+    typeof rawScoreRaw === 'number' && Number.isFinite(rawScoreRaw) ? rawScoreRaw : null;
 
-  const risk: OrthogonalRiskLedger = {
+  const risk: CanonicalRiskLedger = {
     automation: finiteNumber(riskRaw?.automation),
     tampering: finiteNumber(riskRaw?.tampering),
     network: finiteNumber(riskRaw?.network),
     environment: finiteNumber(riskRaw?.environment),
     velocity: finiteNumber(riskRaw?.velocity),
-    raw_score: finiteNumber(riskRaw?.raw_score ?? riskRoot?.raw_score) || score,
+    raw_score: rawScore,
     score_0_100: score,
-    tier: canonicalRisk?.tier as unknown as RiskTier,
+    tier,
     evidence_ledger: evidenceLedger,
     // Optional server-supplied mirrors — pass-through only, never recomputed on the client.
     score10: riskScore10,
@@ -590,8 +656,9 @@ export function resolveCanonical(data: IntelVisitorResponse | null): CanonicalVi
   // Identity confidence is the server's calibrated value from the canonical envelope's
   // `identity` axis. Mirror it verbatim with an `as unknown as` pass-through (0..1 or null):
   // a null score stays null, and the client never applies its own gate, floor or recomputation.
-  const confidenceTier = (identityRaw?.confidence_tier ??
-    'New Unobserved Profile') as unknown as string;
+  // When the identity axis is absent the tier is absent too — no "New Unobserved Profile"
+  // tier is fabricated on the client.
+  const confidenceTier = (identityRaw?.confidence_tier ?? null) as unknown as string | null;
   const confidenceScore = (identityRaw?.confidence_score ?? null) as unknown as number | null;
   const calibrationStatus = (identityRaw?.calibration_status ?? 'uncalibrated') as unknown as
     | 'uncalibrated'

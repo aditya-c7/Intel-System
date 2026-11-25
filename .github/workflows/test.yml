@@ -15,8 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm
@@ -29,14 +29,21 @@ jobs:
           grep -F 'Cases:  15 total — 15 PASS, 0 FAIL, 0 SKIP' "$RUNNER_TEMP/benchmark15.log"
           grep -F 'Checks: 66 total — 66 PASS, 0 FAIL, 0 SKIP' "$RUNNER_TEMP/benchmark15.log"
           grep -F '[gemini-gate] 10/10 lock constraints verified' "$RUNNER_TEMP/benchmark15.log"
+      - name: Upload benchmark log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark15-log
+          path: ${{ runner.temp }}/benchmark15.log
+          if-no-files-found: warn
 
   unit:
     name: Unit (test:unit aggregate)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm
@@ -50,9 +57,12 @@ jobs:
     env:
       CHROMIUM_PATH: /usr/bin/google-chrome
       CI: 'true'
+      INTEL_BASE_URL: http://127.0.0.1:3000
+      INTEL_RUNS: '2'
+      VISITOR_HMAC_SECRET: ci-integration-hmac-secret-with-more-than-thirty-two-characters
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm
@@ -63,10 +73,42 @@ jobs:
           "$CHROMIUM_PATH" --headless --no-sandbox --disable-gpu --dump-dom about:blank > /dev/null
       - name: Build the dashboard the browser harnesses drive
         run: npm run build
+      - name: Start the local dashboard server for test:identity-browser
+        run: |
+          npm run start > "$RUNNER_TEMP/intel-server.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/intel-server.pid"
+          for i in $(seq 1 90); do
+            if curl -fsS "$INTEL_BASE_URL/api/health" > /dev/null; then
+              echo "Server ready on $INTEL_BASE_URL"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server did not become ready; log follows:"
+          cat "$RUNNER_TEMP/intel-server.log"
+          exit 1
       - name: Run worker + browser harnesses (a browser SKIP fails CI)
-        run: npm run test:integration
+        run: |
+          set -o pipefail
+          npm run test:integration 2>&1 | tee "$RUNNER_TEMP/integration.log"
+          # npm echoes the test:browser-suite script source, which itself contains
+          # the literal SKIP text — require the runtime RUN line and reject only
+          # an actual SKIP line printed by the harness.
+          grep -F 'RUN  test:identity-browser' "$RUNNER_TEMP/integration.log"
+          if grep -E '^[[:space:]]*SKIP test:identity-browser:' "$RUNNER_TEMP/integration.log"; then
+            echo "FAIL: test:identity-browser was SKIPPED; it must run against INTEL_BASE_URL."
+            exit 1
+          fi
       - name: Shadow diagnostics (test:diag / test:proxy / test:vpn via test:shadow)
         run: npm run test:shadow
+      - name: Stop the local dashboard server
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/intel-server.pid" ]; then
+            PID=$(cat "$RUNNER_TEMP/intel-server.pid")
+            kill "$PID"
+          fi
+          echo "local server stopped"
 
   live:
     name: Live server suites (test:live = test:signals + test:truth)
@@ -76,8 +118,8 @@ jobs:
       INTEL_BASE_URL: http://127.0.0.1:3000
       VISITOR_HMAC_SECRET: ci-only-hmac-secret-with-more-than-thirty-two-characters
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm

@@ -330,19 +330,9 @@ const MATCH_TIERS_WITH_EVIDENCE: ReadonlySet<string> = new Set([
 const CONTINUITY_CORROBORATION_STEP = 0.03;
 const MAX_CONTINUITY_CORROBORATION = 0.09;
 
-/** Keys that only the evidence-based scorer accepts — used to dispatch the overload. */
-const EVIDENCE_ONLY_KEYS = [
-  'match_tier',
-  'structural_anchor_ratio',
-  'matched_anchors',
-  'total_anchors',
-  'distinct_storage_seeds_count',
-  'browser_family_consensus',
-  'os_family_consensus',
-  'storageHealed',
-  'visitContinuity',
-  'profileAgeDays',
-] as const;
+/* Overload dispatch is deliberately narrow: see `isEvidenceInput` below. In particular,
+ * continuity keys (`storageHealed`, `visitContinuity`, `profileAgeDays`) are NEVER used to
+ * select the evidence path — legacy callers forward them next to `match_mode`. */
 
 function finiteNumber(value: unknown): number | null {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
@@ -356,14 +346,14 @@ function finiteNumber(value: unknown): number | null {
 }
 
 /**
- * Seed counts are valid non-negative integers. A missing/null field is "no evidence"
- * (zero weight), while a *present but invalid* value (NaN, Infinity, negative, fractional,
- * non-numeric) is defensively treated as a single corroborating seed — never a collision.
+ * Seed counts are valid non-negative integers. Missing/null AND present-but-invalid values
+ * (NaN, Infinity, negative, fractional, non-numeric) all mean "no evidence": null, zero weight.
+ * An invalid count must never fabricate the +0.10 single-seed corroboration bonus.
  */
 function effectiveSeedCount(value: unknown): number | null {
   if (value === undefined || value === null) return null;
   const parsed = finiteNumber(value);
-  if (parsed === null || !Number.isInteger(parsed) || parsed < 0) return 1;
+  if (parsed === null || !Number.isInteger(parsed) || parsed < 0) return null;
   return parsed;
 }
 
@@ -423,7 +413,13 @@ function continuityCorroborationFor(
 function isEvidenceInput(input: unknown): input is EvidenceConfidenceInput {
   if (!input || typeof input !== 'object') return false;
   const obj = input as Record<string, unknown>;
-  return EVIDENCE_ONLY_KEYS.some((key) => key in obj);
+  // Only the true evidence-score shape selects the numeric overload: `match_tier` is present
+  // and the legacy `match_mode` discriminator is absent. Continuity keys are ignored here so
+  // a legacy caller forwarding them still gets a ConfidenceResult (never a bare number).
+  return (
+    Object.prototype.hasOwnProperty.call(obj, 'match_tier') &&
+    !Object.prototype.hasOwnProperty.call(obj, 'match_mode')
+  );
 }
 
 /**
@@ -437,7 +433,11 @@ export function scoreConfidenceBreakdown(input: EvidenceConfidenceInput = {}): C
 
   /* 1 — match-tier base. */
   const tier = typeof source.match_tier === 'string' ? source.match_tier.trim().toLowerCase() : '';
-  const base = EVIDENCE_TIER_BASE[tier] ?? 0;
+  // `match_tier` is untrusted: a plain-object lookup would resolve inherited keys such as
+  // `constructor` / `__proto__`. Only declared tiers contribute a base.
+  const base = Object.prototype.hasOwnProperty.call(EVIDENCE_TIER_BASE, tier)
+    ? EVIDENCE_TIER_BASE[tier]
+    : 0;
   components.push({
     name: 'match_tier_base',
     evidence: base,
@@ -476,7 +476,8 @@ export function scoreConfidenceBreakdown(input: EvidenceConfidenceInput = {}): C
         : 'anchor evidence missing; zero weight',
   });
 
-  /* 4 — distinct storage seeds: one corroborates, two or more is a collision. */
+  /* 4 — distinct storage seeds: one corroborates, two or more is a collision,
+   * valid zero/unavailable counts carry no weight. */
   const rawSeeds = source.distinct_storage_seeds_count;
   const seeds = effectiveSeedCount(rawSeeds);
   let seedAdjustment = 0;
@@ -489,9 +490,9 @@ export function scoreConfidenceBreakdown(input: EvidenceConfidenceInput = {}): C
     seedDetail = `distinct_storage_seeds_count=${seeds} (collision)`;
   } else if (seeds !== null) {
     seedDetail = `distinct_storage_seeds_count=${seeds}`;
-  }
-  if (rawSeeds !== undefined && rawSeeds !== null && seeds !== finiteNumber(rawSeeds)) {
-    seedDetail += '; invalid count defaulted to 1';
+  } else if (rawSeeds !== undefined && rawSeeds !== null) {
+    // Present but invalid: disclose the unavailable evidence instead of claiming one seed.
+    seedDetail = `distinct_storage_seeds_count=${String(rawSeeds)} invalid/unavailable; zero weight`;
   }
   // Continuity corroboration shares the single signed adjustment bucket. `weight` stays the
   // documented seed adjustment (so the rubric never drifts); the corroboration is disclosed in
@@ -572,8 +573,9 @@ export function evidenceScoreToTier(score: number): EvidenceScoreTier {
  *  - the legacy v2.0 telemetry shape (`match_mode`, entropy, tampering flags…) → `ConfidenceResult`;
  *  - the evidence shape (`match_tier`, anchor/seed/consensus evidence…) → a number in [0,1].
  *
- * The `match_tier` discriminator keeps the legacy overload's return type intact for the
- * resolver, server and verification suite, which all read `.score` / `.spoof_likelihood`.
+ * The `match_tier` (without `match_mode`) discriminator keeps the legacy overload's return
+ * type intact for the resolver, server and verification suite, which all read `.score` /
+ * `.spoof_likelihood` — even when they forward continuity keys.
  */
 export function scoreConfidence(input: EvidenceConfidenceInput & { match_tier: EvidenceMatchTier }): number;
 export function scoreConfidence(input: ConfidenceInput): ConfidenceResult;

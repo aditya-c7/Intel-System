@@ -248,10 +248,12 @@ async function run(): Promise<void> {
 
   check('C5', 'confidence is accuracy-derived, capped to [0,1] and monotone', () => {
     const tight = proximityFromGeolocation({ lat: 1, lon: 1, accuracyMeters: 0 }, SALT).proximity!;
-    const loose = proximityFromGeolocation({ lat: 1, lon: 1, accuracyMeters: 10000 }, SALT).proximity!;
+    const loose = proximityFromGeolocation({ lat: 1, lon: 1, accuracyMeters: 1000 }, SALT).proximity!;
     assert.ok(tight.confidence <= 1 && tight.confidence >= 0);
     assert.ok(loose.confidence >= 0 && loose.confidence <= 1);
     assert.ok(tight.confidence > loose.confidence);
+    // Implausible accuracy must never be published as a precise 5 km cell.
+    assert.equal(proximityFromGeolocation({ lat: 1, lon: 1, accuracyMeters: 10000 }, SALT).proximity, null);
   });
 
   check('C6', 'invalid coordinates yield proximity null, never an IP fallback', () => {

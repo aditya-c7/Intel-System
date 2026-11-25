@@ -21,6 +21,11 @@
  *  - Confidence is derived exclusively from the reported accuracy (delegated to
  *    hexProximity's accuracy-only confidence function). Coordinates never
  *    influence confidence; they influence only the salted cell id.
+ *  - Caller-held salt: PRODUCTION MUST inject a tenant/server-held secret as the
+ *    optional second argument of `resolveProximity`. The built-in label is public
+ *    and non-secret, so ids derived from it are enumerable/cross-tenant-linkable;
+ *    it exists only for callers with no key. This pure module never reads env or
+ *    global state — key ownership stays with the caller.
  *  - Additive only: `proximityBodyField` returns a fresh `hex_proximity` object to
  *    spread into an API v4 body, or `undefined` when nothing may be emitted.
  *    `hex_proximity` is deliberately namespaced away from the IP-derived
@@ -29,6 +34,7 @@
 
 import {
   proximityFromGeolocation,
+  sanitizeProximityForBody,
   type HexProximity,
 } from './hexProximity';
 
@@ -84,11 +90,23 @@ export const REASON_INVALID_FIX = 'invalid_fix';
 export const REASON_OK = 'ok';
 
 /**
- * Domain-separated, internal PRF key. The public `resolveProximity` signature
- * intentionally has no salt argument, so a fixed versioned constant is used;
- * ids remain deterministic, salted, one-way and coordinate-free.
+ * PUBLIC, NON-SECRET fallback label — NOT a key. It is used ONLY when a caller
+ * supplies no trusted salt. Because it is public, cell ids produced with it are
+ * enumerable and cross-tenant-linkable. PRODUCTION MUST pass a tenant/server-held
+ * secret to `resolveProximity` instead. This module never reads environment
+ * variables or global state; the caller owns and injects the real key.
  */
-const BRIDGE_SALT = 'geoProximityBridge|v1';
+const PUBLIC_DEFAULT_SALT_LABEL = 'geoProximityBridge|v1|PUBLIC-NON-SECRET-DEFAULT';
+
+/** Accepts only a non-empty string secret; hostile/absent values use the public label. */
+function resolveSalt(trustedSalt: unknown): string {
+  try {
+    if (typeof trustedSalt === 'string' && trustedSalt.length > 0) return trustedSalt;
+  } catch {
+    // fall through to the public, non-secret label
+  }
+  return PUBLIC_DEFAULT_SALT_LABEL;
+}
 
 /* -------------------------------------------------------------------------- */
 /* Defensive, non-throwing readers                                            */
@@ -152,10 +170,16 @@ function isApiV4(apiVersion: unknown): boolean {
  * built exclusively from the validated `lat` / `lon` / `accuracyM` values.
  *
  * Returns `permission_required` when permission is not exactly 'granted', and
- * `invalid_fix` when the granted fix is missing, non-finite or has accuracyM <= 0.
+ * `invalid_fix` when the granted fix is missing, non-finite, has accuracyM <= 0,
+ * or exceeds the module's maximum supported accuracy.
+ *
+ * @param input An already-observed permission decision plus browser fix.
+ * @param trustedSalt Optional tenant/server-held PRF secret. PRODUCTION MUST
+ *   inject it; omitting it uses a public, non-secret label (enumerable ids).
  */
 export function resolveProximity(
-  input: ResolveProximityInput | null | undefined
+  input: ResolveProximityInput | null | undefined,
+  trustedSalt?: unknown
 ): ResolveProximityResult {
   try {
     const record = safeObject(input);
@@ -175,7 +199,7 @@ export function resolveProximity(
     // confidence. No other proximity source is consulted.
     const delegated = proximityFromGeolocation(
       { lat, lon, accuracyMeters: accuracyM },
-      BRIDGE_SALT
+      resolveSalt(trustedSalt)
     );
     const core: HexProximity | null = delegated.proximity;
     if (!core) {
@@ -201,9 +225,11 @@ export function resolveProximity(
  * Returns the additive API v4 body field for a resolved proximity, or
  * `undefined` when the field may not be emitted:
  *  - the API version is not v4 (defaults to v4 when omitted),
- *  - the result is missing / structurally unusable, or
- *  - the proximity is absent (permission denied / invalid fix).
+ *  - the result's `reason` is not EXACTLY 'ok', or
+ *  - the proximity is missing / structurally unusable (bad id scheme, radius,
+ *    confidence outside [0,1], or missing/non-positive accuracy_m).
  *
+ * Validation is shared with the adapter emitter via `sanitizeProximityForBody`.
  * The returned object is a fresh copy so callers cannot mutate the source. Only
  * the browser-fix-derived `hex_proximity` shape is accepted; no IP-derived field
  * can be smuggled in through this function.
@@ -217,33 +243,15 @@ export function proximityBodyField(
   const version = arguments.length < 2 ? 4 : apiVersion;
   if (!isApiV4(version)) return undefined;
 
-  const record = safeObject(result);
-  if (!record) return undefined;
-
-  const proximity = safeObject(safeRead(record, 'proximity'));
-  if (!proximity) return undefined;
-
-  const id = safeRead(proximity, 'id');
-  const precisionRadius = safeFiniteNumber(safeRead(proximity, 'precision_radius'));
-  const confidence = safeFiniteNumber(safeRead(proximity, 'confidence'));
-  const accuracyM = safeFiniteNumber(safeRead(proximity, 'accuracy_m'));
-  if (
-    typeof id !== 'string' ||
-    id.length === 0 ||
-    precisionRadius === null ||
-    confidence === null ||
-    accuracyM === null ||
-    accuracyM <= 0
-  ) {
-    return undefined;
-  }
+  const sanitized = sanitizeProximityForBody(result, true);
+  if (!sanitized || sanitized.accuracy_m === undefined) return undefined;
 
   return {
     hex_proximity: {
-      id,
-      precision_radius: precisionRadius,
-      confidence,
-      accuracy_m: accuracyM,
+      id: sanitized.id,
+      precision_radius: sanitized.precision_radius,
+      confidence: sanitized.confidence,
+      accuracy_m: sanitized.accuracy_m,
     },
   };
 }

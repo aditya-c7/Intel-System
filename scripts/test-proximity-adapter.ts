@@ -207,7 +207,7 @@ function run(): void {
 
   check('B6', 'confidence is accuracy-derived and monotone', () => {
     const tight = proximityOf(granted(1, 1, 0))!;
-    const loose = proximityOf(granted(1, 1, 10000))!;
+    const loose = proximityOf(granted(1, 1, 1000))!;
     assert.ok(tight.confidence >= 0 && tight.confidence <= 1);
     assert.ok(loose.confidence >= 0 && loose.confidence <= 1);
     assert.ok(tight.confidence > loose.confidence);

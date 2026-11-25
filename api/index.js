@@ -508,8 +508,53 @@ function parseAsnNetwork(raw) {
   if (!value) return "";
   return /^(?:\d{1,3}\.){3}\d{1,3}\/\d{1,2}$|^[0-9a-fA-F:.]+\/\d{1,3}$/.test(value) ? value : "";
 }
-function parseEdgeGeoPayload(raw) {
+var EDGE_GEO_SIGNATURE_FIELDS = ["sig", "signature", "hmac", "mac"];
+function verifyEdgeGeoPayload(rawHeader, verify) {
+  const invalid = { verified: false, payload: null };
+  if (typeof rawHeader !== "string" || !rawHeader || typeof verify !== "function") return invalid;
+  let envelope;
+  try {
+    const decoded = decodeURIComponent(rawHeader);
+    const parsed = JSON.parse(decoded);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return invalid;
+    envelope = parsed;
+  } catch {
+    return invalid;
+  }
+  let signatureField = "";
+  let signature = "";
+  for (const name of EDGE_GEO_SIGNATURE_FIELDS) {
+    const value = envelope[name];
+    if (typeof value === "string" && value.trim()) {
+      signatureField = name;
+      signature = value.trim();
+      break;
+    }
+  }
+  if (!signatureField || !signature) return invalid;
+  let unsigned;
+  let signedPayloadText;
+  try {
+    unsigned = { ...envelope };
+    delete unsigned[signatureField];
+    signedPayloadText = JSON.stringify(unsigned);
+  } catch {
+    return invalid;
+  }
+  let verified = false;
+  try {
+    verified = verify(signedPayloadText, signature) === true;
+  } catch {
+    verified = false;
+  }
+  return { verified, payload: unsigned };
+}
+function parseEdgeGeoPayload(raw, verify) {
   if (!raw) return null;
+  if (typeof verify === "function") {
+    const result = verifyEdgeGeoPayload(raw, verify);
+    return result.verified ? result.payload : null;
+  }
   try {
     const decoded = JSON.parse(decodeURIComponent(raw));
     if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) return null;
@@ -532,45 +577,78 @@ function payloadAnyText(payload, keys) {
 function payloadAccuracyRadius(payload) {
   return parseAccuracyRadius(payload.accuracyRadius) ?? parseAccuracyRadius(payload.accuracy_radius);
 }
-function readEdgeGeoHeaders(headers) {
-  const signedPayload = parseEdgeGeoPayload(headerValue(headers, ["x-intel-edge-geo"]));
-  if (signedPayload) {
-    const rawCountry = payloadText(signedPayload, "country");
-    const isTorNetwork2 = /^t1$/i.test(rawCountry);
-    const countryCode2 = normalizeCountryCode(rawCountry);
-    const city2 = decodeCity(payloadText(signedPayload, "city"));
-    const region2 = payloadText(signedPayload, "region");
-    const regionCode2 = payloadAnyText(signedPayload, ["regionCode", "region_code"]);
-    const continent2 = payloadAnyText(signedPayload, [
-      "continent",
-      "continentCode",
-      "continent_code"
-    ]);
-    const timezone2 = payloadText(signedPayload, "timezone");
-    const postalCode2 = payloadAnyText(signedPayload, ["postalCode", "postal_code"]);
-    const accuracyRadius2 = payloadAccuracyRadius(signedPayload);
-    const asnNetwork2 = parseAsnNetwork(
-      payloadAnyText(signedPayload, ["asnNetwork", "asn_network"])
-    );
-    return {
-      city: isMissingGeoValue(city2) ? "" : city2,
-      region: isMissingGeoValue(region2) ? "" : region2,
-      country: countryNameFromCode(countryCode2),
-      countryCode: countryCode2,
-      timezone: isMissingGeoValue(timezone2) ? "" : timezone2,
-      latitude: parseLat(payloadText(signedPayload, "latitude")),
-      longitude: parseLng(payloadText(signedPayload, "longitude")),
-      asn: normalizeAsnLabel(payloadText(signedPayload, "asn")),
-      organization: payloadText(signedPayload, "organization"),
-      postalCode: isMissingGeoValue(postalCode2) ? "" : postalCode2,
-      regionCode: isMissingGeoValue(regionCode2) ? "" : regionCode2,
-      continent: isMissingGeoValue(continent2) ? "" : continent2,
-      accuracyRadius: accuracyRadius2,
-      asnNetwork: asnNetwork2,
-      isTorNetwork: isTorNetwork2,
-      trusted: true,
-      source: "cloudflare"
-    };
+function unverifiedEdgeGeo() {
+  return {
+    city: "",
+    region: "",
+    country: "",
+    countryCode: "",
+    timezone: "",
+    latitude: null,
+    longitude: null,
+    asn: "",
+    organization: "",
+    postalCode: "",
+    regionCode: "",
+    continent: "",
+    accuracyRadius: null,
+    asnNetwork: "",
+    isTorNetwork: false,
+    trusted: false,
+    source: "unverified"
+  };
+}
+function hasEdgeGeoSignature(payload) {
+  const record = payload;
+  return EDGE_GEO_SIGNATURE_FIELDS.some(
+    (name) => typeof record[name] === "string" && String(record[name]).trim().length > 0
+  );
+}
+function readEdgeGeoHeaders(headers, verify) {
+  const rawSigned = headerValue(headers, ["x-intel-edge-geo"]);
+  if (rawSigned) {
+    const plainPayload = parseEdgeGeoPayload(rawSigned);
+    const signedEnvelope = plainPayload ? hasEdgeGeoSignature(plainPayload) : false;
+    const signedPayload = signedEnvelope ? verify ? parseEdgeGeoPayload(rawSigned, verify) : null : plainPayload;
+    if (signedEnvelope && !signedPayload) return unverifiedEdgeGeo();
+    if (signedPayload) {
+      const rawCountry = payloadText(signedPayload, "country");
+      const isTorNetwork2 = /^t1$/i.test(rawCountry);
+      const countryCode2 = normalizeCountryCode(rawCountry);
+      const city2 = decodeCity(payloadText(signedPayload, "city"));
+      const region2 = payloadText(signedPayload, "region");
+      const regionCode2 = payloadAnyText(signedPayload, ["regionCode", "region_code"]);
+      const continent2 = payloadAnyText(signedPayload, [
+        "continent",
+        "continentCode",
+        "continent_code"
+      ]);
+      const timezone2 = payloadText(signedPayload, "timezone");
+      const postalCode2 = payloadAnyText(signedPayload, ["postalCode", "postal_code"]);
+      const accuracyRadius2 = payloadAccuracyRadius(signedPayload);
+      const asnNetwork2 = parseAsnNetwork(
+        payloadAnyText(signedPayload, ["asnNetwork", "asn_network"])
+      );
+      return {
+        city: isMissingGeoValue(city2) ? "" : city2,
+        region: isMissingGeoValue(region2) ? "" : region2,
+        country: countryNameFromCode(countryCode2),
+        countryCode: countryCode2,
+        timezone: isMissingGeoValue(timezone2) ? "" : timezone2,
+        latitude: parseLat(payloadText(signedPayload, "latitude")),
+        longitude: parseLng(payloadText(signedPayload, "longitude")),
+        asn: normalizeAsnLabel(payloadText(signedPayload, "asn")),
+        organization: payloadText(signedPayload, "organization"),
+        postalCode: isMissingGeoValue(postalCode2) ? "" : postalCode2,
+        regionCode: isMissingGeoValue(regionCode2) ? "" : regionCode2,
+        continent: isMissingGeoValue(continent2) ? "" : continent2,
+        accuracyRadius: accuracyRadius2,
+        asnNetwork: asnNetwork2,
+        isTorNetwork: isTorNetwork2,
+        trusted: true,
+        source: "cloudflare"
+      };
+    }
   }
   const vercelCountryCode = headerValue(headers, [
     "x-vercel-ip-country",
@@ -684,13 +762,28 @@ function firstMeaningful(...values) {
 }
 function mergeLocationWithEdge(location, edge) {
   const extras = location;
-  const edgeCountryCode = normalizeCountryCode(edge.countryCode);
+  const edgeUsable = edge.trusted === true || edge.source !== "unverified";
+  const edgeCountryCode = edgeUsable ? normalizeCountryCode(edge.countryCode) : "";
+  const edgeCountry = edgeUsable ? edge.country : "";
+  const edgeAsn = edgeUsable ? edge.asn : "";
+  const edgeOrganization = edgeUsable ? edge.organization : "";
+  const edgeLatitude = edgeUsable ? edge.latitude : null;
+  const edgeLongitude = edgeUsable ? edge.longitude : null;
+  const edgeCity = edgeUsable ? edge.city : "";
+  const edgeRegion = edgeUsable ? edge.region : "";
+  const edgeTimezone = edgeUsable ? edge.timezone : "";
+  const edgeContinent = edgeUsable ? edge.continent : "";
+  const edgeRegionCode = edgeUsable ? edge.regionCode : "";
+  const edgePostalCode = edgeUsable ? edge.postalCode : "";
+  const edgeAccuracyRadius = edgeUsable ? edge.accuracyRadius : null;
+  const edgeAsnNetwork = edgeUsable ? edge.asnNetwork : "";
+  const edgeIsTorNetwork = edgeUsable && edge.isTorNetwork;
   const providerCountryCode = normalizeCountryCode(location.countryCode);
   const countryCode = edgeCountryCode || providerCountryCode;
   const providerCountryAgrees = !edgeCountryCode || !providerCountryCode || edgeCountryCode === providerCountryCode;
-  const country = countryNameFromCode(countryCode) || (providerCountryAgrees && meaningful(location.country) ? location.country : "") || edge.country || countryNameFromCode(location.country) || "Unknown";
-  const asn = edge.asn || normalizeAsnLabel(location.asn);
-  const edgeOrg = meaningful(edge.organization) ? edge.organization : cloudProviderOrgForAsn(edge.asn);
+  const country = countryNameFromCode(countryCode) || (providerCountryAgrees && meaningful(location.country) ? location.country : "") || edgeCountry || countryNameFromCode(location.country) || "Unknown";
+  const asn = edgeAsn || normalizeAsnLabel(location.asn);
+  const edgeOrg = meaningful(edgeOrganization) ? edgeOrganization : cloudProviderOrgForAsn(edgeAsn);
   const providerIspUsable = providerCountryAgrees && meaningful(location.isp);
   const isp = providerIspUsable ? location.isp : edgeOrg || (meaningful(location.org) ? location.org : meaningful(location.isp) ? location.isp : asn ? `Autonomous System ${asn}` : "Unknown");
   const org = meaningful(location.org) && providerCountryAgrees ? location.org : edgeOrg || isp;
@@ -702,15 +795,15 @@ function mergeLocationWithEdge(location, edge) {
     latitude = null;
     longitude = null;
   }
-  if (latitude === null && edge.latitude !== null && edge.longitude !== null && (!countryCode || isCoordinateConsistentWithCountry(edge.latitude, edge.longitude, countryCode))) {
-    latitude = edge.latitude;
-    longitude = edge.longitude;
+  if (latitude === null && edgeLatitude !== null && edgeLongitude !== null && (!countryCode || isCoordinateConsistentWithCountry(edgeLatitude, edgeLongitude, countryCode))) {
+    latitude = edgeLatitude;
+    longitude = edgeLongitude;
   }
   const providerLocationTrusted = providerCountryAgrees && (!providerHasCoords || providerCoordsUsable) && (!edgeCountryCode || Boolean(providerCountryCode) || providerCoordsUsable);
-  const city = providerLocationTrusted && meaningful(location.city) ? location.city : edge.city || "Unknown";
-  const region = providerLocationTrusted && meaningful(location.region) ? location.region : edge.region || "Unknown";
-  const timezone = meaningful(location.timezone) ? location.timezone : edge.timezone || void 0;
-  const edgeContinent = parseContinentValue(edge.continent);
+  const city = providerLocationTrusted && meaningful(location.city) ? location.city : edgeCity || "Unknown";
+  const region = providerLocationTrusted && meaningful(location.region) ? location.region : edgeRegion || "Unknown";
+  const timezone = meaningful(location.timezone) ? location.timezone : edgeTimezone || void 0;
+  const edgeContinentParsed = parseContinentValue(edgeContinent);
   const providerContinent = providerCountryAgrees ? parseContinentValue(
     firstMeaningful(
       extras.continentCode,
@@ -720,19 +813,19 @@ function mergeLocationWithEdge(location, edge) {
       extras.continent
     )
   ) : { code: "", name: "" };
-  const continentCode = edgeContinent.code || providerContinent.code;
-  const continentName = edgeContinent.name || providerContinent.name;
+  const continentCode = edgeContinentParsed.code || providerContinent.code;
+  const continentName = edgeContinentParsed.name || providerContinent.name;
   const providerSubdivision = providerCountryAgrees ? firstMeaningful(
     extras.subdivisionIso,
     extras.subdivision_iso,
     extras.regionCode,
     extras.region_code
   ) : "";
-  const subdivisionIso = firstMeaningful(edge.regionCode, providerSubdivision) || null;
+  const subdivisionIso = firstMeaningful(edgeRegionCode, providerSubdivision) || null;
   const providerPostal = providerCountryAgrees ? firstMeaningful(extras.postalCode, extras.postal_code, extras.postal) : "";
-  const postalCode = firstMeaningful(edge.postalCode, providerPostal) || null;
-  const accuracyRadius = (providerCountryAgrees ? parseAccuracyRadius(extras.accuracyRadius ?? extras.accuracy_radius) : null) ?? edge.accuracyRadius ?? null;
-  const asnNetwork = parseAsnNetwork(firstMeaningful(extras.asnNetwork, extras.asn_network)) || parseAsnNetwork(edge.asnNetwork) || null;
+  const postalCode = firstMeaningful(edgePostalCode, providerPostal) || null;
+  const accuracyRadius = (providerCountryAgrees ? parseAccuracyRadius(extras.accuracyRadius ?? extras.accuracy_radius) : null) ?? edgeAccuracyRadius ?? null;
+  const asnNetwork = parseAsnNetwork(firstMeaningful(extras.asnNetwork, extras.asn_network)) || parseAsnNetwork(edgeAsnNetwork) || null;
   const locationPrecision = meaningful(city) && !isMissingGeoValue(city) ? "city" : meaningful(region) && !isMissingGeoValue(region) ? "region" : countryCode ? "country" : "unknown";
   const hasCountry = Boolean(countryCode) || meaningful(country) && country !== "Unknown";
   return {
@@ -747,8 +840,8 @@ function mergeLocationWithEdge(location, edge) {
     isp,
     org,
     asn,
-    isTor: Boolean(location.isTor) || edge.isTorNetwork,
-    isTorExit: Boolean(location.isTorExit) || edge.isTorNetwork,
+    isTor: Boolean(location.isTor) || edgeIsTorNetwork,
+    isTorExit: Boolean(location.isTorExit) || edgeIsTorNetwork,
     locationSource: edgeCountryCode ? "edge" : location.locationSource ?? "provider",
     locationPrecision,
     isLocationVerified: hasCountry,
@@ -2867,8 +2960,9 @@ var BROWSER_SPECS = [
      * every "UA says Chrome" payload a latent Chromium match — the Google Chrome
      * spec happens to mask it today, but any brand/version path that reaches this
      * spec would mislabel a plain Chrome client. Only a genuine bare `Chromium/<ver>`
-     * token (or an explicit Chromium-only UA-CH brand claim, i.e. Chromium is the
-     * sole real brand) identifies unbranded Chromium. */
+     * token identifies unbranded Chromium; a Chromium-only UA-CH brand list paired
+     * with a plain `Chrome/<ver>` UA token is resolved as Google Chrome instead
+     * (see `isUnbrandedChrome`). */
     uaTokens: [/Chromium\/([\d.]+)/]
   },
   {
@@ -2923,6 +3017,15 @@ function uaToSpec(ua) {
   }
   return null;
 }
+function isUnbrandedChrome(brands, ua) {
+  const real = brands.filter((b) => !!b && !GREASE_RE.test(b.brand));
+  if (real.length === 0 || !real.every((b) => b.brand.toLowerCase() === CHROMIUM_PLACEHOLDER)) {
+    return false;
+  }
+  if (/Chromium\/([\d.]+)/i.test(ua)) return false;
+  if (!/Chrome\/([\d.]+)/i.test(ua)) return false;
+  return uaToSpec(ua)?.name === "Google Chrome";
+}
 function tokensForName(name) {
   const spec = BROWSER_SPECS.find((s) => s.name === name);
   if (spec) return spec.uaTokens;
@@ -2932,6 +3035,7 @@ function tokensForName(name) {
 function pickFullerVersion(preferred, candidate) {
   if (!candidate) return preferred;
   if (!preferred) return candidate;
+  if (majorOf(candidate) !== majorOf(preferred)) return preferred;
   const a = preferred.split(".").length;
   const b = candidate.split(".").length;
   return b > a ? candidate : preferred;
@@ -2987,7 +3091,8 @@ function resolveBrowser(ua, uad, secCh) {
     }
     if (!version) version = findUaVersion(spec, ua) ?? "";
     if (isPlaceholderVersion(version)) version = "";
-    return { name: spec.name, full: version, major: majorOf(version), is_headless_brand: headlessBrand };
+    const name = spec.name === "Chromium" && isUnbrandedChrome(candidate.brands, ua) ? "Google Chrome" : spec.name;
+    return { name, full: version, major: majorOf(version), is_headless_brand: headlessBrand };
   }
   const uaSpec = ua ? uaToSpec(ua) : null;
   if (uaSpec) {
@@ -3295,16 +3400,28 @@ function explicitHost(name, ideOnly) {
   }
   return ideOnly ? null : { re: /^$/, name: normalized, ide: false };
 }
+function sameShellName(a, b) {
+  const na = normalizeShellName(a.trim()).toLowerCase();
+  const nb = normalizeShellName(b.trim()).toLowerCase();
+  return na.length > 0 && na === nb;
+}
 function resolveRuntime(ua, signals) {
-  const electronVersion = signals.electronVersion || String(signals.processVersions?.electron ?? "") || firstMatch(/Electron\/([\d.]+)/i, ua) || "";
-  const nodeVersion = signals.nodeVersion || String(signals.processVersions?.node ?? "");
-  const hostSpec = explicitHost(signals.hostApp ?? "", false) || hostAppFromUa(ua, false);
-  const ideSpec = explicitHost(signals.ideShell ?? "", true) || hostAppFromUa(ua, true);
-  const webview = signals.webView === true || WEBVIEW_UA_RE.test(ua);
+  const ev = signals.aliasEvidence;
+  const uaElectronToken = firstMatch(/Electron\/([\d.]+)/i, ua) ?? "";
+  const aliasElectron = ev.electron ? signals.electronVersion : "";
+  const pvElectron = ev.electron ? String(signals.processVersions?.electron ?? "") : "";
+  const electronVersion = uaElectronToken || aliasElectron || pvElectron || "";
+  const aliasNode = ev.node ? signals.nodeVersion : "";
+  const pvNode = ev.node ? String(signals.processVersions?.node ?? "") : "";
+  const nodeVersion = aliasNode || pvNode || "";
+  const hostSpec = (ev.hostApp ? explicitHost(signals.hostApp ?? "", false) : null) || hostAppFromUa(ua, false);
+  const ideSpec = (ev.ideShell ? explicitHost(signals.ideShell ?? "", true) : null) || hostAppFromUa(ua, true);
+  const trustedHost = ev.hostApp ? signals.hostApp ?? "" : "";
+  const webview = ev.webView && signals.webView === true || WEBVIEW_UA_RE.test(ua);
   if (electronVersion) {
     return {
       runtime: "electron",
-      host_app: hostSpec?.name || signals.hostApp || "",
+      host_app: hostSpec?.name || trustedHost || "",
       client_type: "desktop_app",
       preferredBrowserName: "Electron"
     };
@@ -3312,7 +3429,7 @@ function resolveRuntime(ua, signals) {
   if (nodeVersion) {
     return {
       runtime: "node",
-      host_app: hostSpec?.name || signals.hostApp || "",
+      host_app: hostSpec?.name || trustedHost || "",
       client_type: "node",
       preferredBrowserName: "Node.js"
     };
@@ -3328,7 +3445,7 @@ function resolveRuntime(ua, signals) {
   if (webview) {
     return {
       runtime: "webview",
-      host_app: hostSpec?.name || signals.hostApp || "",
+      host_app: hostSpec?.name || trustedHost || "",
       client_type: "webview",
       preferredBrowserName: hostSpec?.name || "WebView"
     };
@@ -3350,13 +3467,35 @@ function isGenericBrowserName(name) {
 function runtimeSignalsFromInput(input) {
   const runtime = input.runtime ?? null;
   const processVersions = input.processVersions ?? runtime?.processVersions ?? null;
+  const ua = String(input.userAgent ?? "");
+  const trustedPv = runtime?.processVersions ?? null;
+  const uaElectron = /Electron\/([\d.]+)/i.test(ua);
+  const uaWebView = WEBVIEW_UA_RE.test(ua);
+  const uaHost = hostAppFromUa(ua, false);
+  const uaIde = hostAppFromUa(ua, true);
+  const trustedElectron = Boolean(runtime?.electronVersion) || Boolean(trustedPv?.electron);
+  const trustedNode = Boolean(runtime?.nodeVersion) || Boolean(trustedPv?.node);
+  const trustedHost = runtime?.hostApp ?? "";
+  const trustedIde = runtime?.ideShell ?? "";
+  const trustedWebView = runtime?.webView === true;
+  const flatHost = input.hostApp ?? "";
+  const flatIde = input.ideShell ?? "";
+  const hostCorroborated = flatHost.trim() ? sameShellName(flatHost, trustedHost) || uaHost !== null && sameShellName(flatHost, uaHost.name) : Boolean(trustedHost.trim());
+  const ideCorroborated = flatIde.trim() ? sameShellName(flatIde, trustedIde) || uaIde !== null && sameShellName(flatIde, uaIde.name) : Boolean(trustedIde.trim());
   return {
     electronVersion: input.electronVersion ?? runtime?.electronVersion ?? processVersions?.electron ?? "",
     nodeVersion: input.nodeVersion ?? runtime?.nodeVersion ?? processVersions?.node ?? "",
     processVersions,
     hostApp: input.hostApp ?? runtime?.hostApp ?? "",
     ideShell: input.ideShell ?? runtime?.ideShell ?? "",
-    webView: input.webView ?? runtime?.webView ?? false
+    webView: input.webView ?? runtime?.webView ?? false,
+    aliasEvidence: {
+      electron: uaElectron || trustedElectron,
+      node: trustedNode,
+      hostApp: hostCorroborated,
+      ideShell: ideCorroborated,
+      webView: uaWebView || trustedWebView
+    }
   };
 }
 var BLANK_IDENTITY = {
@@ -3392,13 +3531,13 @@ function normalizeIdentity2(input) {
     const browser = resolveBrowser(ua, uad, secCh);
     const archRes = resolveArchitecture(ua, platformStr, uad, secCh);
     if (runtime.runtime === "electron" && !firstMatch(/Electron\/([\d.]+)/i, ua)) {
-      const v = signals.electronVersion || String(signals.processVersions?.electron ?? "");
+      const v = signals.aliasEvidence.electron ? signals.electronVersion || String(signals.processVersions?.electron ?? "") : "";
       if (v.trim()) {
         browser.full = v.trim();
         browser.major = majorOf(v.trim());
       }
     } else if (runtime.runtime === "node") {
-      const v = signals.nodeVersion || String(signals.processVersions?.node ?? "");
+      const v = signals.aliasEvidence.node ? signals.nodeVersion || String(signals.processVersions?.node ?? "") : "";
       if (v.trim()) {
         browser.full = v.trim();
         browser.major = majorOf(v.trim());
@@ -4854,8 +4993,8 @@ function cpuSim(s, i) {
   if (!a || !b) return 0;
   let comparable = 0;
   let matched = 0;
-  const archA = str(a.arch).toLowerCase();
-  const archB = str(b.arch).toLowerCase();
+  const archA = normalizeArch(str(a.arch));
+  const archB = normalizeArch(str(b.arch));
   if (archA && archB) {
     comparable += 1;
     if (archA !== archB) return 0;
@@ -5110,6 +5249,32 @@ function normalizeArch(arch) {
   if (a.indexOf("arm") !== -1) return "arm";
   return a;
 }
+function leadingMajor(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? Math.floor(value) : null;
+  if (typeof value === "string") {
+    const match = /^(\d+)/.exec(value.trim());
+    if (match) {
+      const major = Number.parseInt(match[1], 10);
+      return Number.isFinite(major) ? major : null;
+    }
+  }
+  return null;
+}
+function legacyBrowserOf(input) {
+  return input.browser ?? null;
+}
+function versionFamilyOf(input) {
+  const fromVersions = str(input.versions?.browserFamily).toLowerCase();
+  if (fromVersions) return fromVersions;
+  return str(legacyBrowserOf(input)?.family).toLowerCase();
+}
+function versionMajorOf(input) {
+  const fromVersions = leadingMajor(input.versions?.browserMajor);
+  if (fromVersions !== null && fromVersions > 0) return fromVersions;
+  const fromBrowser = leadingMajor(legacyBrowserOf(input)?.major);
+  if (fromBrowser !== null) return fromBrowser;
+  return fromVersions;
+}
 function hardwareSignalsMatch(raws) {
   const checks = [];
   const gpu = raws.gpu;
@@ -5157,13 +5322,11 @@ function compareFingerprints(stored, incoming, mode) {
     raws[family] = sim === null || !isFinite(sim) ? null : Math.max(0, Math.min(1, sim));
   }
   const violations = [];
-  const vs = s.versions;
-  const vi = i.versions;
-  const famA = str(vs?.browserFamily).toLowerCase();
-  const famB = str(vi?.browserFamily).toLowerCase();
+  const famA = versionFamilyOf(s);
+  const famB = versionFamilyOf(i);
   const sameFamily = Boolean(famA && famB && famA === famB);
-  const majorA = vs && typeof vs.browserMajor === "number" && isFinite(vs.browserMajor) ? vs.browserMajor : null;
-  const majorB = vi && typeof vi.browserMajor === "number" && isFinite(vi.browserMajor) ? vi.browserMajor : null;
+  const majorA = versionMajorOf(s);
+  const majorB = versionMajorOf(i);
   let driftAllowed = false;
   if (sameFamily && majorA !== null && majorB !== null) {
     const delta = majorB - majorA;
@@ -5417,18 +5580,6 @@ var MATCH_TIERS_WITH_EVIDENCE = /* @__PURE__ */ new Set([
 ]);
 var CONTINUITY_CORROBORATION_STEP = 0.03;
 var MAX_CONTINUITY_CORROBORATION = 0.09;
-var EVIDENCE_ONLY_KEYS = [
-  "match_tier",
-  "structural_anchor_ratio",
-  "matched_anchors",
-  "total_anchors",
-  "distinct_storage_seeds_count",
-  "browser_family_consensus",
-  "os_family_consensus",
-  "storageHealed",
-  "visitContinuity",
-  "profileAgeDays"
-];
 function finiteNumber(value) {
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
   if (typeof value === "string" && value.trim() !== "") {
@@ -5440,7 +5591,7 @@ function finiteNumber(value) {
 function effectiveSeedCount(value) {
   if (value === void 0 || value === null) return null;
   const parsed = finiteNumber(value);
-  if (parsed === null || !Number.isInteger(parsed) || parsed < 0) return 1;
+  if (parsed === null || !Number.isInteger(parsed) || parsed < 0) return null;
   return parsed;
 }
 function clamp01(value) {
@@ -5480,13 +5631,13 @@ function continuityCorroborationFor(source, tier) {
 function isEvidenceInput(input) {
   if (!input || typeof input !== "object") return false;
   const obj = input;
-  return EVIDENCE_ONLY_KEYS.some((key) => key in obj);
+  return Object.prototype.hasOwnProperty.call(obj, "match_tier") && !Object.prototype.hasOwnProperty.call(obj, "match_mode");
 }
 function scoreConfidenceBreakdown(input = {}) {
   const source = input && typeof input === "object" ? input : {};
   const components = [];
   const tier = typeof source.match_tier === "string" ? source.match_tier.trim().toLowerCase() : "";
-  const base = EVIDENCE_TIER_BASE[tier] ?? 0;
+  const base = Object.prototype.hasOwnProperty.call(EVIDENCE_TIER_BASE, tier) ? EVIDENCE_TIER_BASE[tier] : 0;
   components.push({
     name: "match_tier_base",
     evidence: base,
@@ -5527,9 +5678,8 @@ function scoreConfidenceBreakdown(input = {}) {
     seedDetail = `distinct_storage_seeds_count=${seeds} (collision)`;
   } else if (seeds !== null) {
     seedDetail = `distinct_storage_seeds_count=${seeds}`;
-  }
-  if (rawSeeds !== void 0 && rawSeeds !== null && seeds !== finiteNumber(rawSeeds)) {
-    seedDetail += "; invalid count defaulted to 1";
+  } else if (rawSeeds !== void 0 && rawSeeds !== null) {
+    seedDetail = `distinct_storage_seeds_count=${String(rawSeeds)} invalid/unavailable; zero weight`;
   }
   const corroboration = continuityCorroborationFor(source, tier);
   seedDetail += corroboration.detail;
@@ -5589,6 +5739,31 @@ function parseMajor(value) {
   const match = /^(\d{1,5})/.exec(text);
   return match ? Number.parseInt(match[1], 10) : null;
 }
+function effectiveSeedCount2(value) {
+  if (typeof value === "number") {
+    return Number.isFinite(value) && Number.isInteger(value) && value >= 0 ? value : null;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const num = Number(value);
+    return Number.isFinite(num) && Number.isInteger(num) && num >= 0 ? num : null;
+  }
+  return null;
+}
+function hasHardwareMergeConsensus(seedCount) {
+  return seedCount !== null && seedCount >= 2;
+}
+function distinctSeedsFromDb(db2, hardwareValues) {
+  for (const hardware of hardwareValues) {
+    if (!hardware) continue;
+    try {
+      const row = db2.prepare("SELECT MAX(distinct_storage_seeds_count) AS seeds FROM hardware_anchors WHERE hardware_id = ?").get(hardware);
+      const count = row ? effectiveSeedCount2(row.seeds) : null;
+      if (count !== null) return count;
+    } catch {
+    }
+  }
+  return null;
+}
 function clampScore(score) {
   const num = typeof score === "number" ? score : Number(score);
   if (!Number.isFinite(num)) return 0;
@@ -5603,14 +5778,21 @@ var LADDER_TIERS = [
   { mode: "lenient", min: 82, priority: 1 }
 ];
 var EXACT_PRIORITY = 4;
-var ENGINE_MODE_TIERS = {
-  exact: { mode: "exact", min: 100, priority: EXACT_PRIORITY },
-  strict: { mode: "lenient", min: 82, priority: 1 },
-  lenient: { mode: "lenient", min: 82, priority: 1 },
-  "cross-browser": { mode: "cross_browser", min: 85, priority: 2 },
-  "hardware-only": { mode: "hardware", min: 88, priority: 3 },
-  "engine-only": { mode: "cross_browser", min: 85, priority: 2 }
-};
+var ENGINE_MODE_TIERS = Object.assign(
+  /* @__PURE__ */ Object.create(null),
+  {
+    exact: { mode: "exact", min: 100, priority: EXACT_PRIORITY },
+    strict: { mode: "lenient", min: 82, priority: 1 },
+    lenient: { mode: "lenient", min: 82, priority: 1 },
+    "cross-browser": { mode: "cross_browser", min: 85, priority: 2 },
+    "hardware-only": { mode: "hardware", min: 88, priority: 3 },
+    "engine-only": { mode: "cross_browser", min: 85, priority: 2 }
+  }
+);
+function tierForEngineMode(mode) {
+  if (!mode || !Object.prototype.hasOwnProperty.call(ENGINE_MODE_TIERS, mode)) return null;
+  return ENGINE_MODE_TIERS[mode] ?? null;
+}
 function tierForScore(score) {
   for (const tier of LADDER_TIERS) {
     if (score >= tier.min) return tier;
@@ -5670,31 +5852,24 @@ var ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012345678
 var ID_LENGTH = 20;
 function randomIdByte() {
   const cryptoRef = globalThis.crypto;
-  if (typeof cryptoRef?.getRandomValues !== "function") return null;
+  if (typeof cryptoRef?.getRandomValues !== "function") {
+    throw new Error("secure visitor id generation unavailable: WebCrypto getRandomValues is missing");
+  }
   const buffer = new Uint8Array(1);
   for (let attempt = 0; attempt < 32; attempt += 1) {
     cryptoRef.getRandomValues(buffer);
     const byte = buffer[0];
     if (byte < 248) return byte;
   }
-  return null;
-}
-function createLcgBytes() {
-  let seed = (Date.now() ^ Math.floor(Math.random() * 4294967295)) >>> 0;
-  return () => {
-    seed = Math.imul(seed, 1664525) + 1013904223 >>> 0;
-    return seed >>> 16 & 255;
-  };
+  throw new Error("secure visitor id generation unavailable: rejection sampling did not converge");
 }
 function idFromByte(byte) {
   return ID_ALPHABET[byte % ID_ALPHABET.length];
 }
 function mintVisitorId() {
-  const lcg = createLcgBytes();
   let id = "";
   while (id.length < ID_LENGTH) {
-    const byte = randomIdByte() ?? lcg();
-    id += idFromByte(byte);
+    id += idFromByte(randomIdByte());
   }
   return id;
 }
@@ -5710,7 +5885,7 @@ function generateVisitorId(db2) {
       return candidate;
     }
   }
-  return (mintVisitorId() + Date.now().toString(36).slice(-4)).slice(0, ID_LENGTH);
+  return mintVisitorId();
 }
 function upsertVisitorProfile(db2, visitorId, profile, hardwareFingerprint, nowUtc) {
   db2.prepare(
@@ -5763,7 +5938,7 @@ function healStoredProfile(stored, incoming) {
   const next = { ...storedProfile };
   const incomingMajor = browserMajorOf(incoming);
   const storedMajor = browserMajorOf(storedProfile);
-  const driftAllowed = incomingMajor === null || storedMajor === null || incomingMajor >= storedMajor;
+  const driftAllowed = incomingMajor !== null && storedMajor !== null && incomingMajor >= storedMajor;
   if (incomingMajor !== null && storedMajor !== null && incomingMajor > storedMajor) {
     const storedBrowser = storedProfile.browser ?? {};
     next["browser"] = {
@@ -5845,6 +6020,8 @@ async function resolveVisitor(db2, input) {
     const incomingHw = normalizeText2(profile.hardwareFingerprint);
     const storageVisitorId = normalizeText2(input.storageVisitorId) || "";
     const keys = blockKeysFor(profile);
+    const providedSeeds = effectiveSeedCount2(input.distinctStorageSeedsCount) ?? effectiveSeedCount2(input.distinct_storage_seeds_count);
+    const rawHardware = typeof profile.hardwareFingerprint === "string" ? profile.hardwareFingerprint.trim() : "";
     if (storageVisitorId) {
       const stored = loadVisitorProfile(db2, storageVisitorId);
       if (stored) {
@@ -5873,19 +6050,23 @@ async function resolveVisitor(db2, input) {
       if (stored.profile_json && stored.profile_json.includes("version_downgrade_anomaly")) continue;
       const storedHw = normalizeText2(stored.hardware_fingerprint) || normalizeText2(stored.profile?.hardwareFingerprint);
       if (incomingHw && storedHw && incomingHw === storedHw) {
-        best = {
-          id: candidateId,
-          stored,
-          mode: "exact",
-          score: 100,
-          violations: [],
-          priority: EXACT_PRIORITY
-        };
-        break;
+        const seedCount = providedSeeds ?? distinctSeedsFromDb(db2, [rawHardware, incomingHw, storedHw]);
+        if (hasHardwareMergeConsensus(seedCount)) {
+          best = {
+            id: candidateId,
+            stored,
+            mode: "exact",
+            score: 100,
+            violations: [],
+            priority: EXACT_PRIORITY
+          };
+          break;
+        }
+        continue;
       }
       const { score, violations, engineMode } = await runEngine(profile, stored.profile);
       if (violations.includes("version_downgrade_anomaly")) continue;
-      const tier = engineMode && ENGINE_MODE_TIERS[engineMode] || tierForScore(score);
+      const tier = tierForEngineMode(engineMode) || tierForScore(score);
       if (!tier || score < tier.min) continue;
       if (!best || tier.priority > best.priority || tier.priority === best.priority && score > best.score) {
         best = { id: candidateId, stored, mode: tier.mode, score, violations, priority: tier.priority };
@@ -6055,6 +6236,9 @@ var ENVELOPE_MAX_AGE_MS = 65e3;
 var ENVELOPE_MAX_FUTURE_SKEW_MS = 3e5;
 
 // src/lib/specInvariants.ts
+function asRecord(value) {
+  return value !== null && typeof value === "object" ? value : {};
+}
 function isPrivacyHardenedUserAgent(userAgent) {
   const ua = String(userAgent || "").toLowerCase();
   if (!ua) return false;
@@ -6065,9 +6249,14 @@ function isPrivacyHardenedUserAgent(userAgent) {
   return false;
 }
 function resolvePrivacyHardened(ctx = {}) {
-  return Boolean(
-    ctx.privacyHardened || ctx.firefoxFpp || ctx.resistFingerprinting || ctx.safariAtfp || ctx.torBrowser || ctx.braveShields || isPrivacyHardenedUserAgent(ctx.userAgent || "")
-  );
+  try {
+    const source = asRecord(ctx);
+    return Boolean(
+      source.privacyHardened || source.firefoxFpp || source.resistFingerprinting || source.safariAtfp || source.torBrowser || source.braveShields || isPrivacyHardenedUserAgent(source.userAgent || "")
+    );
+  } catch {
+    return false;
+  }
 }
 function isSwiftShaderRenderer(renderer) {
   return /swiftshader|subzero|0x0000c0de|llvmpipe|mesa offscreen|software rasterizer/i.test(
@@ -6102,36 +6291,46 @@ function resolveGpuObservation(vendor, renderer, capabilityClass) {
 }
 var DEVICE_MEMORY_DOMAIN = [0.25, 0.5, 1, 2, 4, 8, 16, 32];
 function checkDeviceMemory(value, context = {}) {
-  if (value === null || value === void 0) return [];
-  if (!Number.isFinite(value) || !DEVICE_MEMORY_DOMAIN.includes(value)) {
-    return [
-      {
-        id: "spec.device_memory.domain",
-        severity: context.privacyHardened ? "soft" : "hard",
-        detail: `navigator.deviceMemory ${String(value)} is outside the power-of-two domain {0.25,0.5,1,2,4,8,16,32}`
-      }
-    ];
+  try {
+    const source = asRecord(context);
+    if (value === null || value === void 0) return [];
+    if (!Number.isFinite(value) || !DEVICE_MEMORY_DOMAIN.includes(value)) {
+      return [
+        {
+          id: "spec.device_memory.domain",
+          severity: source.privacyHardened ? "soft" : "hard",
+          detail: `navigator.deviceMemory ${String(value)} is outside the power-of-two domain {0.25,0.5,1,2,4,8,16,32}`
+        }
+      ];
+    }
+    return [];
+  } catch {
+    return [];
   }
-  return [];
 }
 function checkNetworkRtt(rtt, context = {}) {
-  if (rtt === null || rtt === void 0) return [];
-  if (!Number.isFinite(rtt) || rtt < 0) {
-    return [
-      { id: "spec.network_information.rtt_domain", severity: "hard", detail: `rtt ${String(rtt)} is not a finite non-negative number` }
-    ];
+  try {
+    const source = asRecord(context);
+    if (rtt === null || rtt === void 0) return [];
+    if (!Number.isFinite(rtt) || rtt < 0) {
+      return [
+        { id: "spec.network_information.rtt_domain", severity: "hard", detail: `rtt ${String(rtt)} is not a finite non-negative number` }
+      ];
+    }
+    if (rtt === 0) return [];
+    if (Math.abs(rtt % 25) > 1e-9) {
+      return [
+        {
+          id: "spec.network_information.rtt_quantization",
+          severity: source.privacyHardened ? "soft" : "hard",
+          detail: `rtt ${rtt} is not a multiple of 25`
+        }
+      ];
+    }
+    return [];
+  } catch {
+    return [];
   }
-  if (rtt === 0) return [];
-  if (Math.abs(rtt % 25) > 1e-9) {
-    return [
-      {
-        id: "spec.network_information.rtt_quantization",
-        severity: context.privacyHardened ? "soft" : "hard",
-        detail: `rtt ${rtt} is not a multiple of 25`
-      }
-    ];
-  }
-  return [];
 }
 function checkBatteryManager(battery) {
   if (!battery) return [];
@@ -6186,20 +6385,25 @@ function classifyWebglBackend(renderer) {
   return "unknown";
 }
 function checkWebglBackendAgainstOs(renderer, osFamily, context = {}) {
-  const backend = classifyWebglBackend(renderer);
-  const os2 = String(osFamily || "").toLowerCase();
-  if (backend === "swiftshader" || backend === "vulkan" || backend === "unknown") return [];
-  const osMatches = backend === "direct3d" && /windows|win32|win64/.test(os2) || backend === "metal" && /macos|mac os|ios|ipad|iphone/.test(os2) || backend === "mesa" && /linux|ubuntu|fedora|debian|chrome ?os/.test(os2);
-  if (!osMatches) {
-    return [
-      {
-        id: "spec.webgl.backend_os_mismatch",
-        severity: context.privacyHardened ? "soft" : "hard",
-        detail: `WebGL backend ${backend} is inconsistent with OS ${osFamily || "unknown"}`
-      }
-    ];
+  try {
+    const source = asRecord(context);
+    const backend = classifyWebglBackend(renderer);
+    const os2 = String(osFamily || "").toLowerCase();
+    if (backend === "swiftshader" || backend === "vulkan" || backend === "unknown") return [];
+    const osMatches = backend === "direct3d" && /windows|win32|win64/.test(os2) || backend === "metal" && /macos|mac os|ios|ipad|iphone/.test(os2) || backend === "mesa" && /linux|ubuntu|fedora|debian|chrome ?os/.test(os2);
+    if (!osMatches) {
+      return [
+        {
+          id: "spec.webgl.backend_os_mismatch",
+          severity: source.privacyHardened ? "soft" : "hard",
+          detail: `WebGL backend ${backend} is inconsistent with OS ${osFamily || "unknown"}`
+        }
+      ];
+    }
+    return [];
+  } catch {
+    return [];
   }
-  return [];
 }
 function checkPdfPluginFace(deviceKind, hasPdfFace) {
   if (deviceKind === "unknown" || hasPdfFace === null || hasPdfFace === void 0) return [];
@@ -6217,94 +6421,126 @@ function checkPdfPluginFace(deviceKind, hasPdfFace) {
   return [];
 }
 function checkHttpUaChReconciliation(transport, context = {}) {
-  const http = String(transport.httpPlatform || "").toLowerCase();
-  const js = String(transport.jsPlatform || "").toLowerCase();
-  if (!http || !js) return [];
-  const family = (value) => {
-    if (/win/.test(value)) return "windows";
-    if (/mac|iphone|ipad|ipod/.test(value)) return "apple";
-    if (/android/.test(value)) return "android";
-    if (/linux|cros|chrome ?os/.test(value)) return "linux";
-    return "";
-  };
-  const httpFamily = family(http);
-  const jsFamily = family(js);
-  if (httpFamily && jsFamily && httpFamily !== jsFamily) {
-    return [
-      {
-        id: "spec.transport.platform_reconciliation",
-        severity: context.privacyHardened ? "soft" : "hard",
-        detail: `HTTP/UA-CH platform ${http} disagrees with JS platform ${js}`
-      }
-    ];
+  try {
+    const source = asRecord(transport);
+    const privacySource = asRecord(context);
+    const http = String(source.httpPlatform || "").toLowerCase();
+    const js = String(source.jsPlatform || "").toLowerCase();
+    if (!http || !js) return [];
+    const family = (value) => {
+      if (/win/.test(value)) return "windows";
+      if (/mac|iphone|ipad|ipod/.test(value)) return "apple";
+      if (/android/.test(value)) return "android";
+      if (/linux|cros|chrome ?os/.test(value)) return "linux";
+      return "";
+    };
+    const httpFamily = family(http);
+    const jsFamily = family(js);
+    if (httpFamily && jsFamily && httpFamily !== jsFamily) {
+      return [
+        {
+          id: "spec.transport.platform_reconciliation",
+          severity: privacySource.privacyHardened ? "soft" : "hard",
+          detail: `HTTP/UA-CH platform ${http} disagrees with JS platform ${js}`
+        }
+      ];
+    }
+    return [];
+  } catch {
+    return [];
   }
-  return [];
 }
 function checkHardwareDrift(current, previous, context = {}) {
-  if (context.privacyHardened) return [];
-  const violations = [];
-  const compare = (key, label) => {
-    const a = current[key];
-    const b = previous[key];
-    if (a === void 0 || b === void 0 || a === null || b === null) return;
-    if (String(a) !== String(b)) {
-      violations.push({
-        id: `spec.hardware_drift.${label}`,
-        severity: "hard",
-        detail: `${label} drifted from ${String(b)} to ${String(a)} across loads`
-      });
-    }
-  };
-  compare("gpu", "gpu");
-  compare("cpuCores", "cpuCores");
-  compare("memoryGb", "memoryGb");
-  compare("screen", "screen");
-  compare("platform", "platform");
-  return violations;
+  try {
+    const source = asRecord(context);
+    const currentSnapshot = asRecord(current);
+    const previousSnapshot = asRecord(previous);
+    if (source.privacyHardened) return [];
+    const violations = [];
+    const compare = (key, label) => {
+      const a = currentSnapshot[key];
+      const b = previousSnapshot[key];
+      if (a === void 0 || b === void 0 || a === null || b === null) return;
+      if (String(a) !== String(b)) {
+        violations.push({
+          id: `spec.hardware_drift.${label}`,
+          severity: "hard",
+          detail: `${label} drifted from ${String(b)} to ${String(a)} across loads`
+        });
+      }
+    };
+    compare("gpu", "gpu");
+    compare("cpuCores", "cpuCores");
+    compare("memoryGb", "memoryGb");
+    compare("screen", "screen");
+    compare("platform", "platform");
+    return violations;
+  } catch {
+    return [];
+  }
 }
 function evaluateSpecInvariants(input = {}) {
-  const privacyHardened = resolvePrivacyHardened(input);
-  const softwareRenderer = isSwiftShaderRenderer(input.webglRenderer || "");
-  const gpuObservation = resolveGpuObservation(
-    input.webglVendor,
-    input.webglRenderer,
-    input.gpuCapabilityClass
-  );
-  const violations = [
-    ...checkDeviceMemory(input.deviceMemoryGb, { privacyHardened }),
-    ...checkNetworkRtt(input.networkRtt, { privacyHardened }),
-    ...checkBatteryManager(input.battery),
-    ...checkJsHeapSizeLimit(input.jsHeapSizeLimit, input.expectedJsHeapSizeLimit),
-    ...checkWebglBackendAgainstOs(input.webglRenderer || "", input.osFamily || "", { privacyHardened }),
-    ...checkPdfPluginFace(input.deviceKind || "unknown", input.hasPdfFace),
-    ...checkHttpUaChReconciliation(input.transport || {}, { privacyHardened }),
-    ...checkHardwareDrift(input.currentHardware || {}, input.previousHardware || {}, { privacyHardened })
-  ];
-  const hard = violations.filter((v) => v.severity === "hard");
-  const soft = violations.filter((v) => v.severity === "soft");
-  return {
-    violations,
-    reasons: violations.map((v) => v.detail),
-    hardViolations: hard.map((v) => v.id),
-    softViolations: soft.map((v) => v.id),
-    hard_spec_violation: hard.length > 0,
-    privacy_hardened: privacyHardened,
-    software_renderer: softwareRenderer,
-    gpu_observation: gpuObservation
-  };
+  try {
+    const source = asRecord(input);
+    const privacyHardened = resolvePrivacyHardened(source);
+    const softwareRenderer = isSwiftShaderRenderer(source.webglRenderer || "");
+    const gpuObservation = resolveGpuObservation(
+      source.webglVendor,
+      source.webglRenderer,
+      source.gpuCapabilityClass
+    );
+    const violations = [
+      ...checkDeviceMemory(source.deviceMemoryGb, { privacyHardened }),
+      ...checkNetworkRtt(source.networkRtt, { privacyHardened }),
+      ...checkBatteryManager(source.battery),
+      ...checkJsHeapSizeLimit(source.jsHeapSizeLimit, source.expectedJsHeapSizeLimit),
+      ...checkWebglBackendAgainstOs(source.webglRenderer || "", source.osFamily || "", { privacyHardened }),
+      ...checkPdfPluginFace(source.deviceKind || "unknown", source.hasPdfFace),
+      ...checkHttpUaChReconciliation(source.transport || {}, { privacyHardened }),
+      ...checkHardwareDrift(source.currentHardware || {}, source.previousHardware || {}, { privacyHardened })
+    ];
+    const hard = violations.filter((v) => v.severity === "hard");
+    const soft = violations.filter((v) => v.severity === "soft");
+    return {
+      violations,
+      reasons: violations.map((v) => v.detail),
+      hardViolations: hard.map((v) => v.id),
+      softViolations: soft.map((v) => v.id),
+      hard_spec_violation: hard.length > 0,
+      privacy_hardened: privacyHardened,
+      software_renderer: softwareRenderer,
+      gpu_observation: gpuObservation
+    };
+  } catch {
+    return {
+      violations: [],
+      reasons: [],
+      hardViolations: [],
+      softViolations: [],
+      hard_spec_violation: false,
+      privacy_hardened: false,
+      software_renderer: false,
+      gpu_observation: "observation_unavailable"
+    };
+  }
 }
 function enforceTamperingInvariant(input) {
-  const privacy = Boolean(input.privacy_hardened);
-  const swiftshader = Boolean(input.software_renderer);
-  const rawReasons = (input.reasons || []).filter((r) => typeof r === "string" && r.trim());
-  const reasons = rawReasons.filter((reason) => {
-    if (privacy && /privacy|rfp|fpp|brave|tor|atfp|fingerprint.?protection/i.test(reason)) return false;
-    if (swiftshader && /swiftshader|software.?render|llvmpipe|mesa offscreen/i.test(reason)) return false;
-    return true;
-  });
-  const hard_spec_violation = Boolean(input.hard_spec_violation) && !privacy;
-  const detected = reasons.length > 0 || hard_spec_violation;
-  return { detected, reasons, hard_spec_violation, privacy_hardened: privacy };
+  try {
+    const source = asRecord(input);
+    const privacy = Boolean(source.privacy_hardened);
+    const swiftshader = Boolean(source.software_renderer);
+    const rawReasons = (source.reasons || []).filter((r) => typeof r === "string" && r.trim());
+    const reasons = rawReasons.filter((reason) => {
+      if (privacy && /privacy|rfp|fpp|brave|tor|atfp|fingerprint.?protection/i.test(reason)) return false;
+      if (swiftshader && /swiftshader|software.?render|llvmpipe|mesa offscreen/i.test(reason)) return false;
+      return true;
+    });
+    const hard_spec_violation = Boolean(source.hard_spec_violation) && !privacy;
+    const detected = reasons.length > 0 || hard_spec_violation;
+    return { detected, reasons, hard_spec_violation, privacy_hardened: privacy };
+  } catch {
+    return { detected: false, reasons: [], hard_spec_violation: false, privacy_hardened: false };
+  }
 }
 function toInspectorState(state) {
   switch (state) {
@@ -6322,15 +6558,20 @@ function toInspectorState(state) {
   }
 }
 function resolveInspectorState(signals = {}) {
-  const cdp = Boolean(signals.cdpAttached) || Boolean(signals.strongCdpProof);
-  const verifiedUi = Boolean(signals.devtoolsActiveVerified);
-  if (cdp && verifiedUi) return "yes-corroborated";
-  if (cdp) return "yes-unattributed";
-  if (verifiedUi || Boolean(signals.developerTools)) return "devtools_active_verified";
-  if (Boolean(signals.cdpRuntimeLeak) || signals.automationEnvironment === "electron" || signals.automationEnvironment === "ide_webview" || Boolean(signals.viewportContractionNormalized)) {
-    return "devtools_docked_suspected";
+  try {
+    const source = asRecord(signals);
+    const cdp = Boolean(source.cdpAttached) || Boolean(source.strongCdpProof);
+    const verifiedUi = Boolean(source.devtoolsActiveVerified);
+    if (cdp && verifiedUi) return "yes-corroborated";
+    if (cdp) return "yes-unattributed";
+    if (verifiedUi || Boolean(source.developerTools)) return "devtools_active_verified";
+    if (Boolean(source.cdpRuntimeLeak) || source.automationEnvironment === "electron" || source.automationEnvironment === "ide_webview" || Boolean(source.viewportContractionNormalized)) {
+      return "devtools_docked_suspected";
+    }
+    return "no";
+  } catch {
+    return "no";
   }
-  return "no";
 }
 function inspectorFlagsForState(state) {
   switch (state) {
@@ -6352,33 +6593,44 @@ function permitsHumanVerdict(state) {
   return toInspectorState(state) === "no";
 }
 function checkInspectorInvariants(input) {
-  const canonical_state = toInspectorState(input.inspector_state);
-  const expected_flags = inspectorFlagsForState(input.inspector_state);
-  const contradictions = [];
-  if (input.cdp_attached !== void 0 && Boolean(input.cdp_attached) !== expected_flags.cdp_attached) {
-    contradictions.push(
-      `cdp_attached=${Boolean(input.cdp_attached)} contradicts inspector_state '${canonical_state}' (expected ${expected_flags.cdp_attached})`
-    );
+  try {
+    const source = asRecord(input);
+    const canonical_state = toInspectorState(source.inspector_state);
+    const expected_flags = inspectorFlagsForState(source.inspector_state);
+    const contradictions = [];
+    if (source.cdp_attached !== void 0 && Boolean(source.cdp_attached) !== expected_flags.cdp_attached) {
+      contradictions.push(
+        `cdp_attached=${Boolean(source.cdp_attached)} contradicts inspector_state '${canonical_state}' (expected ${expected_flags.cdp_attached})`
+      );
+    }
+    if (source.developer_tools !== void 0 && Boolean(source.developer_tools) !== expected_flags.developer_tools) {
+      contradictions.push(
+        `developer_tools=${Boolean(source.developer_tools)} contradicts inspector_state '${canonical_state}' (expected ${expected_flags.developer_tools})`
+      );
+    }
+    const permits_human_verdict = permitsHumanVerdict(canonical_state);
+    const tier = typeof source.verdict_tier === "string" ? source.verdict_tier : "";
+    if (!permits_human_verdict && /verified\s+human/i.test(tier)) {
+      contradictions.push(
+        `"Verified Human" verdict is forbidden while inspector_state is '${canonical_state}'`
+      );
+    }
+    return {
+      consistent: contradictions.length === 0,
+      contradictions,
+      canonical_state,
+      expected_flags,
+      permits_human_verdict
+    };
+  } catch {
+    return {
+      consistent: true,
+      contradictions: [],
+      canonical_state: "no",
+      expected_flags: { cdp_attached: false, developer_tools: false },
+      permits_human_verdict: true
+    };
   }
-  if (input.developer_tools !== void 0 && Boolean(input.developer_tools) !== expected_flags.developer_tools) {
-    contradictions.push(
-      `developer_tools=${Boolean(input.developer_tools)} contradicts inspector_state '${canonical_state}' (expected ${expected_flags.developer_tools})`
-    );
-  }
-  const permits_human_verdict = permitsHumanVerdict(canonical_state);
-  const tier = typeof input.verdict_tier === "string" ? input.verdict_tier : "";
-  if (!permits_human_verdict && /verified\s+human/i.test(tier)) {
-    contradictions.push(
-      `"Verified Human" verdict is forbidden while inspector_state is '${canonical_state}'`
-    );
-  }
-  return {
-    consistent: contradictions.length === 0,
-    contradictions,
-    canonical_state,
-    expected_flags,
-    permits_human_verdict
-  };
 }
 var INSPECTOR_STATE_VALUES = /* @__PURE__ */ new Set([
   "no",
@@ -6583,7 +6835,9 @@ function isCalibrationEligible(input) {
   const source = input && typeof input === "object" ? input : {};
   const pairs = source.labeledPairs;
   const ece = source.heldOutEce;
-  return typeof pairs === "number" && Number.isFinite(pairs) && pairs >= CALIBRATION_MIN_LABELED_PAIRS && typeof ece === "number" && Number.isFinite(ece) && ece >= 0 && ece <= CALIBRATION_MAX_ECE;
+  return typeof pairs === "number" && Number.isFinite(pairs) && // A labeled-pair count is a count of human-labeled pairs: only whole pairs count.
+  // A fractional value (e.g. 200.5) must never satisfy the >= 200 gate.
+  Number.isInteger(pairs) && pairs >= CALIBRATION_MIN_LABELED_PAIRS && typeof ece === "number" && Number.isFinite(ece) && ece >= 0 && ece <= CALIBRATION_MAX_ECE;
 }
 function calibrationStatusFor(inputOrPairs, maybeEce) {
   const input = typeof inputOrPairs === "number" ? { labeledPairs: inputOrPairs, heldOutEce: maybeEce } : inputOrPairs;
@@ -6608,9 +6862,12 @@ function confidenceBandForScore(score) {
   if (score >= 0.4) return "Medium";
   return "Low";
 }
-function confidenceLabel(score, calibrated) {
-  const finite = typeof score === "number" && Number.isFinite(score) ? score : 0;
-  const percent = Math.round(Math.max(0, Math.min(1, finite)) * 100);
+function confidenceLabel(score, calibrated, capped = false) {
+  if (typeof score !== "number" || !Number.isFinite(score)) {
+    return "Match evidence unavailable";
+  }
+  const percent = Math.round(Math.max(0, Math.min(1, score)) * 100);
+  if (capped) return `Match evidence <=${percent}% (capped)`;
   return calibrated ? `Confidence ${percent}%` : `Match evidence ${percent}%`;
 }
 function computeHonestIdentityConfidence(input) {
@@ -6832,6 +7089,72 @@ function resolveIdentityStage(input = {}) {
     confidenceTier: "New Unobserved Profile"
   };
 }
+var HR_SHA_K = new Uint32Array([
+  1116352408,
+  1899447441,
+  3049323471,
+  3921009573,
+  961987163,
+  1508970993,
+  2453635748,
+  2870763221,
+  3624381080,
+  310598401,
+  607225278,
+  1426881987,
+  1925078388,
+  2162078206,
+  2614888103,
+  3248222580,
+  3835390401,
+  4022224774,
+  264347078,
+  604807628,
+  770255983,
+  1249150122,
+  1555081692,
+  1996064986,
+  2554220882,
+  2821834349,
+  2952996808,
+  3210313671,
+  3336571891,
+  3584528711,
+  113926993,
+  338241895,
+  666307205,
+  773529912,
+  1294757372,
+  1396182291,
+  1695183700,
+  1986661051,
+  2177026350,
+  2456956037,
+  2730485921,
+  2820302411,
+  3259730800,
+  3345764771,
+  3516065817,
+  3600352804,
+  4094571909,
+  275423344,
+  430227734,
+  506948616,
+  659060556,
+  883997877,
+  958139571,
+  1322822218,
+  1537002063,
+  1747873779,
+  1955562222,
+  2024104815,
+  2227730452,
+  2361852424,
+  2428436474,
+  2756734187,
+  3204031479,
+  3329325298
+]);
 
 // src/lib/verdict.ts
 var STEALTH_SIGNAL_REASON_IDS2 = Object.freeze({
@@ -12063,6 +12386,7 @@ var TIER_BANDS = [
   { upperExclusive: 1e3, radiusMeters: 1e3, label: "coarse" },
   { upperExclusive: Number.POSITIVE_INFINITY, radiusMeters: 5e3, label: "rough" }
 ];
+var MAX_REPORTED_ACCURACY_METERS = TIER_BANDS[TIER_BANDS.length - 1].radiusMeters;
 var UNKNOWN_LABEL = "unknown";
 function resolvePrecisionTier(accuracyMeters) {
   let valid = false;
@@ -12105,9 +12429,19 @@ function roundAxial(q, r) {
   else rz = -rx - ry;
   return { q: rx, r: rz };
 }
+function normalizeLongitude(lon) {
+  return ((lon + 180) % 360 + 360) % 360 - 180;
+}
 function axialForPoint(lat, lon, hexSizeMeters) {
-  const y = lat * DEG_TO_RAD * EARTH_RADIUS_METERS;
-  const x = lon * DEG_TO_RAD * EARTH_RADIUS_METERS * Math.cos(lat * DEG_TO_RAD);
+  const latRad = lat * DEG_TO_RAD;
+  const cosLat = Math.cos(latRad);
+  const y = latRad * EARTH_RADIUS_METERS;
+  const circumference = Math.max(1, 2 * Math.PI * EARTH_RADIUS_METERS * cosLat);
+  const columns = Math.max(1, Math.round(circumference / hexSizeMeters));
+  const u = (normalizeLongitude(lon) + 180) / 360;
+  const column = (Math.floor(u * columns + 0.5) % columns + columns) % columns;
+  const seamSafeLon = -180 + (column + 0.5) * 360 / columns;
+  const x = seamSafeLon * DEG_TO_RAD * EARTH_RADIUS_METERS * cosLat;
   const q = (SQRT3_OVER_3 * x - y / 3) / hexSizeMeters;
   const r = 2 / 3 * y / hexSizeMeters;
   return roundAxial(q, r);
@@ -12223,6 +12557,12 @@ function proximityFromGeolocation(point, salt) {
       reason: denied ? "geolocation permission denied or position absent; no IP-geolocation fallback used" : "geolocation position invalid; no IP-geolocation fallback used"
     };
   }
+  if (safe.accuracyMeters > MAX_REPORTED_ACCURACY_METERS) {
+    return {
+      proximity: null,
+      reason: `geolocation accuracy ${safe.accuracyMeters}m exceeds supported maximum ${MAX_REPORTED_ACCURACY_METERS}m; no IP-geolocation fallback used`
+    };
+  }
   const tierInfo = resolvePrecisionTier(safe.accuracyMeters);
   try {
     return {
@@ -12240,12 +12580,20 @@ function proximityFromGeolocation(point, salt) {
     };
   }
 }
+var HEX_PROXIMITY_ID_PATTERN = Object.freeze(/^hex_[0-9a-f]{32}$/);
 
 // src/lib/geoProximityBridge.ts
 var REASON_PERMISSION_REQUIRED = "permission_required";
 var REASON_INVALID_FIX = "invalid_fix";
 var REASON_OK = "ok";
-var BRIDGE_SALT = "geoProximityBridge|v1";
+var PUBLIC_DEFAULT_SALT_LABEL = "geoProximityBridge|v1|PUBLIC-NON-SECRET-DEFAULT";
+function resolveSalt(trustedSalt) {
+  try {
+    if (typeof trustedSalt === "string" && trustedSalt.length > 0) return trustedSalt;
+  } catch {
+  }
+  return PUBLIC_DEFAULT_SALT_LABEL;
+}
 function safeObject(value) {
   try {
     if (value === null || value === void 0 || typeof value !== "object") return null;
@@ -12277,7 +12625,7 @@ function isGranted(value) {
     return false;
   }
 }
-function resolveProximity(input) {
+function resolveProximity(input, trustedSalt) {
   try {
     const record = safeObject(input);
     if (!isGranted(safeRead(record, "permission"))) {
@@ -12291,7 +12639,7 @@ function resolveProximity(input) {
     }
     const delegated = proximityFromGeolocation(
       { lat, lon, accuracyMeters: accuracyM },
-      BRIDGE_SALT
+      resolveSalt(trustedSalt)
     );
     const core = delegated.proximity;
     if (!core) {
@@ -12442,7 +12790,6 @@ function isTrue3(record, key) {
   return readField2(record, key) === true;
 }
 function acceptedVendorFamily2(value) {
-  if (value === true) return "explicit vendor signature";
   if (typeof value !== "string") return null;
   const key = value.toLowerCase().replace(/[^a-z0-9]/g, "");
   if (key.length === 0) return null;
@@ -12494,9 +12841,11 @@ function resolveAntiDetectExemption(input = {}) {
       }
     }
     const exemptionBase = privacyHardened || vendorFamily !== null;
-    const suppressPenalty = exemptionBase && noiseOnly && !hardContradiction;
+    const suppressPenalty = exemptionBase && noiseOnly && !hardContradiction && !automationPresent;
     if (suppressPenalty) {
       reasons.push("Exemption granted: privacy posture/signature with noise-only artifacts; penalty suppressed");
+    } else if (!hardContradiction && exemptionBase && noiseOnly && automationPresent) {
+      reasons.push("Automation artifact present; exemption withheld (automation proof outranks privacy posture/signature)");
     } else if (!hardContradiction && exemptionBase && !noiseOnly) {
       reasons.push("Privacy posture present but noise-only condition missing; no penalty suppression");
     } else if (!hardContradiction && !exemptionBase && noiseOnly) {
@@ -12576,8 +12925,11 @@ function stabilizeConfidence(input) {
     );
     const changed = stabilized !== normalized;
     return {
+      // The quantized value is published only for display stability. The tier is derived
+      // from the caller's RAW score so quantization can never upgrade the meaning:
+      // e.g. raw 0.83 is 'Medium-High' and must not become 'High' after snapping to 0.85.
+      tier: confidenceBandForScore(raw),
       score: stabilized,
-      tier: confidenceBandForScore(stabilized),
       stabilityKey,
       changed,
       reason: changed ? "score_quantized_for_stability" : "score_stable"
@@ -12916,13 +13268,15 @@ function resolveIdbDurabilityTruth(input = {}) {
     );
     return { incognito: true, confidence: "high", rule: "strong_ram_signature", reasons };
   }
+  if (!highVariance && opfsCorroboration && ratio <= IDB_NORMAL_RATIO_MIN) {
+    reasons.push(
+      `ratio ${ratio} in deadband (<= ${IDB_NORMAL_RATIO_MIN}) with independent private-mode corroboration`
+    );
+    return { incognito: true, confidence: "high", rule: "corroborated_private", reasons };
+  }
   if (ratio > IDB_NORMAL_RATIO_MIN) {
     reasons.push(`strict/relaxed ratio ${ratio} > ${IDB_NORMAL_RATIO_MIN}: disk-backed profile`);
     return { incognito: false, confidence: "high", rule: "disk_backed", reasons };
-  }
-  if (ratio < IDB_PRIVATE_RATIO_MAX && !highVariance && opfsCorroboration) {
-    reasons.push(`ratio ${ratio} below ${IDB_PRIVATE_RATIO_MAX} with independent corroboration`);
-    return { incognito: true, confidence: "high", rule: "corroborated_private", reasons };
   }
   reasons.push(
     `ratio ${ratio} in deadband${highVariance ? " with high variance" : ""} and no decisive corroboration`
@@ -14066,8 +14420,8 @@ var AI_AGENT_UA_RULES2 = AI_AGENT_UA_RULES;
 var AI_BOT_CIDR_SOURCES2 = AI_BOT_CIDR_SOURCES;
 function registryLookup(value, key) {
   if (!value || typeof value !== "object") return void 0;
-  const asRecord = value;
-  if (Object.prototype.hasOwnProperty.call(asRecord, key)) return asRecord[key];
+  const asRecord2 = value;
+  if (Object.prototype.hasOwnProperty.call(asRecord2, key)) return asRecord2[key];
   const getter = value.get;
   if (typeof getter === "function") return getter.call(value, key);
   return void 0;
@@ -14301,7 +14655,30 @@ var SESSION_EXPIRATION_MS = SESSION_TIMEOUT_MINUTES * 60 * 1e3;
 var IS_SERVERLESS_RUNTIME = Boolean(
   process.env.VERCEL || process.env.VERCEL_ENV || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.NETLIFY
 );
-var HMAC_SECRET = process.env.VISITOR_HMAC_SECRET || "intel-system-first-party-hmac-secret-2026";
+function resolveVisitorHmacKeyRing() {
+  const ephemeralOptIn = process.env.NODE_ENV === "test" || process.env.INTEL_ALLOW_EPHEMERAL_HMAC === "1";
+  const strict = process.env.NODE_ENV === "production" || process.env.INTEL_STRICT_SECRET === "1" || !ephemeralOptIn;
+  const readSecret = (name) => typeof process.env[name] === "string" ? process.env[name] : "";
+  const MIN_KEY_LENGTH = 32;
+  const current = readSecret("VISITOR_HMAC_SECRET");
+  const previous = readSecret("VISITOR_HMAC_SECRET_PREVIOUS");
+  const currentKey = current.length >= MIN_KEY_LENGTH ? current : "";
+  const previousKey = previous.length >= MIN_KEY_LENGTH ? previous : "";
+  const misconfigured = strict && !currentKey;
+  if (misconfigured) {
+    console.error(
+      "VISITOR_HMAC_SECRET (>=32 chars) is required here; /api/* is failing closed."
+    );
+  }
+  const keys = Array.from(
+    new Set(
+      [currentKey || crypto.randomBytes(MIN_KEY_LENGTH).toString("hex"), previousKey].filter(Boolean)
+    )
+  );
+  return { keys, misconfigured };
+}
+var { keys: VISITOR_HMAC_KEYS, misconfigured: VISITOR_HMAC_MISCONFIGURED } = resolveVisitorHmacKeyRing();
+var HMAC_SECRET = VISITOR_HMAC_KEYS[0];
 function createInMemoryDbAdapter() {
   const visitorsMap = /* @__PURE__ */ new Map();
   const visitsList = [];
@@ -14372,6 +14749,15 @@ function createInMemoryDbAdapter() {
               Array.from(visitorsMap.values()).filter((v) => v.updated_at_utc >= cutoff && v.hardware_id).map((v) => v.hardware_id)
             );
             return { n: activeHardware.size };
+          }
+          if (normalized.includes("intel:devicehardware")) {
+            const cutoff = String(params[0] || "");
+            const activeHardware = new Set(
+              Array.from(hardwareAnchorsMap.values()).filter(
+                (anchor) => anchor.updated_at_utc >= cutoff && anchor.hardware_id && visitorsMap.has(anchor.visitor_id)
+              ).map((anchor) => anchor.hardware_id)
+            );
+            return { total: activeHardware.size };
           }
           if (normalized.includes("FROM hardware_anchors WHERE hardware_id = ?")) {
             return hardwareAnchorsMap.get(String(params[0] || ""));
@@ -14870,20 +15256,35 @@ function verifyVisitorToken(visitorId, token2) {
   if (!visitorId || !token2 || typeof visitorId !== "string" || typeof token2 !== "string") {
     return false;
   }
-  const expected = signVisitorId(visitorId);
-  if (expected.length !== token2.length) return false;
-  try {
-    return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(token2, "hex"));
-  } catch {
-    return false;
+  let matched = false;
+  for (const key of VISITOR_HMAC_KEYS) {
+    const expected = crypto.createHmac("sha256", key).update(visitorId).digest("hex");
+    if (expected.length !== token2.length) continue;
+    try {
+      const equal = crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(token2, "hex"));
+      matched = matched || equal;
+    } catch {
+    }
   }
+  return matched;
 }
-function computeHistoryBackupSignature(visitorId, totalVisits, totalSessions, firstVisitUtc, visits, legacyDigest = false) {
+function computeHistoryBackupSignatureWithKey(secret, visitorId, totalVisits, totalSessions, firstVisitUtc, visits, legacyDigest = false) {
   const visitDigest = visits.map(
     (v) => legacyDigest ? `${v.visitId}:${v.sessionId}:${v.visitedAtUtc}:${v.publicIp}` : `${v.visitId}:${v.sessionId}:${v.visitedAtUtc}:${v.publicIp}:${typeof v.suspectScore === "number" ? v.suspectScore : 0}:${v.riskLevel ?? "Low"}:${v.botName ?? ""}`
   ).join("|");
   const payload = `hist:${visitorId}:${totalVisits}:${totalSessions}:${firstVisitUtc}:${visitDigest}`;
-  return crypto.createHmac("sha256", HMAC_SECRET).update(payload).digest("hex");
+  return crypto.createHmac("sha256", secret).update(payload).digest("hex");
+}
+function computeHistoryBackupSignature(visitorId, totalVisits, totalSessions, firstVisitUtc, visits, legacyDigest = false) {
+  return computeHistoryBackupSignatureWithKey(
+    HMAC_SECRET,
+    visitorId,
+    totalVisits,
+    totalSessions,
+    firstVisitUtc,
+    visits,
+    legacyDigest
+  );
 }
 function createSignedHistoryBackup(visitorId, totalVisits, totalSessions, firstVisitUtc, visits, hardwareId) {
   const compactVisits = visits.slice(0, 35);
@@ -14908,33 +15309,31 @@ function verifySignedHistoryBackup(expectedVisitorId, backup) {
   if (!backup || typeof backup !== "object" || backup.visitorId !== expectedVisitorId || typeof backup.signature !== "string" || typeof backup.totalVisits !== "number" || typeof backup.totalSessions !== "number" || typeof backup.firstVisitUtc !== "string" || !Array.isArray(backup.visits)) {
     return false;
   }
-  const expectedSig = computeHistoryBackupSignature(
-    backup.visitorId,
-    backup.totalVisits,
-    backup.totalSessions,
-    backup.firstVisitUtc,
-    backup.visits
-  );
-  const legacySig = computeHistoryBackupSignature(
-    backup.visitorId,
-    backup.totalVisits,
-    backup.totalSessions,
-    backup.firstVisitUtc,
-    backup.visits,
-    true
-  );
-  const matches = [expectedSig, legacySig].some((candidate) => {
-    if (candidate.length !== backup.signature.length) return false;
-    try {
-      return crypto.timingSafeEqual(
-        Buffer.from(candidate, "hex"),
-        Buffer.from(backup.signature, "hex")
+  const visits = backup.visits.slice(0, 35);
+  let matched = false;
+  for (const key of VISITOR_HMAC_KEYS) {
+    for (const legacyDigest of [false, true]) {
+      const candidate = computeHistoryBackupSignatureWithKey(
+        key,
+        backup.visitorId,
+        backup.totalVisits,
+        backup.totalSessions,
+        backup.firstVisitUtc,
+        visits,
+        legacyDigest
       );
-    } catch {
-      return false;
+      if (candidate.length !== backup.signature.length) continue;
+      try {
+        const equal = crypto.timingSafeEqual(
+          Buffer.from(candidate, "hex"),
+          Buffer.from(backup.signature, "hex")
+        );
+        matched = matched || equal;
+      } catch {
+      }
     }
-  });
-  return matches;
+  }
+  return matched;
 }
 function generateVisitorId2() {
   return "vid_" + crypto.randomBytes(10).toString("hex");
@@ -15758,15 +16157,23 @@ function withWbaVerification(base, verification) {
 }
 function verifyPageAttestation(headers, authority, userAgent, publicIp) {
   try {
-    const secret = process.env.VISITOR_HMAC_SECRET;
-    if (!secret || secret.length < 32) return null;
     const cookie = readRequestHeader(headers, "cookie");
     const match = /(?:^|;\s*)intel_wba=([^;]+)/.exec(cookie);
     if (!match) return null;
     const parts = match[1].split(".");
     if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
-    const expected = crypto.createHmac("sha256", secret).update(parts[0]).digest("base64url");
-    if (expected !== parts[1]) return null;
+    let signatureValid = false;
+    for (const secret of VISITOR_HMAC_KEYS) {
+      if (secret.length < 32) continue;
+      const expected = crypto.createHmac("sha256", secret).update(parts[0]).digest("base64url");
+      if (expected.length !== parts[1].length) continue;
+      try {
+        const equal = crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(parts[1]));
+        signatureValid = signatureValid || equal;
+      } catch {
+      }
+    }
+    if (!signatureValid) return null;
     const payload = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
     const now = Date.now();
     if (!payload.exp || payload.exp <= now || payload.exp > now + 6e4) return null;
@@ -15790,13 +16197,22 @@ function verifyPageAttestation(headers, authority, userAgent, publicIp) {
     return null;
   }
 }
+function isTrustedWbaDirectoryHost(hostname) {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (!host || net.isIP(host)) return false;
+  return WBA_TRUSTED_SIGNERS.some(
+    (signer) => signer.directoryHosts.some((trusted) => trusted.toLowerCase() === host) || (signer.directoryHostSuffixes ?? []).some((suffix) => host.endsWith(suffix.toLowerCase()))
+  );
+}
 async function fetchWebBotAuthDirectory(agentUrl) {
-  let origin = "";
+  let parsed;
   try {
-    origin = new URL(agentUrl).origin;
+    parsed = new URL(agentUrl);
   } catch {
     return null;
   }
+  if (parsed.protocol !== "https:" || !isTrustedWbaDirectoryHost(parsed.hostname)) return null;
+  const origin = parsed.origin;
   const nowMs = Date.now();
   const cached = aiAuthDirectoryCache.get(origin);
   if (cached && cached.expiresAtMs > nowMs) {
@@ -17400,9 +17816,10 @@ function computeDeviceRarity(db2, browserDevice) {
   try {
     const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1e3).toISOString();
     const row = db2.prepare(
-      `SELECT COUNT(DISTINCT hardware_id) AS total
-         FROM visits
-         WHERE visited_at_utc >= ? AND hardware_id IS NOT NULL AND hardware_id != ''`
+      `/* intel:devicehardware */ SELECT COUNT(DISTINCT ha.hardware_id) AS total
+         FROM hardware_anchors ha
+         JOIN visitors v ON v.visitor_id = ha.visitor_id
+         WHERE ha.updated_at_utc >= ? AND ha.hardware_id IS NOT NULL AND ha.hardware_id != ''`
     ).get(cutoff);
     const total = Number(row?.total) || 0;
     const matching = total > 0 ? 1 : 0;
@@ -18007,6 +18424,16 @@ function detectServerRegion(req) {
 var app = express();
 app.set("trust proxy", true);
 app.use(cookieParser());
+if (VISITOR_HMAC_MISCONFIGURED) {
+  app.use("/api", (req, res, next) => {
+    const probe = req.path.toLowerCase();
+    if (probe === "/health" || probe === "/network/ping" || probe === "/ping") {
+      next();
+      return;
+    }
+    res.status(503).json({ error: "Visitor HMAC secret not configured." });
+  });
+}
 app.use(clientHintsMiddleware);
 app.use((_req, res, next) => {
   res.setHeader(
@@ -20425,7 +20852,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       botType = "ai_crawler";
       botVerdict = "good";
     }
-    if (automationTargetedTampering) {
+    if (automationTargetedTampering && !verifierSignedGood) {
       botInfo = {
         category: "browser_automation",
         provider: effectiveBotClassification.provider || "Stealth Automation",
@@ -20436,7 +20863,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       botVerdict = "bad";
     }
     if (spoofedVerifiedBotClaim) {
-      const spoofEvidence = `Spoofed verified-bot identity claim: ${String(fullRequestUserAgent || "").slice(0, 120)} \u2014 no RFC 9421 signature or official CIDR / FCrDNS proof`;
+      const spoofEvidence = "Spoofed verified-bot identity claim (raw UA withheld)";
       botInfo = {
         category: "browser_automation",
         provider: aiAgent?.operator || effectiveBotClassification.provider || "Unverified",
@@ -20464,7 +20891,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       aiAgent?.verified && /signed/i.test(String(aiAgent.executionMode || ""))
     );
     const lingeringCloudAgentLabel = aiAgent?.agentId === "gemini" || /google gemini|cloud agent/i.test(botInfo?.name || "");
-    if (lingeringCloudAgentLabel && !signedAgentIdentity && !spoofedVerifiedBotClaim && (hardAutomationSignals || botVerdict === "bad" || /stealth|headless|chromium/i.test(String(botType || "")))) {
+    if (lingeringCloudAgentLabel && !verifierSignedGood && !signedAgentIdentity && !spoofedVerifiedBotClaim && (hardAutomationSignals || botVerdict === "bad" || /stealth|headless|chromium/i.test(String(botType || "")))) {
       securitySignals.aiAgent = null;
       const headlessVariant = /headless|chromium/i.test(String(botType || ""));
       botInfo = {
@@ -20563,13 +20990,11 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       firstSeenDesktop: !isReturning,
       consistencyFlags: resolvedIdentity.reasons,
       rfpOrTor: Boolean(securitySignals.torExitNode) || Boolean(securitySignals.isTorBrowserClient),
-      genuineSpoof: botVerdict === "bad" && botInfo?.identity === "spoofed",
-      // P0-6 continuity corroboration. The scorer's input types are owned by another module;
-      // the cast keeps this call compatible with both the legacy and evidence shapes. The
-      // calibration/publication gate is untouched — only the evidence input is forwarded.
-      storageHealed: Boolean(storageHealed || resolvedIdentity.healed),
-      visitContinuity: statistics.totalVisits,
-      profileAgeDays: profileAgeDaysForConfidence
+      genuineSpoof: botVerdict === "bad" && botInfo?.identity === "spoofed"
+      // Continuity keys are intentionally NOT forwarded here: this legacy call has no
+      // `match_tier`, so a scorer dispatching on those keys alone would return a bare number
+      // where a ConfidenceResult is expected (NaN). They are consumed below by rarityHonesty /
+      // computeHonestIdentityConfidence.
     });
     const identityConsistencyFlags = Array.from(new Set(resolvedIdentity.reasons));
     const identityConsistency = {
@@ -20791,7 +21216,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       // strength, never a probability. The human-facing label says "Match evidence", not
       // "Confidence"/probability.
       calibration_status: "uncalibrated",
-      confidence_label: confidenceLabel(finalIdentityConfidenceScore, false),
+      confidence_label: confidenceLabel(finalIdentityConfidenceScore, false, capsAtZeroSix),
       ...downgradeRecognition ? { confidence_tier: "Shared Hardware Class - Ambiguous" } : {}
     };
     const stabilizedConfidence = stabilizeConfidence({
@@ -20811,7 +21236,7 @@ app.post("/api/visitor/identify", identifyRateLimit, async (req, res) => {
       if (!downgradeRecognition) {
         identityConfidenceHonest.confidence_tier = stabilizedConfidence.tier;
       }
-      identityConfidenceHonest.confidence_label = confidenceLabel(stabilizedConfidence.score, false);
+      identityConfidenceHonest.confidence_label = confidenceLabel(stabilizedConfidence.score, false, capsAtZeroSix);
     }
     identityConfidenceHonest.calibration_status = "uncalibrated";
     const identityScope = resolveIdentityScope({
@@ -21312,6 +21737,13 @@ app.post("/api/visitor/corroborate", identifyRateLimit, (req, res) => {
   }
 });
 app.get("/api/visitor/history/:visitorId", (req, res) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  const existingVary = res.getHeader("Vary");
+  const varyValues = typeof existingVary === "string" ? existingVary.split(",").map((item) => item.trim()).filter(Boolean) : [];
+  for (const value of ["Cookie", "X-Visitor-Token"]) {
+    if (!varyValues.some((item) => item.toLowerCase() === value.toLowerCase())) varyValues.push(value);
+  }
+  res.setHeader("Vary", varyValues.join(", "));
   const requestedVisitorId = req.params.visitorId;
   const headerToken = req.headers["x-visitor-token"];
   const cookieVid = req.cookies?.intel_http_vid;

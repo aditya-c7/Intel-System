@@ -53,5 +53,8 @@
       "simple": { "limit": 40, "period": 60 }
     }
   ],
-  "observability": { "enabled": true }
+  "observability": { "enabled": true },
+  // Workers Builds runs `npx wrangler preview` for non-production branches; that command
+  // requires a previews block in this file. An empty block keeps production unchanged.
+  "previews": {}
 }

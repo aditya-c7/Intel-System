@@ -1,6 +1,12 @@
 import type { IntelVisitorResponse } from '../types/visitor';
 import type { RiskTier } from '../lib/telemetryContract';
-import { resolveCanonical, isSwiftShader, SWIFTSHADER_LABEL } from './canonical';
+import {
+  resolveCanonical,
+  isSwiftShader,
+  SWIFTSHADER_LABEL,
+  confidenceLabelOrNull,
+  gpuTruthIsVerified,
+} from './canonical';
 
 export type { RiskTier };
 
@@ -369,13 +375,18 @@ export function resolveVmVerdict(
       observationRestricted ||
       gpuUnreliable ||
       rendererOnlyWebgl);
+  // A raw renderer string is spoofable WebGL output. It carries a visible "(unverified)"
+  // qualifier unless EVERY server GPU truth axis independently verified physical hardware.
+  const rendererQualifier = gpuTruthIsVerified(canonicalView) ? '' : ' (unverified)';
   const reportedRendererStatus =
-    gpuRenderer.length > 0 ? `Reported renderer (unverified): ${gpuRenderer}` : null;
+    gpuRenderer.length > 0 ? `Reported renderer: ${gpuRenderer}${rendererQualifier}` : null;
+  // Masked / unavailable observations are absence of evidence: they outrank any raw renderer
+  // claim, even when a renderer string was reported by WebGL.
   const status =
-    state === 'unknown' && hardwareUnverifiable && reportedRendererStatus
-      ? reportedRendererStatus
-      : state === 'unknown' && restrictedGpuStatus
+    state === 'unknown' && restrictedGpuStatus
       ? restrictedGpuStatus
+      : state === 'unknown' && hardwareUnverifiable && reportedRendererStatus
+      ? reportedRendererStatus
       : state === 'vm'
       ? signalState === 'vm'
         ? signalStatus
@@ -513,26 +524,6 @@ export function resolveCdpVerdict(data: IntelVisitorResponse): InspectorVerdict 
 export function resolveDeveloperToolsVerdict(data: IntelVisitorResponse): boolean {
   return resolveInspectorVerdict(data).developerTools;
 }
-
-/* -------------------------------------------------------------------------- */
-/* Risk tier — Low / Elevated / High / Critical from canonical score10         */
-/* -------------------------------------------------------------------------- */
-
-/**
- * Derives the canonical risk tier from the server's 0..10 headline score. The cut points
- * mirror the frozen 0..100 rubric (75 / 50 / 25) after `round(score / 10)`, so the tier is
- * consistent with `canonical.riskScore10` instead of an ad-hoc per-tile threshold.
- */
-export function resolveRiskTier(score10: number): RiskTier {
-  const score = Number.isFinite(score10) ? Math.max(0, Math.min(10, score10)) : 0;
-  if (score >= 8) return 'Critical';
-  if (score >= 5) return 'High';
-  if (score >= 3) return 'Elevated';
-  return 'Low';
-}
-
-/** Explicit alias for callers that want the derivation source in the name. */
-export const resolveRiskTierFromScore10 = resolveRiskTier;
 
 export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRowData[] {
   const canonicalView = resolveCanonical(data);
@@ -840,31 +831,21 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
     tone: 'clean',
   });
 
-  // Both risk tiles read the SAME canonical 0-10 headline and tier, mirrored verbatim from the
-  // risk ledger (the exact values App.tsx headlines and publishes to the Event JSON). A missing
-  // / non-finite headline degrades to 0, never NaN. The local derivation is only a fallback for
-  // legacy payloads that carry no canonical tier — no tier is invented on the client.
+  // Both risk tiles mirror the SAME canonical 0-10 headline and tier verbatim from the risk
+  // ledger (the exact values App.tsx headlines and publishes to the Event JSON). A missing
+  // headline stays unavailable — never a client-derived 0, and no tier is ever derived from
+  // a score on the client.
   const rawScore10 = canonicalView.riskScore10;
-  const suspectScore =
-    typeof rawScore10 === 'number' && Number.isFinite(rawScore10)
-      ? Math.max(0, Math.min(10, rawScore10))
-      : 0;
-  const canonicalTier = canonicalView.riskTier;
-  const riskTier: RiskTier =
-    canonicalTier === 'Low' ||
-    canonicalTier === 'Elevated' ||
-    canonicalTier === 'High' ||
-    canonicalTier === 'Critical'
-      ? canonicalTier
-      : resolveRiskTier(suspectScore);
+  const suspectScore10: number | null =
+    typeof rawScore10 === 'number' && Number.isFinite(rawScore10) ? rawScore10 : null;
+  const riskTier: RiskTier | null = canonicalView.riskTier;
   // Confidence copy is bound to the server's own `confidence_label`, never recomputed from a
-  // score. A null / absent label means the evidence is unavailable — it is NOT rendered as 0%
-  // (a fabricated zero would imply a measured but empty match). Calibration evidence stays an
-  // appended detail only; the 0-10 headline and "uncalibrated" posture are untouched.
-  const serverConfidenceLabel =
-    typeof canonicalView.confidenceLabel === 'string' && canonicalView.confidenceLabel.trim()
-      ? canonicalView.confidenceLabel.trim()
-      : null;
+  // score. A null / absent / placeholder label means the evidence is unavailable — it is NOT
+  // rendered as 0% (a fabricated zero would imply a measured but empty match). Calibration
+  // evidence stays an appended detail only; the 0-10 headline is untouched.
+  const serverConfidenceLabel = confidenceLabelOrNull(
+    canonicalView.confidenceLabel ?? canonicalView.confidence_label
+  );
   const confidenceCopy = serverConfidenceLabel ?? 'Match evidence unavailable';
   const calibrationMirror = canonicalView.calibration_evidence;
   const calibrationDetail =
@@ -881,31 +862,29 @@ export function buildSmartSignalRows(data: IntelVisitorResponse): SmartSignalRow
           .filter((part): part is string => part != null)
           .join(' · ')
       : undefined;
-  rows.push({
-    key: 'suspectScore',
-    label: 'Suspect Score',
-    status: `${suspectScore}/10`,
-    triggered: riskTier === 'High' || riskTier === 'Critical',
-    tone: riskTier === 'High' || riskTier === 'Critical'
+  const riskTone: SmartSignalRowData['tone'] =
+    riskTier === 'High' || riskTier === 'Critical'
       ? 'trigger'
       : riskTier === 'Elevated'
       ? 'neutral'
-      : 'clean',
+      : riskTier === 'Low'
+      ? 'clean'
+      : 'neutral';
+  rows.push({
+    key: 'suspectScore',
+    label: 'Suspect Score',
+    status: suspectScore10 === null ? 'Unavailable' : `${suspectScore10}/10`,
+    triggered: riskTier === 'High' || riskTier === 'Critical',
+    tone: suspectScore10 === null ? 'neutral' : riskTone,
     detail: [confidenceCopy, calibrationDetail].filter(Boolean).join(' · '),
   });
   rows.push({
     key: 'riskTier',
     label: 'Risk Tier',
-    status: riskTier,
+    status: riskTier ?? 'Unavailable',
     triggered: riskTier === 'High' || riskTier === 'Critical',
-    tone: riskTier === 'Critical'
-      ? 'trigger'
-      : riskTier === 'High'
-      ? 'trigger'
-      : riskTier === 'Elevated'
-      ? 'neutral'
-      : 'clean',
-    detail: `Canonical score ${suspectScore}/10`,
+    tone: riskTone,
+    detail: suspectScore10 === null ? 'Unavailable' : `Canonical score ${suspectScore10}/10`,
   });
 
   // Proximity is EXCLUSIVELY a browser-granted geolocation observation. IP-derived city /

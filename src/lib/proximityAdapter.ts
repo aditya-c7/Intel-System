@@ -35,6 +35,7 @@
 
 import {
   proximityFromGeolocation,
+  sanitizeProximityForBody,
   type HexProximity,
   type ProximityResult,
 } from './hexProximity';
@@ -76,7 +77,8 @@ export interface GeolocationPermissionInput {
  * from the existing IP-derived `proximity` / `location` blocks.
  */
 export interface ProximityBodyField {
-  hex_proximity: HexProximity;
+  /** `accuracy_m` is included whenever the source carries a valid one. */
+  hex_proximity: HexProximity & { accuracy_m?: number };
 }
 
 /** Shared audit marker present in every reason this module emits. */
@@ -129,15 +131,24 @@ function safeFiniteNumber(value: unknown): number | null {
   }
 }
 
-/** Returns a normalized permission token, or '' for any unusable input. */
-function safePermission(value: unknown): string {
-  let token = '';
+/** True only for the exact string 'granted' — no trim, case-fold or coercion. */
+function isGranted(value: unknown): boolean {
   try {
-    if (typeof value === 'string') token = value.trim().toLowerCase();
+    return typeof value === 'string' && value === 'granted';
   } catch {
-    return '';
+    return false;
   }
-  return token;
+}
+
+/** Label for audit reasons only — never used to grant permission. */
+function safePermissionLabel(value: unknown): string {
+  try {
+    if (typeof value === 'string' && value.length > 0) return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  } catch {
+    // fall through
+  }
+  return 'unknown';
 }
 
 /* -------------------------------------------------------------------------- */
@@ -165,14 +176,14 @@ export function proximityFromPermission(
     };
   }
 
-  const permission = safePermission(safeRead(record, 'permission'));
-  if (permission !== 'granted') {
+  const permission = safeRead(record, 'permission');
+  if (!isGranted(permission)) {
     return {
       proximity: null,
       reason:
         permission === 'denied'
           ? `geolocation permission denied; ${NO_IP_FALLBACK_MARKER}`
-          : `geolocation permission not granted (state=${permission || 'unknown'}); ${NO_IP_FALLBACK_MARKER}`,
+          : `geolocation permission not granted (state=${safePermissionLabel(permission)}); ${NO_IP_FALLBACK_MARKER}`,
     };
   }
 
@@ -219,35 +230,35 @@ function isApiV4(apiVersion: unknown): boolean {
 /**
  * Returns the additive API v4 body field for a resolved proximity, or
  * `undefined` when the field may not be emitted:
- *  - the API version is not v4, or
- *  - proximity is missing (the permission-gated producer returned `null`), or
- *  - the payload is structurally unusable.
+ *  - the API version is not v4 (defaults to v4 when omitted — same as the bridge),
+ *  - an envelope's `reason` is not EXACTLY 'ok', or
+ *  - the payload fails the shared id-scheme / radius / confidence gate.
  *
- * Never populates a field from an IP-derived proximity: the only accepted shape
- * is `HexProximity` (`id` / `precision_radius` / `confidence`). The returned
- * object is a fresh copy so callers cannot mutate the source payload.
+ * Validation is shared with the bridge emitter via `sanitizeProximityForBody`.
+ * For backward compatibility a raw gated `HexProximity` (as returned by
+ * `proximityFromPermission(...).proximity`) is accepted directly; a result
+ * envelope `{ proximity, reason }` is accepted only with `reason === 'ok'`.
+ * `accuracy_m` is included whenever the source carries a valid one, matching
+ * the bridge emitter. The returned object is a fresh copy; no IP-derived field
+ * can be smuggled in.
  */
 export function proximityBodyField(
-  proximity: HexProximity | null | undefined,
-  apiVersion: unknown
+  proximity: HexProximity | ProximityResult | null | undefined,
+  apiVersion?: unknown
 ): ProximityBodyField | undefined {
-  if (!isApiV4(apiVersion)) return undefined;
+  // Same default as the bridge: omitting the version means v4; an explicitly
+  // passed undefined/null is NOT a v4 token — fail closed.
+  const version = arguments.length < 2 ? 4 : apiVersion;
+  if (!isApiV4(version)) return undefined;
 
-  const source = safeObject(proximity);
-  if (!source) return undefined;
+  const sanitized = sanitizeProximityForBody(proximity, false);
+  if (!sanitized) return undefined;
 
-  const id = safeRead(source, 'id');
-  const precisionRadius = safeFiniteNumber(safeRead(source, 'precision_radius'));
-  const confidence = safeFiniteNumber(safeRead(source, 'confidence'));
-  if (typeof id !== 'string' || id.length === 0 || precisionRadius === null || confidence === null) {
-    return undefined;
-  }
-
-  return {
-    hex_proximity: {
-      id,
-      precision_radius: precisionRadius,
-      confidence,
-    },
+  const hexProximity: HexProximity & { accuracy_m?: number } = {
+    id: sanitized.id,
+    precision_radius: sanitized.precision_radius,
+    confidence: sanitized.confidence,
   };
+  if (sanitized.accuracy_m !== undefined) hexProximity.accuracy_m = sanitized.accuracy_m;
+  return { hex_proximity: hexProximity };
 }

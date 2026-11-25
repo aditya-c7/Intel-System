@@ -22,6 +22,11 @@
  *      fonts, timezone NAME, audio hardware traits). Volatile signals (canvas noise,
  *      storage quota, timezone OFFSET, audio fingerprint sum) are structurally excluded.
  *
+ * The R4 supplementary high-recall ID lives in `identityEngine.ts` as an ADDITIVE sibling:
+ * a deterministic, versioned HMAC-SHA-256 hint derived only from resolved stable signals.
+ * It is emitted beside the primary id, carries no confidence score and is never a sole
+ * blocking key. This module's Tier-2 group keys below remain descriptive cohort labels.
+ *
  * HONESTY / RESEARCH BOUNDARY:
  *   - The 512-bit hash is a HEURISTIC cohort label, NOT a verified device identity.
  *   - WebGPU static limits + features carry only ~5.19 bits (~122 anonymity sets), and
@@ -67,6 +72,19 @@ export interface IdentityTierSignals {
   platform?: string | null;
   hardwareConcurrency?: number | null;
   deviceMemory?: number | null;
+
+  /* ALREADY RESOLVED stable signals consumed by the additive high-recall sibling id in
+   * `identityEngine.ts` (buildHighRecallInput / resolveSupplementaryHighRecall). These are
+   * descriptive inputs only: this module never mints an id from them. Raw IP / raw UA are
+   * deliberately absent — only a /24 or /48 prefix and a normalized UA may be used as seed. */
+  normalizedUserAgent?: string | null;
+  firstLanguage?: string | null;
+  language?: string | null;
+  clientIp?: string | null;
+  publicIp?: string | null;
+  ip?: string | null;
+  tenantId?: string | null;
+  instanceId?: string | null;
 
   /* browser-invariant screen / font / timezone / audio-hardware traits */
   screenWidth?: number | null;

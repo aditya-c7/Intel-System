@@ -105,6 +105,9 @@ export function isCalibrationEligible(input: CalibrationGateInput): boolean {
   return (
     typeof pairs === 'number' &&
     Number.isFinite(pairs) &&
+    // A labeled-pair count is a count of human-labeled pairs: only whole pairs count.
+    // A fractional value (e.g. 200.5) must never satisfy the >= 200 gate.
+    Number.isInteger(pairs) &&
     pairs >= CALIBRATION_MIN_LABELED_PAIRS &&
     typeof ece === 'number' &&
     Number.isFinite(ece) &&
@@ -191,10 +194,22 @@ export function confidenceBandForScore(score: number): NumericConfidenceTier {
 /**
  * Human-facing label for a published numeric score. An uncalibrated number is explicitly
  * presented as observable evidence strength — never as a calibrated probability.
+ *
+ *  - a missing / non-finite score publishes no number at all ('... unavailable');
+ *  - `capped` marks a value that is an upper bound, so it is always shown as capped
+ *    "Match evidence" (never promoted to a calibrated point estimate);
+ *  - the word "Confidence" is reserved for a score that actually passed the gate.
  */
-export function confidenceLabel(score: number | null | undefined, calibrated: boolean): string {
-  const finite = typeof score === 'number' && Number.isFinite(score) ? score : 0;
-  const percent = Math.round(Math.max(0, Math.min(1, finite)) * 100);
+export function confidenceLabel(
+  score: number | null | undefined,
+  calibrated: boolean,
+  capped = false
+): string {
+  if (typeof score !== 'number' || !Number.isFinite(score)) {
+    return 'Match evidence unavailable';
+  }
+  const percent = Math.round(Math.max(0, Math.min(1, score)) * 100);
+  if (capped) return `Match evidence <=${percent}% (capped)`;
   return calibrated ? `Confidence ${percent}%` : `Match evidence ${percent}%`;
 }
 

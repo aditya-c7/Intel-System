@@ -53,6 +53,8 @@ interface NativePressureObserverConstructor {
 
 const FIVE_MINUTES_MS = 5 * 60 * 1000; // 300,000 ms rolling five-minute timeline
 const STALE_THRESHOLD_MS = 15 * 1000; // 15s threshold to indicate held/unchanged state
+const AWAITING_FIRST_CHANGE = 'Awaiting first change';
+const EMPTY_GRAPH_TEXT = `${AWAITING_FIRST_CHANGE} — no CPU pressure observations collected yet`;
 
 const PRESSURE_MAP: Record<RawPressureState, DisplayPressureLevel> = {
   nominal: 'Normal',
@@ -770,26 +772,23 @@ export function CpuActivityPanel() {
   };
 
   // Format main current load description concisely. `Level · Qualifier` is short enough for
-  // the metric box, so "Normal (nomi..." truncation can never happen.
+  // the metric box, so "Normal (nomi..." truncation can never happen. With no observation at
+  // all there is no level to print — every surface uses the same awaiting-first-change copy.
   const renderCurrentLoadValue = () => {
-    if (status === 'Initializing') {
-      return 'Initializing...';
+    if (!latestSample) {
+      if (status === 'Unavailable') return 'Unavailable';
+      if (status === 'Blocked') return insideIframe ? 'Blocked in iframe' : 'Policy blocked';
+      if (status === 'Paused') return 'Paused';
+      if (status === 'Error') return 'Error';
+      return AWAITING_FIRST_CHANGE;
     }
-    if (status === 'Monitoring' && !latestSample) {
-      return 'Awaiting first change';
-    }
-    if ((status === 'Live' || status === 'Paused' || status === 'Monitoring') && latestSample) {
+    if (
+      status === 'Live' ||
+      status === 'Paused' ||
+      status === 'Monitoring' ||
+      (status === 'Unavailable' && fallbackActive)
+    ) {
       return `${latestSample.displayLevel} · ${PRESSURE_QUALIFIER[latestSample.rawState]}`;
-    }
-    if (status === 'Unavailable') {
-      return fallbackActive && latestSample
-        ? `${latestSample.displayLevel} · ${PRESSURE_QUALIFIER[latestSample.rawState]}`
-        : 'Unavailable';
-    }
-    if (status === 'Paused') {
-      return latestSample
-        ? `${latestSample.displayLevel} · ${PRESSURE_QUALIFIER[latestSample.rawState]}`
-        : 'Paused';
     }
     if (status === 'Blocked') {
       return insideIframe ? 'Blocked in iframe' : 'Policy blocked';
@@ -878,7 +877,8 @@ export function CpuActivityPanel() {
           <div className="px-4 py-3 min-w-0">
             <SystemLoadBadge
               level={currentBadgeLevel}
-              unavailable={status === 'Unavailable' && !fallbackActive}
+              // Never render a green "Normal" gauge before the first real observation.
+              unavailable={latestSample === null || (status === 'Unavailable' && !fallbackActive)}
             />
           </div>
 
@@ -899,7 +899,7 @@ export function CpuActivityPanel() {
               Last Sample
             </span>
             <span className="text-xs sm:text-sm font-mono tabular-nums font-medium text-zinc-900 dark:text-zinc-100 mt-0.5 block truncate">
-              {latestSample ? formatClockTimestamp(latestSample.timestampMs) : 'Waiting...'}
+              {latestSample ? formatClockTimestamp(latestSample.timestampMs) : AWAITING_FIRST_CHANGE}
             </span>
           </div>
 
@@ -907,8 +907,15 @@ export function CpuActivityPanel() {
             <span className="text-xs text-zinc-500 dark:text-zinc-400 font-normal block truncate">
               Samples
             </span>
-            <span className="text-xs sm:text-sm font-mono tabular-nums font-medium text-zinc-900 dark:text-zinc-100 mt-0.5 block truncate">
-              {samples.length}
+            <span
+              className="text-xs sm:text-sm font-mono tabular-nums font-medium text-zinc-900 dark:text-zinc-100 mt-0.5 block truncate"
+              title={
+                samples.length === 0
+                  ? 'No CPU pressure observations collected yet — awaiting first change'
+                  : `${samples.length} CPU pressure observations collected`
+              }
+            >
+              {samples.length === 0 ? '—' : samples.length}
             </span>
           </div>
         </div>
@@ -936,10 +943,12 @@ export function CpuActivityPanel() {
           <div className="flex items-center justify-between text-xs text-zinc-500 dark:text-zinc-400 mb-2">
             <span>CPU Pressure (Normal to Heavy) · Click line to inspect</span>
             <span className="font-mono tabular-nums">
-              {status === 'Live'
+              {samples.length === 0
+                ? AWAITING_FIRST_CHANGE
+                : status === 'Live'
                 ? 'Live 5m'
                 : status === 'Monitoring'
-                ? 'Awaiting first change'
+                ? AWAITING_FIRST_CHANGE
                 : status}
             </span>
           </div>
@@ -1068,19 +1077,9 @@ export function CpuActivityPanel() {
                   textAnchor="middle"
                   className="fill-zinc-400 font-sans text-[11px] font-normal"
                 >
-                  {status === 'Monitoring'
-                    ? 'Waiting for first CPU pressure observation'
-                    : status === 'Initializing'
-                    ? 'Initializing PressureObserver...'
-                    : status === 'Paused'
-                    ? 'Paused (Browser tab inactive or stopped)'
-                    : status === 'Blocked'
-                    ? insideIframe
-                      ? 'Blocked in iframe (open URL in direct tab)'
-                      : 'Blocked: Permissions Policy rejected access'
-                    : status === 'Unavailable'
-                    ? 'Unavailable: CPU pressure source unavailable (auto-reconnect active)'
-                    : errorDetail || 'Error initializing CPU telemetry'}
+                  {samples.length === 0
+                    ? EMPTY_GRAPH_TEXT
+                    : 'No CPU pressure observations in the last 5 minutes'}
                 </text>
               )}
             </svg>

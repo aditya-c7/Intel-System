@@ -334,7 +334,7 @@ check('label clamps / rounds the score and never throws on hostile input', () =>
   assert.equal(confidenceLabelFor('calibrated', 2), 'Confidence 100%');
   assert.equal(confidenceLabelFor('calibrated', -1), 'Confidence 0%');
   assert.doesNotThrow(() => confidenceLabelFor('calibrated', null));
-  assert.equal(confidenceLabelFor('uncalibrated', null), 'Match evidence 0%');
+  assert.equal(confidenceLabelFor('uncalibrated', null), 'Match evidence unavailable');
 });
 
 check('label tracks the record produced by the engine end-to-end', () => {

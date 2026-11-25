@@ -103,11 +103,10 @@ function run(): void {
     }
   });
 
-  check('A3', 'a boolean vendorSignature=true + noiseOnly suppresses the penalty', () => {
+  check('A3', 'a bare boolean vendorSignature=true is not vendor evidence and cannot suppress', () => {
     const verdict = resolveAntiDetectExemption({ vendorSignature: true, noiseOnly: true });
-    assert.equal(verdict.suppressPenalty, true);
-    assert.equal(verdict.anti_detect_browser, false);
-    assert.equal(verdict.anomaly_score, 0);
+    assert.equal(verdict.suppressPenalty, false);
+    assert.ok(verdict.reasons.some((reason) => /vendor/i.test(reason) && /ignor|unrecognized/i.test(reason)));
   });
 
   check('A4', 'privacyHardened and vendorSignature together still suppress (no double count)', () => {

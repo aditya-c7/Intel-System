@@ -404,13 +404,16 @@ function cpuSim(s: ComparisonInput, i: ComparisonInput): number | null {
   if (!a || !b) return 0;
   let comparable = 0;
   let matched = 0;
-  const archA = str(a.arch).toLowerCase();
-  const archB = str(b.arch).toLowerCase();
+  /* Same canonicalization as the hard veto below: x64/x86_64/amd64 and
+   * arm64/aarch64 must not be penalized for spelling differences. */
+  const archA = normalizeArch(str(a.arch));
+  const archB = normalizeArch(str(b.arch));
   if (archA && archB) {
     comparable += 1;
-    if (archA !== archB) return 0; /* arch mismatch is also a hard veto */
+    if (archA !== archB) return 0; /* normalized arch disagreement is a hard veto */
     matched += 1;
   }
+  /* One-sided / absent arch: abstain entirely — no agreement credit, no veto. */
   if (a.cores !== null && a.cores !== undefined && b.cores !== null && b.cores !== undefined) {
     comparable += 1;
     if (a.cores === b.cores) matched += 1;
@@ -712,6 +715,44 @@ function normalizeArch(arch: string): string {
   return a;
 }
 
+/** Leading integer of a numeric/string version ('126.0.6478.126' → 126). */
+function leadingMajor(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? Math.floor(value) : null;
+  if (typeof value === 'string') {
+    const match = /^(\d+)/.exec(value.trim());
+    if (match) {
+      const major = Number.parseInt(match[1], 10);
+      return Number.isFinite(major) ? major : null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Version evidence arrives in two shapes: the engine `versions` slot (numeric
+ * `browserMajor` / `browserFamily`, with 0 meaning "unparsed") and the
+ * resolver/legacy `browser` slot (string major + family). Prefer a positive
+ * `versions.browserMajor`, then `browser.major`, then the 0 sentinel — so a
+ * regression encoded in either shape is still detected.
+ */
+function legacyBrowserOf(input: ComparisonInput): { family?: unknown; major?: unknown } | null {
+  return (input as unknown as { browser?: { family?: unknown; major?: unknown } }).browser ?? null;
+}
+
+function versionFamilyOf(input: ComparisonInput): string {
+  const fromVersions = str(input.versions?.browserFamily).toLowerCase();
+  if (fromVersions) return fromVersions;
+  return str(legacyBrowserOf(input)?.family).toLowerCase();
+}
+
+function versionMajorOf(input: ComparisonInput): number | null {
+  const fromVersions = leadingMajor(input.versions?.browserMajor);
+  if (fromVersions !== null && fromVersions > 0) return fromVersions;
+  const fromBrowser = leadingMajor(legacyBrowserOf(input)?.major);
+  if (fromBrowser !== null) return fromBrowser;
+  return fromVersions;
+}
+
 /**
  * Rendering-hash drift allowance: same browser family, incoming version is
  * 0–3 majors ahead of stored, and the hardware signals (gpu / screen / cpu
@@ -795,13 +836,11 @@ export function compareFingerprints(
 
   /* 2. Version monotonicity + drift allowance. */
   const violations: string[] = [];
-  const vs = s.versions;
-  const vi = i.versions;
-  const famA = str(vs?.browserFamily).toLowerCase();
-  const famB = str(vi?.browserFamily).toLowerCase();
+  const famA = versionFamilyOf(s);
+  const famB = versionFamilyOf(i);
   const sameFamily = Boolean(famA && famB && famA === famB);
-  const majorA = vs && typeof vs.browserMajor === 'number' && isFinite(vs.browserMajor) ? vs.browserMajor : null;
-  const majorB = vi && typeof vi.browserMajor === 'number' && isFinite(vi.browserMajor) ? vi.browserMajor : null;
+  const majorA = versionMajorOf(s);
+  const majorB = versionMajorOf(i);
 
   let driftAllowed = false;
   if (sameFamily && majorA !== null && majorB !== null) {
