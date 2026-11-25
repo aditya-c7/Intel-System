@@ -31,6 +31,13 @@ import {
 } from '../src/lib/riskLedger';
 import { timezonesEquivalent, timezoneMismatchContext } from '../src/lib/timezone';
 import { isIncognitoDiagnosticsEnabled } from '../src/lib/collector';
+import {
+  buildTimingShadow,
+  evaluateCollectorBudget,
+  percentilesFromTimings,
+  type CollectorTimingStats,
+} from '../src/lib/collectorTimingShadow';
+import { buildFjsV5ParitySnapshot } from '../src/lib/fjsV5Parity';
 
 let passed = 0;
 const failures: string[] = [];
@@ -510,6 +517,148 @@ function main(): void {
     assert.equal(primitive.score_0_100, withoutDiag.score_0_100);
     assert.equal(primitive.tier, withoutDiag.tier);
     assert.equal(primitive.tier, riskTier(primitive.score_0_100));
+  });
+
+  /* ------------------------------------------------------------------------ */
+  section('5. Additive collector timing shadow: flag-gated, deterministic, total');
+  /* ------------------------------------------------------------------------ */
+
+  check('percentilesFromTimings uses nearest-rank p50/p95 over finite numeric timings', () => {
+    const stats = percentilesFromTimings({ a: 100, b: 200, c: 300, d: 400 });
+    assert.equal(stats.count, 4);
+    // ceil(0.5*4)=2 -> 200 ; ceil(0.95*4)=4 -> 400
+    assert.equal(stats.p50, 200);
+    assert.equal(stats.p95, 400);
+    const odd = percentilesFromTimings({ boot: 120, probe: 260, render: 700 });
+    assert.equal(odd.count, 3);
+    assert.equal(odd.p50, 260); // ceil(0.5*3)=2
+    assert.equal(odd.p95, 700); // ceil(0.95*3)=3
+  });
+
+  check('percentilesFromTimings is deterministic and never mutates its input', () => {
+    const timings: Record<string, number> = { z: 90, a: 10, m: 50 };
+    const keys = Object.keys(timings);
+    const snapshot = { ...timings };
+    const first = percentilesFromTimings(timings);
+    const second = percentilesFromTimings(timings);
+    assert.deepEqual(first, second);
+    assert.deepEqual(timings, snapshot);
+    assert.deepEqual(Object.keys(timings), keys);
+  });
+
+  check('percentilesFromTimings is total on null/hostile input (neutral count=0)', () => {
+    const neutral = { count: 0, p50: 0, p95: 0 };
+    const hostile: unknown[] = [
+      null,
+      undefined,
+      42,
+      'x',
+      [],
+      { a: NaN },
+      { a: Infinity },
+      { a: '5' },
+      { a: null },
+    ];
+    for (const value of hostile) {
+      assert.deepEqual(
+        percentilesFromTimings(value as unknown as Record<string, number>),
+        neutral,
+        `hostile input ${String(value)}`,
+      );
+    }
+  });
+
+  check('evaluateCollectorBudget reports the 250ms/800ms budgets descriptively', () => {
+    assert.deepEqual(evaluateCollectorBudget({ count: 3, p50: 100, p95: 500 }), {
+      p50Within250: true,
+      p95Within800: true,
+    });
+    assert.deepEqual(evaluateCollectorBudget({ count: 3, p50: 300, p95: 900 }), {
+      p50Within250: false,
+      p95Within800: false,
+    });
+    // Boundary values are inclusive.
+    assert.deepEqual(evaluateCollectorBudget({ count: 1, p50: 250, p95: 800 }), {
+      p50Within250: true,
+      p95Within800: true,
+    });
+  });
+
+  check('evaluateCollectorBudget is total and neutral on hostile input', () => {
+    const neutral = { p50Within250: false, p95Within800: false };
+    const hostile: unknown[] = [null, undefined, 7, 'x', {}, { count: 0, p50: 0, p95: 0 }];
+    for (const value of hostile) {
+      assert.deepEqual(
+        evaluateCollectorBudget(value as unknown as CollectorTimingStats),
+        neutral,
+      );
+    }
+  });
+
+  check('buildTimingShadow composes stats + budget deterministically without side effects', () => {
+    const timings = { boot: 120, probe: 260, render: 700 };
+    const first = buildTimingShadow(timings);
+    const second = buildTimingShadow(timings);
+    assert.deepEqual(first, second);
+    assert.deepEqual(first, {
+      count: 3,
+      p50: 260,
+      p95: 700,
+      budget: { p50Within250: false, p95Within800: true },
+    });
+    assert.deepEqual(buildTimingShadow(null), {
+      count: 0,
+      p50: 0,
+      p95: 0,
+      budget: { p50Within250: false, p95Within800: false },
+    });
+  });
+
+  check('flag-off payload has no timing_shadow and load_get_timing is byte-identical', () => {
+    // Mirror of the exact identify-body spread logic: the flag gate is the ONLY switch.
+    const recordedTimings = { boot: 120, probe: 260 };
+    const recordedTotalDuration = 900;
+    const loadGetTiming = {
+      source: 'signals.meta',
+      timings_ms: recordedTimings,
+      ...(typeof recordedTotalDuration === 'number' && Number.isFinite(recordedTotalDuration)
+        ? { total_duration_ms: recordedTotalDuration }
+        : {}),
+    };
+    const compose = (diagOn: boolean): Record<string, unknown> => ({
+      ...(loadGetTiming ? { load_get_timing: loadGetTiming } : {}),
+      ...(diagOn ? { timing_shadow: buildTimingShadow(recordedTimings) } : {}),
+    });
+    const off = compose(false);
+    const on = compose(true);
+    assert.deepEqual(Object.keys(off), ['load_get_timing']);
+    assert.deepEqual(off, { load_get_timing: loadGetTiming });
+    assert.equal(JSON.stringify(off.load_get_timing), JSON.stringify(on.load_get_timing));
+    assert.deepEqual(Object.keys(on).sort(), ['load_get_timing', 'timing_shadow']);
+    assert.deepEqual(on.timing_shadow, buildTimingShadow(recordedTimings));
+  });
+
+  check('flag-off payload has no fjs_v5_parity_shadow; flag-on is descriptive only', () => {
+    const sample = { fonts: { installed: ['Arial', 'Roboto'] } };
+    const compose = (diagOn: boolean): Record<string, unknown> => ({
+      ...(diagOn
+        ? { fjs_v5_parity_shadow: buildFjsV5ParitySnapshot(sample) }
+        : {}),
+    });
+    const off = compose(false);
+    const on = compose(true);
+    assert.deepEqual(off, {});
+    const shadow = on.fjs_v5_parity_shadow as Record<string, unknown>;
+    assert.equal(shadow.surface, 'fjs-v5-parity');
+    assert.equal(typeof shadow.fontCoverage, 'object');
+    // No verdict/score surface may appear as a FIELD (prose notes may mention the words).
+    for (const key of Object.keys(shadow)) {
+      assert.equal(['surface', 'status', 'fontCoverage', 'emoji', 'math', 'fontPreferences', 'geoFields', 'battery', 'keyboard', 'reasons'].includes(key), true, `unexpected shadow key ${key}`);
+    }
+    const asString = JSON.stringify(shadow);
+    for (const forbidden of ['"score10"', '"risk_level"', '"digest"', '"confidence_score"']) {
+      assert.equal(asString.includes(forbidden), false, `shadow must not carry ${forbidden}`);
+    }
   });
 }
 

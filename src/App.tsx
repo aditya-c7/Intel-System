@@ -922,6 +922,27 @@ export default function App() {
   // Flag-gated console diagnostics: the latest identify response's `diagnostics` object.
   // A ref so capturing it never re-renders the dashboard.
   const diagRef = useRef<unknown>(null);
+  // Small popover explaining match evidence vs calibrated confidence.
+  const [calibrationInfoOpen, setCalibrationInfoOpen] = useState<boolean>(false);
+  const calibrationInfoRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!calibrationInfoOpen) return;
+    const dismissOnOutside = (event: MouseEvent) => {
+      if (!calibrationInfoRef.current?.contains(event.target as Node)) {
+        setCalibrationInfoOpen(false);
+      }
+    };
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setCalibrationInfoOpen(false);
+    };
+    document.addEventListener('mousedown', dismissOnOutside);
+    document.addEventListener('keydown', dismissOnEscape);
+    return () => {
+      document.removeEventListener('mousedown', dismissOnOutside);
+      document.removeEventListener('keydown', dismissOnEscape);
+    };
+  }, [calibrationInfoOpen]);
 
   // Swiss light mode is the only theme: strip any legacy class before the first paint.
   useLayoutEffect(enforceLightTheme, []);
@@ -2284,9 +2305,34 @@ export default function App() {
                         canonical.confidenceLabel.trim()
                           ? canonical.confidenceLabel.trim()
                           : null;
-                      const isUncalibrated = canonical?.calibrationStatus !== 'calibrated';
                       return (
                         <>
+                          <div
+                            className="relative inline-flex items-center"
+                            ref={calibrationInfoRef}
+                          >
+                            <button
+                              type="button"
+                              onClick={() => setCalibrationInfoOpen((open) => !open)}
+                              aria-label="About match evidence and calibration"
+                              aria-expanded={calibrationInfoOpen}
+                              title="About match evidence and calibration"
+                              className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-slate-300 bg-white font-serif text-[11px] font-bold italic leading-none text-slate-600 hover:border-slate-400 hover:text-slate-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#F05A28]/40 cursor-pointer"
+                            >
+                              i
+                            </button>
+                            {calibrationInfoOpen && (
+                              <div
+                                role="dialog"
+                                aria-label="About match evidence and calibration"
+                                className="absolute left-0 top-full z-30 mt-2 w-72 max-w-[calc(100vw-2rem)] rounded-xl border border-slate-200 bg-white p-3 text-left shadow-lg"
+                              >
+                                <p className="mt-1.5 whitespace-pre-line text-[11px] leading-relaxed text-slate-600">
+                                  {'Match evidence, not a probability'}
+                                </p>
+                              </div>
+                            )}
+                          </div>
                           <span
                             className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
                               serverLabel
@@ -2306,26 +2352,6 @@ export default function App() {
                             )}
                             {serverLabel ?? 'Match evidence unavailable'}
                           </span>
-                          {isUncalibrated && (
-                            <span
-                              className="inline-flex items-center rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-800"
-                              title="No held-out calibration gate has passed for this score"
-                            >
-                              <span aria-hidden="true" className="mr-1">
-                                !
-                              </span>
-                              uncalibrated
-                            </span>
-                          )}
-                          {/* "why?" path — the authoritative value and its provenance live in
-                              the canonical Event JSON below; no new panel is introduced. */}
-                          <a
-                            href="#raw-json"
-                            className="text-[10px] font-medium text-slate-600 underline underline-offset-2 hover:text-slate-900"
-                            title="See canonical.identity.confidence_label and calibration_status in the Event JSON"
-                          >
-                            why?
-                          </a>
                         </>
                       );
                     })()}

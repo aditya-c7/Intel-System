@@ -19,6 +19,7 @@ import {
   type NetworkLayerInput,
   type TlsLiteInput,
 } from '../src/lib/networkEdge.ts';
+import { buildNetworkTruthShadow } from '../src/lib/networkTruthShadow.ts';
 
 let passed = 0;
 const failures: string[] = [];
@@ -274,6 +275,124 @@ const hostileCombined = noThrow(() => networkLayerDetail({ ja4h: 5 as unknown as
 check(
   'hostile combined input does not throw and degrades to "unavailable"',
   hostileCombined !== null && hostileCombined.hash === 'unavailable' && hostileCombined.available === false
+);
+
+/* -------------------------------------------------------------------------- */
+/* buildNetworkTruthShadow — flag-gated additive diagnostic                    */
+/* -------------------------------------------------------------------------- */
+section('buildNetworkTruthShadow — additive-only, descriptive, fails closed');
+
+// Flag-off parity: with no genuine signal the builder returns undefined, so the two
+// conditional spreads emit no new key. Input objects are never mutated.
+const flagOffInput = {
+  edgeTransport: { httpProtocol: 'unavailable', clientTcpRtt: null, colo: '' },
+  geo: { countryCode: '', country: '' },
+  proxyDetails: { provider: 'unknown', observedAt: 'not-a-date' },
+  observedRttMs: null,
+};
+const flagOffSnapshot = JSON.stringify(flagOffInput);
+const flagOffShadow = noThrow(() => buildNetworkTruthShadow(flagOffInput));
+check(
+  'flag-off / no genuine signal emits no diagnostic key',
+  flagOffShadow === undefined && JSON.stringify(flagOffInput) === flagOffSnapshot
+);
+check(
+  'absent input and hostile primitives also emit no key',
+  buildNetworkTruthShadow() === undefined &&
+    buildNetworkTruthShadow(null) === undefined &&
+    buildNetworkTruthShadow(42) === undefined
+);
+
+// Flag-on: only the four additive namespaced fields appear, with descriptive values.
+const shadowInput = {
+  edgeTransport: { httpProtocol: 'HTTP/3', clientTcpRtt: 0, colo: 'SFO' },
+  geo: { countryCode: 'US', country: 'United States' },
+  proxyDetails: {
+    proxy: true,
+    provider: 'ExampleRelay',
+    observedAt: '2026-11-24T10:00:00Z',
+    reason: 'supplied by producer',
+  },
+  observedRttMs: 42,
+};
+const shadowSnapshot = JSON.stringify(shadowInput);
+const shadow = buildNetworkTruthShadow(shadowInput);
+const shadowKeys = shadow ? Object.keys(shadow).sort() : [];
+check(
+  'flag-on emits only the four additive namespaced keys',
+  JSON.stringify(shadowKeys) ===
+    JSON.stringify(['edgeTransport', 'lightDistance', 'proxyObservedAt', 'proxyProvider']),
+  shadowKeys.join(',')
+);
+check(
+  'proxy provider and observation time are surfaced only when genuine',
+  shadow?.proxyProvider === 'ExampleRelay' && shadow?.proxyObservedAt === '2026-11-24T10:00:00.000Z'
+);
+check(
+  'QUIC normalization is descriptive and nulls a 0 ms TCP RTT placeholder on QUIC',
+  shadow?.edgeTransport?.quicNormalized.status === 'quic_signal_present' &&
+    shadow.edgeTransport.quicNormalized.basis === 'httpProtocol' &&
+    typeof shadow.edgeTransport.quicNormalized.zeroTcpRttNote === 'string'
+);
+check(
+  'effective RTT source is descriptive (client-reported fallback here)',
+  shadow?.edgeTransport?.effectiveRttSource.source === 'clientReportedRtt'
+);
+check(
+  'light distance is labelled approximation / not JA4L with a descriptive direction',
+  /approximation/i.test(shadow?.lightDistance?.label ?? '') &&
+    /not JA4L/i.test(shadow?.lightDistance?.label ?? '') &&
+    /client → edge colo SFO/.test(shadow?.lightDistance?.direction ?? '')
+);
+check(
+  'mirror carries no verdict, score, tier, confidence or verification claim',
+  !/verdict|score|\btier\b|confidence|verified|verification|isBot/i.test(
+    JSON.stringify(shadow ?? null)
+  ),
+  JSON.stringify(shadow ?? null)
+);
+check('flag-on never mutates its inputs', JSON.stringify(shadowInput) === shadowSnapshot);
+check(
+  'builder is deterministic for identical inputs',
+  JSON.stringify(buildNetworkTruthShadow(shadowInput)) === JSON.stringify(shadow)
+);
+
+const partialShadow = buildNetworkTruthShadow({ proxyDetails: { provider: 'RelayCo' } });
+check(
+  'only genuinely supplied members are present (absent ones are not fabricated)',
+  partialShadow !== undefined &&
+    Object.keys(partialShadow).length === 1 &&
+    partialShadow.proxyProvider === 'RelayCo' &&
+    !('proxyObservedAt' in partialShadow) &&
+    !('edgeTransport' in partialShadow) &&
+    !('lightDistance' in partialShadow)
+);
+
+// Hostile inputs fail closed: no throw, no invented provider/time/direction.
+const hostileShadow = noThrow(() =>
+  buildNetworkTruthShadow({
+    get edgeTransport() {
+      throw new Error('hostile getter');
+    },
+    geo: [],
+    proxyDetails: 42,
+    observedRttMs: Number.NaN,
+  })
+);
+check('throwing getters and hostile shapes fail closed without throwing', hostileShadow === undefined);
+
+const unavailableShadow = buildNetworkTruthShadow({
+  edgeTransport: { httpProtocol: 'unknown', clientTcpRtt: -1, colo: 'n/a' },
+  proxyDetails: { provider: 'unavailable', observedAt: 'garbage' },
+  observedRttMs: 0,
+});
+check(
+  'unavailable tokens and non-positive RTTs never become fabricated values',
+  unavailableShadow === undefined
+);
+check(
+  'over-long hostile provider strings fail closed',
+  buildNetworkTruthShadow({ proxyDetails: { provider: 'x'.repeat(500) } }) === undefined
 );
 
 /* -------------------------------------------------------------------------- */

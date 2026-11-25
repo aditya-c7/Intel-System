@@ -19,6 +19,7 @@ import {
   type HardwareSimHashProfile,
   type VisitorIdentityTier,
 } from '../src/lib/identityTiers';
+import { deriveSupplementaryCohort } from '../src/lib/supplementaryCohort';
 
 let passed = 0;
 const failures: string[] = [];
@@ -556,6 +557,108 @@ check('GPU renderer family is a coarse stable bucket', () => {
   assert.equal(renamed.features.gpu_renderer_family, 'nvidia');
   const software = resolveHardwareSimHashProfile({ gpuRenderer: 'SwiftShader Device' });
   assert.equal(software.features.gpu_renderer_family, 'software');
+});
+
+/* -------------------------------------------------------------------------- */
+/* 5. Supplementary cohort — shadow-only, non-canonical derivation             */
+/* -------------------------------------------------------------------------- */
+
+section('5. deriveSupplementaryCohort — shadow-only cohort key');
+
+check('result has exactly four fields, shadow status and a namespaced cohort key', () => {
+  const result = deriveSupplementaryCohort(STABLE_SIGNALS);
+  assert.deepEqual(Object.keys(result).sort(), ['cohort_key', 'evidence_score', 'status', 'version']);
+  assert.equal(result.status, 'shadow');
+  assert.equal(result.version, '1');
+  assert.match(result.cohort_key, /^cohort:v1:[0-9a-f]{32}$/);
+  assert.ok(Number.isInteger(result.evidence_score));
+  assert.ok(result.evidence_score > 0 && result.evidence_score <= 100);
+});
+
+check('no canonical/supplied id is echoed and no visitor_id field is minted', () => {
+  const secrets = {
+    storageVisitorId: 'secret-visitor-id-123',
+    exactHardwareId: 'secret-hardware-id-456',
+    hardware_fingerprint: 'secret-hw-fp-789',
+    browser_fingerprint: 'secret-browser-fp-abc',
+    session_id: 'secret-session-def',
+    visitor_id: 'secret-canonical-ghi',
+  };
+  const result = deriveSupplementaryCohort({ ...STABLE_SIGNALS, ...secrets });
+  const serialized = JSON.stringify(result);
+  for (const secret of Object.values(secrets)) {
+    assert.ok(!serialized.includes(secret), `must not echo ${secret}`);
+  }
+  for (const field of ['visitor_id', 'visitorId', 'hardware_fingerprint', 'browser_fingerprint', 'session_id']) {
+    assert.ok(!Object.prototype.hasOwnProperty.call(result, field), `must not mint ${field}`);
+  }
+  assert.ok(!result.cohort_key.includes('secret'), 'cohort key must be an opaque hash, not a raw id');
+});
+
+check('volatile inputs (screen/timezone/canvas/quota/audio/fonts) do not change the cohort key', () => {
+  const base = deriveSupplementaryCohort(STABLE_SIGNALS);
+  const noisy = deriveSupplementaryCohort({
+    ...STABLE_SIGNALS,
+    screenWidth: 3840,
+    screenHeight: 2160,
+    colorDepth: 30,
+    pixelDepth: 30,
+    timezone: 'Asia/Tokyo',
+    timezoneOffset: 540,
+    canvasNoise: Math.random(),
+    canvasHash: 'per-session-noise',
+    storageQuota: 987654321,
+    audioSum: 42.42,
+    systemFonts: ['Comic Sans MS'],
+    fontCount: 3,
+  });
+  assert.equal(noisy.cohort_key, base.cohort_key, 'volatile noise must not move the cohort key');
+  assert.deepEqual(noisy, base, 'the entire shadow result must be stable');
+});
+
+check('shadow cohort derivation is deterministic and insertion-order independent', () => {
+  const a = deriveSupplementaryCohort(STABLE_SIGNALS);
+  assert.deepEqual(a, deriveSupplementaryCohort(STABLE_SIGNALS));
+  const reversed: Record<string, unknown> = {};
+  for (const key of Object.keys(STABLE_SIGNALS).reverse()) reversed[key] = STABLE_SIGNALS[key as keyof typeof STABLE_SIGNALS];
+  assert.deepEqual(deriveSupplementaryCohort(reversed), a);
+});
+
+check('different stable cohorts produce different keys', () => {
+  const base = deriveSupplementaryCohort(STABLE_SIGNALS);
+  const arm = deriveSupplementaryCohort({
+    ...STABLE_SIGNALS,
+    architecture: 'arm64',
+    gpuArchFamily: 'arm',
+    gpuVendor: 'Apple',
+    hostOs: 'macos',
+    osFamily: 'macos',
+  });
+  assert.notEqual(arm.cohort_key, base.cohort_key);
+  assert.equal(arm.status, 'shadow');
+});
+
+check('empty and hostile input fails closed without throwing', () => {
+  const hostile: unknown[] = [
+    undefined,
+    null,
+    7,
+    'x',
+    [],
+    Symbol('s'),
+    new Proxy({}, { get() { throw new Error('no'); } }),
+    { canvasNoise: 1, storageQuota: 2, timezoneOffset: 3 },
+  ];
+  for (const input of hostile) {
+    let result: ReturnType<typeof deriveSupplementaryCohort> | undefined;
+    assert.doesNotThrow(() => {
+      result = deriveSupplementaryCohort(input);
+    });
+    assert.equal(result?.cohort_key, 'cohort:unclassified');
+    assert.equal(result?.evidence_score, 0);
+    assert.equal(result?.status, 'shadow');
+    assert.deepEqual(Object.keys(result ?? {}).sort(), ['cohort_key', 'evidence_score', 'status', 'version']);
+  }
 });
 
 /* -------------------------------------------------------------------------- */
