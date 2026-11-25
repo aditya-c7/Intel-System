@@ -30,6 +30,7 @@ import { collectMathSignals } from './math';
 import { collectSystemEntropySignals } from './systemEntropy';
 import { collectAutomationSignals, startKinematicsTracker } from './automation';
 import { stableHash32, stableStringify, errorMessage } from './hash';
+import { loadSources, type Component, type Source } from './loader';
 import type {
   AudioSignals,
   AutomationSignals,
@@ -40,6 +41,7 @@ import type {
   EmojiSignals,
   FontPreferenceSignals,
   FontSignals,
+  KinematicsTracker,
   MathSignals,
   SystemEntropySignals,
   WebglBasics,
@@ -188,6 +190,160 @@ const fallbackAutomation = (): AutomationSignals => ({
   shapes: [],
 });
 
+/* -------------------------------------------------------------------------- */
+/* Two-phase source path — FingerprintJS v5 `load()` / `getComponents()`       */
+/* -------------------------------------------------------------------------- */
+
+/** Shared context handed to every source of one `loadAll()` call. */
+export interface SignalSourceOptions {
+  /** One shared cache per load; sources may cross-reference values by key. */
+  cache: Record<string, unknown>;
+  /** Collector options forwarded from `loadAll`. */
+  options: CollectAllOptions;
+  /** Started at load time so behavior during phase 1 is captured too. */
+  kinematics: KinematicsTracker;
+}
+
+function flagEnabled(value: unknown): boolean {
+  return value === true || value === 'true' || value === 1 || value === '1';
+}
+
+/**
+ * Reads the `FP_TWO_PHASE_SOURCES` switch (default OFF). A `globalThis` value
+ * wins so Node/tsx tests can toggle it; Vite `import.meta.env` is the fallback
+ * for browser builds.
+ */
+export function twoPhaseSourcesEnabled(): boolean {
+  const fromGlobal = (globalThis as { FP_TWO_PHASE_SOURCES?: unknown }).FP_TWO_PHASE_SOURCES;
+  if (fromGlobal !== undefined) return flagEnabled(fromGlobal);
+  try {
+    const env = (import.meta as unknown as { env?: Record<string, unknown> }).env;
+    if (env) {
+      const fromEnv = env.FP_TWO_PHASE_SOURCES ?? env.VITE_FP_TWO_PHASE_SOURCES;
+      if (fromEnv !== undefined) return flagEnabled(fromEnv);
+    }
+  } catch {
+    // `import.meta.env` does not exist outside Vite; the global flag is the switch.
+  }
+  return false;
+}
+
+interface CanvasGroup {
+  canvas: CanvasSignals;
+  noise: CanvasNoiseReport;
+}
+
+function cacheValue<T>(ctx: SignalSourceOptions, key: string, value: T): T {
+  ctx.cache[key] = value;
+  return value;
+}
+
+/**
+ * Built-in sources in FIXED DECLARATION ORDER. Async sources come first so
+ * they overlap the synchronous ones; the automation source is two-stage and
+ * reads its phase-1 dependencies from the shared cache at get time.
+ */
+const signalSources = {
+  audio: async (): Promise<AudioSignals> => {
+    const signals = await collectAudioSignals();
+    signals.audioBaseLatency = await collectAudioBaseLatency();
+    return signals;
+  },
+  canvas: (ctx: SignalSourceOptions): CanvasGroup =>
+    cacheValue(ctx, 'canvasGroup', (() => {
+      const canvas = getCanvasFingerprint();
+      const noise = classifyCanvasNoise(canvas, ctx.options.browserHints);
+      return { canvas, noise };
+    })()),
+  fonts: (ctx: SignalSourceOptions): FontSignals => cacheValue(ctx, 'fonts', collectFontSignals()),
+  fontPreferences: (ctx: SignalSourceOptions): FontPreferenceSignals =>
+    cacheValue(ctx, 'fontPreferences', collectFontPreferenceSignals()),
+  emoji: (): EmojiSignals => collectEmojiSignals(),
+  webglBasics: (ctx: SignalSourceOptions): WebglBasics => cacheValue(ctx, 'webglBasics', getWebglBasics()),
+  webglExtensions: (): WebglExtensions => getWebglExtensions(),
+  webglGpuIdentity: (ctx: SignalSourceOptions): WebglGpuIdentity =>
+    cacheValue(ctx, 'webglGpuIdentity', getWebglGpuIdentity()),
+  math: (): Promise<MathSignals> => collectMathSignals(),
+  systemEntropy: (): Promise<SystemEntropySignals> => collectSystemEntropySignals(),
+  automation: (ctx: SignalSourceOptions) => async (): Promise<AutomationSignals> => {
+    const fonts = ctx.cache.fonts as FontSignals | undefined;
+    const fontPreferences = ctx.cache.fontPreferences as FontPreferenceSignals | undefined;
+    const webglBasics = ctx.cache.webglBasics as WebglBasics | undefined;
+    const webglGpuIdentity = ctx.cache.webglGpuIdentity as WebglGpuIdentity | undefined;
+    return collectAutomationSignals({
+      fontsInstalled: fonts?.installed,
+      fontWidthsExact: fontPreferences?.widthsExactIntegers,
+      rendererUnmasked: webglBasics?.rendererUnmasked ?? webglGpuIdentity?.normalizedGpu,
+      secChBrands: ctx.options.secChBrands,
+    });
+  },
+} satisfies Record<string, Source<SignalSourceOptions, unknown>>;
+
+/** A component error is mapped onto the same annotated fallback the legacy path uses. */
+function unwrapComponent<T>(component: Component<T> | undefined, fallbackFactory: () => T): T {
+  if (component && 'value' in component) return component.value;
+  const fallback = fallbackFactory() as { error?: string };
+  if (component && 'error' in component) {
+    if (!fallback.error) fallback.error = errorMessage(component.error);
+  } else {
+    fallback.error = 'source returned no component';
+  }
+  return fallback as T;
+}
+
+/**
+ * Phase 1 — start every source (one shared cache) and return `getComponents()`.
+ * Phase 2 — `getComponents()` assembles the same `CollectedSignals` shape as
+ * `collectAllSignals`, so neither digests nor the payload key set change.
+ */
+export function loadAll(options?: CollectAllOptions): () => Promise<CollectedSignals> {
+  const started = nowMs();
+  const ctx: SignalSourceOptions = {
+    cache: {},
+    options: options ?? {},
+    kinematics: startKinematicsTracker(),
+  };
+  const getComponents = loadSources(signalSources, ctx, []);
+
+  return async function getComponentsAsSignals(): Promise<CollectedSignals> {
+    const components = await getComponents();
+    const timingsMs: Record<string, number> = {};
+    for (const key of Object.keys(components) as (keyof typeof components)[]) {
+      timingsMs[key] = components[key].duration;
+    }
+
+    const canvasGroup = unwrapComponent(components.canvas, () => ({
+      canvas: fallbackCanvas(),
+      noise: fallbackCanvasNoise(),
+    }));
+
+    const automation = unwrapComponent(components.automation, fallbackAutomation);
+    const kinematicReasons = ctx.kinematics.drain();
+    ctx.kinematics.stop();
+    automation.reasonIds = Array.from(new Set([...automation.reasonIds, ...kinematicReasons]));
+
+    return {
+      canvas: canvasGroup.canvas,
+      canvasNoise: canvasGroup.noise,
+      fonts: unwrapComponent(components.fonts, fallbackFonts),
+      fontPreferences: unwrapComponent(components.fontPreferences, fallbackFontPreferences),
+      emoji: unwrapComponent(components.emoji, fallbackEmoji),
+      webglBasics: unwrapComponent(components.webglBasics, fallbackWebglBasics),
+      webglExtensions: unwrapComponent(components.webglExtensions, fallbackWebglExtensions),
+      webglGpuIdentity: unwrapComponent(components.webglGpuIdentity, fallbackWebglGpuIdentity),
+      audio: unwrapComponent(components.audio, fallbackAudio),
+      math: unwrapComponent(components.math, fallbackMath),
+      systemEntropy: unwrapComponent(components.systemEntropy, fallbackSystemEntropy),
+      automation,
+      meta: {
+        collectedAt: new Date().toISOString(),
+        totalDurationMs: Math.round(nowMs() - started),
+        timingsMs,
+      },
+    };
+  };
+}
+
 /**
  * Runs every collector. Best results occur after DOM ready (collectors
  * attach elements to document.body). Each collector is independent and
@@ -195,6 +351,12 @@ const fallbackAutomation = (): AutomationSignals => ({
  * poisons the others.
  */
 export async function collectAllSignals(opts?: CollectAllOptions): Promise<CollectedSignals> {
+  // Flag-gated two-phase path. When OFF (the default) the legacy body below is
+  // unchanged and behavior is byte-identical to before this loader existed.
+  if (twoPhaseSourcesEnabled()) {
+    return loadAll(opts)();
+  }
+
   const timeoutMs = opts?.timeouts ?? DEFAULT_TIMEOUT_MS;
   const timings: Timings = { record: {} };
   const started = nowMs();

@@ -1,0 +1,228 @@
+{
+  "schema_version": 1,
+  "frozen": true,
+  "offline": true,
+  "generated_on": "2026-11-24",
+  "note": "SHADOW / research fixture for the R4 supplementary high-recall sibling id. These are deterministic HMAC-SHA-256 cohort hints derived from ALREADY RESOLVED stable signals only. They are NOT primary ids, NOT confidence scores and NOT blocking keys. No network, no DO writes and no random minting are involved.",
+  "contract": {
+    "purpose_key": "high-recall:v1",
+    "prior_key_accepted_one_rotation": "high-recall:v0",
+    "id_alphabet": "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+    "id_length": 20,
+    "max_id_length": 25,
+    "ipv4_prefix": "/24",
+    "ipv6_prefix": "/48",
+    "confidence_claim": "none",
+    "primary_id_authoritative": true,
+    "hr_hint_only_never_sole_blocking_key": true,
+    "friction_matrix": {
+      "both_match": "low",
+      "hr_only": "moderate",
+      "both_differ": "new"
+    }
+  },
+  "cases": [
+    {
+      "id": "full-stable-bundle",
+      "name": "All resolved stable signals present; tenant-scoped pepper",
+      "input": {
+        "normalizedUserAgent": "Chrome/124.0.0.0 Windows NT 10.0",
+        "firstLanguage": "en-US",
+        "clientIp": "203.0.113.42",
+        "timezone": "America/New_York",
+        "platform": "Win32",
+        "architecture": "x86_64",
+        "browserDetails": { "browser_name": "Chrome" },
+        "tenantId": "tenant-acme"
+      },
+      "expected": {
+        "visitor_id": "Hrug9cDgKCZSGz6rIMxe",
+        "visitor_found": true,
+        "reason": "derived_from:architecture,browser,ip_prefix,language,platform,timezone,ua",
+        "key_version": "high-recall:v1"
+      },
+      "expected_input": {
+        "values": {
+          "ua": "chrome/124.0.0.0 windows nt 10.0",
+          "language": "en-us",
+          "ip_prefix": "203.0.113.0/24",
+          "timezone": "america/new_york",
+          "platform": "win32",
+          "architecture": "x86_64",
+          "browser": "chrome"
+        },
+        "pepper": "tenant-acme",
+        "key_version": "high-recall:v1"
+      }
+    },
+    {
+      "id": "same-ip24-different-host",
+      "name": "Two hosts in the same IPv4 /24 collapse to one HR cohort",
+      "input": {
+        "normalizedUserAgent": "Chrome/124.0.0.0 Windows NT 10.0",
+        "firstLanguage": "en-US",
+        "clientIp": "203.0.113.99",
+        "timezone": "America/New_York",
+        "platform": "Win32",
+        "architecture": "x86_64",
+        "browserDetails": { "browser_name": "Chrome" },
+        "tenantId": "tenant-acme"
+      },
+      "expected": {
+        "visitor_id": "Hrug9cDgKCZSGz6rIMxe",
+        "visitor_found": true,
+        "reason": "derived_from:architecture,browser,ip_prefix,language,platform,timezone,ua",
+        "key_version": "high-recall:v1"
+      }
+    },
+    {
+      "id": "ipv6-full",
+      "name": "Full IPv6 address truncated to /48 (three zero-padded hextets)",
+      "input": {
+        "normalizedUserAgent": "Chrome/124.0.0.0 Windows NT 10.0",
+        "firstLanguage": "en-US",
+        "clientIp": "2001:db8:abcd:1234:5678:9abc:def0:0001",
+        "timezone": "America/New_York",
+        "platform": "Win32",
+        "architecture": "x86_64",
+        "browserDetails": { "browser_name": "Chrome" },
+        "tenantId": "tenant-acme"
+      },
+      "expected": {
+        "visitor_id": "IRHMlK56AOKuvOFtanGc",
+        "visitor_found": true,
+        "reason": "derived_from:architecture,browser,ip_prefix,language,platform,timezone,ua",
+        "key_version": "high-recall:v1"
+      },
+      "expected_input": {
+        "values": {
+          "ua": "chrome/124.0.0.0 windows nt 10.0",
+          "language": "en-us",
+          "ip_prefix": "2001:0db8:abcd::/48",
+          "timezone": "america/new_york",
+          "platform": "win32",
+          "architecture": "x86_64",
+          "browser": "chrome"
+        },
+        "pepper": "tenant-acme",
+        "key_version": "high-recall:v1"
+      }
+    },
+    {
+      "id": "ipv6-compressed-suffix",
+      "name": "Compressed IPv6 suffix collapses to the same /48 cohort as the full form",
+      "input": {
+        "normalizedUserAgent": "Chrome/124.0.0.0 Windows NT 10.0",
+        "firstLanguage": "en-US",
+        "clientIp": "2001:db8:abcd::beef",
+        "timezone": "America/New_York",
+        "platform": "Win32",
+        "architecture": "x86_64",
+        "browserDetails": { "browser_name": "Chrome" },
+        "tenantId": "tenant-acme"
+      },
+      "expected": {
+        "visitor_id": "IRHMlK56AOKuvOFtanGc",
+        "visitor_found": true,
+        "reason": "derived_from:architecture,browser,ip_prefix,language,platform,timezone,ua",
+        "key_version": "high-recall:v1"
+      }
+    },
+    {
+      "id": "prior-key-rotation",
+      "name": "One prior purpose key is accepted during rotation",
+      "input": {
+        "normalizedUserAgent": "Chrome/124.0.0.0 Windows NT 10.0",
+        "firstLanguage": "en-US",
+        "clientIp": "203.0.113.42",
+        "timezone": "America/New_York",
+        "platform": "Win32",
+        "architecture": "x86_64",
+        "browserDetails": { "browser_name": "Chrome" },
+        "tenantId": "tenant-acme",
+        "key_version": "high-recall:v0"
+      },
+      "expected": {
+        "visitor_id": "aX5tiJYMIm23JHAm80Zf",
+        "visitor_found": true,
+        "reason": "derived_from:architecture,browser,ip_prefix,language,platform,timezone,ua",
+        "key_version": "high-recall:v0"
+      }
+    },
+    {
+      "id": "unsupported-key-rotation",
+      "name": "Anything older than one rotation is rejected without minting an id",
+      "input": {
+        "timezone": "America/New_York",
+        "tenantId": "tenant-acme",
+        "key_version": "high-recall:v-9"
+      },
+      "expected": {
+        "visitor_id": null,
+        "visitor_found": false,
+        "reason": "unsupported_key_version",
+        "key_version": "high-recall:v-9"
+      }
+    },
+    {
+      "id": "different-tenant",
+      "name": "Tenant-scoped pepper isolates otherwise identical signals",
+      "input": {
+        "normalizedUserAgent": "Chrome/124.0.0.0 Windows NT 10.0",
+        "firstLanguage": "en-US",
+        "clientIp": "203.0.113.42",
+        "timezone": "America/New_York",
+        "platform": "Win32",
+        "architecture": "x86_64",
+        "browserDetails": { "browser_name": "Chrome" },
+        "tenantId": "tenant-beta"
+      },
+      "expected": {
+        "visitor_id": "0GdxtUcBrAtM1Tdymckz",
+        "visitor_found": true,
+        "reason": "derived_from:architecture,browser,ip_prefix,language,platform,timezone,ua",
+        "key_version": "high-recall:v1"
+      }
+    },
+    {
+      "id": "minimal-one-signal",
+      "name": "Coverage-first: a single resolved stable signal still yields a hint",
+      "input": { "tenantId": "tenant-acme", "timezone": "UTC" },
+      "expected": {
+        "visitor_id": "1NDneTNvlpI8V2aAAvzY",
+        "visitor_found": true,
+        "reason": "derived_from:timezone",
+        "key_version": "high-recall:v1"
+      }
+    },
+    {
+      "id": "volatile-only",
+      "name": "Volatile signals and the DST offset are structurally excluded -> no id",
+      "input": {
+        "tenantId": "tenant-acme",
+        "canvasNoise": "per-session",
+        "canvasHash": "random",
+        "storageQuota": 123456789,
+        "timezoneOffset": -240,
+        "audioSum": 123.456
+      },
+      "expected": {
+        "visitor_id": null,
+        "visitor_found": false,
+        "reason": "insufficient_resolved_signals",
+        "key_version": "high-recall:v1"
+      }
+    },
+    {
+      "id": "no-signals",
+      "name": "Empty bundle degrades conservatively instead of minting an id",
+      "input": {},
+      "expected": {
+        "visitor_id": null,
+        "visitor_found": false,
+        "reason": "insufficient_resolved_signals",
+        "key_version": "high-recall:v1"
+      }
+    }
+  ]
+}

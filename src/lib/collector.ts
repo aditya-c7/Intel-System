@@ -46,6 +46,14 @@ import {
   hashStrings,
   type CollectedSignals,
 } from '../client/signals';
+/**
+ * Namespace form of the SAME module — used only by the FP_SHARED_PROBES bridge below.
+ * A namespace lookup lets the shared implementations be adopted (or upgraded in the
+ * signals/loader module) without forcing a hard named-import dependency here, so the
+ * default-off path keeps compiling and behaving byte-for-byte as before.
+ */
+import * as sharedSignalModule from '../client/signals';
+import * as sharedLoaderModule from '../client/signals/loader';
 import type { BrowserCanvasHints } from '../client/signals/types';
 import { loadStoredIdentity, persistIdentity, getSessionId } from '../client/storage/identityStore';
 import { normalizeIdentity } from '../shared/normalization/uaNormalizer';
@@ -1375,6 +1383,355 @@ async function computeWebAudioSignature(): Promise<AudioSignatureResult> {
   }
 }
 
+/* -------------------------------------------------------------------------- */
+/* FP_SHARED_PROBES — opt-in bridge to the single shared probe implementations. */
+/*                                                                            */
+/* The legacy probes above remain the default and are byte-for-byte unchanged  */
+/* while the flag is off. When a caller explicitly opts in, the equivalent      */
+/* implementations exported by `src/client/signals` (the public barrel that also */
+/* re-exports the shared loader) are used INSTEAD, but only when they are       */
+/* present AND return the same contract. A missing, malformed or throwing       */
+/* shared implementation always falls back to the legacy probe — never a       */
+/* verdict, digest or payload change. All routing metadata below is additive    */
+/* telemetry: it is never read by a score, verdict, threshold or identity hash. */
+/* -------------------------------------------------------------------------- */
+
+export interface SharedProbeTelemetry {
+  /** FP_SHARED_PROBES state at resolution time. */
+  enabled: boolean;
+  /** True when at least one usable shared implementation was exported. */
+  available: boolean;
+  /** Which probes were actually served by a shared implementation. */
+  routed: { webgl: boolean; canvas: boolean; audio: boolean };
+  /** Where the shared implementations came from, or 'legacy'. */
+  source: string;
+  /** Non-decision diagnostics explaining any fallback (never a verdict input). */
+  reasons: string[];
+}
+
+const SHARED_PROBE_TELEMETRY_DEFAULT: SharedProbeTelemetry = {
+  enabled: false,
+  available: false,
+  routed: { webgl: false, canvas: false, audio: false },
+  source: 'legacy',
+  reasons: [],
+};
+
+let lastSharedProbeTelemetry: SharedProbeTelemetry = {
+  ...SHARED_PROBE_TELEMETRY_DEFAULT,
+  routed: { ...SHARED_PROBE_TELEMETRY_DEFAULT.routed },
+  reasons: [],
+};
+
+/** Read-only copy of the additive shared-probe routing telemetry. Never throws. */
+export function getSharedProbeTelemetry(): SharedProbeTelemetry {
+  return {
+    enabled: lastSharedProbeTelemetry.enabled,
+    available: lastSharedProbeTelemetry.available,
+    routed: { ...lastSharedProbeTelemetry.routed },
+    source: lastSharedProbeTelemetry.source,
+    reasons: [...lastSharedProbeTelemetry.reasons],
+  };
+}
+
+type SharedProbeFn = () => unknown;
+type UnknownRecord = Record<string, unknown>;
+
+/**
+ * FP_SHARED_PROBES — default OFF. Opt in through a `globalThis.FP_SHARED_PROBES`
+ * truthy value, a `?FP_SHARED_PROBES=1` URL token, a `FP_SHARED_PROBES=1`
+ * sessionStorage key, or a process env var in Node. Any hostile/inaccessible
+ * scope means "off" — the default everywhere. Never throws.
+ */
+export function isSharedProbesEnabled(): boolean {
+  const truthy = (value: unknown): boolean =>
+    value === true || value === 1 || value === '1' || value === 'true';
+  try {
+    const scope = globalThis as unknown as {
+      FP_SHARED_PROBES?: unknown;
+      process?: { env?: Record<string, unknown> };
+    };
+    if (truthy(scope.FP_SHARED_PROBES)) return true;
+    if (truthy(scope.process?.env?.FP_SHARED_PROBES)) return true;
+  } catch {
+    // Hostile global scope — stay off.
+  }
+  try {
+    if (typeof window !== 'undefined' && window.location) {
+      const search = window.location.search;
+      if (typeof search === 'string' && /(?:^|[?&])FP_SHARED_PROBES(?:=[^&]*)?/i.test(search)) {
+        const token = search.match(/[?&]FP_SHARED_PROBES=([^&]*)/i);
+        if (!token || truthy(token[1])) return true;
+      }
+    }
+  } catch {
+    // Hostile location — stay off.
+  }
+  try {
+    if (typeof sessionStorage !== 'undefined' && truthy(sessionStorage.getItem('FP_SHARED_PROBES'))) {
+      return true;
+    }
+  } catch {
+    // Storage blocked — stay off.
+  }
+  return false;
+}
+
+function recordSharedProbeReason(reason: string): void {
+  if (!lastSharedProbeTelemetry.reasons.includes(reason)) {
+    lastSharedProbeTelemetry.reasons.push(reason);
+  }
+}
+
+function markSharedProbeRouted(probe: 'webgl' | 'canvas' | 'audio'): void {
+  lastSharedProbeTelemetry.routed[probe] = true;
+}
+
+function asUnknownRecord(value: unknown): UnknownRecord | null {
+  return value && typeof value === 'object' ? (value as UnknownRecord) : null;
+}
+
+/** Export-name candidates for each shared probe; exact collector names come first. */
+const SHARED_PROBE_NAMES = {
+  webgl: ['getSharedWebGlProbe', 'sharedGetWebGlProbe', 'getSharedWebglProbe'],
+  canvas: ['computeCanvas2dSignature', 'sharedComputeCanvas2dSignature', 'computeCanvasSignature'],
+  audio: ['computeWebAudioSignature', 'sharedComputeWebAudioSignature', 'computeAudioSignature'],
+  inspectGpu: ['inspectWebGlGpu', 'sharedInspectWebGlGpu'],
+  auditSurfaces: ['auditWebGlSurfaces', 'sharedAuditWebGlSurfaces'],
+  bundleLoader: ['loadSharedProbes', 'getSharedProbeBundle'],
+} as const;
+
+/**
+ * Finds a shared implementation on the signals namespace, including a small set of
+ * documented nested barrels so the other agent may export from `loader` directly.
+ */
+function findSharedFn(root: unknown, names: readonly string[]): SharedProbeFn | null {
+  const modules: unknown[] = [root];
+  const rootRecord = asUnknownRecord(root);
+  if (rootRecord) {
+    for (const key of ['sharedProbes', 'sharedProbeLoader', 'probes', 'loader']) {
+      const nested = asUnknownRecord(rootRecord[key]);
+      if (nested) modules.push(nested);
+    }
+  }
+  for (const mod of modules) {
+    const record = asUnknownRecord(mod);
+    if (!record) continue;
+    for (const name of names) {
+      const candidate = record[name];
+      if (typeof candidate === 'function') return candidate as SharedProbeFn;
+    }
+  }
+  return null;
+}
+
+interface ResolvedSharedProbes {
+  webgl: SharedProbeFn | null;
+  canvas: SharedProbeFn | null;
+  audio: SharedProbeFn | null;
+  source: string;
+}
+
+let resolvedSharedProbesPromise: Promise<ResolvedSharedProbes> | null = null;
+
+/**
+ * Resolves the shared implementations once per page. `getSharedWebGlProbe` is preferred;
+ * when only the two lower-level probes are exported they are composed locally with the
+ * same shape. A `loadSharedProbes()` bundle export is honoured as a third fallback.
+ */
+async function resolveSharedProbes(): Promise<ResolvedSharedProbes> {
+  if (!resolvedSharedProbesPromise) {
+    resolvedSharedProbesPromise = (async (): Promise<ResolvedSharedProbes> => {
+      // The shared implementations may live in the public signals barrel or directly in
+      // its loader module. Both are static imports (no runtime path resolution), so the
+      // default-off path has no extra I/O and nothing can throw at module load.
+      const find = (names: readonly string[]): SharedProbeFn | null =>
+        findSharedFn(sharedSignalModule, names) ?? findSharedFn(sharedLoaderModule, names);
+      let webgl = find(SHARED_PROBE_NAMES.webgl);
+      let canvas = find(SHARED_PROBE_NAMES.canvas);
+      let audio = find(SHARED_PROBE_NAMES.audio);
+      const inspectGpu = find(SHARED_PROBE_NAMES.inspectGpu);
+      const auditSurfaces = find(SHARED_PROBE_NAMES.auditSurfaces);
+
+      if (!webgl && inspectGpu && auditSurfaces) {
+        webgl = (): unknown => ({
+          ...(asUnknownRecord(inspectGpu()) ?? {}),
+          surfaceAudit: auditSurfaces(),
+        });
+      }
+
+      if (!webgl || !canvas || !audio) {
+        const loadBundle = find(SHARED_PROBE_NAMES.bundleLoader);
+        if (loadBundle) {
+          try {
+            const bundle = asUnknownRecord(await loadBundle());
+            if (bundle) {
+              if (!webgl) webgl = findSharedFn(bundle, SHARED_PROBE_NAMES.webgl);
+              if (!canvas) canvas = findSharedFn(bundle, SHARED_PROBE_NAMES.canvas);
+              if (!audio) audio = findSharedFn(bundle, SHARED_PROBE_NAMES.audio);
+            }
+          } catch {
+            recordSharedProbeReason('shared probe bundle loader threw; using legacy probes');
+          }
+        }
+      }
+
+      const resolved: ResolvedSharedProbes = {
+        webgl,
+        canvas,
+        audio,
+        source: webgl || canvas || audio ? 'client/signals' : 'legacy',
+      };
+      lastSharedProbeTelemetry.enabled = true;
+      lastSharedProbeTelemetry.source = resolved.source;
+      lastSharedProbeTelemetry.available = Boolean(webgl || canvas || audio);
+      if (!webgl) recordSharedProbeReason('webgl: no shared implementation exported; using legacy probe');
+      if (!canvas) recordSharedProbeReason('canvas: no shared implementation exported; using legacy probe');
+      if (!audio) recordSharedProbeReason('audio: no shared implementation exported; using legacy probe');
+      return resolved;
+    })();
+  }
+  return resolvedSharedProbesPromise;
+}
+
+/** Validates + normalises a shared WebGL probe into the exact legacy contract. */
+function coerceSharedWebGlProbe(value: unknown): SharedWebGlProbe | null {
+  const record = asUnknownRecord(value);
+  const audit = record ? asUnknownRecord(record.surfaceAudit) : null;
+  if (
+    !record ||
+    typeof record.gpuVendor !== 'string' ||
+    typeof record.gpuRenderer !== 'string' ||
+    typeof record.gpuClass !== 'string' ||
+    !audit ||
+    !Array.isArray(audit.surfaces)
+  ) {
+    return null;
+  }
+  return {
+    gpuVendor: record.gpuVendor,
+    gpuRenderer: record.gpuRenderer,
+    maxTextureSize:
+      typeof record.maxTextureSize === 'number' && Number.isFinite(record.maxTextureSize)
+        ? record.maxTextureSize
+        : 0,
+    gpuClass: record.gpuClass,
+    softwareRenderer: Boolean(record.softwareRenderer),
+    debugExtensionAvailable: Boolean(record.debugExtensionAvailable),
+    maskedVendor: typeof record.maskedVendor === 'string' ? record.maskedVendor : 'Unavailable',
+    maskedRenderer: typeof record.maskedRenderer === 'string' ? record.maskedRenderer : 'Unavailable',
+    unmaskedVendor: typeof record.unmaskedVendor === 'string' ? record.unmaskedVendor : null,
+    unmaskedRenderer: typeof record.unmaskedRenderer === 'string' ? record.unmaskedRenderer : null,
+    shaderPrecisionProfile:
+      typeof record.shaderPrecisionProfile === 'string' ? record.shaderPrecisionProfile : 'unknown',
+    surfaceAudit: record.surfaceAudit as WebGlSurfaceAudit,
+  };
+}
+
+/** Validates + normalises a shared canvas probe into the exact legacy contract. */
+function coerceSharedCanvas(value: unknown): CanvasSignatureResult | null {
+  const record = asUnknownRecord(value);
+  if (!record || typeof record.signature !== 'string') return null;
+  return {
+    signature: record.signature,
+    coarseHash: typeof record.coarseHash === 'string' ? record.coarseHash : null,
+    noise: Boolean(record.noise),
+  };
+}
+
+/** Validates + normalises a shared audio probe. The exact float is passed through verbatim. */
+function coerceSharedAudio(value: unknown): AudioSignatureResult | null {
+  const record = asUnknownRecord(value);
+  if (!record || typeof record.signature !== 'string') return null;
+  const stability =
+    record.stability === 'stable' || record.stability === 'noisy' || record.stability === 'unavailable'
+      ? record.stability
+      : 'unavailable';
+  return {
+    signature: record.signature,
+    noise: Boolean(record.noise),
+    sum: typeof record.sum === 'number' && Number.isFinite(record.sum) ? record.sum : null,
+    renderSums: Array.isArray(record.renderSums) ? (record.renderSums as number[]) : [],
+    getChannelDataWrapped: Boolean(record.getChannelDataWrapped),
+    copyFromChannelMatches:
+      typeof record.copyFromChannelMatches === 'boolean' ? record.copyFromChannelMatches : true,
+    silentBufferNonZero: Boolean(record.silentBufferNonZero),
+    stability,
+    usableForIdentity: Boolean(record.usableForIdentity),
+    tamperingInconclusive: Boolean(record.tamperingInconclusive),
+    noiseReasons: Array.isArray(record.noiseReasons) ? (record.noiseReasons as string[]) : [],
+  };
+}
+
+let effectiveWebGlProbePromise: Promise<SharedWebGlProbe> | null = null;
+
+/** Legacy probe when the flag is off; shared probe (cached once) when opted in. */
+async function effectiveWebGlProbe(): Promise<SharedWebGlProbe> {
+  if (!isSharedProbesEnabled()) return getSharedWebGlProbe();
+  const shared = await resolveSharedProbes();
+  if (!effectiveWebGlProbePromise) {
+    if (!shared.webgl) {
+      effectiveWebGlProbePromise = Promise.resolve(getSharedWebGlProbe());
+    } else {
+      const fn = shared.webgl;
+      effectiveWebGlProbePromise = Promise.resolve()
+        .then(() => fn())
+        .then((value) => {
+          const valid = coerceSharedWebGlProbe(value);
+          if (!valid) {
+            recordSharedProbeReason('webgl: shared payload failed contract validation; using legacy probe');
+            return getSharedWebGlProbe();
+          }
+          markSharedProbeRouted('webgl');
+          return valid;
+        })
+        .catch(() => {
+          recordSharedProbeReason('webgl: shared probe threw; using legacy probe');
+          return getSharedWebGlProbe();
+        });
+    }
+  }
+  return effectiveWebGlProbePromise;
+}
+
+/** Legacy canvas probe when the flag is off; shared probe when opted in and valid. */
+async function effectiveCanvas2dSignature(): Promise<CanvasSignatureResult> {
+  if (!isSharedProbesEnabled()) return computeCanvas2dSignature();
+  const shared = await resolveSharedProbes();
+  if (!shared.canvas) return computeCanvas2dSignature();
+  try {
+    const valid = coerceSharedCanvas(await shared.canvas());
+    if (!valid) {
+      recordSharedProbeReason('canvas: shared payload failed contract validation; using legacy probe');
+      return computeCanvas2dSignature();
+    }
+    markSharedProbeRouted('canvas');
+    return valid;
+  } catch {
+    recordSharedProbeReason('canvas: shared probe threw; using legacy probe');
+    return computeCanvas2dSignature();
+  }
+}
+
+/** Legacy audio probe when the flag is off; shared probe when opted in and valid. */
+async function effectiveWebAudioSignature(): Promise<AudioSignatureResult> {
+  if (!isSharedProbesEnabled()) return computeWebAudioSignature();
+  const shared = await resolveSharedProbes();
+  if (!shared.audio) return computeWebAudioSignature();
+  try {
+    const valid = coerceSharedAudio(await shared.audio());
+    if (!valid) {
+      recordSharedProbeReason('audio: shared payload failed contract validation; using legacy probe');
+      return computeWebAudioSignature();
+    }
+    markSharedProbeRouted('audio');
+    return valid;
+  } catch {
+    recordSharedProbeReason('audio: shared probe threw; using legacy probe');
+    return computeWebAudioSignature();
+  }
+}
+
 /**
  * Permission-gated browser geolocation bridge. Reads `navigator.permissions.geolocation`
  * and calls `getCurrentPosition` ONLY when the permission is exactly `granted`. The emitted
@@ -1819,7 +2176,9 @@ export async function collectBrowserDeviceInfo(): Promise<BrowserDeviceInfo & Cl
     typeof window !== 'undefined' && 'ontouchstart' in window;
   const viewportWidth =
     typeof window !== 'undefined' ? Number(window.innerWidth) || 0 : 0;
-  const gpuProbe = getSharedWebGlProbe();
+  // FP_SHARED_PROBES off (default) calls the exact legacy probe; opt-in routes through
+  // the single shared implementation. The gate reads the same shape either way.
+  const gpuProbe = await effectiveWebGlProbe();
   const pcLock = getPcLock();
 
   const deviceGate: DeviceGateResult = classifyGenuineDevice({
@@ -2199,6 +2558,8 @@ export async function collectHardwareSignals(
     shaderPrecisionProfile: string;
     renderer_reported_unverified?: string | null;
     gpuSurfaceAudit?: WebGlSurfaceAudit;
+    /** Additive, flag-gated routing telemetry. Absolutely no decision path reads this. */
+    sharedProbeTelemetry?: SharedProbeTelemetry;
   }
 > {
   const [
@@ -2220,9 +2581,9 @@ export async function collectHardwareSignals(
     audio,
   ] =
     await Promise.all([
-      Promise.resolve(getSharedWebGlProbe()),
-      computeCanvas2dSignature(),
-      computeWebAudioSignature(),
+      effectiveWebGlProbe(),
+      effectiveCanvas2dSignature(),
+      effectiveWebAudioSignature(),
     ]);
   const canvasHash = canvas.signature;
   const audioHash = audio.signature;
@@ -2443,6 +2804,9 @@ export async function collectHardwareSignals(
     audioUsableForIdentity: audio.usableForIdentity,
     audioNoiseReasons: audio.noiseReasons,
     audioTamperingInconclusive: audio.tamperingInconclusive,
+    // Additive telemetry ONLY, and only present when FP_SHARED_PROBES is opted in, so the
+    // default-off payload (keys, digests, scores, verdicts) remains byte-identical.
+    ...(isSharedProbesEnabled() ? { sharedProbeTelemetry: getSharedProbeTelemetry() } : {}),
   };
 }
 

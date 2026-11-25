@@ -332,3 +332,475 @@ export function resolveIdentityStage(input: IdentityResolutionInput = {}): Ident
     confidenceTier: 'New Unobserved Profile',
   };
 }
+
+/* -------------------------------------------------------------------------- */
+/* R4 — supplementary high-recall identity (coverage-first sibling)            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * WEB RESEARCH BRIEF R4 — fingerprint-style supplementary high-recall id.
+ *
+ * This is a COVERAGE hint emitted ALONGSIDE the primary visitor id. It never replaces the
+ * primary id, never becomes a sole blocking key and never makes a confidence claim. The
+ * output shape is the same alphanumeric <= 25-char base62 shape as the primary id (20 chars
+ * here), derived deterministically by HMAC-SHA-256 over ALREADY RESOLVED stable signals
+ * only. No random UUID, Math.random, Date.now, network call or Durable Object write occurs.
+ *
+ * DESIGN INVARIANTS:
+ *   - Inputs are whitelisted resolved signals: normalized UA, first language, truncated IP
+ *     (IPv4 /24 or IPv6 /48), timezone NAME (never the DST-volatile offset), platform,
+ *     architecture and browser family. Raw PII (full IP, raw UA) is never used as a seed.
+ *   - Canonicalization is lowercase + trim + whitespace collapse + delimiter stripping;
+ *     the HMAC message is sorted `key=value` pairs joined by the fixed `|` delimiter, so
+ *     key insertion order cannot change the result.
+ *   - The purpose key is VERSIONED (`high-recall:v1`). Exactly one prior key
+ *     (`high-recall:v0`) is accepted during a rotation; anything older is rejected.
+ *   - The HMAC key is tenant/instance scoped via a caller-supplied pepper; a default
+ *     `instance-local` scope keeps the helper total for offline / single-tenant callers.
+ *   - Collision risk is BOUNDED by the coarse cohort width of the resolved signals, not by
+ *     the 20-char output: many visitors may share an HR id, which is why it is a hint only.
+ *   - `visitor_found` means "a stable HR candidate was derived" (coverage), NOT that a
+ *     storage/hardware match was confirmed. The result deliberately has NO confidence field.
+ */
+
+/** Active purpose key. Versioned so a rotation can be rolled without breaking lookups. */
+export const HIGH_RECALL_PURPOSE_KEY = 'high-recall:v1';
+/** Exactly one prior key is accepted (one rotation). Older versions are rejected. */
+export const HIGH_RECALL_PRIOR_PURPOSE_KEY = 'high-recall:v0';
+/** Same base62 alphabet as the primary id generator (server/identity/resolver.ts). */
+export const HIGH_RECALL_ID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+export const HIGH_RECALL_ID_LENGTH = 20;
+export const HIGH_RECALL_MAX_ID_LENGTH = 25;
+export const HIGH_RECALL_DEFAULT_PEPPER = 'instance-local';
+/** Only these canonical fields may enter the HMAC message. */
+export const HIGH_RECALL_STABLE_FIELDS: readonly string[] = [
+  'architecture',
+  'browser',
+  'ip_prefix',
+  'language',
+  'platform',
+  'timezone',
+  'ua',
+];
+
+/** Canonical, PII-minimized input built by `buildHighRecallInput`. Contains only resolved
+ *  stable tokens plus the tenant scope and purpose-key version. */
+export interface HighRecallInput {
+  readonly values: Readonly<Record<string, string>>;
+  readonly pepper: string;
+  readonly key_version: string;
+}
+
+/** Pure result of `resolveSupplementaryHighRecall` — four fields, NO confidence score. */
+export interface SupplementaryHighRecallResult {
+  visitor_id: string | null;
+  visitor_found: boolean;
+  reason: string;
+  key_version: string;
+}
+
+/**
+ * Additive optional SIBLING object. It is attached beside the existing identity fields;
+ * `visitor_id` / `visitor_found` / `match_stage` / `identification` are never mutated.
+ * `confidence` is deliberately absent (or exactly 0 when a caller needs an explicit value)
+ * because an HR hint carries no calibrated probability.
+ */
+export interface SupplementaryHighRecallIdentity {
+  visitor_id: string | null;
+  visitor_found: boolean;
+  confidence?: 0;
+  first_seen_at?: string;
+  last_seen_at?: string;
+}
+
+export type HighRecallFriction = 'low' | 'moderate' | 'new';
+
+export interface HighRecallFrictionDecision {
+  friction: HighRecallFriction;
+  /** Always false: an HR hint is never a sole blocking key. */
+  blocks: false;
+  reason: string;
+}
+
+/* --- defensive primitives (all total) ------------------------------------- */
+
+function hrSafeGet(source: unknown, key: string): unknown {
+  if (source === null || source === undefined) return undefined;
+  const kind = typeof source;
+  if (kind !== 'object' && kind !== 'function') return undefined;
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch {
+    return undefined;
+  }
+}
+
+/** Lowercase / trim / whitespace-collapse / delimiter-strip / bound. */
+function hrToken(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const cleaned = value
+    .replace(/[\u0000-\u001f\u007f|=,]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+  if (!cleaned) return '';
+  return cleaned.length > 256 ? cleaned.slice(0, 256).trim() : cleaned;
+}
+
+function hrFirstToken(source: unknown, keys: readonly string[]): string {
+  for (const key of keys) {
+    const token = hrToken(hrSafeGet(source, key));
+    if (token) return token;
+  }
+  return '';
+}
+
+/** Trim/bound ONLY — preserves case for already-canonical ids and ISO timestamps. */
+function hrPlainString(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  const text = value.trim();
+  if (!text) return '';
+  return text.length > 256 ? text.slice(0, 256).trim() : text;
+}
+
+/** IPv4 -> first three octets + .0/24. Rejects non-octal, out-of-range and hostile input. */
+function hrTruncateIpv4(value: string): string {
+  const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:\/\d{1,2})?$/.exec(value);
+  if (!match) return '';
+  const octets = [match[1], match[2], match[3]].map((part) => Number(part));
+  if (octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) return '';
+  return `${octets.join('.')}.0/24`;
+}
+
+/** IPv6 -> first three (zero-padded) hextets + ::/48. Handles `::` compression and a
+ *  trailing prefix length. Embedded-IPv4 forms are rejected rather than guessed. */
+function hrTruncateIpv6(value: string): string {
+  let text = value.trim().toLowerCase();
+  if (text.startsWith('[')) {
+    const end = text.indexOf(']');
+    if (end > 0) text = text.slice(1, end);
+  }
+  text = text.split('%')[0]; // strip zone id
+  if (text.includes('.')) return ''; // embedded IPv4 is deliberately unsupported
+  if (text.includes('/')) text = text.slice(0, text.indexOf('/'));
+
+  let groups: string[];
+  if (text.includes('::')) {
+    const halves = text.split('::');
+    if (halves.length !== 2) return '';
+    // `2001:::1` has an empty group between colons and must be rejected, not repaired.
+    if (halves[0].split(':').some((part) => part === '')) return '';
+    if (halves[1].split(':').some((part) => part === '')) return '';
+    const left = halves[0] ? halves[0].split(':') : [];
+    const right = halves[1] ? halves[1].split(':') : [];
+    const missing = 8 - left.length - right.length;
+    if (missing < 0) return '';
+    groups = [...left, ...new Array<string>(missing).fill('0'), ...right];
+  } else {
+    groups = text.split(':').filter(Boolean);
+  }
+  if (groups.length !== 8) return '';
+  for (const group of groups) if (!/^[0-9a-f]{1,4}$/.test(group)) return '';
+  const head = groups.slice(0, 3).map((group) => group.padStart(4, '0'));
+  return `${head.join(':')}::/48`;
+}
+
+/** Never returns a raw IP: only the /24 or /48 prefix token can leave this function. */
+function hrIpPrefix(value: unknown): string {
+  const text = hrToken(value);
+  if (!text) return '';
+  return hrTruncateIpv4(text) || hrTruncateIpv6(text);
+}
+
+function hrNormalizedUa(source: unknown): string {
+  const direct = hrFirstToken(source, [
+    'normalizedUserAgent', 'normalizedUa', 'uaNormalized', 'ua_normal', 'normalizedUserAgentString',
+  ]);
+  if (direct) return direct;
+  const details = hrSafeGet(source, 'browser_details') ?? hrSafeGet(source, 'browserDetails');
+  const parts = [
+    hrFirstToken(details, ['browser_name', 'browserName']),
+    hrFirstToken(details, ['browser_major_version', 'browserMajorVersion']),
+    hrFirstToken(details, ['os', 'osFamily']),
+    hrFirstToken(details, ['os_version', 'osVersion']),
+  ].filter(Boolean);
+  return parts.join(' ');
+}
+
+function hrLanguage(source: unknown): string {
+  const direct = hrFirstToken(source, ['firstLanguage', 'primaryLanguage', 'language', 'browserLanguage']);
+  if (direct) return direct;
+  const langs = hrSafeGet(source, 'languages') ?? hrSafeGet(hrSafeGet(source, 'browserDevice'), 'languages');
+  try {
+    if (Array.isArray(langs)) return hrToken(langs[0]);
+    if (langs instanceof Set) return hrToken(langs.values().next().value);
+  } catch {
+    // A hostile iterable contributes nothing.
+  }
+  return '';
+}
+
+/* Pure-JS SHA-256 + HMAC-SHA-256, vendored from src/client/signals/hash.ts so this lib
+ * stays import-free and synchronous in Node, the browser bundle and Workers alike. */
+
+const HR_SHA_K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+const hrRotr = (x: number, n: number): number => (x >>> n) | (x << (32 - n));
+
+function hrUtf8Bytes(input: string): Uint8Array {
+  const out: number[] = [];
+  for (let i = 0; i < input.length; i += 1) {
+    let code = input.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff && i + 1 < input.length) {
+      const low = input.charCodeAt(i + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00);
+        i += 1;
+      }
+    }
+    if (code < 0x80) out.push(code);
+    else if (code < 0x800) out.push(0xc0 | (code >> 6), 0x80 | (code & 63));
+    else if (code < 0x10000) out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 63), 0x80 | (code & 63));
+    else out.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 63), 0x80 | ((code >> 6) & 63), 0x80 | (code & 63));
+  }
+  return new Uint8Array(out);
+}
+
+function hrSha256Bytes(bytes: Uint8Array): Uint8Array {
+  const bitLen = bytes.length * 8;
+  const paddedLen = (bytes.length + 9 + 63) & ~63;
+  const buf = new Uint8Array(paddedLen);
+  buf.set(bytes);
+  buf[bytes.length] = 0x80;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(paddedLen - 8, Math.floor(bitLen / 4294967296) >>> 0, false);
+  dv.setUint32(paddedLen - 4, bitLen >>> 0, false);
+
+  let h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a;
+  let h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+  const w = new Uint32Array(64);
+
+  for (let off = 0; off < paddedLen; off += 64) {
+    for (let i = 0; i < 16; i += 1) w[i] = dv.getUint32(off + i * 4, false);
+    for (let i = 16; i < 64; i += 1) {
+      const a15 = w[i - 15];
+      const a2 = w[i - 2];
+      const s0 = hrRotr(a15, 7) ^ hrRotr(a15, 18) ^ (a15 >>> 3);
+      const s1 = hrRotr(a2, 17) ^ hrRotr(a2, 19) ^ (a2 >>> 10);
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+    for (let i = 0; i < 64; i += 1) {
+      const s1 = hrRotr(e, 6) ^ hrRotr(e, 11) ^ hrRotr(e, 25);
+      const ch = (e & f) ^ (~e & g);
+      const t1 = (h + s1 + ch + HR_SHA_K[i] + w[i]) >>> 0;
+      const s0 = hrRotr(a, 2) ^ hrRotr(a, 13) ^ hrRotr(a, 22);
+      const mj = (a & b) ^ (a & c) ^ (b & c);
+      const t2 = (s0 + mj) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0; h3 = (h3 + d) >>> 0;
+    h4 = (h4 + e) >>> 0; h5 = (h5 + f) >>> 0; h6 = (h6 + g) >>> 0; h7 = (h7 + h) >>> 0;
+  }
+
+  const out = new Uint8Array(32);
+  const odv = new DataView(out.buffer);
+  const state = [h0, h1, h2, h3, h4, h5, h6, h7];
+  for (let i = 0; i < 8; i += 1) odv.setUint32(i * 4, state[i], false);
+  return out;
+}
+
+function hrHmacSha256(keyMaterial: string, message: string): Uint8Array {
+  let key = hrUtf8Bytes(keyMaterial);
+  if (key.length > 64) key = hrSha256Bytes(key);
+  const padded = new Uint8Array(64);
+  padded.set(key);
+  const msg = hrUtf8Bytes(message);
+  const inner = new Uint8Array(64 + msg.length);
+  const outer = new Uint8Array(64 + 32);
+  for (let i = 0; i < 64; i += 1) {
+    inner[i] = padded[i] ^ 0x36;
+    outer[i] = padded[i] ^ 0x5c;
+  }
+  inner.set(msg, 64);
+  const innerDigest = hrSha256Bytes(inner);
+  outer.set(innerDigest, 64);
+  return hrSha256Bytes(outer);
+}
+
+/** Big-endian HMAC bytes -> fixed-length base62 id (same alphabet/shape as primary). */
+function hrBase62(bytes: Uint8Array, length: number): string {
+  let value = 0n;
+  for (const byte of bytes) value = (value << 8n) | BigInt(byte);
+  let out = '';
+  for (let i = 0; i < length; i += 1) {
+    out = HIGH_RECALL_ID_ALPHABET[Number(value % BigInt(HIGH_RECALL_ID_ALPHABET.length))] + out;
+    value /= BigInt(HIGH_RECALL_ID_ALPHABET.length);
+  }
+  return out;
+}
+
+/* --- public helpers -------------------------------------------------------- */
+
+/**
+ * Build the canonical, PII-minimized HR input from an ALREADY RESOLVED signal bundle.
+ * Only whitelisted stable fields are read; raw PII (full IP / raw UA) never leaves here.
+ * Total over hostile input — a malformed bundle yields an empty `values` map, which the
+ * resolver reports as `visitor_found: false` instead of minting an id.
+ */
+export function buildHighRecallInput(resolved: unknown): HighRecallInput {
+  try {
+    const values: Record<string, string> = {};
+    const add = (key: string, value: string): void => {
+      const canonical = hrToken(value);
+      if (canonical && HIGH_RECALL_STABLE_FIELDS.includes(key)) values[key] = canonical;
+    };
+
+    add('ua', hrNormalizedUa(resolved));
+    add('language', hrLanguage(resolved));
+    add('ip_prefix', hrIpPrefix(hrFirstToken(resolved, [
+      'clientIp', 'publicIp', 'ipAddress', 'ip', 'remoteAddr', 'cfConnectingIp',
+    ])));
+    add('timezone', hrFirstToken(resolved, [
+      'timezone', 'timezoneName', 'tz', 'browserTimezone', 'ipTimezone',
+    ]));
+    add('platform', hrFirstToken(resolved, ['platform', 'hostOs', 'osFamily', 'normalizedPlatform']));
+    add('architecture', hrFirstToken(resolved, ['architecture', 'cpuArchitecture', 'deviceArchitecture']));
+    const details = hrSafeGet(resolved, 'browser_details') ?? hrSafeGet(resolved, 'browserDetails');
+    add('browser', hrFirstToken(resolved, ['browserFamily', 'browserName']) || hrFirstToken(details, ['browser_name']));
+
+    // The pepper is a tenant / instance SCOPE, never a personal signal. Callers should
+    // supply one; the constant fallback keeps single-tenant offline use deterministic.
+    const pepper =
+      hrFirstToken(resolved, ['tenantId', 'tenant', 'instanceId', 'instance', 'pepper', 'keyScope', 'key_scope']) ||
+      HIGH_RECALL_DEFAULT_PEPPER;
+    const keyVersion =
+      hrFirstToken(resolved, ['highRecallKeyVersion', 'key_version', 'keyVersion']) || HIGH_RECALL_PURPOSE_KEY;
+
+    const sortedValues: Record<string, string> = {};
+    for (const key of Object.keys(values).sort()) sortedValues[key] = values[key];
+    return { values: sortedValues, pepper, key_version: keyVersion };
+  } catch {
+    return { values: {}, pepper: HIGH_RECALL_DEFAULT_PEPPER, key_version: HIGH_RECALL_PURPOSE_KEY };
+  }
+}
+
+/**
+ * Derive the supplementary high-recall id. Pure, synchronous, non-throwing, no IO.
+ * The message is `key=value` pairs sorted by key and joined with `|`; the HMAC key is
+ * `purposeKey \0 tenantScope`. Exactly one prior purpose key is accepted on rotation.
+ *
+ * `visitor_found: true` means a candidate was DERIVED (coverage), not that a visitor was
+ * confirmed by storage or hardware. There is intentionally no confidence score.
+ */
+export function resolveSupplementaryHighRecall(input: unknown): SupplementaryHighRecallResult {
+  try {
+    const source = input !== null && typeof input === 'object' ? (input as Record<string, unknown>) : null;
+    if (!source) {
+      return { visitor_id: null, visitor_found: false, reason: 'invalid_high_recall_input', key_version: HIGH_RECALL_PURPOSE_KEY };
+    }
+
+    const rawValues = hrSafeGet(source, 'values');
+    const values: Record<string, string> = {};
+    if (rawValues !== null && typeof rawValues === 'object') {
+      for (const key of Object.keys(rawValues).sort()) {
+        if (!HIGH_RECALL_STABLE_FIELDS.includes(key)) continue;
+        const canonical = hrToken(hrSafeGet(rawValues, key));
+        if (canonical) values[key] = canonical;
+      }
+    }
+    const keys = Object.keys(values).sort();
+    if (keys.length === 0) {
+      return { visitor_id: null, visitor_found: false, reason: 'insufficient_resolved_signals', key_version: HIGH_RECALL_PURPOSE_KEY };
+    }
+
+    const pepper = hrToken(hrSafeGet(source, 'pepper')) || HIGH_RECALL_DEFAULT_PEPPER;
+    const keyVersion = hrToken(hrSafeGet(source, 'key_version')) || HIGH_RECALL_PURPOSE_KEY;
+    if (keyVersion !== HIGH_RECALL_PURPOSE_KEY && keyVersion !== HIGH_RECALL_PRIOR_PURPOSE_KEY) {
+      return { visitor_id: null, visitor_found: false, reason: 'unsupported_key_version', key_version: keyVersion };
+    }
+
+    const seed = keys.map((key) => `${key}=${values[key]}`).join('|');
+    const digest = hrHmacSha256(`${keyVersion}\u0000${pepper}`, seed);
+    const visitorId = hrBase62(digest, Math.min(HIGH_RECALL_ID_LENGTH, HIGH_RECALL_MAX_ID_LENGTH));
+    return {
+      visitor_id: visitorId,
+      visitor_found: true,
+      reason: `derived_from:${keys.join(',')}`,
+      key_version: keyVersion,
+    };
+  } catch {
+    return {
+      visitor_id: null,
+      visitor_found: false,
+      reason: 'high_recall_resolution_failed',
+      key_version: HIGH_RECALL_PURPOSE_KEY,
+    };
+  }
+}
+
+/**
+ * Friction matrix — both signals match -> low; primary misses but HR hint matches ->
+ * moderate; neither matches -> new enrollment. A primary match stays authoritative even
+ * when the HR hint disagrees, and `blocks` is ALWAYS false: an HR hint is never a sole
+ * blocking key.
+ */
+export function resolveSupplementaryFriction(input: unknown): HighRecallFrictionDecision {
+  try {
+    const primaryMatch = hrSafeGet(input, 'primaryMatch') === true;
+    const highRecallMatch = hrSafeGet(input, 'highRecallMatch') === true;
+    if (primaryMatch) {
+      return { friction: 'low', blocks: false, reason: 'primary_authoritative_hr_hint_ignored' };
+    }
+    if (highRecallMatch) {
+      return { friction: 'moderate', blocks: false, reason: 'high_recall_hint_only_no_block' };
+    }
+    return { friction: 'new', blocks: false, reason: 'no_authoritative_or_hint_match_new_enrollment' };
+  } catch {
+    return { friction: 'new', blocks: false, reason: 'friction_check_failed_new_enrollment' };
+  }
+}
+
+/** Build the additive sibling object. No `confidence` field is emitted. */
+export function asSupplementaryIdentity(
+  result: SupplementaryHighRecallResult | null | undefined,
+  timestamps?: { first_seen_at?: string; last_seen_at?: string } | null
+): SupplementaryHighRecallIdentity {
+  const id = hrPlainString(hrSafeGet(result, 'visitor_id'));
+  const sibling: SupplementaryHighRecallIdentity = {
+    visitor_id: id || null,
+    visitor_found: hrSafeGet(result, 'visitor_found') === true && id.length > 0,
+  };
+  // Confidence is deliberately absent — an HR hint makes no calibrated score claim.
+  const first = hrPlainString(hrSafeGet(timestamps, 'first_seen_at'));
+  const last = hrPlainString(hrSafeGet(timestamps, 'last_seen_at'));
+  if (first) sibling.first_seen_at = first;
+  if (last) sibling.last_seen_at = last;
+  return sibling;
+}
+
+/** Attach the sibling WITHOUT mutating any existing identification field. */
+export function withSupplementaryHighRecall<T extends object>(
+  identification: T,
+  sibling: SupplementaryHighRecallIdentity | null | undefined
+): T & { supplementary_high_recall?: SupplementaryHighRecallIdentity } {
+  try {
+    const base = identification !== null && typeof identification === 'object' ? identification : ({} as T);
+    const next = { ...base } as T & { supplementary_high_recall?: SupplementaryHighRecallIdentity };
+    if (sibling && sibling.visitor_found && sibling.visitor_id) next.supplementary_high_recall = sibling;
+    return next;
+  } catch {
+    // Even a hostile / non-spreadable identification object must keep its primary id.
+    const fallback = identification !== null && typeof identification === 'object' ? identification : {};
+    return fallback as T & { supplementary_high_recall?: SupplementaryHighRecallIdentity };
+  }
+}

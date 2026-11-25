@@ -19,6 +19,10 @@ createServer(app).listen(API_PORT);
  * The Worker is the only component that can see the real Cloudflare edge object, and it
  * is also the only trust boundary: `request.cf` cannot be set by a client. Everything is
  * encoded so the value stays inside the ASCII ByteString range that fetch() headers allow.
+ *
+ * R3: it also carries a single transport-normalized client RTT (rtt_transport / rtt_source /
+ * status, in milliseconds). That value comes ONLY from request.cf — never from a client
+ * header and never from the Server-Timing `cfL4` response metric.
  */
 const EDGE_GEO_HEADER = 'x-intel-edge-geo';
 
@@ -97,6 +101,24 @@ const UNTRUSTED_FORWARD_HEADERS = [
   'x-real-ip',
   'x-client-ip',
   'x-appengine-user-ip',
+  // R3 lookalikes for the sealed edge-transport headers. colo / protocol / client lat-lon /
+  // normalized RTT come ONLY from request.cf via the worker-set x-intel-edge-geo header;
+  // an inbound copy of any of these names is deleted before that header is stamped.
+  'x-intel-edge-rtt',
+  'x-intel-rtt',
+  'x-intel-rtt-ms',
+  'x-intel-rtt-transport',
+  'x-intel-rtt-source',
+  'x-intel-rtt-status',
+  'x-intel-client-rtt',
+  'x-intel-edge-transport',
+  'x-intel-edge-protocol',
+  'x-intel-edge-colo',
+  'x-intel-client-latitude',
+  'x-intel-client-longitude',
+  'cf-client-rtt',
+  'cf-rtt',
+  'cf-request-rtt',
 ];
 
 /** Document headers that would pin a stale/cached copy of a UA-specific verdict. */
@@ -168,26 +190,52 @@ function lightDistanceKm(rttMs) {
   return { rttMs, estimatedKm: Math.round(km) };
 }
 
+/**
+ * R3: the single transport-aware client RTT normalizer. `request.cf` is the only source.
+ * HTTP/3 (QUIC) reads `clientQuicRtt`; every other transport reads `clientTcpRtt`. There is
+ * deliberately NO cross-transport fallback — a QUIC request never borrows a TCP round trip.
+ * Cloudflare's 0 placeholder ("not measured"), negatives, NaN and absent values all become
+ * `rtt_ms: null` with `status: 'no-data'`. The value stays in milliseconds (never seconds), and
+ * the Server-Timing `cfL4` metric is never consulted here.
+ */
+function normalizedRtt(cf, isHttp3) {
+  const rtt_transport = isHttp3 ? 'quic' : 'tcp';
+  const rtt_source = isHttp3 ? 'clientQuicRtt' : 'clientTcpRtt';
+  const raw = isHttp3 ? cf.clientQuicRtt : cf.clientTcpRtt;
+  const rtt_ms = typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : null;
+  return {
+    label: 'normalized edge-observed client RTT (milliseconds; 0/absent = no data)',
+    rtt_ms,
+    rtt_transport,
+    rtt_source,
+    status: rtt_ms === null ? 'no-data' : 'measured',
+  };
+}
+
 function buildEdgeGeoHeader(request) {
   const cf = request.cf || {};
   const botManagement = cf.botManagement;
   const httpProtocol = cfString(cf.httpProtocol);
   // HTTP/3 is QUIC — there is no TCP round trip on that path. `edgeL4` is a secondary QUIC
-  // signal for deployments where `httpProtocol` is not populated on request.cf.
+  // signal for deployments where `httpProtocol` is not populated on request.cf. This is a
+  // request.cf transport hint ONLY: the Server-Timing `cfL4` response metric is never read.
   const isQuic = /HTTP\/3|QUIC/i.test(httpProtocol) || /^quic$/i.test(cfString(cf.edgeL4));
+  // R3: one transport-normalized RTT from request.cf. HTTP/3 uses clientQuicRtt, all other
+  // transports use clientTcpRtt, with NO cross-transport fallback. 0 => null / 'no-data'.
+  const rtt = normalizedRtt(cf, isQuic);
+  // Raw per-transport observations are normalized too (0 => null) so no placeholder can
+  // become a fabricated 0 ms "measurement" downstream.
   const observedTcpRtt =
-    typeof cf.clientTcpRtt === 'number' && Number.isFinite(cf.clientTcpRtt) ? cf.clientTcpRtt : null;
+    typeof cf.clientTcpRtt === 'number' && Number.isFinite(cf.clientTcpRtt) && cf.clientTcpRtt > 0
+      ? cf.clientTcpRtt
+      : null;
   const observedQuicRtt =
-    typeof cf.clientQuicRtt === 'number' && Number.isFinite(cf.clientQuicRtt) ? cf.clientQuicRtt : null;
-  // Truth rule: a 0 ms TCP RTT on QUIC is "not measured", not a measurement. Null it before
-  // anything downstream can turn it into a fabricated 0 km light-distance estimate.
-  const tcpRttUnavailableOnQuic = isQuic && observedTcpRtt === 0;
-  const clientTcpRtt = tcpRttUnavailableOnQuic ? null : observedTcpRtt;
-  // Prefer the real QUIC RTT when present and positive; it is the only meaningful client RTT
-  // on HTTP/3. Absent or 0 stays unavailable — no invented number, never a JA3/JA4 claim.
-  const quicRttAvailable = observedQuicRtt !== null && observedQuicRtt > 0;
-  const effectiveRtt = quicRttAvailable ? observedQuicRtt : clientTcpRtt;
-  const effectiveRttSource = quicRttAvailable ? 'clientQuicRtt' : 'clientTcpRtt';
+    typeof cf.clientQuicRtt === 'number' && Number.isFinite(cf.clientQuicRtt) && cf.clientQuicRtt > 0
+      ? cf.clientQuicRtt
+      : null;
+  // Legacy field kept for the server's existing readEdgeTransport() contract. It is the TCP
+  // observation only — the normalized cross-transport RTT is `rtt` / `clientRttMs` below.
+  const clientTcpRtt = observedTcpRtt;
   const payload = {
     v: 1,
     country: cfString(cf.country),
@@ -207,10 +255,19 @@ function buildEdgeGeoHeader(request) {
     tlsVersion: cfString(cf.tlsVersion),
     tlsCipher: cfString(cf.tlsCipher),
     clientTcpRtt,
-    clientTcpRttLabel: tcpRttUnavailableOnQuic
-      ? 'not applicable on QUIC/HTTP/3 (0 is a placeholder, not a measurement)'
-      : 'edge-observed TCP round-trip time',
+    clientTcpRttLabel: isQuic
+      ? 'not applicable on QUIC/HTTP/3 (normalized RTT uses clientQuicRtt; 0 is a placeholder)'
+      : 'edge-observed TCP round-trip time (milliseconds; 0 => no data)',
     httpProtocol,
+    // R3 normalized RTT. Sealed inside x-intel-edge-geo; every client-supplied lookalike is
+    // stripped before this header is stamped (see UNTRUSTED_FORWARD_HEADERS). Milliseconds
+    // only, 0 => null / 'no-data', and never sourced from Server-Timing `cfL4`.
+    rtt,
+    // Flat aliases for the server's sealed-header reader, carrying the same normalized value.
+    clientRttMs: rtt.rtt_ms,
+    rttTransport: rtt.rtt_transport,
+    rttSource: rtt.rtt_source,
+    rttStatus: rtt.status,
     // Bot-Management-only hash fields (Enterprise plans). Null-guarded and isolated in a
     // distinctly named field so the free-plan TLS-lite components below are NEVER reported
     // as JA3 / JA4. Absent on free plans: "out of list" means unavailable, not malicious.
@@ -224,13 +281,13 @@ function buildEdgeGeoHeader(request) {
     rttLightDistance: {
       label: 'RTT-based light-distance estimate (approximation)',
       propagationFactor: LIGHT_DISTANCE_PROPAGATION_FACTOR,
-      // Per-transport fields kept for compatibility. Both use normalized RTTs, so a QUIC 0
+      // Per-transport fields kept for compatibility. Both are normalized (0 => null), so a
       // placeholder can never become a fabricated 0 km "measurement".
-      tcp: lightDistanceKm(clientTcpRtt),
-      quic: lightDistanceKm(quicRttAvailable ? observedQuicRtt : null),
-      // Selected estimate: clientQuicRtt when present, otherwise clientTcpRtt.
-      selected: lightDistanceKm(effectiveRtt),
-      selectedSource: effectiveRttSource,
+      tcp: lightDistanceKm(observedTcpRtt),
+      quic: lightDistanceKm(observedQuicRtt),
+      // Selected estimate: the R3 normalized RTT only — no cross-transport fallback.
+      selected: lightDistanceKm(rtt.rtt_ms),
+      selectedSource: rtt.rtt_source,
     },
     // Eight FREE request.cf TLS/network fields available on every plan. These are raw
     // edge-derived TLS components — NOT JA3/JA4 or any Bot-Management-only fingerprint — and
@@ -247,10 +304,8 @@ function buildEdgeGeoHeader(request) {
       tlsClientAuth: cfString(cf.tlsClientAuth),
       requestPriority: cfString(cf.requestPriority),
       edgeL4: cfString(cf.edgeL4),
-      clientQuicRtt:
-        typeof cf.clientQuicRtt === 'number' && Number.isFinite(cf.clientQuicRtt)
-          ? cf.clientQuicRtt
-          : null,
+      // Normalized the same way as the R3 RTT: a 0 placeholder is no data, not a measurement.
+      clientQuicRtt: observedQuicRtt,
     },
   };
   return encodeURIComponent(JSON.stringify(payload));
