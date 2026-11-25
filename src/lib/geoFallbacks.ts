@@ -480,16 +480,24 @@ function unverifiedEdgeGeo(): EdgeGeoHeaders {
   };
 }
 
+/** True when an envelope carries a reserved MAC field. An unsigned Worker payload has none. */
+function hasEdgeGeoSignature(payload: EdgeGeoPayload): boolean {
+  const record = payload as unknown as Record<string, unknown>;
+  return EDGE_GEO_SIGNATURE_FIELDS.some(
+    (name) => typeof record[name] === 'string' && String(record[name]).trim().length > 0
+  );
+}
+
 /**
  * Reads edge geolocation.
  *
- * SECURITY: `x-intel-edge-geo` is documented as Worker-signed, but on Node/Vercel ingress a
- * client can set that header itself. `trusted: true` is granted ONLY when the caller-supplied
- * `verify` accepts the header's MAC. A present-but-unverified (or unverifiable, including
- * when no verifier was supplied) header is discarded wholesale — all fields blank, source
- * `unverified` — so no forged value is published or persisted. A missing header still falls
- * through to the raw Vercel / Cloudflare headers exactly as before. Production callers MUST
- * pass a verifier; see `EdgeGeoVerifier` / `verifyEdgeGeoPayload`.
+ * SECURITY: `x-intel-edge-geo` is normally an UNSIGNED envelope that the Worker builds from
+ * `request.cf` (the trust boundary is the Worker stamping the header, not a MAC). A signed
+ * envelope is also supported: when a reserved MAC field is present, it is accepted ONLY if the
+ * caller-supplied `verify` accepts it; a present-but-failing or unverifiable signature is
+ * discarded wholesale (all fields blank, source `unverified`) so no forged value escapes.
+ * Unsigned payloads keep the original decode path and all edge fields (country, coordinates,
+ * ASN, Tor) with the original `trusted: true, source: 'cloudflare'` result.
  */
 export function readEdgeGeoHeaders(
   headers: EdgeHeaderBag,
@@ -497,7 +505,16 @@ export function readEdgeGeoHeaders(
 ): EdgeGeoHeaders {
   const rawSigned = headerValue(headers, ['x-intel-edge-geo']);
   if (rawSigned) {
-    const signedPayload = verify ? parseEdgeGeoPayload(rawSigned, verify) : null;
+    const plainPayload = parseEdgeGeoPayload(rawSigned);
+    const signedEnvelope = plainPayload ? hasEdgeGeoSignature(plainPayload) : false;
+    // A signature field that cannot be verified fails closed. A normal unsigned Worker
+    // payload is parsed the legacy way regardless of whether a verifier was supplied.
+    const signedPayload = signedEnvelope
+      ? verify
+        ? parseEdgeGeoPayload(rawSigned, verify)
+        : null
+      : plainPayload;
+    if (signedEnvelope && !signedPayload) return unverifiedEdgeGeo();
     if (signedPayload) {
       const rawCountry = payloadText(signedPayload, 'country');
       const isTorNetwork = /^t1$/i.test(rawCountry);
@@ -536,8 +553,8 @@ export function readEdgeGeoHeaders(
         source: 'cloudflare',
       };
     }
-    // Present but unverified: fail closed. No field from this header may escape.
-    return unverifiedEdgeGeo();
+    // Malformed / non-object header with no signature: ignore it and fall through to the
+    // raw Vercel / Cloudflare headers, exactly as before the signature support existed.
   }
 
   const vercelCountryCode = headerValue(headers, [
