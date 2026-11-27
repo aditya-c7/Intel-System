@@ -17,6 +17,12 @@
 import { readFile } from 'node:fs/promises';
 import { isDeepStrictEqual } from 'node:util';
 
+/* Static imports for the direct wiring-regression section (runWiringRegressions).
+ * The fixture-driven cases keep their lazy helper registry below. */
+import { composeBotVerdict } from '../src/server/agents/botVerifier';
+import { buildGradedRiskLedger } from '../src/lib/riskLedger';
+import { enrichNetwork } from '../src/server/network/asnEnricher';
+
 /* -------------------------------------------------------------------------- */
 /* Fixture types                                                                */
 /* -------------------------------------------------------------------------- */
@@ -538,6 +544,133 @@ async function run(): Promise<void> {
   for (const testCase of fixture.cases) {
     await runCase(testCase);
   }
+
+  await runWiringRegressions();
+}
+
+/* -------------------------------------------------------------------------- */
+/* Wiring regressions — direct pins for server-side wiring (not fixture-driven) */
+/*                                                                              */
+/* The identify handler is a monolithic server script and cannot be imported    */
+/* here, so these checks pin the CONTRACTS the handler must satisfy: the        */
+/* composeBotVerdict stealth/clientProbe inputs the handler now threads, the    */
+/* graded-ledger signed-agent exemption the handler must supply, and the        */
+/* enrichNetwork edge tier the handler must feed with the edge organization.    */
+/* The enrichNetwork edge tier performs no I/O (ASN + org short-circuit), and    */
+/* the registry-tier negative case resolves in-process without DNS.             */
+/* -------------------------------------------------------------------------- */
+
+let wiringChecks = 0;
+let wiringFailures = 0;
+
+function wiringCheck(name: string, condition: boolean, detail?: unknown): void {
+  wiringChecks += 1;
+  if (condition) {
+    console.log(`  ok    [wiring] ${name}`);
+    return;
+  }
+  wiringFailures += 1;
+  console.error(`  FAIL  [wiring] ${name}`);
+  if (detail !== undefined) console.error('     ', fmt(detail));
+}
+
+async function runWiringRegressions(): Promise<void> {
+  section('WIRING REGRESSIONS — stealth escalation / signed-agent precedence / ASN org hint');
+
+  /* 1 — stealth-input wiring: a non-empty hard stealth tier with NO WBA verification     */
+  /*     escalates the composed verdict to bad/automated-runtime (the handler maps this   */
+  /*     to bad / stealth_automation and automation tier A).                              */
+  const hardStealth = {
+    detected: true,
+    ids: ['documentInterception', 'runtimeEnableLeak'],
+    hard: ['documentInterception'],
+    confirmed: ['documentInterception'],
+  };
+  const escalated = composeBotVerdict({ stealth: hardStealth });
+  wiringCheck(
+    'composed stealth hard tier (no WBA) escalates to bad/automated-runtime',
+    escalated.verdict === 'bad' &&
+      escalated.reason === 'automated-runtime' &&
+      escalated.severity === 'high',
+    escalated
+  );
+  wiringCheck(
+    'stealth reasons ride the SAME probe channel (no second taxonomy)',
+    escalated.reason_ids.slice(1).includes('stealth.document-interception-protocol') &&
+      escalated.reason_ids.slice(1).includes('stealth.runtime-enable-leak'),
+    escalated.reason_ids
+  );
+
+  /* 2 — verified-agent precedence: the identical stealth evidence CANNOT escalate a      */
+  /*     signed-good agent; the composed verdict stays good/signed-agent and ZERO         */
+  /*     stealth/automation reasons escape it.                                            */
+  const signedGood = composeBotVerdict({
+    stealth: hardStealth,
+    clientProbe: { verdict: 'agent', reasons: ['bot.playwright-binding'] },
+    webBotAuth: {
+      verified: true,
+      outcome: 'VALID',
+      identity: 'signed',
+      reason: 'signed-agent',
+      category: 'ai_agent',
+      bot_id: 'signed-agent-fixture',
+    },
+  });
+  wiringCheck(
+    'signed-good agent is never escalated by stealth/clientProbe evidence',
+    signedGood.verdict === 'good' && signedGood.reason === 'signed-agent',
+    signedGood
+  );
+  wiringCheck(
+    'signed-good verdict publishes exactly [signed-agent] (no stealth reasons leak)',
+    signedGood.reason_ids.length === 1 && signedGood.reason_ids[0] === 'signed-agent',
+    signedGood.reason_ids
+  );
+
+  /* 3 — verified-agent ledger precedence: rfc9421SignedAgent exempts the automation      */
+  /*     family even when tier-A hard automation evidence is present.                     */
+  const exemptLedger = buildGradedRiskLedger({
+    automation: { tierA: true, rfc9421SignedAgent: true },
+    network: { vpnOrRelay: true },
+    environment: { swiftshader: true, ephemeralOrPrivateStorage: true },
+  });
+  wiringCheck(
+    'rfc9421SignedAgent zeroes the automation family despite tier-A evidence',
+    exemptLedger.automation === 0,
+    exemptLedger
+  );
+  wiringCheck(
+    'no scored automation component is billed for a signed agent',
+    !exemptLedger.evidence_ledger.some(
+      (line) => line.family === 'automation' && line.points > 0
+    ),
+    exemptLedger.evidence_ledger
+  );
+  const unexemptLedger = buildGradedRiskLedger({ automation: { tierA: true } });
+  wiringCheck(
+    'without the exemption the automation family still bills tier A (45)',
+    unexemptLedger.automation === 45,
+    unexemptLedger
+  );
+
+  /* 4 — ASN org-hint acceptance: asnEnricher's zero-cost edge tier requires BOTH the     */
+  /*     ASN and the organization; the identify/geolocation handlers must forward         */
+  /*     `edgeGeo.organization` as asOrganization or the tier never fires.                */
+  const edgeEnriched = await enrichNetwork('8.8.8.8', {
+    asn: 15169,
+    asOrganization: 'Google LLC',
+  });
+  wiringCheck(
+    'enrichNetwork edge tier fires when asOrganization is supplied',
+    edgeEnriched.source === 'edge' && edgeEnriched.asn_name === 'Google LLC',
+    edgeEnriched
+  );
+  const asnOnly = await enrichNetwork('8.8.4.4', { asn: 15169 });
+  wiringCheck(
+    'an ASN without an organization never fabricates the edge tier',
+    asnOnly.source !== 'edge',
+    asnOnly
+  );
 }
 
 /* -------------------------------------------------------------------------- */
@@ -552,12 +685,18 @@ try {
   const totalCases = counters.casesPass + counters.casesFail + counters.casesSkip;
   const totalChecks = counters.checksPass + counters.checksFail + counters.checksSkip;
   const totalFields = counters.fieldsPass + counters.fieldsFail;
-  const failed = fatal || counters.casesFail > 0 || counters.checksFail > 0 || counters.fieldsFail > 0;
+  const failed =
+    fatal ||
+    counters.casesFail > 0 ||
+    counters.checksFail > 0 ||
+    counters.fieldsFail > 0 ||
+    wiringFailures > 0;
 
   section('RESULT');
   console.log(`Cases:  ${totalCases} total — ${counters.casesPass} PASS, ${counters.casesFail} FAIL, ${counters.casesSkip} SKIP`);
   console.log(`Checks: ${totalChecks} total — ${counters.checksPass} PASS, ${counters.checksFail} FAIL, ${counters.checksSkip} SKIP`);
   console.log(`Fields: ${totalFields} total — ${counters.fieldsPass} PASS, ${counters.fieldsFail} FAIL`);
+  console.log(`Wiring: ${wiringChecks} checks — ${wiringChecks - wiringFailures} PASS${wiringFailures > 0 ? `, ${wiringFailures} FAIL` : ''}`);
   if (failed) {
     console.log('RESULT: FAIL — P0 regression harness detected failures');
     process.exitCode = 1;

@@ -348,11 +348,44 @@ export function detectBotD19Signals(gpuRenderer?: string): BotD19Result {
         reasons.push('window.external toString tampering');
       }
     }
+    // Sequentum scan — content-extraction bots leak their brand through the
+    // stringified window.external payload (custom toString / own property
+    // names / JSON shape) even when the `[object External]` brand is intact,
+    // so the brand check above alone is not enough. Same weight tier as the
+    // brand check: it flips the same `window_external` signal.
+    if (ext !== undefined && ext !== null) {
+      let serialized = '';
+      try {
+        serialized = String(ext);
+      } catch {}
+      try {
+        const json = JSON.stringify(ext);
+        if (typeof json === 'string' && json.length > 0) serialized += ` ${json}`;
+      } catch {}
+      try {
+        const keys = Object.keys(ext as object).join(' ');
+        if (keys.length > 0) serialized += ` ${keys}`;
+      } catch {}
+      if (serialized.length > 0 && /Sequentum/i.test(serialized)) {
+        signals.window_external = true;
+        reasons.push('window.external Sequentum content-extraction signature');
+      }
+    }
   } catch {}
 
-  // 19. window_size
+  // 19. window_size — BotD-style document-focus gate. Some browsers report
+  // outerWidth/outerHeight 0 for ANY unfocused tab or minimized window, not
+  // only headless ones, so the zero-outer-size anomaly is only automation
+  // evidence while the document HAS focus. Without focus evidence (hostile or
+  // stubbed document.hasFocus) we stay silent: this is a weak signal and a
+  // false flag on an ordinary background tab is worse than a missed detection.
   try {
-    if (window.outerWidth === 0 && window.outerHeight === 0) {
+    // Bare global, matching this function's other `document` reads (checks 2-3).
+    const doc = typeof document !== 'undefined'
+      ? (document as unknown as { hasFocus?: () => boolean })
+      : undefined;
+    const hasFocus = typeof doc?.hasFocus === 'function' ? doc.hasFocus() === true : false;
+    if (hasFocus && window.outerWidth === 0 && window.outerHeight === 0) {
       signals.window_size = true;
       reasons.push('Window outerWidth and outerHeight are 0');
     }

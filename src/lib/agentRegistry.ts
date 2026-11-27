@@ -8,7 +8,9 @@
  * - Every derived legacy view (GOOD_BOT_UA_RULES, AI_AGENT_UA_RULES, BOT_DIRECTORY, …) is
  *   computed from AGENT_REGISTRY, so there is exactly one source of truth.
  * - "good" bot means search_crawler / link_preview only. Every AI category is "bad" in the
- *   API v4 bot verdict (see aiBotDirectory.formatBotInfoForApiV4).
+ *   API v4 bot verdict (see aiBotDirectory.formatBotInfoForApiV4). 'archiver' (web-archive
+ *   crawlers) is likewise never "good": only network proof can mark a bot verified, and the
+ *   good verdict additionally requires the search_crawler / link_preview category.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -18,6 +20,7 @@
 export type AgentCategory =
   | 'search_crawler'
   | 'link_preview'
+  | 'archiver'
   | 'ai_crawler'
   | 'ai_search'
   | 'ai_assistant'
@@ -45,7 +48,8 @@ export type AgentBucket =
   | 'apple'
   | 'amazon'
   | 'microsoft'
-  | 'commoncrawl';
+  | 'commoncrawl'
+  | 'hark';
 
 /** Superset of CursorAttributionOverlay's CursorIdentityKind plus exact named-agent kinds. */
 export type PillKind =
@@ -80,7 +84,22 @@ export type PillKind =
   | 'perplexity_bot'
   | 'perplexity_user'
   | 'amazonbot'
-  | 'bingbot';
+  | 'bingbot'
+  | 'hark'
+  | 'baiduspider'
+  | 'yandex'
+  | 'duckduckbot'
+  | 'terracotta'
+  | 'archive'
+  | 'arquivo'
+  | 'bytespider'
+  | 'tiktok_spider'
+  | 'meta'
+  | 'petalbot'
+  | 'prorata'
+  | 'timpibot'
+  | 'novellum'
+  | 'anchor';
 
 export type ProofTier = 'rfc9421' | 'signed_agent' | 'cidr' | 'fcrdns' | 'allowlist' | 'ua_claim' | 'automation';
 
@@ -146,6 +165,16 @@ export const PREFIX_FEEDS: readonly PrefixFeedDef[] = [
   { sourceId: 'amzn-user', url: 'https://developer.amazon.com/amazonbot/live-ip-addresses/', format: 'amazon-html', pinnedKey: 'amzn-user', refreshMs: DAY, maxBytes: 4_000_000 },
   { sourceId: 'claude', url: 'https://claude.com/crawling/bots.json', format: 'json', pinnedKey: 'claude', refreshMs: DAY, maxBytes: 2_000_000 },
   { sourceId: 'claude-agent-sail', url: 'https://claude.com/.well-known/sail', format: 'sail-toml', pinnedKey: 'claude-agent-sail', refreshMs: 3_600_000, maxBytes: 1_000_000 },
+  // Extended catalog (fetched 2026-11-27): Google ipranges siblings, OpenAI AdsBot, DuckDuckGo,
+  // Ahrefs and Hark (HarkBot requests are additionally RFC 9421 signed — see hark_bot).
+  { sourceId: 'google-user-triggered-agents', url: 'https://developers.google.com/search/apis/ipranges/user-triggered-agents.json', format: 'json', pinnedKey: 'google-user-triggered-agents', refreshMs: DAY, maxBytes: 8_000_000 },
+  { sourceId: 'google-special-crawlers', url: 'https://developers.google.com/search/apis/ipranges/special-crawlers.json', format: 'json', pinnedKey: 'google-special-crawlers', refreshMs: DAY, maxBytes: 8_000_000 },
+  { sourceId: 'google-user-triggered-fetchers', url: 'https://developers.google.com/search/apis/ipranges/user-triggered-fetchers.json', format: 'json', pinnedKey: 'google-user-triggered-fetchers', refreshMs: DAY, maxBytes: 8_000_000 },
+  { sourceId: 'google-user-triggered-fetchers-google', url: 'https://developers.google.com/search/apis/ipranges/user-triggered-fetchers-google.json', format: 'json', pinnedKey: 'google-user-triggered-fetchers-google', refreshMs: DAY, maxBytes: 8_000_000 },
+  { sourceId: 'openai-adsbot', url: 'https://openai.com/adsbot.json', format: 'json', pinnedKey: 'openai-adsbot', refreshMs: DAY, maxBytes: 2_000_000 },
+  { sourceId: 'duckduckbot', url: 'https://duckduckgo.com/duckduckbot.json', format: 'json', pinnedKey: 'duckduckbot', refreshMs: DAY, maxBytes: 4_000_000 },
+  { sourceId: 'ahrefs', url: 'https://api.ahrefs.com/v3/public/crawler-ip-ranges', format: 'json', pinnedKey: 'ahrefs', refreshMs: DAY, maxBytes: 2_000_000 },
+  { sourceId: 'hark', url: 'https://hark.com/agent/ipranges/harkbot.json', format: 'json', pinnedKey: 'hark', refreshMs: DAY, maxBytes: 2_000_000 },
   // Web Bot Auth directories carry JWKs, not CIDRs. They are never fetched as prefix feeds;
   // the verifier resolves them through WBA_TRUSTED_SIGNERS / PREFIX_FEEDS format 'none'.
   { sourceId: 'manus-wba', url: 'https://api.manus.im/.well-known/http-message-signatures-directory', format: 'none', refreshMs: DAY, maxBytes: 1_000_000 },
@@ -466,6 +495,131 @@ const REGISTRY_LITERAL = [
     executionMode: 'Autonomous Crawler',
     pill: { kind: 'automation', label: 'CCBot' },
   },
+  {
+    // Baidu publishes no IP ranges; the operator documents FCrDNS verification instead: a
+    // genuine Baiduspider crawl IP reverse-resolves under *.baidu.com or *.baidu.jp with a
+    // matching forward lookup. The single \b-anchored token covers the documented family
+    // variants (Baiduspider-image/-video/-news/-favo/-cpro/-ads and the mobile
+    // "Baiduspider+(+http://www.baidu.com/search/spider.htm)" UA), which share one operator
+    // and one verification contract.
+    id: 'baiduspider',
+    provider: 'Baidu',
+    displayName: 'Baiduspider',
+    category: 'search_crawler',
+    bucket: 'search-crawler',
+    rank: 210,
+    which: ['classifier', 'robodex', 'attribution', 'pill'],
+    ua: {
+      patterns: [/\bBaiduspider\b/i],
+      requireNetworkMatch: true,
+      network: /baidu/i,
+    },
+    fcrdnsSuffixes: ['baidu.com', 'baidu.jp'],
+    minProofForVerified: 'fcrdns',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'baiduspider', label: 'Baiduspider' },
+  },
+  {
+    // Yandex publishes no IP ranges; its webmaster docs ("How to check that a robot belongs
+    // to Yandex", yandex.com/support/webmaster) document FCrDNS: every Yandex robot IP
+    // reverse-resolves under *.yandex.ru, *.yandex.net or *.yandex.com with a matching
+    // forward lookup. One entry covers the documented robot family (YandexBot plus the
+    // Images/Video/News/Metrika/… sibling tokens and YaDirectFetcher — one operator, one
+    // reverse-DNS contract).
+    id: 'yandex_bot',
+    provider: 'Yandex',
+    displayName: 'YandexBot',
+    category: 'search_crawler',
+    bucket: 'search-crawler',
+    rank: 220,
+    which: ['classifier', 'robodex', 'attribution', 'pill'],
+    ua: {
+      patterns: [
+        /\bYandexBot\b/i,
+        /\bYandex(?:Images|Video|News|Metrika|AccessibilityBot|AdNet|ForDomain|Turbo|Vertis)\b/i,
+        /\bYaDirectFetcher\b/i,
+      ],
+      requireNetworkMatch: true,
+      network: /yandex/i,
+    },
+    fcrdnsSuffixes: ['yandex.ru', 'yandex.net', 'yandex.com'],
+    minProofForVerified: 'fcrdns',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'yandex', label: 'YandexBot' },
+  },
+  {
+    // DuckDuckGo's search crawler, verified against the operator's official CIDR feed
+    // (duckduckgo.com/duckduckbot.json — already pinned as PREFIX_FEEDS source 'duckduckbot').
+    id: 'duckduckbot',
+    provider: 'DuckDuckGo',
+    displayName: 'DuckDuckBot',
+    category: 'search_crawler',
+    bucket: 'search-crawler',
+    rank: 230,
+    which: ['classifier', 'robodex', 'attribution', 'pill'],
+    ua: {
+      patterns: [/\bDuckDuckBot\/1\.0\b/i, /\bDuckDuckBot\b/i],
+      requireNetworkMatch: true,
+      network: /duckduckgo/i,
+    },
+    feedIds: ['duckduckbot'],
+    minProofForVerified: 'cidr',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'duckduckbot', label: 'DuckDuckBot' },
+  },
+  {
+    // Web archivers. The Internet Archive documents no reverse-DNS contract and publishes no
+    // IP ranges (rDNS verification is an open proposal in internetarchive/heritrix3#507), and
+    // Arquivo.pt publishes no ranges or DNS contract either — so both stay UA claims that can
+    // never be upgraded by a UA alone. Category 'archiver' is never a "good" bot verdict.
+    id: 'archive_bot',
+    provider: 'Internet Archive',
+    displayName: 'Archive.org Bot',
+    category: 'archiver',
+    bucket: 'none',
+    rank: 240,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/\barchive\.org_bot\b/i, /\bia_archiver\b/i] },
+    minProofForVerified: 'ua_claim',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'archive', label: 'Archive.org Bot' },
+  },
+  {
+    id: 'arquivo_bot',
+    provider: 'Arquivo.pt',
+    displayName: 'Arquivo Web Crawler',
+    category: 'archiver',
+    bucket: 'none',
+    rank: 250,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/\bArquivo-web-crawler\b/i] },
+    minProofForVerified: 'ua_claim',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'arquivo', label: 'Arquivo Web Crawler' },
+  },
+  {
+    // Google publishes no dedicated CloudVertexBot ipranges file (developers.google.com
+    // …/ipranges/vertexbot.json → HTTP 404), but its crawler docs extend the Googlebot FCrDNS
+    // contract to Google-CloudVertexBot: reverse DNS must end in googlebot.com or google.com
+    // with a matching forward lookup. The Vertex AI indexing crawler only visits sites whose
+    // owners request indexing, but it is an AI family, never a "good" bot verdict.
+    id: 'cloudvertex_bot',
+    provider: 'Google',
+    displayName: 'Google-CloudVertexBot',
+    category: 'ai_crawler',
+    bucket: 'gemini',
+    rank: 260,
+    which: ['classifier', 'robodex', 'attribution', 'pill'],
+    ua: {
+      patterns: [/\bGoogle-CloudVertexBot\b/i],
+      requireNetworkMatch: true,
+      network: /google|googleusercontent/i,
+    },
+    fcrdnsSuffixes: ['googlebot.com', 'google.com'],
+    minProofForVerified: 'fcrdns',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'googlebot', label: 'CloudVertexBot' },
+  },
   /* ---- Legacy directory agents preserved from the pre-registry bot directory ----
      These were previously detected by BOT_DIRECTORY. Keeping them in the single registry
      avoids losing coverage while adding the newly verified crawler catalog above. */
@@ -495,29 +649,37 @@ const REGISTRY_LITERAL = [
     executionMode: 'Coding Agent',
   },
   {
-    id: 'gemini_deep_research',
-    provider: 'Google',
-    displayName: 'Gemini Deep Research',
-    category: 'ai_agent',
-    bucket: 'gemini',
-    rank: 807,
-    which: ['robodex'],
-    ua: { patterns: [/Gemini-Deep-Research|GoogleAgent-Mariner|Mariner|Google-Agent/i] },
-    asns: [15169, 396982],
-    asnPatterns: [/google llc|google cloud/i],
-    minProofForVerified: 'allowlist',
-    executionMode: 'User-Triggered Fetcher',
-  },
-  {
+    // The Google-Agent UA token is only a CLAIM: verification comes from the published
+    // user-triggered-agents CIDR feed plus the bare-origin Signature-Agent anchor
+    // (`agent.bot.goog`, anchored in WBA_TRUSTED_SIGNERS in wbaVerifier.ts — referenced,
+    // never redefined here). Rank 807: the exact Google-Agent token outranks the broader
+    // gemini_deep_research alternation, which also matches it at 808.
     id: 'google_agent',
     provider: 'Google',
     displayName: 'Google-Agent',
     category: 'ai_agent',
     bucket: 'gemini',
+    rank: 807,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/Google-Agent\/?/i] },
+    signature: { wbaRequired: true, agentHosts: ['agent.bot.goog'] },
+    feedIds: ['google-user-triggered-agents'],
+    minProofForVerified: 'cidr',
+    executionMode: 'User-Triggered Fetcher',
+    pill: { kind: 'gemini', label: 'Google-Agent' },
+  },
+  {
+    id: 'gemini_deep_research',
+    provider: 'Google',
+    displayName: 'Gemini Deep Research',
+    category: 'ai_agent',
+    bucket: 'gemini',
     rank: 808,
     which: ['robodex'],
-    ua: { patterns: [/Google-Agent/i] },
-    minProofForVerified: 'ua_claim',
+    ua: { patterns: [/Gemini-Deep-Research|GoogleAgent-Mariner|Mariner|Google-Agent/i] },
+    asns: [15169, 396982],
+    asnPatterns: [/google llc|google cloud/i],
+    minProofForVerified: 'allowlist',
     executionMode: 'User-Triggered Fetcher',
   },
   {
@@ -668,10 +830,11 @@ const REGISTRY_LITERAL = [
     category: 'ai_browser',
     bucket: 'cloud-browser',
     rank: 818,
-    which: ['robodex'],
+    which: ['robodex', 'pill'],
     ua: { patterns: [/AnchorBrowser|anchor-browser/i] },
     minProofForVerified: 'ua_claim',
     executionMode: 'Cloud Browser Agent',
+    pill: { kind: 'anchor', label: 'Anchor Browser' },
   },
   {
     id: 'notte_browser',
@@ -757,6 +920,168 @@ const REGISTRY_LITERAL = [
     ua: { patterns: [/\bInstinct\b/i] },
     minProofForVerified: 'ua_claim',
     executionMode: 'Cloud Browser Agent',
+  },
+  {
+    // RFC 9421 Web Bot Auth signed agent: Hark's own feed notes and bot page
+    // (https://hark.com/about/bot) confirm the Signature-Agent contract and key directory
+    // at hark.com, and the published harkbot.json CIDR feed corroborates the network
+    // origin. The UA token alone remains only a claim.
+    id: 'hark_bot',
+    provider: 'Hark',
+    displayName: 'HarkBot',
+    category: 'ai_agent',
+    bucket: 'hark',
+    rank: 826,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/\bHarkBot\/1\.0/i] },
+    signature: {
+      wbaRequired: true,
+      agentHosts: ['hark.com'],
+    },
+    feedIds: ['hark'],
+    minProofForVerified: 'signed_agent',
+    executionMode: 'RFC 9421 Signed Agent',
+    pill: { kind: 'hark', label: 'HarkBot' },
+  },
+  /* ---- Extended crawler catalog (ua_claim unless a proof source is documented) ------------
+     Every entry below names a real operator token; none of these operators publishes an
+     official CIDR feed or a documented reverse-DNS suffix, so a UA match alone can NEVER
+     verify them (minProofForVerified: 'ua_claim' keeps identity 'unknown'). */
+  {
+    // Cloudflare Radar categorizes Ceramic's TerraCotta as a search-engine crawler
+    // (SEARCH_ENGINE_CRAWLER; sibling token "Terracotta-News"). The \b-anchored token covers
+    // both. No published ranges, no documented DNS contract — UA claim only.
+    id: 'terracotta_bot',
+    provider: 'Ceramic',
+    displayName: 'TerraCotta',
+    category: 'search_crawler',
+    bucket: 'search-crawler',
+    rank: 830,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/\bTerracotta\b/i] },
+    minProofForVerified: 'ua_claim',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'terracotta', label: 'TerraCotta' },
+  },
+  {
+    // ByteDance's AI training / search-index crawler. No official CIDR feed or DNS contract.
+    id: 'bytespider',
+    provider: 'ByteDance',
+    displayName: 'Bytespider',
+    category: 'ai_crawler',
+    bucket: 'none',
+    rank: 832,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/\bBytespider\b/i] },
+    minProofForVerified: 'ua_claim',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'bytespider', label: 'Bytespider' },
+  },
+  {
+    // ByteDance's sibling token (in-app link fetching / indexing for TikTok). Separate token
+    // from Bytespider; same operator, same absence of published network proof.
+    id: 'tiktok_spider',
+    provider: 'ByteDance',
+    displayName: 'TikTokSpider',
+    category: 'ai_crawler',
+    bucket: 'none',
+    rank: 834,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/\bTikTokSpider\b/i] },
+    minProofForVerified: 'ua_claim',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'tiktok_spider', label: 'TikTokSpider' },
+  },
+  {
+    // Meta's legacy AI-training token (largely consolidated into Meta-ExternalAgent but still
+    // seen in the wild). Meta's web-crawlers docs publish no IP ranges — UA claim only.
+    id: 'facebookbot',
+    provider: 'Meta',
+    displayName: 'FacebookBot',
+    category: 'ai_crawler',
+    bucket: 'muse',
+    rank: 836,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/\bFacebookBot\b/i] },
+    minProofForVerified: 'ua_claim',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'meta', label: 'FacebookBot' },
+  },
+  {
+    // Meta's user-triggered fetcher (per Meta's docs: fetches on user request, may bypass
+    // robots.txt). No published ranges — UA claim only.
+    id: 'meta_external_fetcher',
+    provider: 'Meta',
+    displayName: 'Meta-ExternalFetcher',
+    category: 'ai_assistant',
+    bucket: 'muse',
+    rank: 838,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/\bMeta-ExternalFetcher\b/i] },
+    minProofForVerified: 'ua_claim',
+    executionMode: 'User-Triggered Fetcher',
+    pill: { kind: 'meta', label: 'Meta-ExternalFetcher' },
+  },
+  {
+    // Huawei's PetalBot (Petal Search / Aspiegel). Third-party guides disagree on whether
+    // the operator formally documents a reverse-DNS suffix, and the operator's own pages
+    // publish no ranges — so no suffix is wired and the token stays a claim.
+    id: 'petalbot',
+    provider: 'Huawei',
+    displayName: 'PetalBot',
+    category: 'ai_crawler',
+    bucket: 'none',
+    rank: 840,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/\bPetalBot\b/i] },
+    minProofForVerified: 'ua_claim',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'petalbot', label: 'PetalBot' },
+  },
+  {
+    // ProRata's Gist AI search crawler (same family as GPTBot-class training crawlers).
+    id: 'prorata_inc',
+    provider: 'ProRata',
+    displayName: 'ProRataInc',
+    category: 'ai_crawler',
+    bucket: 'none',
+    rank: 842,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/\bProRataInc\b/i] },
+    minProofForVerified: 'ua_claim',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'prorata', label: 'ProRataInc' },
+  },
+  {
+    // Timpi's decentralized-search crawler, categorized as an AI crawler; the operator
+    // documents no published verification method — UA claim only.
+    id: 'timpibot',
+    provider: 'Timpi',
+    displayName: 'Timpibot',
+    category: 'ai_crawler',
+    bucket: 'none',
+    rank: 844,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/\bTimpibot\b/i] },
+    minProofForVerified: 'ua_claim',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'timpibot', label: 'Timpibot' },
+  },
+  {
+    // "Novellum" is the in-the-wild token; some directories log the fuller "NovellumAICrawl"
+    // spelling — both accepted. Third-party writeups mention signed requests, but the
+    // operator publishes no key directory, so nothing beyond the UA claim is wired.
+    id: 'novellum_ai_crawl',
+    provider: 'Novellum',
+    displayName: 'Novellum AI Crawl',
+    category: 'ai_crawler',
+    bucket: 'none',
+    rank: 846,
+    which: ['robodex', 'attribution', 'pill'],
+    ua: { patterns: [/\bNovellum\b/i, /\bNovellumAICrawl\b/i] },
+    minProofForVerified: 'ua_claim',
+    executionMode: 'Autonomous Crawler',
+    pill: { kind: 'novellum', label: 'Novellum AI Crawl' },
   },
   {
     // Policy tokens are robots.txt directives, never HTTP user agents. They never visit.
@@ -903,6 +1228,14 @@ const UA_IMPERSONABLE_AGENT_IDS = new Set([
   'chatgpt_user',
   'perplexity_bot',
   'ccbot',
+  'google_agent',
+  // FCrDNS-verified crawlers whose tokens are routinely spoofed (Baidu's and Yandex's own
+  // docs lead with the fake-spiders warning); verification needs the per-request reverse-DNS
+  // check, so the static catalog never pre-grants them a verified identity.
+  'baiduspider',
+  'yandex_bot',
+  'duckduckbot',
+  'cloudvertex_bot',
 ]);
 
 function escapeRegExp(value: string): string {

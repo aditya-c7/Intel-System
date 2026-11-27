@@ -251,6 +251,11 @@ export const HARD_AGENT_REASON_IDS = [
   'stealth.storage-partitioning-protocol',
   'stealth.puppeteer-source-url',
   'stealth.playwright-source-url',
+  // H3 desktop conjunction (mirror of verdict.ts HARD_REASONS; exact entry wins over
+  // the weak `headless.swiftshader.caveat` and the medium `headless.` prefix): a
+  // software-GL context returned despite failIfMajorPerformanceCaveat under a
+  // desktop-claiming UA-CH platform with zero touch points — a forced headless launch.
+  'headless.swiftshader.caveat.desktop',
   'bot.cdp-tampered',
   'bot.playwright-binding',
   // RS-E: cdc_* binding globals are UNATTRIBUTED runtime artifacts (CDP bridge / injected
@@ -265,6 +270,10 @@ export const HARD_AGENT_REASON_IDS = [
 const DEVELOPER_TOOLS_REASON_IDS: ReadonlySet<string> = new Set([
   'cdp.runtime.enable.empty_source',
   'cdp.network.enable.pre_load_message',
+  // C1 dedicated-Worker variant (mirror of verdict.ts DEVELOPER_TOOLS_REASONS): the
+  // empty-source uncaught-error tell observed inside a Blob Worker realm. Weight 0,
+  // corroborating only — never a bot verdict on its own.
+  'cdp.runtime.enable.worker',
   'bot.cdp-runtime-leak',
   // RS-E: cdc_* / bare CDP are unattributed runtime artifacts — telemetry-only evidence.
   // Automation is expected for verified agents and cannot disqualify signed good.
@@ -284,6 +293,9 @@ const MEDIUM_REASON_IDS: ReadonlySet<string> = new Set([
   'headless.font-exact-integers',
   'headless.no-intlyen-key',
   'headless.secch-headless-mismatch',
+  // Notification-permission contract mismatch (mirror of verdict.ts MEDIUM_REASONS):
+  // Notification.permission says 'denied' while the Permissions API resolves 'prompt'.
+  'headless.notification-contract',
   'instinct.credentials.wrappers',
   'instinct.geetest.accessor-pair',
   'muse.cloud-browser.password-manager',
@@ -352,6 +364,8 @@ const AUTOMATION_REASON_IDS: ReadonlySet<string> = new Set([
   'ua.brands-vs-ua-mismatch',
   'headless.any-pointer-none',
   'headless.swiftshader.caveat',
+  'headless.swiftshader.caveat.desktop',
+  'headless.notification-contract',
   'headless.no-intlyen-key',
   'headless.chrome-extension-port',
   'headless.heap-3digit-rounding',

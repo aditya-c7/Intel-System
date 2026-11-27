@@ -55,6 +55,14 @@ import {
 import * as sharedSignalModule from '../client/signals';
 import * as sharedLoaderModule from '../client/signals/loader';
 import type { BrowserCanvasHints } from '../client/signals/types';
+// Aggregate kinematics (zero-PII motion attestation): shape features come from the
+// SAME kinematics tracker module that emits behavior.* reason ids — never a
+// parallel capture system. Only scalar reductions are imported; no raw sample
+// type is consumed here.
+import {
+  getKinematicsShapeFeatures,
+  type KinematicsAggregate,
+} from '../client/signals/automation';
 import { loadStoredIdentity, persistIdentity, getSessionId } from '../client/storage/identityStore';
 import { normalizeIdentity } from '../shared/normalization/uaNormalizer';
 import {
@@ -3636,6 +3644,8 @@ interface InteractionCounters {
   /** Trusted intervals between ANY successive deduped input events — human rhythm across phases. */
   inputIntervalsMs: number[];
   scrolls: number;
+  /** Trusted wheel input events — scroll intent. Counted, never serialized. */
+  wheels: number;
   keyDowns: number;
   keyIntervalsMs: number[];
   /** Trusted pointer-move coordinates — a real trail has varying positions, a script does not. */
@@ -3655,6 +3665,7 @@ const interactionCounters: InteractionCounters = {
   touchIntervalsMs: [],
   inputIntervalsMs: [],
   scrolls: 0,
+  wheels: 0,
   keyDowns: 0,
   keyIntervalsMs: [],
   pointerPositions: [],
@@ -3679,6 +3690,12 @@ export interface InspectorProbes {
   crossRealmNativeDescriptor: boolean;
   /** Additive shadow observation: a "clean" iframe returned contentWindow === window. */
   iframeContentWindowEqualsWindow?: boolean;
+  /**
+   * `tamper.cyclic-native-absent` — `Object.setPrototypeOf(fn, fn)` did NOT throw for at
+   * least one audited native, i.e. a Proxy swallowed the cyclic-prototype write. TAMPERING
+   * axis only: the reason id is carried here as telemetry and is never a bot signal.
+   */
+  tamperCyclicNativeAbsent?: boolean;
   inspectorProbeError: string;
 }
 export const inspectorProbes: InspectorProbes = {
@@ -3689,6 +3706,7 @@ export const inspectorProbes: InspectorProbes = {
   crossRealmGetterSourceMismatch: false,
   crossRealmNativeDescriptor: false,
   iframeContentWindowEqualsWindow: false,
+  tamperCyclicNativeAbsent: false,
   inspectorProbeError: '',
 };
 
@@ -4045,6 +4063,13 @@ export function installTrustedInputTracker(): void {
       interactionCounters.scrolls += 1;
       stamp();
     };
+    // Wheel is counted on window capture ONLY — unlike scroll it bubbles, so a
+    // duplicate document listener would double-count every event.
+    const onWheel = (event: Event): void => {
+      if (!(event as WheelEvent).isTrusted) return;
+      interactionCounters.wheels += 1;
+      stamp();
+    };
     const onKey = (event: Event): void => {
       if (!(event as KeyboardEvent).isTrusted) return;
       trustedKeyEvents += 1;
@@ -4070,6 +4095,7 @@ export function installTrustedInputTracker(): void {
     window.addEventListener('pointerdown', onPointerDown, options);
     window.addEventListener('pointermove', onPointerMove, options);
     window.addEventListener('keydown', onKey, options);
+    window.addEventListener('wheel', onWheel, options);
     window.addEventListener('touchstart', onTouchStart, options);
     window.addEventListener('touchmove', onTouchMove, options);
     window.addEventListener('touchend', onTouchEnd, options);
@@ -4095,6 +4121,52 @@ export function installTrustedInputTracker(): void {
 // Install at module load, before App mount and before the first identify, so genuine
 // pre-identify input is visible. The function itself is a no-op without a window.
 if (typeof window !== 'undefined') installTrustedInputTracker();
+
+/**
+ * ZERO-PII INVARIANT (payload site). `kinematics` is the aggregate motion
+ * attestation posted alongside identify/corroborate so the server can award
+ * "Corroborated Human". It contains ONLY the scalar statistics below — never
+ * coordinates, never timestamps, never key values or key content, never raw
+ * event or point arrays. Counts come from `interactionCounters`, which stores
+ * counts/interval statistics only; shape features come from the automation.ts
+ * kinematics tracker, whose raw trail lives in that module's memory and is
+ * never serialized. Every float is rounded to 3 decimals; every shape feature
+ * is null when there are too few events to compute it.
+ */
+export function buildKinematicsPayload(): KinematicsAggregate {
+  const counters = interactionCounters;
+  // Pointer-family input: moves, presses and touch phases (a touch is pointer activity).
+  const pointerEvents =
+    counters.pointerMoves +
+    counters.pointerDowns +
+    counters.touchStarts +
+    counters.touchMoves +
+    counters.touchEnds;
+  // Keyboard: counts only — never key identity/content.
+  const keyEvents = counters.keyDowns;
+  const scrollEvents = counters.scrolls + counters.wheels;
+  const shape = getKinematicsShapeFeatures();
+  const interactionMs =
+    counters.firstInteractionAt > 0 && counters.lastInteractionAt > counters.firstInteractionAt
+      ? counters.lastInteractionAt - counters.firstInteractionAt
+      : 0;
+  return {
+    eventCount: pointerEvents + keyEvents + scrollEvents,
+    pointerEvents,
+    keyEvents,
+    scrollEvents,
+    interactionMs,
+    brakingRatio: shape.brakingRatio,
+    microStructure: shape.microStructure,
+    meanTurnAngle: shape.meanTurnAngle,
+    turnsWhileFast: shape.turnsWhileFast,
+    straightness: shape.straightness,
+    speedCv: shape.speedCv,
+    minFlightMs: shape.minFlightMs,
+    clockMonotonic: shape.clockMonotonic,
+    maxSpeedPx: shape.maxSpeedPx,
+  };
+}
 
 /**
  * Human-corroboration score in [0, 1].
@@ -4345,6 +4417,58 @@ export function detectStealthArtifacts(gpuRenderer?: string): StealthArtifacts {
     }
   } catch {
     // Blocked iframes are inconclusive; never a verdict.
+  }
+
+  // `tamper.cyclic-native-absent` — cyclic-prototype tamper audit. A STOCK native
+  // function throws TypeError ('Cyclic __proto__ value') when set as its own prototype;
+  // a Proxy-wrapped native installs a [[SetPrototypeOf]] trap that swallows the write,
+  // so the ABSENCE of that throw is direct evidence of a wrapper. Routed ONLY to the
+  // TAMPERING axis (forwarded below via `tamperingLies.prototypeCyclicTrap`, the
+  // existing POINTS:0 shadow channel): privacy extensions (CanvasBlocker and friends)
+  // wrap canvas/audio natives legitimately, and privacy-hardened browsers must never
+  // bot-flag — so this never joins `stealthReasons` / the bot gate.
+  try {
+    // typeof guards keep an absent constructor (older engines, exotic webviews) from
+    // aborting the whole audit on a ReferenceError — each surface is judged on its own.
+    const cyclicAuditTargets: Array<() => unknown> = [
+      () => (typeof HTMLCanvasElement === 'undefined' ? undefined : HTMLCanvasElement.prototype.toDataURL),
+      () =>
+        typeof CanvasRenderingContext2D === 'undefined'
+          ? undefined
+          : CanvasRenderingContext2D.prototype.getImageData,
+      () =>
+        typeof WebGLRenderingContext === 'undefined'
+          ? undefined
+          : WebGLRenderingContext.prototype.getParameter,
+      () => (typeof AudioBuffer === 'undefined' ? undefined : AudioBuffer.prototype.getChannelData),
+    ];
+    for (const resolveTarget of cyclicAuditTargets) {
+      const fn = resolveTarget() as unknown;
+      if (typeof fn !== 'function') continue; // API absent — audit the next surface
+      const previousPrototype = Object.getPrototypeOf(fn);
+      let threwCyclic = true;
+      try {
+        Object.setPrototypeOf(fn as object, fn as object);
+        threwCyclic = false; // no throw ⇒ the write was swallowed by a Proxy trap
+      } catch {
+        threwCyclic = true; // stock native: the expected TypeError ('Cyclic …')
+      } finally {
+        try {
+          // Restore whatever the (possibly intercepted) write changed. On a swallowing
+          // Proxy the target is untouched and this is a no-op; on exotic hosts it keeps
+          // the audit side-effect-free.
+          Object.setPrototypeOf(fn as object, previousPrototype);
+        } catch {
+          // Restoration refused — the tamper evidence is already recorded below.
+        }
+      }
+      if (!threwCyclic) {
+        inspectorProbes.tamperCyclicNativeAbsent = true;
+        break; // one swallowed write is sufficient evidence; stop mutating surfaces
+      }
+    }
+  } catch {
+    // Hostile global scope — the flag stays absent; the audit is never fatal.
   }
 
   // Patched native accessors across the properties stealth plugins forge.
@@ -6574,6 +6698,11 @@ export interface ClientProvenanceSignals extends ClientRuntimeSignals {
   privacy_signature_ids?: string[];
   /** Additive, informational stealth evidence ids from `./stealthSignals` (never a verdict). */
   stealth_signal_ids?: string[];
+  /**
+   * Additive zero-PII motion attestation (see buildKinematicsPayload). Scalar
+   * aggregates only — never coordinates, timestamps, key content or raw arrays.
+   */
+  kinematics: KinematicsAggregate;
   /* Additive normalized truth/stability mirrors — never verdict or score inputs. */
   gpu_truth_state?: ReturnType<typeof resolveGpuTruthState>['state'];
   gpu_answer_unreliable?: boolean;
@@ -6773,7 +6902,14 @@ function buildStealthObservations(evidence: LightweightStealthEvidence): Stealth
   }
 
   // documentInterception — reads navigation timing already collected by the browser. No new
-  // network request and no fabricated values.
+  // network request and no fabricated values. The guard below IS the RED condition: a
+  // committed document reporting transferSize>0 with an EMPTY nextHopProtocol, an EMPTY
+  // deliveryType and workerStart===0 is a protocol-level impossibility that page scripts,
+  // extensions and user settings cannot reproduce (only an interception of the document
+  // delivery explains it). The confirmed/RED variant is therefore emitted as
+  // corroborated:true — the observation escalates exactly like the other confirmed
+  // signals (`stealthReasonId` maps it to the hard 'stealth.document-interception-protocol')
+  // — instead of the plain medium id.
   if (
     evidence.chromium &&
     typeof performance !== 'undefined' &&
@@ -6790,7 +6926,7 @@ function buildStealthObservations(evidence: LightweightStealthEvidence): Stealth
         nav.deliveryType === '' &&
         Number(nav.workerStart) === 0
       ) {
-        add('documentInterception', true, false);
+        add('documentInterception', true, true);
       }
     } catch {
       // Performance entries unavailable — omit.
@@ -7150,8 +7286,9 @@ export async function evaluateSecuritySignals(
     browserDevice.browser
   );
   // Forward only observations that were actually collected on this path. Worker/shared/service
-  // scopes, silent-buffer and cyclic-__proto__ traps are NOT probed here, so they stay absent
-  // rather than being fabricated as false. Every forwarded field is POINTS:0 shadow telemetry.
+  // scopes and the silent-buffer trap are NOT probed here, so they stay absent rather than
+  // being fabricated as false. (The cyclic-native audit IS collected above and forwarded via
+  // `prototypeCyclicTrap`.) Every forwarded field is POINTS:0 shadow telemetry.
   let windowLanguages: string | null = null;
   try {
     const langs = typeof navigator !== 'undefined' ? navigator.languages : undefined;
@@ -7179,6 +7316,12 @@ export async function evaluateSecuritySignals(
       audioRepeatReadDiverged: hardwareSignals.audioNoise ?? null,
       audioPrivacyNoise: privacyHardened && Boolean(hardwareSignals.audioNoise),
       iframeContentWindowEqualsWindow: inspectorProbes.iframeContentWindowEqualsWindow,
+      // `tamper.cyclic-native-absent` — the cyclic-prototype audit above, routed through
+      // the existing POINTS:0 `prototypeCyclicTrap` shadow channel ('cyclic __proto__ trap
+      // succeeded (Proxy-wrapped native)'). TAMPERING axis only, never the bot gate, and a
+      // privacy-hardened runtime is exempt by construction: wrapper extensions are an
+      // expected defence there, never spoofing evidence.
+      prototypeCyclicTrap: !privacyHardened && inspectorProbes.tamperCyclicNativeAbsent === true,
     },
     canvasNoiseDetected,
     gpuAnswerUnreliable: gpuTruth.answerUnreliable,
@@ -7503,6 +7646,11 @@ export async function evaluateSecuritySignals(
     forcedColors: mediaMatches('(forced-colors: active)'),
     reducedMotion: mediaMatches('(prefers-reduced-motion: reduce)'),
     reducedTransparency: mediaMatches('(prefers-reduced-transparency: reduce)'),
+    // Parity additions (FingerprintJS v3 techniques): monochrome reads the count of
+    // color bits — '(monochrome: 0)' is false on monochrome displays, so the resolved
+    // value is the inverse; inverted-colors is a direct boolean read.
+    monochrome: mediaMatches('(monochrome: 0)') === false,
+    invertedColors: mediaMatches('(inverted-colors)'),
     colorScheme:
       colorSchemeDark === true ? 'dark' : colorSchemeLight === true ? 'light' : null,
     contrast:
@@ -7554,6 +7702,10 @@ export async function evaluateSecuritySignals(
     privacy_hardened: privacyVerdict.privacy_hardened,
     privacy_signature_ids: privacyVerdict.signatures,
     stealth_signal_ids: stealthEvaluation.ids,
+    /* Zero-PII motion attestation for "Corroborated Human" — scalar aggregates only
+       (never coordinates, timestamps, key content or raw arrays; see
+       buildKinematicsPayload). Additive, informational, never a verdict input. */
+    kinematics: buildKinematicsPayload(),
     datacenterAsn,
     cloudOrMaskedGpu,
     vpnReasons,
@@ -8788,6 +8940,15 @@ interface WorkerTriangulationTelemetry {
   soft: boolean;
   strong_fields: string[];
   soft_fields: string[];
+  /**
+   * C1 dedicated-Worker variant (`cdp.runtime.enable.worker`): true only when the worker's
+   * uncaught `__cdp_probe_worker__` ReferenceError reported an EMPTY script URL — the same
+   * Runtime.enable tell as the window probe, observed in the worker realm. false = the
+   * error was seen with a normal source or never surfaced (mirrors the window probe's
+   * safety-timeout "not flagged"); null = worker blocked, deadline hit, or the result
+   * message never arrived (inconclusive). Weight 0, corroborating only.
+   */
+  cdpRuntimeEnable: boolean | null;
 }
 
 async function collectWorkerTriangulation(): Promise<WorkerTriangulationTelemetry | null> {
@@ -8808,10 +8969,29 @@ async function collectWorkerTriangulation(): Promise<WorkerTriangulationTelemetr
     'deviceMemory:(typeof n.deviceMemory==="number"?n.deviceMemory:null),',
     'brands:(u&&Array.isArray(u.brands))?u.brands.map(function(b){return b.brand;}):[],',
     'languages:Array.isArray(n.languages)?n.languages.slice():[]',
-    '});};',
+    '});',
+    // C1 dedicated-Worker rerun. Mirrors the window probe exactly: a temporary error
+    // handler, `eval` of the probe token on a zero timer inside a swallowing try/catch,
+    // and the uncaught-error SOURCE posted back. With CDP Runtime.enable active the
+    // exception is attributed to the CDP evaluation realm (empty source); a plain worker
+    // reports the blob URL. The handler only claims our own marker so an unrelated
+    // worker error still surfaces normally, and an internal safety timer reports
+    // "no error" so the main thread can distinguish "checked, not flagged" from
+    // "result never arrived".
+    'var cdpReported=false;',
+    'self.onerror=function(m,s){',
+    'if(String(m).indexOf("__cdp_probe_worker__")<0)return false;',
+    'cdpReported=true;',
+    'self.postMessage({cdpErrorSource:(typeof s==="string"?s:"")});',
+    'return true;};',
+    'setTimeout(function(){try{eval("__cdp_probe_worker__");}catch(e){}},0);',
+    'setTimeout(function(){if(!cdpReported)self.postMessage({cdpErrorSource:null});},100);',
+    '};',
   ].join('');
 
-  const compare = (data: Record<string, unknown>): WorkerTriangulationTelemetry => {
+  const compare = (
+    data: Record<string, unknown>
+  ): Omit<WorkerTriangulationTelemetry, 'cdpRuntimeEnable'> => {
     const strongFields: string[] = [];
     const softFields: string[] = [];
     const windowNav = navigator as unknown as Record<string, unknown>;
@@ -8859,19 +9039,40 @@ async function collectWorkerTriangulation(): Promise<WorkerTriangulationTelemetr
     url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
     const blobWorker = new Worker(url);
     worker = blobWorker;
-    return await Promise.race([
-      new Promise<WorkerTriangulationTelemetry | null>((resolve) => {
-        blobWorker.onmessage = (event: MessageEvent) => {
-          const data = event.data;
-          resolve(data && typeof data === 'object' ? compare(data as Record<string, unknown>) : null);
-        };
-        blobWorker.onerror = () => resolve(null);
-        blobWorker.postMessage('probe');
-      }),
-      new Promise<null>((resolve) => {
-        timer = setTimeout(() => resolve(null), 200);
-      }),
-    ]);
+    // Two worker messages are expected: the navigator telemetry and the C1 uncaught-error
+    // source. The race settles when both arrived, at the deadline (partial telemetry
+    // preserved, missing C1 result degrading to null), or never after an escaped error.
+    let triangulation: Omit<WorkerTriangulationTelemetry, 'cdpRuntimeEnable'> | null = null;
+    let cdpErrorSource: string | null | undefined; // undefined = result not yet reported
+    const finalize = (): WorkerTriangulationTelemetry | null => {
+      if (!triangulation) return null;
+      return {
+        ...triangulation,
+        cdpRuntimeEnable: cdpErrorSource === undefined ? null : cdpErrorSource === '',
+      };
+    };
+    const settled = new Promise<WorkerTriangulationTelemetry | null>((resolve) => {
+      blobWorker.onmessage = (event: MessageEvent) => {
+        const data = event.data;
+        if (!data || typeof data !== 'object') return;
+        const record = data as Record<string, unknown>;
+        if ('cdpErrorSource' in record) {
+          // The worker reported its uncaught-error source (or "none" as null).
+          cdpErrorSource = typeof record.cdpErrorSource === 'string' ? record.cdpErrorSource : null;
+        } else {
+          triangulation = compare(record);
+        }
+        if (triangulation && cdpErrorSource !== undefined) resolve(finalize());
+      };
+      // An error that escaped the worker's own handler means the probe is unreliable —
+      // abstain entirely rather than trust a partial result.
+      blobWorker.onerror = () => resolve(null);
+      blobWorker.postMessage('probe');
+    });
+    const deadline = new Promise<WorkerTriangulationTelemetry | null>((resolve) => {
+      timer = setTimeout(() => resolve(finalize()), 200);
+    });
+    return await Promise.race([settled, deadline]);
   } catch {
     // Workers unavailable / blocked — abstain.
     return null;
@@ -9104,6 +9305,13 @@ export async function identifyCurrentVisitor(options?: {
     const webGpuEntropy = await collectWebGpuEntropy();
     const workerTriangulation = await collectWorkerTriangulation();
     const activeText = collectActiveTextHint();
+    // C1 dedicated-Worker variant (`cdp.runtime.enable.worker`): the empty-source
+    // uncaught-error tell observed inside the Blob Worker realm. It joins the published
+    // reason ids below as weight-0 developer_tools telemetry (the `cdp.` prefix rule and
+    // the exact DEVELOPER_TOOLS entries in verdict.ts / botVerifier.ts both classify it
+    // so) — corroborating evidence only, never a verdict on its own.
+    const workerCdpReasonIds =
+      workerTriangulation?.cdpRuntimeEnable === true ? ['cdp.runtime.enable.worker'] : [];
     const additiveEntropy = collectedSignals
       ? {
           fontPreferences: {
@@ -9256,10 +9464,15 @@ export async function identifyCurrentVisitor(options?: {
         privacy_hardened: securitySignals.privacy_hardened,
         privacy_signature_ids: securitySignals.privacy_signature_ids,
         stealth_signal_ids: securitySignals.stealth_signal_ids,
+        /* Zero-PII motion attestation (mirrored from securitySignals). The block contains
+           ONLY rounded scalar aggregates — no coordinates, no timestamps, no key values,
+           no raw event/point arrays ever reach serialization here (see
+           buildKinematicsPayload for the invariant). Additive, informational. */
+        kinematics: securitySignals.kinematics,
         // Volatile values are kept as CONTEXT only — never folded into a digest or identity key.
         // The raw browser UTC offset also stays in `rawDeviceAttributes.timezone_offset`.
         storageQuotaContext: collectedSignals?.systemEntropy.storageQuota ?? null,
-        cdpReasonIds: securitySignals.cdpReasonIds,
+        cdpReasonIds: [...securitySignals.cdpReasonIds, ...workerCdpReasonIds],
         inspectorSignals: {
           // Only STRONG two-probe CDP proof may claim an attached bridge. The weak
           // Error.prototype.name preview is telemetry in `inspectorProbes` only.

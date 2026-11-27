@@ -90,6 +90,12 @@ const HARD_REASONS: ReadonlySet<string> = new Set([
   'stealth.storage-partitioning-protocol',
   'stealth.puppeteer-source-url',
   'stealth.playwright-source-url',
+  // H3 desktop conjunction (exact entry wins over the weak `headless.swiftshader.caveat`
+  // and the medium `headless.` prefix): a WebGL context returned DESPITE
+  // failIfMajorPerformanceCaveat, on a software rasterizer, under a desktop-claiming
+  // UA-CH platform with zero touch points. Each leg alone stays weak; the conjunction
+  // is a forced software-GL headless launch a real desktop never produces.
+  'headless.swiftshader.caveat.desktop',
   // Real Playwright/CDC bindings and protocol-level CDP tamper are deterministic artifacts
   // of a driven runtime. A plain CDP attachment stays in the developer_tools tier (see
   // DEVELOPER_TOOLS_REASONS / the `cdp.` prefix rule); only a *corroborated* CDP bridge is
@@ -114,6 +120,10 @@ const HARD_REASONS: ReadonlySet<string> = new Set([
 const DEVELOPER_TOOLS_REASONS: ReadonlySet<string> = new Set([
   'cdp.runtime.enable.empty_source',
   'cdp.network.enable.pre_load_message',
+  // C1 dedicated-Worker variant: the same empty-source uncaught-error tell observed
+  // inside a Blob Worker realm. Weight 0, corroborating only — a bare bridge in the
+  // worker scope is still developer-tools evidence, never a bot verdict.
+  'cdp.runtime.enable.worker',
   'bot.cdp-runtime-leak',
   // RS-E: cdc_* and bare CDP are unattributed runtime artifacts — a different evidentiary
   // class, recorded for telemetry only. Automation is expected for verified agents; these
@@ -135,6 +145,10 @@ const MEDIUM_REASONS: ReadonlySet<string> = new Set([
   'headless.font-exact-integers',
   'headless.no-intlyen-key',
   'headless.secch-headless-mismatch',
+  // Notification-permission contract mismatch (Notification.permission says 'denied'
+  // while the Permissions API still resolves 'prompt'): a headless-shell tell, but a
+  // patched-permission environment can imitate parts of it, so corroboration is required.
+  'headless.notification-contract',
   'instinct.credentials.wrappers',
   'instinct.geetest.accessor-pair',
   'muse.cloud-browser.password-manager',

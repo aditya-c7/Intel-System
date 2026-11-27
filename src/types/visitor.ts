@@ -337,6 +337,11 @@ export interface PrivacySettings {
 /**
  * Four-tier stealth-evaluation mirror from `evaluateStealthSignals`
  * (`src/lib/stealthSignals.ts`). Informational only — never a bot verdict.
+ *
+ * The server read path folds this object into `composeBotVerdict`'s `stealth` input
+ * (`BotVerifierStealth`), so the sub-list qualifiers below mirror that contract exactly.
+ * Every field is OPTIONAL: a legacy payload that posts only the flat `stealth_signal_ids`
+ * mirror keeps working, and an absent evaluation stays absent (nothing is inferred).
  */
 export interface StealthSignals {
   detected?: boolean;
@@ -344,6 +349,16 @@ export interface StealthSignals {
   hard?: string[];
   reasons?: string[];
   stealthPluginDetected?: boolean;
+  /** Ids whose RED sub-variant fired (exact protocol-level condition) — hard tier. */
+  confirmed?: string[];
+  /** Ids the probe could not decide (no CSP, exception) — reported at weight 0. */
+  inconclusive?: string[];
+  /** Ids seen only in a soft/YELLOW form (e.g. SwiftShader on a headless-shell host). */
+  soft?: string[];
+  /** Ids observed while DevTools is docked — the runtime-enable leak is capped at YELLOW. */
+  docked?: string[];
+  /** Attribution for a confirmed source-URL leak. */
+  sourceUrlSource?: 'puppeteer' | 'playwright' | null;
   /** Flat mirror of `ids` used by the collector payload. */
   stealth_signal_ids?: string[];
 }

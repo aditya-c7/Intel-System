@@ -4,10 +4,24 @@
  *   npx tsx scripts/test-official-bot-feeds.ts
  *
  * Uses only scripts/fixtures/official-bot-feeds.json (synthetic, representative
- * CIDRs + RFC 5737/3849 documentation addresses). No network, no third-party SDK.
+ * CIDRs + RFC 5737/3849 documentation addresses) plus the frozen pinned-snapshot
+ * store in src/lib/agentFeedSnapshots.ts. No network, no third-party SDK.
  */
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import {
+  AGENT_BY_ID,
+  AGENT_REGISTRY,
+  AI_AGENT_UA_RULES,
+  AI_BOT_CIDR_SOURCES,
+  BOT_DIRECTORY,
+  findAgentByUa,
+  GOOD_BOT_UA_RULES,
+  normalizeFeed,
+  PILLS,
+  PREFIX_FEEDS,
+} from '../src/lib/agentRegistry';
+import { FEED_METADATA, PINNED_PREFIXES } from '../src/lib/agentFeedSnapshots';
 import {
   buildLookup,
   EMPTY_FEED_CACHE,
@@ -233,6 +247,233 @@ function main(): void {
   const openAiCached = updateFeedCache(EMPTY_FEED_CACHE, 'gptbot', feeds.gptbot, nowMs).cache.entries['gptbot'];
   check('uncadenced feed has infinite TTL', isCacheEntryUsable(openAiCached, nowMs + 365 * DAY) === true);
   noThrow('updateFeedCache(null, ...) does not throw', () => updateFeedCache(null, null, null, nowMs).cache as FeedCache);
+
+  /* --- registry prefix feeds + frozen pinned snapshots ------------------- */
+  // The extended operator catalog (fetched 2026-11-27, see FEED_METADATA notes): every
+  // PREFIX_FEEDS entry must expose a pinned snapshot whose shape and prefix count match
+  // the live feed, and the derived registry views must still resolve the new agents.
+  const NEW_FEED_PREFIX_COUNTS: Record<string, number> = {
+    'google-user-triggered-agents': 4,
+    'google-special-crawlers': 272,
+    'google-user-triggered-fetchers': 1096,
+    'google-user-triggered-fetchers-google': 504,
+    'openai-adsbot': 2,
+    'duckduckbot': 486,
+    'ahrefs': 81,
+    'hark': 1,
+  };
+  const CIDR_PATTERN = /^(?:\d{1,3}\.){3}\d{1,3}\/(?:\d|[12]\d|3[0-2])$|^[0-9A-Fa-f:]+\/(?:\d{1,3})$/;
+  for (const id of Object.keys(NEW_FEED_PREFIX_COUNTS)) {
+    const feed = PREFIX_FEEDS.find((entry) => entry.sourceId === id);
+    check(`prefix feed ${id} is registered`, Boolean(feed));
+    check(
+      `prefix feed ${id} declares json format, daily refresh and a bounded maxBytes`,
+      feed?.format === 'json' && feed?.refreshMs === DAY && feed?.pinnedKey === id
+        && typeof feed?.maxBytes === 'number' && feed.maxBytes >= 1_000_000 && feed.maxBytes <= 8_000_000,
+      feed,
+    );
+    check(
+      `prefix feed ${id} is exposed to CIDR consumers`,
+      AI_BOT_CIDR_SOURCES.some((s) => s.id === id && s.url === feed?.url),
+    );
+    const pinned = PINNED_PREFIXES[id];
+    check(`pinned snapshot exists for ${id}`, Array.isArray(pinned) && pinned.length > 0);
+    check(`pinned snapshot ${id} prefix count matches the live feed`, pinned?.length === NEW_FEED_PREFIX_COUNTS[id], pinned?.length);
+    check(`pinned snapshot ${id} holds canonical CIDR prefixes`, (pinned ?? []).every((p) => CIDR_PATTERN.test(p)));
+    check(`pinned snapshot ${id} has no duplicate prefixes`, new Set(pinned ?? []).size === pinned?.length);
+    const meta = FEED_METADATA[id];
+    check(`FEED_METADATA documents ${id}`, Boolean(meta), meta);
+    // Round-trip the first pinned prefixes through the pure normalizer (synthetic body only).
+    const sample = (pinned ?? []).slice(0, 3).map((p) => (p.includes(':') ? { ipv6Prefix: p } : { ipv4Prefix: p }));
+    const normalized = normalizeFeed(id, JSON.stringify({ creationTime: meta?.creationTime ?? undefined, prefixes: sample }));
+    check(`normalizeFeed round-trips ${id} prefixes`, JSON.stringify(normalized.prefixes) === JSON.stringify((pinned ?? []).slice(0, 3)), normalized.prefixes);
+    check(`normalizeFeed round-trips ${id} creationTime`, normalized.creationTime === (meta?.creationTime ?? null), normalized.creationTime);
+  }
+  // Every pinnedKey across the whole catalog resolves to a frozen snapshot (old + new).
+  check(
+    'every PREFIX_FEEDS pinnedKey resolves into PINNED_PREFIXES',
+    PREFIX_FEEDS.every((feed) => feed.pinnedKey === undefined || Array.isArray(PINNED_PREFIXES[feed.pinnedKey])),
+  );
+
+  /* --- registry entries for the new agents -------------------------------- */
+  const googleAgent = AGENT_BY_ID['google_agent'];
+  const harkBot = AGENT_BY_ID['hark_bot'];
+  check(
+    'google_agent verifies via the user-triggered-agents CIDR feed',
+    googleAgent?.feedIds?.includes('google-user-triggered-agents') === true
+      && googleAgent?.minProofForVerified === 'cidr'
+      && googleAgent?.signature?.agentHosts?.includes('agent.bot.goog') === true,
+  );
+  check(
+    'hark_bot is an RFC 9421 signed agent on the hark feed',
+    harkBot?.feedIds?.includes('hark') === true
+      && harkBot?.signature?.wbaRequired === true
+      && harkBot?.signature?.agentHosts?.includes('hark.com') === true
+      && harkBot?.minProofForVerified === 'signed_agent',
+  );
+  check('google_agent UA resolves ahead of gemini_deep_research', findAgentByUa('Mozilla/5.0 (compatible; Google-Agent/1.0)')?.id === 'google_agent');
+  check('hark_bot UA resolves to the exact version-anchored token', findAgentByUa('Mozilla/5.0 (compatible; HarkBot/1.0)')?.id === 'hark_bot');
+  check('registry rank ordering stays ascending', AGENT_REGISTRY.every((agent, i, arr) => i === 0 || arr[i - 1].rank <= agent.rank));
+  check(
+    'derived directory holds google_agent unverified (UA-impersonable) and hark_bot signed',
+    BOT_DIRECTORY.find((e) => e.name === 'Google-Agent')?.identity === 'unknown'
+      && BOT_DIRECTORY.find((e) => e.name === 'HarkBot')?.identity === 'signed'
+      && BOT_DIRECTORY.find((e) => e.name === 'HarkBot')?.requiresWebBotAuth === true,
+  );
+  check(
+    'PILLS cover the new agents',
+    PILLS['google_agent']?.label === 'Google-Agent' && PILLS['hark_bot']?.label === 'HarkBot',
+  );
+
+  /* --- extended crawler catalog: per-crawler registry coverage ----------------------------
+     Every crawler in the owner's target list must resolve by UA to the right id + category.
+     Tokens already covered by earlier entries (googlebot, bingbot, applebot, gptbot family,
+     claude family, perplexity family, amazonbot, ccbot, meta-externalagent, DuckAssistBot,
+     Meta Muse, Anchor Browser) resolve to their EXISTING ids — no duplicate entries exist. */
+  interface CoverageCase { ua: string; id: string; category: string }
+  const COVERAGE_CASES: CoverageCase[] = [
+    // Search engine crawlers (new)
+    { ua: 'Mozilla/5.0 (compatible; Baiduspider/2.0; +http://www.baidu.com/search/spider.html)', id: 'baiduspider', category: 'search_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; Baiduspider-image/2.0; +http://www.baidu.com/search/spider.html)', id: 'baiduspider', category: 'search_crawler' },
+    { ua: 'Mozilla/5.0 (compatible;Baiduspider+(+http://www.baidu.com/search/spider.htm))', id: 'baiduspider', category: 'search_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)', id: 'yandex_bot', category: 'search_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; YandexImages/3.0; +http://yandex.com/bots)', id: 'yandex_bot', category: 'search_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; YandexMetrika/2.0; +http://yandex.com/bots)', id: 'yandex_bot', category: 'search_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; YaDirectFetcher/1.0; +http://yandex.com/bots)', id: 'yandex_bot', category: 'search_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; DuckDuckBot/1.0; +http://duckduckgo.com/duckduckbot.html)', id: 'duckduckbot', category: 'search_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; TerraCotta https://github.com/CeramicTeam/CeramicTerracotta)', id: 'terracotta_bot', category: 'search_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; Terracotta-News/1.0)', id: 'terracotta_bot', category: 'search_crawler' },
+    // Archivers (new category)
+    { ua: 'Mozilla/5.0 (compatible; archive.org_bot; Wayback Machine Living Web Archive; +http://archive.org/details/archive.org_bot)', id: 'archive_bot', category: 'archiver' },
+    { ua: 'ia_archiver', id: 'archive_bot', category: 'archiver' },
+    { ua: 'Mozilla/5.0 (compatible; Arquivo-web-crawler; +https://arquivo.pt/faq/crawling)', id: 'arquivo_bot', category: 'archiver' },
+    // AI crawlers / assistants (new)
+    { ua: 'Mozilla/5.0 (compatible; Bytespider; https://asemangel.github.io/about)', id: 'bytespider', category: 'ai_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; TikTokSpider/1.0; +https://www.tiktok.com)', id: 'tiktok_spider', category: 'ai_crawler' },
+    { ua: 'Google-CloudVertexBot/1.0', id: 'cloudvertex_bot', category: 'ai_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; FacebookBot/1.0; +https://developers.facebook.com/docs/sharing/webmasters/crawler)', id: 'facebookbot', category: 'ai_crawler' },
+    { ua: 'meta-externalfetcher/1.0 (+https://developers.facebook.com/docs/sharing/webmasters/crawler)', id: 'meta_external_fetcher', category: 'ai_assistant' },
+    { ua: 'Mozilla/5.0 (compatible;PetalBot;+https://aspiegel.com/petalbot)', id: 'petalbot', category: 'ai_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; ProRataInc/1.0; +https://www.prorata.com)', id: 'prorata_inc', category: 'ai_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; Timpibot/0.2; +https://timpi.io)', id: 'timpibot', category: 'ai_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; Novellum/1.0; +https://novellum.ai)', id: 'novellum_ai_crawl', category: 'ai_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; NovellumAICrawl/1.0)', id: 'novellum_ai_crawl', category: 'ai_crawler' },
+    // Target-list tokens that ALREADY had registry entries keep resolving there.
+    { ua: 'meta-externalagent/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler)', id: 'meta_external_agent', category: 'ai_search' },
+    { ua: 'Mozilla/5.0 (compatible; DuckAssistBot/1.0; +http://duckduckgo.com/duckassistbot.html)', id: 'duck_assist_bot', category: 'ai_assistant' },
+    { ua: 'Mozilla/5.0 AppleWebKit/537.36 Muse/1.0', id: 'meta_muse', category: 'ai_agent' },
+    { ua: 'Mozilla/5.0 AnchorBrowser/1.0', id: 'anchor_browser', category: 'ai_browser' },
+    // The new entries must not swallow the pre-existing neighbor tokens.
+    { ua: 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)', id: 'googlebot', category: 'search_crawler' },
+    { ua: 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm) Chrome/120.0.0.0 Safari/537.36', id: 'bingbot', category: 'search_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; ClaudeBot/1.0; +claude.com/cli)', id: 'claude_bot', category: 'ai_crawler' },
+    { ua: 'Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)', id: 'gptbot', category: 'ai_crawler' },
+  ];
+  for (const c of COVERAGE_CASES) {
+    const found = findAgentByUa(c.ua);
+    check(
+      `coverage ${c.id} resolves the operator token`,
+      found?.id === c.id && found?.category === c.category,
+      { ua: c.ua, found: found?.id, category: found?.category },
+    );
+  }
+
+  /* --- extended catalog: verification wiring ---------------------------------------------- */
+  // Baidu publishes no IP ranges; its documented contract is FCrDNS (*.baidu.com / *.baidu.jp).
+  const baidu = AGENT_BY_ID['baiduspider'];
+  check(
+    'baiduspider verifies via operator-documented FCrDNS (*.baidu.com / *.baidu.jp), no CIDR feed',
+    baidu?.category === 'search_crawler'
+      && baidu?.fcrdnsSuffixes?.join(',') === 'baidu.com,baidu.jp'
+      && baidu?.minProofForVerified === 'fcrdns'
+      && !baidu?.feedIds
+      && Boolean(baidu?.ua?.requireNetworkMatch),
+    baidu,
+  );
+  // Yandex's webmaster docs publish the same FCrDNS shape for every Yandex robot.
+  const yandex = AGENT_BY_ID['yandex_bot'];
+  check(
+    'yandex_bot verifies via operator-documented FCrDNS (*.yandex.ru / .net / .com)',
+    yandex?.category === 'search_crawler'
+      && yandex?.fcrdnsSuffixes?.join(',') === 'yandex.ru,yandex.net,yandex.com'
+      && yandex?.minProofForVerified === 'fcrdns'
+      && !yandex?.feedIds,
+    yandex,
+  );
+  // DuckDuckBot rides the already-pinned official DuckDuckGo CIDR feed.
+  const duckDuck = AGENT_BY_ID['duckduckbot'];
+  check(
+    'duckduckbot verifies via the pinned official DuckDuckGo CIDR feed',
+    duckDuck?.category === 'search_crawler'
+      && duckDuck?.feedIds?.includes('duckduckbot') === true
+      && duckDuck?.minProofForVerified === 'cidr'
+      && Array.isArray(PINNED_PREFIXES['duckduckbot'])
+      && PINNED_PREFIXES['duckduckbot'].length === 486,
+    duckDuck,
+  );
+  // CloudVertexBot: no dedicated ipranges file (developers.google.com …/vertexbot.json is
+  // HTTP 404) — Google extends the Googlebot reverse-DNS contract to it instead.
+  const cloudvertex = AGENT_BY_ID['cloudvertex_bot'];
+  check(
+    'cloudvertex_bot verifies via the Googlebot FCrDNS contract, never a fabricated feed',
+    cloudvertex?.category === 'ai_crawler'
+      && cloudvertex?.fcrdnsSuffixes?.join(',') === 'googlebot.com,google.com'
+      && cloudvertex?.minProofForVerified === 'fcrdns'
+      && !cloudvertex?.feedIds,
+    cloudvertex,
+  );
+  // Every ua_claim-only catalog entry: token is a claim, identity stays unknown.
+  const CLAIM_ONLY_IDS = [
+    'terracotta_bot', 'bytespider', 'tiktok_spider', 'facebookbot', 'meta_external_fetcher',
+    'petalbot', 'prorata_inc', 'timpibot', 'novellum_ai_crawl', 'archive_bot', 'arquivo_bot',
+  ] as const;
+  check(
+    'ua_claim-only catalog entries carry no feeds/suffixes and stay unverified from a UA',
+    CLAIM_ONLY_IDS.every((id) => {
+      const agent = AGENT_BY_ID[id];
+      return agent?.minProofForVerified === 'ua_claim'
+        && !agent?.feedIds
+        && !agent?.fcrdnsSuffixes
+        && BOT_DIRECTORY.find((e) => e.name === agent.displayName)?.identity === 'unknown';
+    }),
+  );
+  check(
+    'archivers are a derived archiver category, never a good-bot verdict path',
+    AGENT_BY_ID['archive_bot']?.category === 'archiver'
+      && AGENT_BY_ID['arquivo_bot']?.category === 'archiver'
+      && BOT_DIRECTORY.find((e) => e.name === 'Archive.org Bot')?.category === 'archiver'
+      // AI_AGENT_UA_RULES only covers ai_*/automation categories — archivers stay out.
+      && !AI_AGENT_UA_RULES.some((r) => r.label === 'Archive.org Bot')
+      && !AI_AGENT_UA_RULES.some((r) => r.label === 'Arquivo Web Crawler'),
+  );
+  check(
+    'network-gated GOOD_BOT_UA_RULES gained the operator-documented crawlers',
+    GOOD_BOT_UA_RULES.some((r) => r.label === 'Baiduspider' && Boolean(r.network?.test('baidu')))
+      && GOOD_BOT_UA_RULES.some((r) => r.label === 'YandexBot' && Boolean(r.network?.test('yandex')))
+      && GOOD_BOT_UA_RULES.some((r) => r.label === 'DuckDuckBot')
+      && GOOD_BOT_UA_RULES.some((r) => r.label === 'Google-CloudVertexBot'),
+  );
+  check(
+    'PILLS cover every extended-crawler entry',
+    [
+      'baiduspider', 'yandex_bot', 'duckduckbot', 'archive_bot', 'arquivo_bot', 'cloudvertex_bot',
+      'terracotta_bot', 'bytespider', 'tiktok_spider', 'facebookbot', 'meta_external_fetcher',
+      'petalbot', 'prorata_inc', 'timpibot', 'novellum_ai_crawl', 'anchor_browser',
+    ].every((id) => Boolean(PILLS[id])),
+  );
+  check(
+    'anchor_browser keeps its existing entry and only gains the pill',
+    AGENT_BY_ID['anchor_browser']?.pill?.kind === 'anchor'
+      && AGENT_BY_ID['anchor_browser']?.which.includes('pill')
+      && AGENT_BY_ID['anchor_browser']?.minProofForVerified === 'ua_claim',
+  );
+  // Ascending rank by specificity: exact CloudVertexBot token must outrank the broader
+  // googlebot alternation set, and the registry array itself stays monotonic (next check).
+  check(
+    'cloudvertex UA resolves ahead of googlebot family entries',
+    findAgentByUa('Google-CloudVertexBot/1.0')?.id === 'cloudvertex_bot'
+      && findAgentByUa('Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)')?.id === 'googlebot',
+  );
 
   /* --- summary ----------------------------------------------------------- */
   if (failures > 0) {

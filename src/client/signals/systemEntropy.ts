@@ -11,7 +11,7 @@
  * it. FingerprintJS v5 has no equivalent sources.
  */
 
-import { errorMessage } from './hash';
+import { errorMessage, hashStrings } from './hash';
 import type { SystemEntropySignals } from './types';
 
 interface NavigatorWithDeviceMemory extends Navigator {
@@ -20,6 +20,19 @@ interface NavigatorWithDeviceMemory extends Navigator {
 
 interface ApplePaySessionLike {
   canMakePayments?: () => boolean;
+}
+
+/** Standalone read shape (lib.dom may already declare `pdfViewerEnabled: boolean`). */
+interface NavigatorWithPdfViewer {
+  pdfViewerEnabled?: boolean;
+}
+
+interface NavigatorUADataLike {
+  getHighEntropyValues?: (hints: string[]) => Promise<Record<string, unknown>>;
+}
+
+interface NavigatorWithUAData extends Navigator {
+  userAgentData?: NavigatorUADataLike;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -80,11 +93,33 @@ export interface KeyboardStaticSignals {
   error?: string;
 }
 
+export interface UserAgentDataSignals {
+  /** True when `navigator.userAgentData.getHighEntropyValues` was present and callable. */
+  supported: boolean;
+  /**
+   * UA-CH `architecture` CLAIM (e.g. 'x86', 'arm'). LIE-GUARD (see
+   * `src/lib/hardwareTruth.ts:9-10`): the UA/UA-CH architecture claim can be
+   * flat-out wrong on real hardware, so this is telemetry only — NEVER an
+   * architecture anchor and NEVER an input to `HardwareSignals.architecture`
+   * (which anchors on GPU silicon / platform consensus).
+   */
+  architecture: string | null;
+  /** UA-CH `model` CLAIM (empty on desktop). Same lie-guard status as `architecture`. */
+  model: string | null;
+  error?: string;
+}
+
 /** Superset of the stable shape; every added field is strictly additive. */
 export interface SystemEntropySignalsExtended extends SystemEntropySignals {
   battery: BatterySignals;
   geolocation: GeolocationSignals;
   keyboardStatic: KeyboardStaticSignals;
+  /** FNV-style stable hash of the sorted `name|lang` voice list (see `hashSpeechVoiceList`). */
+  speechVoicesListHash: string | null;
+  /** `navigator.pdfViewerEnabled` — standalone boolean, published alongside the entropy booleans. */
+  pdfViewerEnabled: boolean | null;
+  /** UA-CH high-entropy architecture/model CLAIMS — digest-neutral, never an anchor. */
+  userAgentData: UserAgentDataSignals;
 }
 
 const PERMISSION_KEYS: Array<[keyof SystemEntropySignals['permissions'], PermissionName]> = [
@@ -279,6 +314,75 @@ async function collectKeyboardStaticSignals(): Promise<KeyboardStaticSignals> {
   return result;
 }
 
+/** Minimal shape the voice-list hash needs (real `SpeechSynthesisVoice` objects satisfy it). */
+export interface SpeechVoiceLike {
+  name?: unknown;
+  lang?: unknown;
+}
+
+/**
+ * Stable hash of the installed speech-voice LIST (not just its count): each voice
+ * becomes a `name|lang` line, lines are sorted, and the sorted list goes through the
+ * file's existing list hash helper (`hashStrings` in ./hash, the same helper other
+ * collectors use for sorted string lists). Sorting makes the digest independent of the
+ * engine's enumeration order. Returns null when the list is absent or empty — an empty
+ * list (engines may return `[]` until `voiceschanged` fires) has nothing to hash and
+ * must never fake a stable value.
+ */
+export function hashSpeechVoiceList(
+  voices: ReadonlyArray<SpeechVoiceLike> | null | undefined
+): string | null {
+  if (!Array.isArray(voices) || voices.length === 0) return null;
+  try {
+    const lines = voices.map((voice) => {
+      const name = typeof voice?.name === 'string' ? voice.name : '';
+      const lang = typeof voice?.lang === 'string' ? voice.lang : '';
+      return `${name}|${lang}`;
+    });
+    return hashStrings(lines.sort());
+  } catch {
+    return null;
+  }
+}
+
+const UA_CH_TIMEOUT_MS = 1500;
+
+/**
+ * UA-CH high-entropy architecture/model — a CLAIM, never evidence. hardwareTruth.ts
+ * documents real hardware where the UA-CH architecture string is simply wrong, so the
+ * digest-neutral block below is telemetry that can only ever corroborate, never anchor.
+ * Fail-safe like the other additive helpers: a hanging or throwing promise is raced
+ * against a timeout (same pattern as the collector's own getHighEntropyValues races)
+ * and degrades to nulls.
+ */
+async function collectUserAgentDataSignals(): Promise<UserAgentDataSignals> {
+  const result: UserAgentDataSignals = {
+    supported: false,
+    architecture: null,
+    model: null,
+  };
+  if (typeof navigator === 'undefined') return result;
+  try {
+    const uaData = (navigator as NavigatorWithUAData).userAgentData;
+    if (!uaData || typeof uaData.getHighEntropyValues !== 'function') return result;
+    result.supported = true;
+    const hints = await Promise.race([
+      uaData.getHighEntropyValues(['architecture', 'model']),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), UA_CH_TIMEOUT_MS)),
+    ]);
+    if (!hints) return result;
+    if (typeof hints.architecture === 'string' && hints.architecture.length > 0) {
+      result.architecture = hints.architecture;
+    }
+    if (typeof hints.model === 'string' && hints.model.length > 0) {
+      result.model = hints.model;
+    }
+  } catch (err) {
+    result.error = errorMessage(err);
+  }
+  return result;
+}
+
 /** Total (async): always returns a payload. */
 export async function collectSystemEntropySignals(): Promise<SystemEntropySignalsExtended> {
   const result: SystemEntropySignalsExtended = {
@@ -328,6 +432,13 @@ export async function collectSystemEntropySignals(): Promise<SystemEntropySignal
       mapSize: null,
       hasKeyQ: null,
       layoutEmpty: null,
+    },
+    speechVoicesListHash: null,
+    pdfViewerEnabled: null,
+    userAgentData: {
+      supported: false,
+      architecture: null,
+      model: null,
     },
   };
 
@@ -432,10 +543,23 @@ export async function collectSystemEntropySignals(): Promise<SystemEntropySignal
       result.applePayAvailable = null;
     }
 
-    // Speech voices count. Note: engines may return [] until voiceschanged
-    // fires; treat as a weak input downstream.
+    // Speech voices count + list hash. Note: engines may return [] until
+    // voiceschanged fires; treat as a weak input downstream. The list hash is
+    // additive: the count field is kept for digest compatibility.
     try {
-      result.speechVoicesCount = window.speechSynthesis ? window.speechSynthesis.getVoices().length : null;
+      const voices = window.speechSynthesis ? window.speechSynthesis.getVoices() : null;
+      result.speechVoicesCount = voices ? voices.length : null;
+      result.speechVoicesListHash = hashSpeechVoiceList(voices);
+    } catch {
+      /* ignore */
+    }
+
+    // pdfViewerEnabled — a stable per-install browser boolean, published here
+    // next to the other entropy booleans (applePayAvailable). Digest wiring, if
+    // desired, follows the computeBrowserFingerprint pattern in index.ts.
+    try {
+      const value = (navigator as NavigatorWithPdfViewer).pdfViewerEnabled;
+      result.pdfViewerEnabled = typeof value === 'boolean' ? value : null;
     } catch {
       /* ignore */
     }
@@ -458,6 +582,7 @@ export async function collectSystemEntropySignals(): Promise<SystemEntropySignal
     result.battery = await collectBatterySignals();
     result.geolocation = await collectGeolocationSignals(result.permissions.geolocation);
     result.keyboardStatic = await collectKeyboardStaticSignals();
+    result.userAgentData = await collectUserAgentDataSignals();
   } catch (err) {
     result.error = errorMessage(err);
   }

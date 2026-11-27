@@ -55,6 +55,7 @@ interface FakeWindow {
   devicePixelRatio: number;
   matchMedia: (query: string) => { matches: boolean };
   addEventListener: () => void;
+  removeEventListener: () => void;
   process?: { versions?: { electron?: string; node?: string } };
   chrome?: { runtime?: unknown };
   acquireVsCodeApi?: () => unknown;
@@ -86,6 +87,7 @@ function makeWindow(overrides: Partial<FakeWindow> = {}): FakeWindow {
     // Normal window: the device-width query matches every candidate width.
     matchMedia: () => ({ matches: true }),
     addEventListener: () => {},
+    removeEventListener: () => {},
     chrome: { runtime: {} },
     ...overrides,
   };
@@ -145,8 +147,13 @@ function check(label: string, condition: boolean, detail?: unknown): void {
 
 installGlobals();
 
-const { detectAutomationEnvironment, measureHumanCorroboration, detectBotAndAutomation } =
-  await import('../src/lib/collector');
+const {
+  detectAutomationEnvironment,
+  measureHumanCorroboration,
+  detectBotAndAutomation,
+  detectStealthArtifacts,
+  inspectorProbes,
+} = await import('../src/lib/collector');
 import { detectBrowserTampering } from '../src/lib/tamperingDetector';
 const { detectAiBotFromServerSignals } = await import('../src/lib/aiBotDirectory');
 
@@ -458,6 +465,461 @@ check(
     cdp_attached: true,
     developer_tools: true,
   }).consistent,
+);
+
+/* -------------------------------------------------------------------------- */
+/* J. Automation probes — notification contract + SwiftShader desktop tell    */
+/* -------------------------------------------------------------------------- */
+
+section('J. Automation probes: headless.notification-contract + .swiftshader.caveat.desktop');
+
+const { collectAutomationSignals } = await import('../src/client/signals/automation');
+
+interface AutomationGlobalsOptions {
+  /** navigator.maxTouchPoints (default 0 — a plain desktop). */
+  maxTouchPoints?: number;
+  /** UA-CH platform string; omit to simulate a browser without userAgentData. */
+  platformUaCh?: string;
+  /** Notification.permission value; 'not-present' removes the Notification global. */
+  notificationPermission?: 'denied' | 'granted' | 'default' | 'not-present';
+  /** What navigator.permissions.query resolves (or does) for 'notifications'. */
+  permissionsState?: 'prompt' | 'denied' | 'granted' | 'throw' | 'not-present';
+  /** The object a canvas.getContext('webgl', …) returns; omit for no WebGL at all. */
+  canvasContext?: Record<string, unknown> | null;
+}
+
+function installAutomationGlobals(options: AutomationGlobalsOptions = {}): void {
+  const nav = {
+    ...baseNavigator,
+    maxTouchPoints: options.maxTouchPoints ?? 0,
+    ...(options.platformUaCh
+      ? {
+          userAgentData: {
+            brands: [{ brand: 'Chromium', version: '152' }],
+            platform: options.platformUaCh,
+            mobile: false,
+          },
+        }
+      : {}),
+    permissions:
+      options.permissionsState === 'not-present'
+        ? undefined
+        : {
+            query: async (): Promise<{ state: string }> => {
+              if (options.permissionsState === 'throw') throw new TypeError('Bad permission name');
+              return { state: options.permissionsState ?? 'prompt' };
+            },
+          },
+  };
+  const documentStub = {
+    visibilityState: 'visible',
+    createElement: (tag: string) => {
+      if (tag === 'canvas' && options.canvasContext) {
+        return {
+          style: {} as Record<string, string>,
+          getContext: () => options.canvasContext,
+          remove: () => {},
+        };
+      }
+      return { style: {} as Record<string, string>, contentWindow: undefined, remove: () => {} };
+    },
+    body: { appendChild: () => {} },
+    documentElement: { attributes: [], children: [] },
+  };
+  Object.defineProperty(globalThis, 'window', { value: makeWindow(), configurable: true });
+  Object.defineProperty(globalThis, 'document', { value: documentStub, configurable: true });
+  Object.defineProperty(globalThis, 'navigator', { value: nav, configurable: true });
+  if (options.notificationPermission && options.notificationPermission !== 'not-present') {
+    Object.defineProperty(globalThis, 'Notification', {
+      value: { permission: options.notificationPermission },
+      configurable: true,
+    });
+  } else {
+    delete (globalThis as Record<string, unknown>).Notification;
+  }
+}
+
+// A WebGL context that reports SwiftShader despite the failIfMajorPerformanceCaveat
+// request — the H3 precondition (a real browser refuses the context on software GL).
+const SWIFTSHADER_CONTEXT: Record<string, unknown> = {
+  getExtension: () => ({ UNMASKED_RENDERER_WEBGL: 0x9246 }),
+  getParameter: (key: number) => (key === 0x9246 ? 'Google SwiftShader (Intel)' : 'WebKit WebGL'),
+  RENDERER: 0x1f01,
+};
+
+// J1 — happy path: Notification.permission claims 'denied' while the real permission
+// store still answers 'prompt'. A genuine denied store would answer 'denied'.
+installAutomationGlobals({ notificationPermission: 'denied', permissionsState: 'prompt' });
+const contractSignals = await collectAutomationSignals();
+check(
+  'Notification denied vs Permissions prompt → headless.notification-contract',
+  contractSignals.reasonIds.includes('headless.notification-contract'),
+  contractSignals.reasonIds
+);
+
+// J2 — a consistent store (denied vs denied) is NOT a contradiction.
+installAutomationGlobals({ notificationPermission: 'denied', permissionsState: 'denied' });
+const consistentSignals = await collectAutomationSignals();
+check(
+  'denied vs denied is consistent → no notification-contract reason',
+  !consistentSignals.reasonIds.includes('headless.notification-contract'),
+  consistentSignals.reasonIds
+);
+
+// J3 — inconclusive path: the Notification API is absent entirely (Firefox/Safari).
+installAutomationGlobals({ notificationPermission: 'not-present', permissionsState: 'prompt' });
+const noNotificationSignals = await collectAutomationSignals();
+check(
+  'absent Notification API → inconclusive, no reason emitted',
+  !noNotificationSignals.reasonIds.includes('headless.notification-contract'),
+  noNotificationSignals.reasonIds
+);
+
+// J4 — inconclusive path: some browsers throw on the 'notifications' query name.
+installAutomationGlobals({ notificationPermission: 'denied', permissionsState: 'throw' });
+const throwingQuerySignals = await collectAutomationSignals();
+check(
+  'throwing permissions.query → inconclusive, no reason emitted',
+  !throwingQuerySignals.reasonIds.includes('headless.notification-contract'),
+  throwingQuerySignals.reasonIds
+);
+
+// J5 — H3 desktop conjunction happy path: a context returned DESPITE the caveat, the
+// renderer IS SwiftShader, and the runtime claims a desktop platform with no touch.
+installAutomationGlobals({
+  platformUaCh: 'Windows',
+  maxTouchPoints: 0,
+  canvasContext: SWIFTSHADER_CONTEXT,
+});
+const desktopSignals = await collectAutomationSignals();
+check(
+  'SwiftShader context + desktop UA-CH + zero touch → hard desktop conjunction',
+  desktopSignals.reasonIds.includes('headless.swiftshader.caveat.desktop'),
+  desktopSignals.reasonIds
+);
+check(
+  'the weak plain caveat still fires alongside the hard conjunction',
+  desktopSignals.reasonIds.includes('headless.swiftshader.caveat'),
+  desktopSignals.reasonIds
+);
+
+// J6 — anti-flag: a touch-capable device is mobile-shaped, never the desktop tell.
+installAutomationGlobals({
+  platformUaCh: 'Windows',
+  maxTouchPoints: 5,
+  canvasContext: SWIFTSHADER_CONTEXT,
+});
+const touchSignals = await collectAutomationSignals();
+check(
+  'touch-capable device → no hard desktop conjunction (weak caveat only)',
+  !touchSignals.reasonIds.includes('headless.swiftshader.caveat.desktop') &&
+    touchSignals.reasonIds.includes('headless.swiftshader.caveat'),
+  touchSignals.reasonIds
+);
+
+// J7 — anti-flag: without UA-CH the desktop claim cannot be corroborated, so the hard
+// reason is deliberately unreachable (Firefox / Safari never fire it).
+installAutomationGlobals({
+  maxTouchPoints: 0,
+  canvasContext: SWIFTSHADER_CONTEXT,
+});
+const noUachSignals = await collectAutomationSignals();
+check(
+  'UA-CH absent → no hard desktop conjunction',
+  !noUachSignals.reasonIds.includes('headless.swiftshader.caveat.desktop'),
+  noUachSignals.reasonIds
+);
+
+delete (globalThis as Record<string, unknown>).Notification;
+installGlobals({ ua: PLAIN_CHROME_UA });
+
+/* -------------------------------------------------------------------------- */
+/* K. Cyclic-native tamper audit — TAMPERING axis, never bot-hard             */
+/* -------------------------------------------------------------------------- */
+
+section('K. Cyclic prototype tamper check (tamper.cyclic-native-absent)');
+
+// Baseline: none of the audited constructors exists in this environment — every
+// surface is skipped and the flag stays absent (inconclusive, never fabricated true).
+detectStealthArtifacts('ANGLE (NVIDIA, NVIDIA GeForce RTX 3060)');
+check(
+  'no audited natives → tamper flag stays absent',
+  inspectorProbes.tamperCyclicNativeAbsent === false
+);
+
+// Happy path: a Proxy-wrapped AudioBuffer.getChannelData swallows the cyclic-prototype
+// write that every stock native rejects with the 'Cyclic __proto__' TypeError. The
+// three stock methods before it must throw and NOT flag, then the wrapper flags.
+const swallowingProxy = new Proxy(function getChannelData(): Float32Array {
+  return new Float32Array(0);
+}, {
+  setPrototypeOf: () => true,
+});
+class FakeHTMLCanvasElement {}
+class FakeCanvasRenderingContext2D {
+  getImageData(): object {
+    return {};
+  }
+}
+class FakeWebGLRenderingContext {
+  getParameter(): string {
+    return '';
+  }
+}
+class FakeAudioBuffer {
+  getChannelData(): Float32Array {
+    return new Float32Array(0);
+  }
+}
+Object.defineProperty(globalThis, 'HTMLCanvasElement', {
+  value: FakeHTMLCanvasElement,
+  configurable: true,
+});
+Object.defineProperty(globalThis, 'CanvasRenderingContext2D', {
+  value: FakeCanvasRenderingContext2D,
+  configurable: true,
+});
+Object.defineProperty(globalThis, 'WebGLRenderingContext', {
+  value: FakeWebGLRenderingContext,
+  configurable: true,
+});
+Object.defineProperty(globalThis, 'AudioBuffer', { value: FakeAudioBuffer, configurable: true });
+Object.defineProperty(FakeAudioBuffer.prototype, 'getChannelData', {
+  value: swallowingProxy,
+  configurable: true,
+  writable: true,
+});
+detectStealthArtifacts('ANGLE (NVIDIA, NVIDIA GeForce RTX 3060)');
+check(
+  'one Proxy-wrapped native (swallowed cyclic write) → tamper flag set',
+  inspectorProbes.tamperCyclicNativeAbsent === true
+);
+check(
+  'the wrapped method kept its original prototype (side-effect-free audit)',
+  Object.getPrototypeOf(swallowingProxy) === Function.prototype
+);
+
+// The collector forwards the flag through the existing tamperingLies.prototypeCyclicTrap
+// channel (TAMPERING axis): a POINTS:0 shadow reason that can never flip the bot gate.
+const cyclicTamperAssessment = detectBrowserTampering({
+  privacyHardened: false,
+  tamperingLies: { prototypeCyclicTrap: inspectorProbes.tamperCyclicNativeAbsent === true },
+});
+check(
+  'the forwarded flag reaches the TAMPERING axis as the cyclic-trap reason',
+  cyclicTamperAssessment.tampering_lies.reasons.includes(
+    'cyclic __proto__ trap succeeded (Proxy-wrapped native)'
+  ),
+  cyclicTamperAssessment.tampering_lies.reasons
+);
+check(
+  'cyclic evidence alone never sets the canonical tampering verdict',
+  cyclicTamperAssessment.tampering === false
+);
+check(
+  'cyclic evidence is gated from anti_detect promotion without scored evidence',
+  cyclicTamperAssessment.tampering_lies.anti_detect_browser === false
+);
+check(
+  'privacy-hardened runtimes never bot-flag from wrapper extensions',
+  detectBrowserTampering({
+    privacyHardened: true,
+    tamperingLies: { prototypeCyclicTrap: true },
+  }).tampering_lies.anti_detect_browser === false
+);
+
+for (const globalName of [
+  'HTMLCanvasElement',
+  'CanvasRenderingContext2D',
+  'WebGLRenderingContext',
+  'AudioBuffer',
+]) {
+  delete (globalThis as Record<string, unknown>)[globalName];
+}
+installGlobals({ ua: PLAIN_CHROME_UA });
+
+/* -------------------------------------------------------------------------- */
+/* L. Aggregate kinematics — zero-PII passive motion attestation              */
+/* -------------------------------------------------------------------------- */
+
+section('L. Kinematics aggregate (zero-PII motion attestation)');
+
+const { computeKinematicsShapeFeatures } = await import('../src/client/signals/automation');
+const { buildKinematicsPayload } = await import('../src/lib/collector');
+
+interface KinematicsPoint {
+  x: number;
+  y: number;
+  t: number;
+}
+
+/** Human reference bands from the Corroborated-Human contract. */
+type KinematicsShapeKey =
+  | 'brakingRatio'
+  | 'microStructure'
+  | 'meanTurnAngle'
+  | 'turnsWhileFast'
+  | 'straightness'
+  | 'speedCv'
+  | 'minFlightMs';
+
+const KINEMATICS_BANDS: Array<[KinematicsShapeKey, string, (value: number | null) => boolean]> = [
+  ['brakingRatio', 'brakingRatio <= 0.25', (v) => v !== null && v <= 0.25],
+  ['microStructure', 'microStructure in 0.3-0.95', (v) => v !== null && v >= 0.3 && v <= 0.95],
+  ['meanTurnAngle', 'meanTurnAngle in 0.08-0.7', (v) => v !== null && v >= 0.08 && v <= 0.7],
+  ['turnsWhileFast', 'turnsWhileFast <= 0.3', (v) => v !== null && v <= 0.3],
+  ['straightness', 'straightness <= 0.985', (v) => v !== null && v <= 0.985],
+  ['speedCv', 'speedCv in 0.35-2.6', (v) => v !== null && v >= 0.35 && v <= 2.6],
+  ['minFlightMs', 'minFlightMs >= 15', (v) => v !== null && v >= 15],
+];
+
+/**
+ * Synthetic HUMAN-like trail (deterministic): cruise with a 3-4 Hz submovement
+ * speed rhythm, a slow corrective phase whose turns happen only while slow, a
+ * gentle arc, then a hard deceleration to rest. Inter-event intervals sit in
+ * the 16-18 ms band of Chrome's coalesced pointermove delivery.
+ */
+function humanTrail(): KinematicsPoint[] {
+  const points: KinematicsPoint[] = [];
+  let x = 100;
+  let y = 200;
+  let heading = 0.4;
+  let t = 0;
+  const push = (stepPx: number, turn: number): void => {
+    heading += turn;
+    x += Math.cos(heading) * stepPx;
+    y += Math.sin(heading) * stepPx;
+    t += 16 + (points.length % 3);
+    points.push({
+      x: Math.round(x * 1000) / 1000,
+      y: Math.round(y * 1000) / 1000,
+      t: Math.round(t * 1000) / 1000,
+    });
+  };
+  for (let i = 0; i < 30; i++) push(Math.max(0.6, 3.1 + 2.1 * Math.sin(i * 0.8)), 0.008);
+  for (let i = 0; i < 26; i++) push(1.4, (i % 2 === 0 ? 1 : -1) * 0.85);
+  for (let i = 0; i < 22; i++) push(Math.max(0.15, 4.5 * Math.exp(-i / 1.6)), 0);
+  return points;
+}
+
+/** Perfectly linear, constant-speed bot trail (8 ms teleport-free dispatch). */
+function botTrail(): KinematicsPoint[] {
+  const points: KinematicsPoint[] = [];
+  for (let i = 0; i < 120; i++) {
+    points.push({ x: 50 + i * 4, y: 300, t: Math.round((i + 1) * 8 * 1000) / 1000 });
+  }
+  return points;
+}
+
+const humanFeatures = computeKinematicsShapeFeatures(humanTrail());
+check('human trail → clockMonotonic true', humanFeatures.clockMonotonic === true, humanFeatures);
+for (const [key, label, inBand] of KINEMATICS_BANDS) {
+  check(`human trail → ${label}`, inBand(humanFeatures[key]), humanFeatures);
+}
+
+const botFeatures = computeKinematicsShapeFeatures(botTrail());
+const botViolations = KINEMATICS_BANDS.filter(
+  ([key, , inBand]) => !inBand(botFeatures[key])
+).map(([, label]) => label);
+check('linear constant-speed bot trail violates >= 3 bounds', botViolations.length >= 3, {
+  botFeatures,
+  botViolations,
+});
+
+const emptyFeatures = computeKinematicsShapeFeatures([]);
+check(
+  'empty trail → every shape feature null',
+  (['brakingRatio', 'microStructure', 'meanTurnAngle', 'turnsWhileFast', 'straightness', 'speedCv', 'minFlightMs', 'maxSpeedPx'] as const).every(
+    (key) => emptyFeatures[key] === null
+  ),
+  emptyFeatures
+);
+check('empty trail → clockMonotonic true', emptyFeatures.clockMonotonic === true);
+
+const nonMonotonic = computeKinematicsShapeFeatures([
+  { x: 0, y: 0, t: 0 },
+  { x: 5, y: 0, t: 50 },
+  { x: 10, y: 0, t: 40 },
+  { x: 15, y: 0, t: 70 },
+  { x: 20, y: 0, t: 90 },
+  { x: 25, y: 0, t: 110 },
+  { x: 30, y: 0, t: 130 },
+  { x: 35, y: 0, t: 150 },
+  { x: 40, y: 0, t: 170 },
+]);
+check('backwards capture clock → clockMonotonic false', nonMonotonic.clockMonotonic === false);
+
+// Payload block: in this process no trusted input ever reached the counters, so the
+// posted kinematics block must be the all-nulls/zero empty state.
+const kinematicsBlock = buildKinematicsPayload();
+check('payload kinematics → eventCount 0', kinematicsBlock.eventCount === 0, kinematicsBlock);
+check(
+  'payload kinematics → pointer/key/scroll counts 0',
+  kinematicsBlock.pointerEvents === 0 && kinematicsBlock.keyEvents === 0 && kinematicsBlock.scrollEvents === 0,
+  kinematicsBlock
+);
+check('payload kinematics → interactionMs 0', kinematicsBlock.interactionMs === 0, kinematicsBlock);
+check('payload kinematics → clockMonotonic true', kinematicsBlock.clockMonotonic === true);
+check(
+  'payload kinematics → shape features null with too few events',
+  (['brakingRatio', 'microStructure', 'meanTurnAngle', 'turnsWhileFast', 'straightness', 'speedCv', 'minFlightMs', 'maxSpeedPx'] as const).every(
+    (key) => kinematicsBlock[key] === null
+  ),
+  kinematicsBlock
+);
+
+// Serialization invariant: round-trip a posted-body-shaped object and assert no raw
+// trajectory data (arrays of points carrying numeric x/y, or any array inside the
+// kinematics block) survives serialization.
+const KINEMATICS_CONTRACT_KEYS = [
+  'eventCount', 'pointerEvents', 'keyEvents', 'scrollEvents', 'interactionMs',
+  'brakingRatio', 'microStructure', 'meanTurnAngle', 'turnsWhileFast', 'straightness',
+  'speedCv', 'minFlightMs', 'clockMonotonic', 'maxSpeedPx',
+];
+const payloadShape: Record<string, unknown> = {
+  pageLoadId: 'page-1',
+  sessionId: 'session-1',
+  kinematics: { ...kinematicsBlock, straightness: 0.912, speedCv: 0.7 },
+  interactionEvidence: ['pointer-kinematics:3', 'keyboard:2'],
+  privacy_signature_ids: ['a.b.c'],
+  cdpReasonIds: ['cdp.runtime.enable'],
+  stealth_signal_ids: ['stealth.x'],
+  gpu_honesty_labels: ['gpu.webgl:reported'],
+  inspectorProbes: { cdpAttached: false, nameGetterCount: 0 },
+};
+const roundTrip = JSON.parse(JSON.stringify(payloadShape)) as unknown;
+const findRawPointArray = (value: unknown): boolean => {
+  if (Array.isArray(value)) {
+    if (
+      value.some(
+        (item) =>
+          typeof item === 'object' &&
+          item !== null &&
+          !Array.isArray(item) &&
+          typeof (item as Record<string, unknown>).x === 'number' &&
+          typeof (item as Record<string, unknown>).y === 'number'
+      )
+    ) {
+      return true;
+    }
+    return value.some((item) => findRawPointArray(item));
+  }
+  if (typeof value === 'object' && value !== null) {
+    return Object.values(value as Record<string, unknown>).some(findRawPointArray);
+  }
+  return false;
+};
+check('round-tripped payload contains no arrays of raw points', !findRawPointArray(roundTrip));
+const rtKinematics = (roundTrip as Record<string, unknown>).kinematics as Record<string, unknown>;
+check(
+  'kinematics block survives serialization as scalars only (no arrays, exactly the contract keys)',
+  Object.keys(rtKinematics).length === KINEMATICS_CONTRACT_KEYS.length &&
+    KINEMATICS_CONTRACT_KEYS.every((key) => Object.prototype.hasOwnProperty.call(rtKinematics, key)) &&
+    Object.values(rtKinematics).every(
+      (value) =>
+        value === null || typeof value === 'number' || typeof value === 'boolean'
+    ),
+  rtKinematics
 );
 
 console.log(`\nHuman-verdict suite: ${passed} passed, ${failed} failed`);

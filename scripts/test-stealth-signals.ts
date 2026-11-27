@@ -16,6 +16,7 @@ import {
   type StealthObservation,
   type StealthSignalId,
 } from '../src/lib/stealthSignals';
+import { stealthReasonId, stealthReasonWeight } from '../src/lib/verdict';
 
 let passed = 0;
 const failures: string[] = [];
@@ -363,6 +364,44 @@ check('reason outcome tokens come from the botVerifier vocabulary', () => {
     evaluateStealthSignals([obs('marionette')], true).reasons,
   ].map((reasons) => reasons[reasons.length - 1]);
   assert.deepEqual(outcomes, ['not_detected', 'developer_tools', 'automated-runtime', 'signed-agent']);
+});
+
+/* -------------------------------------------------------------------------- */
+/* I. Confirmed (RED) variants resolve to the hard protocol ids               */
+/* -------------------------------------------------------------------------- */
+
+section('I. Confirmed (RED) variants resolve to the hard protocol ids');
+
+// The collector's buildStealthObservations emits documentInterception with
+// corroborated:true when the navigation-timing guard is the RED condition
+// (transferSize>0 && nextHopProtocol==='' && deliveryType==='' && workerStart===0) —
+// a protocol-level impossibility no page script, extension or user setting reproduces.
+check('confirmed documentInterception maps to the hard RED id', () => {
+  assert.equal(
+    stealthReasonId('documentInterception', false, { confirmed: true }),
+    'stealth.document-interception-protocol'
+  );
+  assert.equal(stealthReasonWeight('documentInterception', false, { confirmed: true }), 'hard');
+});
+
+check('the bare documentInterception id stays medium', () => {
+  assert.equal(stealthReasonId('documentInterception'), 'stealth.document-interception');
+  assert.equal(stealthReasonWeight('documentInterception'), 'medium');
+});
+
+check('a corroborated documentInterception observation escalates (RED semantics)', () => {
+  const result = evaluateStealthSignals([obs('documentInterception', true, true)]);
+  assert.equal(result.detected, true);
+  // The RED id itself is selected by stealthReasonId at the botVerifier boundary; the
+  // evaluator records the escalation with the medium base id plus the outcome token.
+  assert.ok(result.reasons.includes('stealth.document-interception'));
+  assert.equal(result.reasons[result.reasons.length - 1], 'automated-runtime');
+});
+
+check('the plain (uncorroborated) observation stays bare', () => {
+  const result = evaluateStealthSignals([obs('documentInterception', true, false)]);
+  assert.equal(result.detected, false);
+  assert.equal(result.reasons[result.reasons.length - 1], 'not_detected');
 });
 
 /* -------------------------------------------------------------------------- */
