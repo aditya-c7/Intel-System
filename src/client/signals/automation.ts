@@ -34,6 +34,8 @@ export const REASONS = {
   uaBrandsMismatch: 'ua.brands-vs-ua-mismatch',
   headlessAnyPointerNone: 'headless.any-pointer-none',
   headlessSwiftshaderCaveat: 'headless.swiftshader.caveat',
+  headlessSwiftshaderCaveatDesktop: 'headless.swiftshader.caveat.desktop',
+  headlessNotificationContract: 'headless.notification-contract',
   headlessNoIntlyenKey: 'headless.no-intlyen-key',
   headlessChromeExtensionPort: 'headless.chrome-extension-port',
   headlessHeap3digitRounding: 'headless.heap-3digit-rounding',
@@ -283,7 +285,7 @@ async function detectCdpNetworkOrder(): Promise<boolean | null> {
 }
 
 // ---------------------------------------------------------------------------
-// V1 / F3 / F4 / H2 / H3 / H4 / S1 / S4 / S7
+// V1 / F3 / F4 / H2 / H3 / H5 / H4 / S1 / S4 / S7
 // ---------------------------------------------------------------------------
 
 /** WEAK signal: no 'Google '-prefixed speech voices (a normal desktop Chrome
@@ -352,6 +354,56 @@ function detectAnyPointerNone(): boolean | null {
 }
 
 /**
+ * H5: Notification-permission contract mismatch. A real browser derives BOTH
+ * surfaces from the same permission store, so `Notification.permission === 'denied'`
+ * forces `navigator.permissions.query({ name: 'notifications' })` to resolve
+ * 'denied'. Headless-shell builds patch the Notification API to report 'denied'
+ * while the underlying store still holds the default state, so the query answers
+ * 'prompt' — that denied-vs-prompt contradiction is the tell. Conservative on
+ * purpose: an absent Notification API or Permissions API is inconclusive (null),
+ * a query resolving anything other than 'prompt' is NOT a contradiction, and some
+ * browsers throw on the query name — also inconclusive, never a flag.
+ */
+async function detectNotificationContractMismatch(): Promise<boolean | null> {
+  return new Promise<boolean | null>((resolve) => {
+    let finished = false;
+
+    const finish = (value: boolean | null): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(safetyTimer);
+      resolve(value);
+    };
+
+    const safetyTimer = setTimeout(() => finish(null), 250);
+    try {
+      if (typeof Notification === 'undefined') {
+        finish(null); // API absent (Firefox/Safari): no evidence either way
+        return;
+      }
+      if (Notification.permission !== 'denied') {
+        finish(null); // the contradiction is only observable against a claimed 'denied'
+        return;
+      }
+      const permissions = (navigator as Navigator & { permissions?: Permissions }).permissions;
+      if (!permissions || typeof permissions.query !== 'function') {
+        finish(null);
+        return;
+      }
+      permissions
+        .query({ name: 'notifications' })
+        .then((status) => {
+          // A genuine denied store resolves 'denied'; 'prompt' contradicts the claim.
+          finish(status.state === 'prompt');
+        })
+        .catch(() => finish(null)); // some browsers reject the query name outright
+    } catch {
+      finish(null);
+    }
+  });
+}
+
+/**
  * H3: with `failIfMajorPerformanceCaveat: true` Chrome refuses a context on
  * a software renderer. If a context IS returned and reports a
  * SwiftShader/llvmpipe renderer, the launch is forcing software WebGL —
@@ -393,6 +445,22 @@ function detectSwiftShaderCaveat(): boolean | null {
     }
   } catch {
     return null;
+  }
+}
+
+/**
+ * H3-hard conjunction leg: the runtime CLAIMS a desktop platform (UA-CH platform is
+ * one of the desktop strings) while reporting zero touch points. Only UA-CH browsers
+ * carry `platform`, so Firefox/Safari never satisfy this — the desktop hard reason is
+ * deliberately unreachable where the evidence cannot be corroborated.
+ */
+function claimsDesktopPlatform(): boolean {
+  try {
+    const platform = getNavigatorExtras().userAgentData?.platform;
+    if (platform !== 'Windows' && platform !== 'macOS' && platform !== 'Linux') return false;
+    return navigator.maxTouchPoints === 0;
+  } catch {
+    return false;
   }
 }
 
@@ -603,8 +671,17 @@ const POINTER_STALE_MAX_MOVES = 2;
  *
  * `drain()` returns and clears accumulated IDs; the orchestrator merges them
  * into AutomationSignals.reasonIds (deduplicated).
+ *
+ * This tracker also feeds the page-lifetime kinematics AGGREGATE (see
+ * "Aggregate kinematics" below): `ensureKinematicsAggregateListeners()` is
+ * idempotent and its shared listener set intentionally survives `stop()`, so
+ * dwell-window aggregation continues after the orchestrator's short-lived
+ * collection pass. Event COUNTS for that aggregate are reused from
+ * collector.ts `interactionCounters` (which already count the same trusted
+ * stream) — nothing here double-counts.
  */
 export function startKinematicsTracker(): KinematicsTracker {
+  ensureKinematicsAggregateListeners();
   const moveTimes: number[] = [];
   const reasons: string[] = [];
   let stopped = false;
@@ -693,6 +770,302 @@ export function startKinematicsTracker(): KinematicsTracker {
 }
 
 // ---------------------------------------------------------------------------
+// Aggregate kinematics — zero-PII passive motion attestation
+// ---------------------------------------------------------------------------
+
+/**
+ * ZERO-PII INVARIANT (capture site). The aggregate published to the server is
+ * a fixed set of scalar timing/shape statistics computed from trusted input —
+ * it must NEVER contain coordinates, timestamps, key values, key content,
+ * element identities or raw event arrays. `kinematicsTrail` below lives only
+ * in module memory, is pruned to a short rolling window, and its raw samples
+ * are never serialized, exported or logged; only `computeKinematicsShapeFeatures`
+ * reductions (rounded to 3 decimals, null when too few events) leave this file.
+ * Event counts are reused from collector.ts `interactionCounters` — that
+ * structure already counts the same trusted stream and never stores content.
+ * Tracking is gated on `document.hidden` — nothing is recorded while the
+ * document is not visible.
+ */
+
+/** One raw in-memory pointer sample. Never leaves the page; never serialized. */
+export interface KinematicsSample {
+  x: number;
+  y: number;
+  t: number;
+}
+
+/** Shape/timing features derived from the 25 ms-resampled pointer trail. */
+export interface KinematicsShapeFeatures {
+  /** End-of-movement deceleration: mean tail speed / peak speed. Human ≤ 0.25. */
+  brakingRatio: number | null;
+  /** Second-difference energy / mean step length on the 25 ms grid. Human 0.3–0.95. */
+  microStructure: number | null;
+  /** Mean angle (rad) between consecutive resampled direction vectors. Human 0.08–0.7. */
+  meanTurnAngle: number | null;
+  /** Fraction of significant turns made above half peak speed. Human ≤ 0.3. */
+  turnsWhileFast: number | null;
+  /** Chord / arc length. Human ≤ 0.985 (bots draw near-straight lines). */
+  straightness: number | null;
+  /** Coefficient of variation of resampled segment speeds. Human 0.35–2.6. */
+  speedCv: number | null;
+  /** Minimum interval (ms) between consecutive raw trusted pointermove events. Human ≥ 15. */
+  minFlightMs: number | null;
+  /** Peak resampled speed in px/s (informational). */
+  maxSpeedPx: number | null;
+}
+
+/** The exact kinematics payload block posted with identify/corroborate. */
+export interface KinematicsAggregate extends KinematicsShapeFeatures {
+  /** Total trusted pointer/keydown/scroll/wheel/touch events in the dwell window. */
+  eventCount: number;
+  pointerEvents: number;
+  /** Count only — never key content. */
+  keyEvents: number;
+  scrollEvents: number;
+  /** Dwell window: lastInteractionAt − firstInteractionAt (collector.ts counters). */
+  interactionMs: number;
+  /** True when every recorded capture timestamp was non-decreasing. */
+  clockMonotonic: boolean;
+}
+
+const KINEMATICS_RESAMPLE_MS = 25;
+/** Rolling capture window — the attestation describes recent motion, not the whole session. */
+const KINEMATICS_TRAIL_WINDOW_MS = 10_000;
+const KINEMATICS_TRAIL_MAX_SAMPLES = 1024;
+/** Fewer resampled points than this → shape features are null (too few events). */
+const KINEMATICS_MIN_RESAMPLED_POINTS = 8;
+const KINEMATICS_MIN_ARC_PX = 5;
+/** A resampled direction change ≥ 0.2 rad counts as a "turn" for turnsWhileFast. */
+const KINEMATICS_TURN_RAD = 0.2;
+const KINEMATICS_MIN_TURN_SEGMENT_PX = 0.5;
+
+const round3 = (value: number): number | null =>
+  Number.isFinite(value) ? Math.round(value * 1000) / 1000 : null;
+
+/**
+ * Linear resample of the raw trail onto a fixed 25 ms grid. Pure function over
+ * in-memory samples; the interpolated grid is reduced to scalars immediately
+ * and never stored.
+ */
+function resampleTrail(
+  samples: readonly KinematicsSample[],
+  stepMs: number
+): Array<{ x: number; y: number }> {
+  const t0 = samples[0].t;
+  const tEnd = samples[samples.length - 1].t;
+  if (!(tEnd > t0)) return [{ x: samples[0].x, y: samples[0].y }];
+  const grid: Array<{ x: number; y: number }> = [];
+  let index = 0;
+  const last = Math.floor((tEnd - t0) / stepMs);
+  for (let step = 0; step <= last; step++) {
+    const t = t0 + step * stepMs;
+    while (index < samples.length - 2 && samples[index + 1].t < t) index++;
+    const a = samples[index];
+    const b = samples[index + 1] ?? a;
+    const span = b.t - a.t;
+    const f = span > 0 ? Math.min(1, Math.max(0, (t - a.t) / span)) : 0;
+    grid.push({ x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f });
+  }
+  return grid;
+}
+
+/**
+ * Pure reduction of a raw trail to the aggregate shape features. All nine
+ * features are null when the trail is empty or too short to support them;
+ * `clockMonotonic` is always reported. No raw sample ever escapes this
+ * function — the return value is scalars only.
+ */
+export function computeKinematicsShapeFeatures(
+  samples: readonly KinematicsSample[]
+): KinematicsShapeFeatures & { clockMonotonic: boolean } {
+  const result: KinematicsShapeFeatures & { clockMonotonic: boolean } = {
+    brakingRatio: null,
+    microStructure: null,
+    meanTurnAngle: null,
+    turnsWhileFast: null,
+    straightness: null,
+    speedCv: null,
+    minFlightMs: null,
+    maxSpeedPx: null,
+    clockMonotonic: true,
+  };
+
+  let monotonic = true;
+  let minFlightMs = Number.POSITIVE_INFINITY;
+  for (let i = 1; i < samples.length; i++) {
+    if (samples[i].t < samples[i - 1].t) monotonic = false;
+    const dt = samples[i].t - samples[i - 1].t;
+    if (dt > 0 && dt < minFlightMs) minFlightMs = dt;
+  }
+  result.clockMonotonic = monotonic;
+  result.minFlightMs = Number.isFinite(minFlightMs) ? round3(minFlightMs) : null;
+  if (samples.length < 2) return result;
+
+  const points = resampleTrail(samples, KINEMATICS_RESAMPLE_MS);
+  const n = points.length;
+  if (n < KINEMATICS_MIN_RESAMPLED_POINTS) return result;
+
+  // First differences on the resampled grid.
+  const d1x: number[] = [];
+  const d1y: number[] = [];
+  const segLen: number[] = [];
+  let arcLen = 0;
+  for (let i = 0; i + 1 < n; i++) {
+    const dx = points[i + 1].x - points[i].x;
+    const dy = points[i + 1].y - points[i].y;
+    const len = Math.sqrt(dx * dx + dy * dy);
+    d1x.push(dx);
+    d1y.push(dy);
+    segLen.push(len);
+    arcLen += len;
+  }
+  if (arcLen < KINEMATICS_MIN_ARC_PX) return result;
+
+  const speeds = segLen.map((len) => len / (KINEMATICS_RESAMPLE_MS / 1000));
+  let maxSpeed = 0;
+  let speedSum = 0;
+  for (const speed of speeds) {
+    if (speed > maxSpeed) maxSpeed = speed;
+    speedSum += speed;
+  }
+  const meanSpeed = speedSum / speeds.length;
+  if (maxSpeed <= 0 || meanSpeed <= 0) return result;
+
+  // straightness — chord / arc.
+  const chord = Math.sqrt(
+    (points[n - 1].x - points[0].x) ** 2 + (points[n - 1].y - points[0].y) ** 2
+  );
+  result.straightness = round3(chord / arcLen);
+
+  // speedCv — population stddev / mean of resampled segment speeds.
+  let variance = 0;
+  for (const speed of speeds) variance += (speed - meanSpeed) * (speed - meanSpeed);
+  result.speedCv = round3(Math.sqrt(variance / speeds.length) / meanSpeed);
+  result.maxSpeedPx = round3(maxSpeed);
+
+  // microStructure — mean |second difference| / mean step length.
+  let d2Sum = 0;
+  let d2Count = 0;
+  for (let i = 1; i + 1 < n; i++) {
+    d2Sum += Math.sqrt((d1x[i] - d1x[i - 1]) ** 2 + (d1y[i] - d1y[i - 1]) ** 2);
+    d2Count++;
+  }
+  const meanStep = arcLen / segLen.length;
+  result.microStructure = round3(d2Sum / d2Count / (meanStep + 1e-6));
+
+  // Turn angles between consecutive resampled direction vectors.
+  const angles: number[] = [];
+  const turnSegmentSpeeds: number[] = [];
+  for (let i = 1; i + 1 < n; i++) {
+    if (segLen[i - 1] < KINEMATICS_MIN_TURN_SEGMENT_PX || segLen[i] < KINEMATICS_MIN_TURN_SEGMENT_PX) {
+      continue;
+    }
+    const dot = d1x[i - 1] * d1x[i] + d1y[i - 1] * d1y[i];
+    const cos = Math.min(1, Math.max(-1, dot / (segLen[i - 1] * segLen[i])));
+    angles.push(Math.acos(cos));
+    turnSegmentSpeeds.push(speeds[i]);
+  }
+  if (angles.length > 0) {
+    let angleSum = 0;
+    let turnEvents = 0;
+    let fastTurns = 0;
+    for (let k = 0; k < angles.length; k++) {
+      angleSum += angles[k];
+      if (angles[k] >= KINEMATICS_TURN_RAD) {
+        turnEvents++;
+        if (turnSegmentSpeeds[k] >= 0.5 * maxSpeed) fastTurns++;
+      }
+    }
+    result.meanTurnAngle = round3(angleSum / angles.length);
+    result.turnsWhileFast = round3(turnEvents > 0 ? fastTurns / turnEvents : 0);
+  }
+
+  // brakingRatio — mean speed over the final quarter of resampled segments / peak.
+  const tailCount = Math.max(1, Math.floor(speeds.length / 4));
+  let tailSum = 0;
+  for (let i = speeds.length - tailCount; i < speeds.length; i++) tailSum += speeds[i];
+  result.brakingRatio = round3(Math.min(1, tailSum / tailCount / maxSpeed));
+
+  return result;
+}
+
+// Page-lifetime capture state. Raw samples stay in this module's memory only
+// (see the ZERO-PII INVARIANT above) and are pruned to a rolling window.
+const kinematicsTrail: KinematicsSample[] = [];
+let kinematicsAggregateInstalled = false;
+
+function pruneKinematicsTrail(now: number): void {
+  // Drop samples older than the rolling window, measured against the newest
+  // captured sample (`now`), then enforce the hard length cap.
+  while (
+    kinematicsTrail.length > 0 &&
+    now - kinematicsTrail[0].t > KINEMATICS_TRAIL_WINDOW_MS
+  ) {
+    kinematicsTrail.shift();
+  }
+  while (kinematicsTrail.length > KINEMATICS_TRAIL_MAX_SAMPLES) kinematicsTrail.shift();
+}
+
+const kinematicsListenerOptions: AddEventListenerOptions = { capture: true, passive: true };
+
+const onKinematicsPointerMove = (event: Event): void => {
+  try {
+    if (!(event as PointerEvent).isTrusted) return;
+    if (document.hidden) return; // Track only while the document is visible.
+    const pointerEvent = event as PointerEvent;
+    const x = pointerEvent.clientX;
+    const y = pointerEvent.clientY;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const t = performance.now();
+    pruneKinematicsTrail(t);
+    kinematicsTrail.push({ x, y, t });
+  } catch {
+    /* ignore */
+  }
+};
+
+/** Idempotent page-lifetime install of the aggregate capture listener set. */
+function ensureKinematicsAggregateListeners(): void {
+  if (kinematicsAggregateInstalled || typeof document === 'undefined') return;
+  kinematicsAggregateInstalled = true;
+  try {
+    document.addEventListener('pointermove', onKinematicsPointerMove, kinematicsListenerOptions);
+  } catch {
+    /* ignore */
+  }
+}
+
+// Install once at module load so the dwell window starts before the first
+// collection pass (same pattern as collector.ts installTrustedInputTracker).
+if (typeof window !== 'undefined') ensureKinematicsAggregateListeners();
+
+/**
+ * Snapshot of the aggregate shape features over the rolling capture window.
+ * Returns scalars only (see the ZERO-PII INVARIANT above) — collector.ts
+ * merges these with its `interactionCounters` into the posted `kinematics`
+ * block. Never throws.
+ */
+export function getKinematicsShapeFeatures(): KinematicsShapeFeatures & { clockMonotonic: boolean } {
+  try {
+    const now = kinematicsTrail.length > 0 ? kinematicsTrail[kinematicsTrail.length - 1].t : 0;
+    pruneKinematicsTrail(now);
+    return computeKinematicsShapeFeatures(kinematicsTrail.map((sample) => ({ ...sample })));
+  } catch {
+    return {
+      brakingRatio: null,
+      microStructure: null,
+      meanTurnAngle: null,
+      turnsWhileFast: null,
+      straightness: null,
+      speedCv: null,
+      minFlightMs: null,
+      maxSpeedPx: null,
+      clockMonotonic: true,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main collector
 // ---------------------------------------------------------------------------
 
@@ -741,7 +1114,15 @@ export async function collectAutomationSignals(
 
     const renderer = readRendererUnmasked(args.rendererUnmasked);
     const caveat = detectSwiftShaderCaveat();
-    if (caveat === true) reasons.push(REASONS.headlessSwiftshaderCaveat);
+    if (caveat === true) {
+      reasons.push(REASONS.headlessSwiftshaderCaveat);
+      // H3-hard conjunction: a WebGL context was returned DESPITE
+      // failIfMajorPerformanceCaveat, the renderer IS a software rasterizer, and the
+      // runtime claims a desktop platform with no touch support. Each leg alone stays
+      // weak (hardware acceleration is routinely disabled by users); together they are
+      // a forced software-GL headless launch and hard evidence.
+      if (claimsDesktopPlatform()) reasons.push(REASONS.headlessSwiftshaderCaveatDesktop);
+    }
 
     // --- shapes that only need sync inputs -------------------------------
     const referrer = (() => {
@@ -760,19 +1141,22 @@ export async function collectAutomationSignals(
     if (detectOverlayMarker(/claude/i)) shapes.push(SHAPES.claudeMarker);
 
     // --- async probes -----------------------------------------------------
-    const [runtimeEnable, consoleDebug, networkOrder, languageDetector, keyboard] = await Promise.all([
-      detectCdpRuntimeEnable(),
-      detectCdpConsoleDebug(),
-      detectCdpNetworkOrder(),
-      detectLanguageDetectorUnavailable(),
-      probeKeyboardLayout(),
-    ]);
+    const [runtimeEnable, consoleDebug, networkOrder, languageDetector, keyboard, notificationContract] =
+      await Promise.all([
+        detectCdpRuntimeEnable(),
+        detectCdpConsoleDebug(),
+        detectCdpNetworkOrder(),
+        detectLanguageDetectorUnavailable(),
+        probeKeyboardLayout(),
+        detectNotificationContractMismatch(),
+      ]);
 
     if (runtimeEnable === true) reasons.push(REASONS.cdpRuntimeEnable);
     if (consoleDebug === true) reasons.push(REASONS.cdpConsoleDebug);
     if (networkOrder === true) reasons.push(REASONS.cdpNetworkOrder);
     if (languageDetector === true) reasons.push(REASONS.launchNoLanguageDetector);
     if (keyboard.flagged === true) reasons.push(REASONS.headlessNoIntlyenKey);
+    if (notificationContract === true) reasons.push(REASONS.headlessNotificationContract);
 
     let promptMentionsCodex = false;
     try {

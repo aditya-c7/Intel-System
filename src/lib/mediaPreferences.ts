@@ -30,6 +30,14 @@ export interface MediaPreferencesInput {
   reducedMotion?: boolean | null | undefined;
   /** `matchMedia('(prefers-reduced-transparency: reduce)').matches`. */
   reducedTransparency?: boolean | null | undefined;
+  /**
+   * `matchMedia('(monochrome: 0)').matches` — the INVERSE monochrome read: `true`
+   * reports a color-capable display, `false` a monochrome one. The raw match is
+   * stored verbatim (no polarity flip) so the evidence stays the query's answer.
+   */
+  monochrome?: boolean | null | undefined;
+  /** `matchMedia('(inverted-colors)').matches` — true when the UA reports inverted colors. */
+  invertedColors?: boolean | null | undefined;
   /** `prefers-color-scheme` value: `light`, `dark` or `no-preference`. */
   colorScheme?: string | null | undefined;
   /** `prefers-contrast` value: `no-preference`, `more`, `less` or `forced`. */
@@ -48,6 +56,13 @@ export interface MediaPreferencesResult {
   forced_colors: boolean | null;
   reduced_motion: boolean | null;
   reduced_transparency: boolean | null;
+  /**
+   * Raw `(monochrome: 0)` match: `true` = color display, `false` = monochrome
+   * display. Informational only, exactly like its sibling booleans.
+   */
+  monochrome: boolean | null;
+  /** Raw `(inverted-colors)` match. Informational only, exactly like its sibling booleans. */
+  inverted_colors: boolean | null;
   color_scheme: string | null;
   contrast: string | null;
   locale: string | null;
@@ -235,6 +250,8 @@ export function resolveMediaPreferences(
     forced_colors: null,
     reduced_motion: null,
     reduced_transparency: null,
+    monochrome: null,
+    inverted_colors: null,
     color_scheme: null,
     contrast: null,
     locale: null,
@@ -247,6 +264,8 @@ export function resolveMediaPreferences(
     result.forced_colors = readBoolean(src, 'forcedColors', notes);
     result.reduced_motion = readBoolean(src, 'reducedMotion', notes);
     result.reduced_transparency = readBoolean(src, 'reducedTransparency', notes);
+    result.monochrome = readBoolean(src, 'monochrome', notes);
+    result.inverted_colors = readBoolean(src, 'invertedColors', notes);
     result.color_scheme = readEnum(src, 'colorScheme', COLOR_SCHEMES, COLOR_SCHEME_ALIASES, notes);
     result.contrast = readEnum(src, 'contrast', CONTRASTS, CONTRAST_ALIASES, notes);
     result.locale = readLocale(src, notes);

@@ -36,6 +36,10 @@ import {
   type GradedRiskInput,
 } from '../src/lib/riskLedger';
 import { assertCanonicalConsistency, riskTier } from '../src/lib/telemetryContract';
+import {
+  US_REGION_TIMEZONES,
+  usRegionCodeToTimezone,
+} from '../src/lib/geoFallbacks';
 
 let passed = 0;
 const failures: string[] = [];
@@ -940,6 +944,142 @@ check('local riskBadgeText expectation matches the canonical headline math', () 
       expectedRiskBadgeText(ledger.score10, ledger.risk_tier),
       `${fixture.tier} Risk • ${fixture.score10}/10`,
     );
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* 5b. Kinematics payload contract (zero-PII motion attestation wiring)        */
+/*                                                                            */
+/* The `kinematics` block posted with identify/corroborate must expose EXACTLY */
+/* the agreed aggregate fields — scalars only, never raw trajectories — so    */
+/* the server's "Corroborated Human" validation cannot drift from the client. */
+/* -------------------------------------------------------------------------- */
+
+section('5b. Kinematics payload contract (zero-PII wiring)');
+
+const { buildKinematicsPayload } = await import('../src/lib/collector');
+
+const KINEMATICS_CONTRACT_KEYS = [
+  'eventCount',
+  'pointerEvents',
+  'keyEvents',
+  'scrollEvents',
+  'interactionMs',
+  'brakingRatio',
+  'microStructure',
+  'meanTurnAngle',
+  'turnsWhileFast',
+  'straightness',
+  'speedCv',
+  'minFlightMs',
+  'clockMonotonic',
+  'maxSpeedPx',
+] as const;
+
+check('kinematics payload block exposes exactly the contract fields', () => {
+  const block = buildKinematicsPayload() as unknown as Record<string, unknown>;
+  assert.deepEqual(Object.keys(block).sort(), [...KINEMATICS_CONTRACT_KEYS].sort());
+});
+
+check('kinematics payload block serializes to scalars only (zero-PII: no arrays/objects)', () => {
+  const roundTrip = JSON.parse(JSON.stringify({ kinematics: buildKinematicsPayload() })) as {
+    kinematics: Record<string, unknown>;
+  };
+  for (const value of Object.values(roundTrip.kinematics)) {
+    assert.ok(
+      value === null || typeof value === 'number' || typeof value === 'boolean',
+      `kinematics value must be null|number|boolean, got ${typeof value}`,
+    );
+  }
+  // No nested value anywhere in the block may be an array (raw points would be).
+  const walk = (value: unknown): void => {
+    assert.ok(!Array.isArray(value), 'kinematics block must contain no arrays');
+    if (typeof value === 'object' && value !== null) {
+      for (const nested of Object.values(value as Record<string, unknown>)) walk(nested);
+    }
+  };
+  walk(roundTrip.kinematics);
+});
+
+check('kinematics counts and dwell window are non-negative integers', () => {
+  const block = buildKinematicsPayload();
+  for (const key of ['eventCount', 'pointerEvents', 'keyEvents', 'scrollEvents', 'interactionMs'] as const) {
+    assert.ok(Number.isInteger(block[key]) && block[key] >= 0, `${key} must be a non-negative integer`);
+  }
+  assert.equal(typeof block.clockMonotonic, 'boolean');
+});
+
+/* -------------------------------------------------------------------------- */
+/* 6. US regionCode -> IANA timezone fallback (geo Fix 2)                      */
+/*                                                                            */
+/* The server resolves the IP timezone from the SEALED edge geo first; when    */
+/* the edge reports a US regionCode (request.cf.regionCode) but no timezone,  */
+/* `usRegionCodeToTimezone` supplies the zone from that same first-party edge */
+/* evidence. That resolved IP timezone feeds the canonical TZ-mismatch verdict, */
+/* which in turn selects the network family's marginal-vs-standalone timezone */
+/* component in the graded ledger — so a wrong fallback silently moves risk.   */
+/* -------------------------------------------------------------------------- */
+
+section('6. US regionCode -> IANA timezone fallback (geo Fix 2)');
+
+check('Moncks Corner, South Carolina (regionCode SC) resolves to America/New_York', () => {
+  assert.equal(usRegionCodeToTimezone('SC'), 'America/New_York');
+});
+
+check('Seattle, Washington (regionCode WA) resolves to America/Los_Angeles', () => {
+  assert.equal(usRegionCodeToTimezone('WA'), 'America/Los_Angeles');
+});
+
+check('Denver, Colorado (regionCode CO) resolves to America/Denver', () => {
+  assert.equal(usRegionCodeToTimezone('CO'), 'America/Denver');
+});
+
+check('lookup is case-insensitive and whitespace-tolerant', () => {
+  assert.equal(usRegionCodeToTimezone('sc'), 'America/New_York');
+  assert.equal(usRegionCodeToTimezone(' wa '), 'America/Los_Angeles');
+});
+
+check('Arizona keeps its own no-DST zone and Hawaii/Alaska resolve', () => {
+  assert.equal(usRegionCodeToTimezone('AZ'), 'America/Phoenix');
+  assert.equal(usRegionCodeToTimezone('HI'), 'Pacific/Honolulu');
+  assert.equal(usRegionCodeToTimezone('AK'), 'America/Anchorage');
+});
+
+check('Puerto Rico resolves as a territory', () => {
+  assert.equal(usRegionCodeToTimezone('PR'), 'America/Puerto_Rico');
+});
+
+check('unknown / missing / hostile codes stay absent (never an invented zone)', () => {
+  assert.equal(usRegionCodeToTimezone('XX'), '');
+  assert.equal(usRegionCodeToTimezone(''), '');
+  assert.equal(usRegionCodeToTimezone(null), '');
+  assert.equal(usRegionCodeToTimezone(undefined), '');
+  assert.equal(usRegionCodeToTimezone(42 as unknown as string), '');
+});
+
+check('the map covers all 50 states + DC + PR with non-empty IANA zones', () => {
+  const stateCodes = [
+    'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+    'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+    'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+    'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+    'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY',
+    'DC', 'PR',
+  ];
+  assert.equal(Object.keys(US_REGION_TIMEZONES).length, stateCodes.length);
+  for (const code of stateCodes) {
+    const zone = US_REGION_TIMEZONES[code];
+    assert.ok(
+      typeof zone === 'string' && zone.startsWith('America/') || zone === 'Pacific/Honolulu',
+      `${code} -> ${String(zone)}`,
+    );
+  }
+});
+
+check('every mapped zone is a real IANA identifier in this runtime', () => {
+  const supported = new Set(Intl.supportedValuesOf('timeZone') as string[]);
+  for (const zone of Object.values(US_REGION_TIMEZONES)) {
+    assert.ok(supported.has(zone), `${zone} is not an IANA zone in this runtime`);
   }
 });
 

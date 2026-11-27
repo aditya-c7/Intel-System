@@ -19,6 +19,8 @@ import * as spec from '../src/lib/specInvariants';
 import * as telemetry from '../src/lib/telemetryContract';
 import * as risk from '../src/lib/riskLedger';
 import * as honesty from '../src/lib/rarityHonesty';
+import { collectSystemEntropySignals, hashSpeechVoiceList } from '../src/client/signals/systemEntropy';
+import { hashStrings } from '../src/client/signals/hash';
 
 /* -------------------------------------------------------------------------- */
 /* Fixture + reporting                                                         */
@@ -386,6 +388,166 @@ if (honestyExportsReady && telemetryExportsReady) {
     );
   });
 }
+
+/* -------------------------------------------------------------------------- */
+/* Additive — systemEntropy: speech-voice list hash, pdfViewerEnabled, UA-CH    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Synthetic stubs for the entropy collector: `window` / `navigator` are swapped
+ * in for the async collection and restored afterwards, so the golden-corpus
+ * checks above are never affected. Everything else the collector reads degrades
+ * to null in bare Node (screen, mediaDevices, storage, permissions, battery).
+ */
+interface EntropyGlobals {
+  window?: Record<string, unknown>;
+  navigator?: Record<string, unknown>;
+}
+
+const ENTROPY_VOICES = [
+  { name: 'Microsoft Zira - English (United States)', lang: 'en-US' },
+  { name: 'Amelie', lang: 'fr-FR' },
+];
+
+function entropyGlobalsStub(extra: {
+  voices?: ReadonlyArray<unknown>;
+  navigatorExtras?: Record<string, unknown>;
+}): EntropyGlobals {
+  // Navigator extras are carried through property DESCRIPTORS so a hostile
+  // getter stub survives construction (a plain spread would invoke it).
+  const navigatorDescriptors = Object.getOwnPropertyDescriptors(extra.navigatorExtras ?? {});
+  navigatorDescriptors.hardwareConcurrency = { value: 8, writable: true, enumerable: true, configurable: true };
+  return {
+    window: {
+      speechSynthesis: {
+        getVoices: () =>
+          (extra.voices ?? ENTROPY_VOICES).map(
+            (voice) => ({ ...(voice as Record<string, unknown>) })
+          ),
+      },
+    },
+    navigator: Object.create(Object.prototype, navigatorDescriptors) as Record<string, unknown>,
+  };
+}
+
+async function collectWithEntropyGlobals(stub: EntropyGlobals): Promise<ReturnType<typeof collectSystemEntropySignals>> {
+  const saved = new Map<string, PropertyDescriptor | undefined>();
+  for (const key of ['window', 'navigator'] as const) {
+    saved.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+    if (stub[key] !== undefined) {
+      Object.defineProperty(globalThis, key, { value: stub[key], writable: true, configurable: true });
+    } else {
+      delete (globalThis as unknown as Record<string, unknown>)[key];
+    }
+  }
+  try {
+    return await collectSystemEntropySignals();
+  } finally {
+    for (const key of ['window', 'navigator'] as const) {
+      const descriptor = saved.get(key);
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete (globalThis as unknown as Record<string, unknown>)[key];
+    }
+  }
+}
+
+check('entropy.voice-hash.pure', 'voice-list hash is order-independent and content-sensitive', () => {
+  const reversed = [...ENTROPY_VOICES].reverse();
+  const forward = hashSpeechVoiceList(ENTROPY_VOICES);
+  assert.ok(forward, 'a non-empty list must hash');
+  assert.equal(hashSpeechVoiceList(reversed), forward, 'enumeration order must not change the digest');
+  const different = hashSpeechVoiceList([{ name: 'Microsoft Zira - English (United States)', lang: 'en-US' }]);
+  assert.notEqual(different, forward, 'a different voice list must hash differently');
+  assert.equal(hashSpeechVoiceList([]), null, 'an empty list must never fake a stable hash');
+  assert.equal(hashSpeechVoiceList(null), null);
+  assert.equal(hashSpeechVoiceList(undefined), null);
+  // Junk voice fields degrade to the stable empty-string join, they never throw.
+  assert.equal(hashSpeechVoiceList([{ name: 5, lang: null }]), hashSpeechVoiceList([{ name: 6, lang: false }]));
+});
+
+check('entropy.voice-hash.join', 'digest pins the sorted `name|lang` join through hashStrings', () => {
+  const lines = ENTROPY_VOICES.map((voice) => `${voice.name}|${voice.lang}`).sort();
+  assert.equal(hashSpeechVoiceList(ENTROPY_VOICES), hashStrings(lines));
+});
+
+// Collected once up front (top-level await) so every assertion below stays synchronous
+// and is reported through the shared check() counters.
+const entropyFirst = await collectWithEntropyGlobals(entropyGlobalsStub({ voices: ENTROPY_VOICES }));
+const entropySecond = await collectWithEntropyGlobals(
+  entropyGlobalsStub({ voices: [...ENTROPY_VOICES].reverse() })
+);
+const entropyPdfPresent = await collectWithEntropyGlobals(
+  entropyGlobalsStub({ navigatorExtras: { pdfViewerEnabled: true } })
+);
+const entropyPdfAbsent = await collectWithEntropyGlobals(entropyGlobalsStub({}));
+const entropyPdfHostile = await collectWithEntropyGlobals(
+  entropyGlobalsStub({
+    navigatorExtras: {
+      get pdfViewerEnabled(): boolean {
+        throw new Error('hostile getter');
+      },
+    },
+  })
+);
+const entropyUaClaimed = await collectWithEntropyGlobals(
+  entropyGlobalsStub({
+    navigatorExtras: {
+      userAgentData: {
+        getHighEntropyValues: async (hints: string[]) => {
+          assert.deepEqual(hints, ['architecture', 'model']);
+          return { architecture: 'arm', model: 'Pixel 8' };
+        },
+      },
+    },
+  })
+);
+const entropyUaNoApi = await collectWithEntropyGlobals(entropyGlobalsStub({}));
+const entropyUaRejecting = await collectWithEntropyGlobals(
+  entropyGlobalsStub({
+    navigatorExtras: {
+      userAgentData: {
+        getHighEntropyValues: async () => {
+          throw new Error('hostile UA-CH');
+        },
+      },
+    },
+  })
+);
+
+check('entropy.voice-hash.collector', 'collector keeps speechVoicesCount and adds the list hash', () => {
+  assert.equal(entropyFirst.speechVoicesCount, ENTROPY_VOICES.length, 'count field stays for compatibility');
+  assert.equal(
+    entropyFirst.speechVoicesListHash,
+    hashStrings(ENTROPY_VOICES.map((v) => `${v.name}|${v.lang}`).sort())
+  );
+  assert.equal(entropySecond.speechVoicesListHash, entropyFirst.speechVoicesListHash, 'order-independent through the collector too');
+});
+
+check('entropy.pdf-viewer', 'pdfViewerEnabled publishes only literal booleans, never throws', () => {
+  assert.equal(entropyPdfPresent.pdfViewerEnabled, true);
+  assert.equal(entropyPdfAbsent.pdfViewerEnabled, null);
+  assert.equal(entropyPdfHostile.pdfViewerEnabled, null);
+  assert.equal(entropyPdfHostile.error, undefined, 'a hostile getter is contained per-field');
+});
+
+check('entropy.ua-ch.claims', 'UA-CH architecture/model are captured as CLAIMS, never anchors', () => {
+  // hardwareTruth.ts lie-guard: UA-CH `architecture` can be wrong on real
+  // hardware, so these values are telemetry only — asserted here as passthrough
+  // claims; nothing downstream may treat them as an anchor.
+  assert.equal(entropyUaClaimed.userAgentData.supported, true);
+  assert.equal(entropyUaClaimed.userAgentData.architecture, 'arm');
+  assert.equal(entropyUaClaimed.userAgentData.model, 'Pixel 8');
+});
+
+check('entropy.ua-ch.failsafe', 'UA-CH probe degrades fail-safe without the API or on rejection', () => {
+  assert.equal(entropyUaNoApi.userAgentData.supported, false);
+  assert.equal(entropyUaNoApi.userAgentData.architecture, null);
+  assert.equal(entropyUaNoApi.userAgentData.model, null);
+  assert.equal(entropyUaRejecting.userAgentData.supported, true);
+  assert.equal(entropyUaRejecting.userAgentData.architecture, null);
+  assert.equal(entropyUaRejecting.userAgentData.model, null);
+  assert.ok(entropyUaRejecting.userAgentData.error?.includes('hostile UA-CH'));
+});
 
 /* -------------------------------------------------------------------------- */
 /* Summary                                                                     */

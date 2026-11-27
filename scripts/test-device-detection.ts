@@ -12,6 +12,8 @@
 import { classifyGenuineDevice, extractAndroidModelFromUA } from '../src/lib/deviceDetect';
 import type { DeviceGateInput } from '../src/lib/deviceDetect';
 import { resolvePhoneModel, formatPhoneDisplayLabel } from '../src/lib/phoneModel';
+import { detectBotD19Signals } from '../src/lib/aiBotDirectory';
+import type { BotD19Result } from '../src/lib/aiBotDirectory';
 
 interface Case {
   name: string;
@@ -657,3 +659,193 @@ for (const testCase of cases) {
 
 console.log(`\n${cases.length - failures}/${cases.length} cases passed`);
 if (failures > 0) process.exitCode = 1;
+
+/* -------------------------------------------------------------------------- */
+/* BotD19 client-signal matrix (src/lib/aiBotDirectory.ts)                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Synthetic window/navigator/document stubs for the client-side BotD
+ * detectors (window_size focus gate + Sequentum window.external scan).
+ * Globals are swapped in and restored around every case so the device matrix
+ * above is never affected.
+ */
+const BOTD_DESKTOP_CHROME_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+/** A getter whose Function.prototype.toString carries `[native code]` (bound functions do). */
+const BOTD_NATIVE_GETTER = (function () {
+  return undefined;
+}).bind(null);
+
+interface BotDStub {
+  window: Record<string, unknown>;
+  navigator: Record<string, unknown>;
+  document: Record<string, unknown>;
+  /** Installed as the global `Navigator` so descriptor checks see native getters. */
+  navigatorClass: (abstract new () => Record<string, unknown>) | null;
+}
+
+function botdCleanStub(): BotDStub {
+  class FakeNavigator {}
+  Object.defineProperty(FakeNavigator.prototype, 'plugins', { get: BOTD_NATIVE_GETTER, configurable: true });
+  Object.defineProperty(FakeNavigator.prototype, 'mimeTypes', { get: BOTD_NATIVE_GETTER, configurable: true });
+  return {
+    window: {
+      outerWidth: 1920,
+      outerHeight: 1080,
+      // Branded like the native External object so the tampering brand check passes.
+      external: { [Symbol.toStringTag]: 'External' },
+    },
+    navigator: {
+      userAgent: BOTD_DESKTOP_CHROME_UA,
+      appVersion:
+        '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      language: 'en-US',
+      languages: ['en-US', 'en'],
+      productSub: '20030107',
+      webdriver: false,
+      plugins: { length: 0, item: () => null },
+      mimeTypes: { length: 0, item: () => null },
+    },
+    document: { hasFocus: () => true },
+    navigatorClass: FakeNavigator as unknown as (abstract new () => Record<string, unknown>),
+  };
+}
+
+function withBotDGlobals(stub: BotDStub, fn: () => void): void {
+  const keys = ['window', 'navigator', 'document', 'Navigator'] as const;
+  const saved = new Map<string, PropertyDescriptor | undefined>();
+  for (const key of keys) {
+    saved.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
+  }
+  Object.defineProperty(globalThis, 'window', { value: stub.window, writable: true, configurable: true });
+  Object.defineProperty(globalThis, 'navigator', { value: stub.navigator, writable: true, configurable: true });
+  Object.defineProperty(globalThis, 'document', { value: stub.document, writable: true, configurable: true });
+  if (stub.navigatorClass) {
+    Object.defineProperty(globalThis, 'Navigator', { value: stub.navigatorClass, writable: true, configurable: true });
+  }
+  try {
+    fn();
+  } finally {
+    for (const key of keys) {
+      const descriptor = saved.get(key);
+      if (descriptor) Object.defineProperty(globalThis, key, descriptor);
+      else delete (globalThis as unknown as Record<string, unknown>)[key];
+    }
+  }
+}
+
+interface BotDCase {
+  name: string;
+  mutate: (stub: BotDStub) => void;
+  expect: (result: BotD19Result, problems: string[]) => void;
+}
+
+const botdCases: BotDCase[] = [
+  {
+    name: 'window_size flags zero outer size while the document HAS focus',
+    mutate: (stub) => {
+      stub.window.outerWidth = 0;
+      stub.window.outerHeight = 0;
+    },
+    expect: (result, problems) => {
+      if (result.signals.window_size !== true) problems.push('window_size should be true');
+      if (!result.reasons.includes('Window outerWidth and outerHeight are 0')) problems.push('reason missing');
+      if (result.detected !== true) problems.push('detected should be true');
+    },
+  },
+  {
+    name: 'unfocused tab with zero outer size is never flagged (BotD focus gate)',
+    mutate: (stub) => {
+      stub.window.outerWidth = 0;
+      stub.window.outerHeight = 0;
+      stub.document = { hasFocus: () => false };
+    },
+    expect: (result, problems) => {
+      if (result.signals.window_size !== false) problems.push('window_size should stay false when unfocused');
+      if (result.detected !== false) problems.push('detected should be false');
+    },
+  },
+  {
+    name: 'missing document.hasFocus stays silent on zero outer size',
+    mutate: (stub) => {
+      stub.window.outerWidth = 0;
+      stub.window.outerHeight = 0;
+      stub.document = {};
+    },
+    expect: (result, problems) => {
+      if (result.signals.window_size !== false) problems.push('window_size should stay false without focus evidence');
+      if (result.detected !== false) problems.push('detected should be false');
+    },
+  },
+  {
+    name: 'focused normal window with a native-branded external is fully clean',
+    mutate: () => {},
+    expect: (result, problems) => {
+      if (result.detected !== false) problems.push(`detected should be false, reasons: ${JSON.stringify(result.reasons)}`);
+      if (result.signals.window_size !== false) problems.push('window_size should be false');
+      if (result.signals.window_external !== false) problems.push('window_external should be false');
+    },
+  },
+  {
+    name: 'Sequentum leaks through a custom window.external toString',
+    mutate: (stub) => {
+      stub.window.external = { toString(): string { return 'Sequentum Content Extractor v1'; } };
+    },
+    expect: (result, problems) => {
+      if (result.signals.window_external !== true) problems.push('window_external should be true');
+      if (!result.reasons.some((reason) => /Sequentum/.test(reason))) problems.push('Sequentum reason missing');
+      if (result.detected !== true) problems.push('detected should be true');
+    },
+  },
+  {
+    name: 'Sequentum leaks through external JSON/own keys without a custom toString',
+    mutate: (stub) => {
+      stub.window.external = { SequentumAgent: { build: 42 } };
+    },
+    expect: (result, problems) => {
+      if (result.signals.window_external !== true) problems.push('window_external should be true');
+      if (!result.reasons.some((reason) => /Sequentum/.test(reason))) problems.push('Sequentum reason missing');
+    },
+  },
+  {
+    name: 'Sequentum outside window.external does not flag the external signal',
+    mutate: (stub) => {
+      // The UA itself carries Sequentum (fires `user_agent`), external stays clean.
+      stub.navigator.userAgent = BOTD_DESKTOP_CHROME_UA.replace('Chrome/131.0.0.0', 'Chrome/131.0.0.0 Sequentum/2');
+    },
+    expect: (result, problems) => {
+      if (result.signals.user_agent !== true) problems.push('user_agent should fire for the Sequentum UA');
+      if (result.signals.window_external !== false) problems.push('window_external must stay false for a clean external');
+      if (result.reasons.some((reason) => /Sequentum/.test(reason) && /external/i.test(reason))) {
+        problems.push('Sequentum external reason must not fire');
+      }
+    },
+  },
+];
+
+let botdFailures = 0;
+for (const botdCase of botdCases) {
+  const stub = botdCleanStub();
+  botdCase.mutate(stub);
+  const problems: string[] = [];
+  let result: BotD19Result | undefined;
+  try {
+    withBotDGlobals(stub, () => {
+      result = detectBotD19Signals('ANGLE (Intel UHD Graphics Direct3D11)');
+    });
+  } catch (error) {
+    problems.push(`threw: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (result) botdCase.expect(result, problems);
+  if (problems.length) {
+    botdFailures += 1;
+    console.log(`FAIL ${botdCase.name}\n     ${problems.join('; ')}`);
+  } else {
+    console.log(`ok   ${botdCase.name}`);
+  }
+}
+
+console.log(`\n${botdCases.length - botdFailures}/${botdCases.length} BotD19 client-signal cases passed`);
+if (botdFailures > 0) process.exitCode = 1;

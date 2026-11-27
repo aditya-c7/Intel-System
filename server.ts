@@ -16,6 +16,7 @@ import type {
   IspNetworkClassification,
   SecurityEnvelope,
   SecuritySignals,
+  StealthSignals,
   RiskLevel,
   PersistenceMode,
   LocationInfo,
@@ -38,6 +39,7 @@ import {
   normalizeAsnLabel,
   parseContinentValue,
   readEdgeGeoHeaders,
+  usRegionCodeToTimezone,
   type EdgeGeoHeaders,
   type EdgeHeaderBag,
 } from './src/lib/geoFallbacks';
@@ -48,7 +50,12 @@ import {
 } from './src/lib/timezone';
 import { buildProximityInfo } from './src/lib/geohash';
 import { detectAiBotFromServerSignals } from './src/lib/aiBotDirectory';
-import { composeBotVerdict } from './src/server/agents/botVerifier';
+import {
+  classifyReasonId,
+  composeBotVerdict,
+  stealthReasonId,
+  type BotVerifierStealth,
+} from './src/server/agents/botVerifier';
 import { clientHintsMiddleware, type ParsedClientHints } from './src/server/middleware/clientHints';
 import {
   normalizeUserAgent,
@@ -6199,9 +6206,12 @@ app.get('/api/intel/geolocation', async (req, res) => {
 
     // Same four-tier ASN enrichment as the identify handler: edge headers → bundled
     // registry → Team Cymru. A placeholder ISP is replaced by the resolved operator.
+    // asnEnricher's edge tier requires BOTH the ASN number and the organization, so the
+    // edge-reported org must be forwarded or the zero-cost tier never fires.
     const edgeAsnNumber = Number.parseInt(edgeGeo.asn.replace(/^AS/i, ''), 10);
     const enrichedNetwork = await enrichNetwork(visitorIp, {
       asn: Number.isInteger(edgeAsnNumber) && edgeAsnNumber > 0 ? edgeAsnNumber : undefined,
+      asOrganization: edgeGeo.organization || undefined,
       country: edgeGeo.countryCode || undefined,
     });
     const placeholderIspBefore =
@@ -6767,6 +6777,193 @@ function hasStrongCdpProof(
 function clampHumanCorroboration(value: unknown): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) return 0;
   return Math.max(0, Math.min(1, value));
+}
+
+/* -------------------------------------------------------------------------- */
+/* Stealth / client-probe payload readers (composeBotVerdict wiring)           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The full four-tier stealth evaluation a client may post travels either as a nested
+ * `stealthSignals` / `stealth_signals` object (shape: the extended `StealthSignals`
+ * contract in src/types/visitor.ts, which mirrors `BotVerifierStealth` in
+ * src/server/agents/botVerifier.ts) or as one of the flat id mirrors. Every field is
+ * optional so a legacy payload that posts only `stealth_signal_ids` stays valid.
+ */
+
+/** Bounded, type-safe string-array read: only real non-empty strings survive, max 32. */
+function payloadStringList(value: unknown, limit = 32): string[] {
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  for (const item of value.slice(0, limit)) {
+    if (typeof item === 'string' && item.trim().length > 0) out.push(item.trim().slice(0, 120));
+  }
+  return out;
+}
+
+/**
+ * Reads the client's shadow stealth evaluation off the identify payload and shapes it into
+ * `composeBotVerdict`'s `stealth` input contract.
+ *
+ * Accepted spellings, in precedence order:
+ *   1. a nested evaluation object — `securitySignals.stealthSignals` /
+ *      `securitySignals.stealth_signals` / top-level `stealthSignals` / `stealth_signals`;
+ *   2. the flat id mirrors the collector has always posted — top-level
+ *      `stealth_signal_ids` / `stealthIds` / `stealth_ids` and the same names inside
+ *      `securitySignals`.
+ *
+ * FAIL-CLOSED RULES (never invented evidence):
+ *   - an absent evaluation returns null — old clients keep working unchanged;
+ *   - a nested object carries its sub-lists verbatim; only the `detected` flag may be
+ *     reconciled upward (the evaluator's own invariant: a non-empty hard tier implies
+ *     detection);
+ *   - a flat id list carries NO tier qualifiers, so they are reconstructed strictly from the
+ *     shared bot taxonomy (`stealthReasonId` + `classifyReasonId`) exactly as
+ *     `evaluateStealthSignals` would classify them: hard-tier ids form `hard`, and `detected`
+ *     fires only when a hard id exists or a conditional (medium) id has an admissible
+ *     companion — the evaluator's own rule. A lone bare-CDP id stays weight-0 developer-tools
+ *     and can never escalate.
+ */
+function readStealthEvaluationFromPayload(
+  body: Record<string, unknown> | null | undefined,
+  rawSecuritySignals: Partial<SecuritySignals> | null | undefined
+): BotVerifierStealth | null {
+  const signalBag = (rawSecuritySignals ?? {}) as Record<string, unknown>;
+
+  // 1 — nested evaluation object, first spelling that is a real object wins.
+  const nestedCandidates = [
+    signalBag.stealthSignals,
+    signalBag.stealth_signals,
+    body?.stealthSignals,
+    body?.stealth_signals,
+  ];
+  const nested = nestedCandidates.find(
+    (value): value is Record<string, unknown> =>
+      Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+  );
+
+  if (nested) {
+    const ids = payloadStringList(nested.ids ?? nested.stealth_signal_ids);
+    const hard = payloadStringList(nested.hard);
+    const claimedDetected = nested.detected === true;
+    const detected = claimedDetected || hard.length > 0;
+    const sourceUrlSource =
+      nested.sourceUrlSource === 'puppeteer' || nested.sourceUrlSource === 'playwright'
+        ? (nested.sourceUrlSource as 'puppeteer' | 'playwright')
+        : null;
+    // NOTE: `BotVerifierStealth` has no `reasons` field — the verifier re-derives reason ids
+    // from `ids` + the tier sub-lists itself, so a posted `reasons` array is deliberately NOT
+    // forwarded (it is transport-only metadata in the StealthSignals contract).
+    const confirmed = payloadStringList(nested.confirmed);
+    const inconclusive = payloadStringList(nested.inconclusive);
+    const soft = payloadStringList(nested.soft);
+    const docked = payloadStringList(nested.docked);
+    const evaluation: BotVerifierStealth = {
+      detected,
+      ids,
+      hard,
+      confirmed,
+      inconclusive,
+      soft,
+      docked,
+      sourceUrlSource,
+    };
+    // Nothing observed and nothing claimed: keep the input absent, not an empty shell.
+    if (
+      !detected &&
+      ids.length === 0 &&
+      hard.length === 0 &&
+      confirmed.length === 0 &&
+      inconclusive.length === 0 &&
+      soft.length === 0 &&
+      docked.length === 0
+    ) {
+      return null;
+    }
+    return evaluation;
+  }
+
+  // 2 — flat id mirrors only. Reconstruct the tier semantics the evaluator itself applies;
+  // anything the taxonomy cannot classify is kept as an observed id but contributes no
+  // corroboration and never a hard reason.
+  const flatIds = Array.from(
+    new Set(
+      [
+        ...payloadStringList(body?.stealth_signal_ids),
+        ...payloadStringList(body?.stealthIds),
+        ...payloadStringList(body?.stealth_ids),
+        ...payloadStringList(signalBag.stealth_signal_ids),
+        ...payloadStringList(signalBag.stealthIds),
+        ...payloadStringList(signalBag.stealth_ids),
+      ]
+    )
+  );
+  if (flatIds.length === 0) return null;
+
+  let hardCount = 0;
+  let mediumCount = 0;
+  let weakCount = 0;
+  const hardIds: string[] = [];
+  for (const id of flatIds) {
+    const reason = stealthReasonId(id, false) || '';
+    if (!reason) continue; // unknown id: observed, but weightless here
+    switch (classifyReasonId(reason)) {
+      case 'hard':
+        hardCount += 1;
+        hardIds.push(id);
+        break;
+      case 'medium':
+        mediumCount += 1;
+        break;
+      case 'developer_tools':
+        break; // bare CDP — weight 0, never corroboration
+      default:
+        weakCount += 1;
+        break;
+    }
+  }
+  // evaluateStealthSignals' detection rule: any hard id, or a conditional (medium) id with
+  // an admissible companion (hard + medium + weak observations >= 2).
+  const detected = hardCount > 0 || (mediumCount > 0 && hardCount + mediumCount + weakCount >= 2);
+  if (!detected && hardIds.length === 0) {
+    // Evidence is real but below the escalation tier: pass ids only, no detected claim.
+    return { ids: flatIds, hard: [] };
+  }
+  return { detected, ids: flatIds, hard: hardIds };
+}
+
+/**
+ * Client automation probe for `composeBotVerdict`, built ONLY from the canonical reason ids
+ * the collector already maps from STRONG probes (`cdpReasonIds` — bare Runtime leaks and the
+ * bare webdriver flag are dropped by the collector's mapper, so weight-0 rules in the
+ * verifier stay effective). The probe verdict is the client's own automation claim, gated by
+ * the same STRONG-CDP-proof gate the sanitizer uses: a forged "I am a bot" claim with no
+ * hard reason id still cannot escalate (verifier step 5 is a low-severity
+ * suspected-automation note, and `bot` stays not_detected either way).
+ */
+function readClientProbeFromPayload(
+  body: Record<string, unknown> | null | undefined,
+  rawSecuritySignals: Partial<SecuritySignals> | null | undefined,
+  strongCdpProof: boolean
+): { verdict: string | null; reasons: string[] } | null {
+  const signalBag = (rawSecuritySignals ?? {}) as Record<string, unknown>;
+  // cdpReasonIds travels both at the top level of the identify body and inside
+  // securitySignals; the collector posts the same canonical ids either way.
+  const reasons = Array.from(
+    new Set([
+      ...payloadStringList(body?.cdpReasonIds),
+      ...payloadStringList(signalBag.cdpReasonIds),
+    ])
+  );
+  const clientClaimsAutomation = Boolean(
+    strongCdpProof &&
+      (rawSecuritySignals?.isBot || rawSecuritySignals?.webdriver || rawSecuritySignals?.cdpDetected)
+  );
+  if (!clientClaimsAutomation && reasons.length === 0) return null;
+  return {
+    verdict: clientClaimsAutomation ? 'agent' : null,
+    reasons,
+  };
 }
 
 interface CorroboratedCdpAssessment {
@@ -8557,9 +8754,12 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     // "Autonomous System AS…") is replaced by the resolved operator name. When a numeric
     // ASN is known but every name lookup fails, the network is labelled `AS<number>`
     // rather than "Standard Network"; a real ISP name is never overwritten.
+    // asnEnricher's edge tier requires BOTH the ASN number and the organization, so the
+    // edge-reported org must be forwarded or the zero-cost tier never fires.
     const edgeAsnNumber = Number.parseInt(edgeGeo.asn.replace(/^AS/i, ''), 10);
     const enrichedNetwork = await enrichNetwork(extractedIp, {
       asn: Number.isInteger(edgeAsnNumber) && edgeAsnNumber > 0 ? edgeAsnNumber : undefined,
+      asOrganization: edgeGeo.organization || undefined,
       country: edgeGeo.countryCode || undefined,
     });
     const placeholderIspBefore =
@@ -9137,9 +9337,24 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       });
     }
 
+    // Geo Fix 2 — the IP timezone is EVIDENCE about the network path, so the sealed edge geo
+    // (request.cf via the Worker envelope) is the primary source. The client-posted geo hint
+    // is whatever the page's JS believes and is trivially forged or stale, so it is a
+    // LAST-RESORT fallback only. When the edge reports a US regionCode but no timezone, the
+    // subdivision→IANA fallback in src/lib/geoFallbacks.ts supplies the zone from that same
+    // first-party edge evidence (client hint still outranks nothing — it applies last).
+    const clientTimezoneHint =
+      typeof clientGeoHint?.timezone === 'string' ? clientGeoHint.timezone.trim() : '';
+    const edgeRegionTimezone =
+      edgeGeo.countryCode === 'US'
+        ? usRegionCodeToTimezone(edgeGeo.regionCode)
+        : edgeGeo.countryCode === 'PR'
+        ? usRegionCodeToTimezone('PR')
+        : '';
     const ipTimezoneHint =
-      (typeof clientGeoHint?.timezone === 'string' && clientGeoHint.timezone.trim()) ||
       edgeGeo.timezone ||
+      edgeRegionTimezone ||
+      clientTimezoneHint ||
       '';
 
     // Task 3 — visit velocity / IP rotation across the last hour. The window comes from the
@@ -10208,12 +10423,121 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
 
     // Named AI agents need RFC 9421 / signed-agent / allowlist proof; ASN alone never qualifies.
     const agentProofMethod = resolveAgentProofMethod(rawRequestHeaders);
+    // Verified-agent ledger precedence (approved correction 3): the automation family of the
+    // graded ledger must be EXEMPT whenever a WBA verification actually succeeded — not only
+    // when the registry attribution fired. Automation is expected for a verified agent and can
+    // never disqualify one, so a cryptographically verified RFC 9421 signature (or its
+    // Worker-signed page-attestation equivalent) zeroes the family even when `aiAgent` stayed
+    // undetected (an agent the registry does not list, a CIDR/FCrDNS miss). `effectiveWba` is
+    // only ever a VERIFIED result (requestWba.verified or a HMAC-bound page attestation), so
+    // `verified === true` is exactly "WBA verification succeeded". The old `agentProofMethod`
+    // arm is header-PRESENCE-based and stays gated on `aiAgent?.detected` so a bare unsigned
+    // Signature header can never mint the exemption on its own.
+    const wbaVerificationSucceeded = effectiveWba?.verified === true;
     const rfc9421SignedAgent = Boolean(
-      aiAgent?.detected &&
+      (aiAgent?.detected &&
         (agentProofMethod === 'rfc9421' ||
           agentProofMethod === 'signed_agent' ||
-          (aiAgent as { executionMode?: string }).executionMode === 'RFC 9421 Signed Agent')
+          (aiAgent as { executionMode?: string }).executionMode === 'RFC 9421 Signed Agent')) ||
+        wbaVerificationSucceeded
     );
+
+    /* -------------------------------------------------------------------------- */
+    /* Shared bot-verifier composition — hoisted ABOVE the graded ledger.          */
+    /*                                                                              */
+    /* The full stealth evaluation and the client automation probe are threaded     */
+    /* into `composeBotVerdict` here (both were accepted-but-never-supplied inputs: */
+    /* the collector computed `evaluateStealthSignals` and posted only flat ids,    */
+    /* which the server never folded back in). The composition is pure, so          */
+    /* hoisting it changes no existing verdict; it lets the stealth-driven          */
+    /* `hardAutomationSignals` escalation below feed the ledger's automation        */
+    /* family with the SAME values the bot_info branch consumes.                    */
+    /* -------------------------------------------------------------------------- */
+    // A claimed verified-bot identity (Googlebot / GPTBot / ClaudeBot / …) is only trustworthy
+    // when first-party proof exists: a verified RFC 9421 Web Bot Auth signature, an exact
+    // official CIDR range or a forward-confirmed reverse DNS match. Without any of those the
+    // claim is a spoofed impostor — never "unknown" and never a low spoof likelihood. An
+    // unavailable feed / DNS answer is NOT an alibi: absence of proof is exactly the spoof.
+    const claimedVerifiedBotUa =
+      /\b(?:googlebot|googleother|gptbot|chatgpt-user|oai-searchbot|claudebot|claude-user|claude-searchbot|perplexitybot|perplexity-user|grokbot|xai-bot|meta-externalagent|meta-externalfetcher|facebookbot|muse|bingbot|duckduckbot|baiduspider|yandexbot)\b/i.test(
+        fullRequestUserAgent || ''
+      );
+    // Signed-good precedence: a cryptographically verified RFC 9421 agent keeps its real
+    // attribution even when its UA also names a crawler operator.
+    const signedGoodBot = Boolean(
+      aiAgent?.verified && /signed/i.test(String(aiAgent.executionMode || ''))
+    );
+    const payloadStealthEvaluation = readStealthEvaluationFromPayload(
+      requestBody as unknown as Record<string, unknown>,
+      rawSecuritySignals
+    );
+    const payloadClientProbe = readClientProbeFromPayload(
+      requestBody as unknown as Record<string, unknown>,
+      rawSecuritySignals,
+      strongCdpProof
+    );
+    // Consume the shared verifier verdict: a named crawler / AI-agent UA claim with no valid WBA
+    // signature and no official CIDR / FCrDNS proof is already classified there as
+    // bad / spoofed-impersonation with identity:'spoofed'. Mirroring that reason here keeps
+    // bot_info, spoof_likelihood and the risk evidence line in agreement with the verifier.
+    // `stealth` and `clientProbe` fold into the SAME probe-evidence channel (verifier steps
+    // 4/5) — signed-good rungs 0/1 still return first, so verified agents keep their verdict.
+    const botVerifierVerdict = composeBotVerdict({
+      userAgent: fullRequestUserAgent,
+      webBotAuth: effectiveWba,
+      ipInKnownBotCidr: Boolean(aiAgent?.verified),
+      uaLooksLikeBot: Boolean(aiAgent?.detected || registryAgent),
+      category: registryAgent?.category,
+      directory: aiAgent
+        ? {
+            detected: aiAgent.detected,
+            bot_id: aiAgent.agentId,
+            operator: aiAgent.operator,
+            category: registryAgent?.category,
+            identity: aiAgent.verified ? 'verified' : 'unknown',
+          }
+        : null,
+      // Shadow stealth evaluation — the decisive wiring fix. Absent stays absent: a legacy
+      // payload that posts no stealth evidence composes exactly as before.
+      stealth: payloadStealthEvaluation,
+      // Client automation probe — canonical reason ids the collector mapped from STRONG
+      // probes, plus the client's own automation claim gated by the STRONG-CDP-proof rule.
+      clientProbe: payloadClientProbe,
+      // Weight-0 protocol-inspection axis only; never a bad-bot verdict.
+      activeCdpInspection: activeCdpInspectionActive,
+    });
+    const verifierSpoofed =
+      botVerifierVerdict.reason === 'spoofed-impersonation' ||
+      botVerifierVerdict.identity === 'spoofed';
+    // P0-5 — consume the shared verifier's composition. A signed / verified good agent is
+    // authoritative and outranks hard client automation artifacts: publish bot:'good',
+    // identity:'signed' and NO stealth/automation bot type BEFORE the hard-automation branch.
+    // `cdc_*` protocol inspection is passed to the verifier as a weight-0 axis only, so it can
+    // never contribute a stealth reason here.
+    const verifierSignedGood =
+      !verifierSpoofed &&
+      (botVerifierVerdict.reason === 'signed-agent' ||
+        botVerifierVerdict.reason === 'verified-agent' ||
+        botVerifierVerdict.identity === 'signed' ||
+        botVerifierVerdict.identity === 'verified');
+    const spoofedVerifiedBotClaim =
+      !verifierSignedGood &&
+      ((claimedVerifiedBotUa && !signedGoodBot && !aiAgent?.verified) || verifierSpoofed);
+    // Stealth escalation (the decisive fix's consumer). When the verifier composed a
+    // bad/automated-runtime verdict from a non-empty hard stealth tier, that verdict owns the
+    // hard-automation path below: hardAutomationSignals feeds the ledger's automation family
+    // (tier A) AND the bot_info branch, and the bot type resolves to the neutral
+    // `stealth_automation` identity. VERIFIED-AGENT GUARANTEE: composeBotVerdict's signed-good
+    // rungs (0/1) return before the automation rung, so a WBA-verified agent is never escalated
+    // by its own probe telemetry; the explicit !verifierSignedGood guard is defence in depth.
+    const verifierStealthAutomation =
+      !verifierSignedGood &&
+      !spoofedVerifiedBotClaim &&
+      botVerifierVerdict.verdict === 'bad' &&
+      botVerifierVerdict.reason === 'automated-runtime';
+    if (verifierStealthAutomation && !hardAutomationSignals) {
+      hardAutomationSignals = true;
+    }
 
     const hostingDatacenter = Boolean(
       securitySignals.datacenterAsn || /cloud|datacenter|hosting/i.test(networkTypeLabel)
@@ -10225,7 +10549,52 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       (securitySignals as SecuritySignals & { proxyDetected?: boolean }).proxyDetected
     );
     const timezoneMismatch = Boolean(securitySignals.timezoneMismatch);
-    const swiftshader = specAssessment.software_renderer;
+
+    // GPU truth is informational only. When WebGL is masked / spoofed / unavailable, publish an
+    // explicit points:0 evidence line with the honest detail instead of any "unmasked physical
+    // GPU verified" claim. The score, tier and 0-10 headline are untouched.
+    // Resolved BEFORE the graded ledger (hoisted) so the environment family below can fold the
+    // software-renderer / GPU-contradiction verdict into its swiftshader component.
+    const identifyGpuExtras = hardwareSignals as unknown as Record<string, unknown>;
+    const identifyGpuTruth = resolveGpuTruthState({
+      vendor: hardwareSignals.gpuVendor,
+      renderer: hardwareSignals.gpuRenderer,
+      unmaskedVendor:
+        typeof identifyGpuExtras.gpuVendorUnmasked === 'string'
+          ? identifyGpuExtras.gpuVendorUnmasked
+          : typeof identifyGpuExtras.unmaskedVendor === 'string'
+          ? identifyGpuExtras.unmaskedVendor
+          : null,
+      unmaskedRenderer:
+        typeof identifyGpuExtras.gpuRendererUnmasked === 'string'
+          ? identifyGpuExtras.gpuRendererUnmasked
+          : typeof identifyGpuExtras.unmaskedRenderer === 'string'
+          ? identifyGpuExtras.unmaskedRenderer
+          : null,
+      debugExtensionAvailable: identifyGpuExtras.debugExtensionAvailable === true,
+      shaderPrecisionProfile:
+        typeof identifyGpuExtras.shaderPrecisionProfile === 'string'
+          ? identifyGpuExtras.shaderPrecisionProfile
+          : null,
+      privacyHardened,
+    });
+
+    // Environment family input (Hark fix #4). The spec invariant only sees the raw renderer
+    // STRING, so a masked/unavailable probe or a per-surface contradiction (the collector's
+    // normalized `gpu_truth_state`) never reached the ledger's swiftshader component. The
+    // frozen RISK_RUBRIC has a single software-renderer component, so both truth states route
+    // there: `software_renderer` (SwiftShader / llvmpipe answer) and `spoofed_suspect` (the
+    // GPU surfaces disagree — never a hardware claim). Read from the server-resolved truth
+    // first; the collector's posted `gpu_truth_state` mirror (already collected on every
+    // identify path) covers the client-side per-surface honesty guard the server cannot rerun.
+    const payloadGpuTruthState =
+      typeof rawExtras.gpu_truth_state === 'string' ? rawExtras.gpu_truth_state : '';
+    const gpuTruthSoftwareRenderer =
+      identifyGpuTruth.state === 'software_renderer' ||
+      identifyGpuTruth.state === 'spoofed_suspect' ||
+      payloadGpuTruthState === 'software_renderer' ||
+      payloadGpuTruthState === 'spoofed_suspect';
+    const swiftshader = Boolean(specAssessment.software_renderer || gpuTruthSoftwareRenderer);
     const ephemeralStorage = Boolean(securitySignals.isIncognito);
     const highActivity = highActivityDevice;
     const extremeRotation = velocityReport.distinctIps24h >= 10;
@@ -10270,32 +10639,6 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     });
     const suspectScore100 = riskLedger.score_0_100;
 
-    // GPU truth is informational only. When WebGL is masked / spoofed / unavailable, publish an
-    // explicit points:0 evidence line with the honest detail instead of any "unmasked physical
-    // GPU verified" claim. The score, tier and 0-10 headline are untouched.
-    const identifyGpuExtras = hardwareSignals as unknown as Record<string, unknown>;
-    const identifyGpuTruth = resolveGpuTruthState({
-      vendor: hardwareSignals.gpuVendor,
-      renderer: hardwareSignals.gpuRenderer,
-      unmaskedVendor:
-        typeof identifyGpuExtras.gpuVendorUnmasked === 'string'
-          ? identifyGpuExtras.gpuVendorUnmasked
-          : typeof identifyGpuExtras.unmaskedVendor === 'string'
-          ? identifyGpuExtras.unmaskedVendor
-          : null,
-      unmaskedRenderer:
-        typeof identifyGpuExtras.gpuRendererUnmasked === 'string'
-          ? identifyGpuExtras.gpuRendererUnmasked
-          : typeof identifyGpuExtras.unmaskedRenderer === 'string'
-          ? identifyGpuExtras.unmaskedRenderer
-          : null,
-      debugExtensionAvailable: identifyGpuExtras.debugExtensionAvailable === true,
-      shaderPrecisionProfile:
-        typeof identifyGpuExtras.shaderPrecisionProfile === 'string'
-          ? identifyGpuExtras.shaderPrecisionProfile
-          : null,
-      privacyHardened,
-    });
     if (identifyGpuTruth.state !== 'hardware') {
       riskLedger.evidence_ledger.push({
         family: 'environment',
@@ -10452,59 +10795,10 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
     let botInfo: BotInfo | null = null;
     let botType: string | null = null;
     let botVerdict = 'not_detected';
-    // A claimed verified-bot identity (Googlebot / GPTBot / ClaudeBot / …) is only trustworthy
-    // when first-party proof exists: a verified RFC 9421 Web Bot Auth signature, an exact
-    // official CIDR range or a forward-confirmed reverse DNS match. Without any of those the
-    // claim is a spoofed impostor — never "unknown" and never a low spoof likelihood. An
-    // unavailable feed / DNS answer is NOT an alibi: absence of proof is exactly the spoof.
-    const claimedVerifiedBotUa =
-      /\b(?:googlebot|googleother|gptbot|chatgpt-user|oai-searchbot|claudebot|claude-user|claude-searchbot|perplexitybot|perplexity-user|grokbot|xai-bot|meta-externalagent|meta-externalfetcher|facebookbot|muse|bingbot|duckduckbot|baiduspider|yandexbot)\b/i.test(
-        fullRequestUserAgent || ''
-      );
-    // Signed-good precedence: a cryptographically verified RFC 9421 agent keeps its real
-    // attribution even when its UA also names a crawler operator.
-    const signedGoodBot = Boolean(
-      aiAgent?.verified && /signed/i.test(String(aiAgent.executionMode || ''))
-    );
-    // Consume the shared verifier verdict: a named crawler / AI-agent UA claim with no valid WBA
-    // signature and no official CIDR / FCrDNS proof is already classified there as
-    // bad / spoofed-impersonation with identity:'spoofed'. Mirroring that reason here keeps
-    // bot_info, spoof_likelihood and the risk evidence line in agreement with the verifier.
-    const botVerifierVerdict = composeBotVerdict({
-      userAgent: fullRequestUserAgent,
-      webBotAuth: effectiveWba,
-      ipInKnownBotCidr: Boolean(aiAgent?.verified),
-      uaLooksLikeBot: Boolean(aiAgent?.detected || registryAgent),
-      category: registryAgent?.category,
-      directory: aiAgent
-        ? {
-            detected: aiAgent.detected,
-            bot_id: aiAgent.agentId,
-            operator: aiAgent.operator,
-            category: registryAgent?.category,
-            identity: aiAgent.verified ? 'verified' : 'unknown',
-          }
-        : null,
-      // Weight-0 protocol-inspection axis only; never a bad-bot verdict.
-      activeCdpInspection: activeCdpInspectionActive,
-    });
-    const verifierSpoofed =
-      botVerifierVerdict.reason === 'spoofed-impersonation' ||
-      botVerifierVerdict.identity === 'spoofed';
-    // P0-5 — consume the shared verifier's composition. A signed / verified good agent is
-    // authoritative and outranks hard client automation artifacts: publish bot:'good',
-    // identity:'signed' and NO stealth/automation bot type BEFORE the hard-automation branch.
-    // `cdc_*` protocol inspection is passed to the verifier as a weight-0 axis only, so it can
-    // never contribute a stealth reason here.
-    const verifierSignedGood =
-      !verifierSpoofed &&
-      (botVerifierVerdict.reason === 'signed-agent' ||
-        botVerifierVerdict.reason === 'verified-agent' ||
-        botVerifierVerdict.identity === 'signed' ||
-        botVerifierVerdict.identity === 'verified');
-    const spoofedVerifiedBotClaim =
-      !verifierSignedGood &&
-      ((claimedVerifiedBotUa && !signedGoodBot && !aiAgent?.verified) || verifierSpoofed);
+    // The shared verifier composition (botVerifierVerdict / verifierSpoofed /
+    // verifierSignedGood / spoofedVerifiedBotClaim / verifierStealthAutomation) is computed
+    // ABOVE the graded ledger so the stealth-driven escalation feeds the same automation
+    // family the bot_info branch below consumes. See the hoisted block there.
 
     if (verifierSignedGood) {
       // Signed good bot: no stealth-automation type and no spoof / automation reasons are emitted.
@@ -10533,6 +10827,11 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
       botType = corroboratedCdp.escalate
         ? (corroboratedCdp.botType ?? 'chromium_automation')
         : automationTargetedTampering
+        ? 'stealth_automation'
+        // Composed stealth escalation: the verifier folded a non-empty hard stealth tier
+        // into bad/automated-runtime — the same neutral stealth-automation identity the
+        // anti-detect / tampering paths use, never an "AI agent" label.
+        : verifierStealthAutomation
         ? 'stealth_automation'
         : 'browser_automation';
       botVerdict = 'bad';
@@ -11362,10 +11661,32 @@ app.post('/api/visitor/identify', identifyRateLimit, async (req, res) => {
         : /broadband|residential|consumer/i.test(networkTypeLabel)
         ? 'residential_isp'
         : 'unknown';
+    // Hark fix #1 — TZ-mismatch VPN corroboration. A browser-TZ ≠ IP-TZ mismatch is CONTEXT,
+    // never a tunnel verdict on its own: the locked product rule is that a standalone timezone
+    // mismatch must NEVER set vpn=true (or raise vpnSuspected), because travellers, remote
+    // desktops and mis-set clocks all mismatch legitimately. What it CAN do is corroborate an
+    // independently-observed tunneling signal: when at least one of (a) a datacenter/hosting
+    // ASN or DC-CIDR hit, (b) an already-true vpnOrRelay, (c) a rotating/residential proxy or
+    // (d) Tor fires alongside the mismatch, the VPN confidence rises to 'medium' and the
+    // graded ledger's network family bills the marginal TZ component
+    // (network.timezone_mismatch_marginal, +2 via `otherComponentFired` — already wired into
+    // computeCanonicalRiskLedger). Without corroboration the mismatch stays a standalone,
+    // low-confidence context note and nothing about the VPN verdict moves.
+    const tzMismatchCorroborated =
+      timezoneMismatch &&
+      (hostingDatacenter ||
+        vpnOrRelay ||
+        rotatingProxy ||
+        isTorExit ||
+        torStatus.isRelay ||
+        Boolean(securitySignals.datacenterAsn));
     // vpn_confidence is high only for a confirmed Tor exit list hit or a verified Layer-4 relay
-    // signal. A timezone mismatch alone is contextual and can never reach high.
+    // signal. A timezone mismatch alone is contextual and can never reach high — and can never
+    // set vpn=true from a standalone mismatch (locked restraint above).
     const vpnConfidence: 'low' | 'medium' | 'high' = isTorExit || torStatus.isRelay
       ? 'high'
+      : tzMismatchCorroborated
+      ? 'medium'
       : vpnOrRelay && Array.isArray(securitySignals.vpnReasons) && securitySignals.vpnReasons.length > 1
       ? 'medium'
       : vpnOrRelay

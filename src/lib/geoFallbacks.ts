@@ -675,6 +675,101 @@ export function cloudProviderOrgForAsn(rawAsn: string | null | undefined): strin
   return asn ? CLOUD_ASN_ORG[asn] || '' : '';
 }
 
+/* -------------------------------------------------------------------------- */
+/* US subdivision → IANA timezone fallback (geo Fix 2)                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * ISO-3166-2 subdivision code (Cloudflare `request.cf.regionCode` / Vercel
+ * `x-vercel-ip-country-region`, e.g. `SC`) → the IANA timezone of the subdivision's
+ * primary population centre. Used ONLY when the edge did not report `timezone`: the
+ * answer is derived from first-party edge evidence (`regionCode`), never from a
+ * client-supplied hint, so it stays a last-resort IP-timezone estimate.
+ *
+ * A handful of states straddle two zones; the entry is the zone covering the large
+ * majority of the state's population (CLDR primary-zone convention):
+ *   - Florida panhandle / West Texas / western Kansas & Nebraska / the Dakotas /
+ *     Kentucky & Tennessee splits → the majority zone below;
+ *   - Idaho → America/Boise (southern population belt); Oregon → Pacific.
+ */
+/** US state/territory subdivision code → primary IANA timezone (exported for the pinned tests). */
+export const US_REGION_TIMEZONES: Readonly<Record<string, string>> = Object.freeze({
+  // Eastern (America/New_York)
+  CT: 'America/New_York',
+  DC: 'America/New_York',
+  DE: 'America/New_York',
+  FL: 'America/New_York',
+  GA: 'America/New_York',
+  // Indiana: majority Eastern — America/New_York (identical rules since 2006; the
+  // Indianapolis alias is absent from some runtime ICU builds and adds no offset value).
+  IN: 'America/New_York',
+  KY: 'America/New_York',
+  MA: 'America/New_York',
+  MD: 'America/New_York',
+  ME: 'America/New_York',
+  MI: 'America/Detroit',
+  NC: 'America/New_York',
+  NH: 'America/New_York',
+  NJ: 'America/New_York',
+  NY: 'America/New_York',
+  OH: 'America/New_York',
+  PA: 'America/New_York',
+  RI: 'America/New_York',
+  SC: 'America/New_York',
+  VA: 'America/New_York',
+  VT: 'America/New_York',
+  WV: 'America/New_York',
+  // Central (America/Chicago)
+  AL: 'America/Chicago',
+  AR: 'America/Chicago',
+  IA: 'America/Chicago',
+  IL: 'America/Chicago',
+  KS: 'America/Chicago',
+  LA: 'America/Chicago',
+  MN: 'America/Chicago',
+  MO: 'America/Chicago',
+  MS: 'America/Chicago',
+  ND: 'America/Chicago',
+  NE: 'America/Chicago',
+  OK: 'America/Chicago',
+  SD: 'America/Chicago',
+  TN: 'America/Chicago',
+  TX: 'America/Chicago',
+  WI: 'America/Chicago',
+  // Mountain (America/Denver)
+  CO: 'America/Denver',
+  MT: 'America/Denver',
+  NM: 'America/Denver',
+  UT: 'America/Denver',
+  WY: 'America/Denver',
+  // Arizona — no DST, its own zone
+  AZ: 'America/Phoenix',
+  // Idaho mostly Mountain; America/Boise is the IANA zone covering its population.
+  ID: 'America/Boise',
+  // Pacific (America/Los_Angeles)
+  CA: 'America/Los_Angeles',
+  NV: 'America/Los_Angeles',
+  OR: 'America/Los_Angeles',
+  WA: 'America/Los_Angeles',
+  // Alaska / Hawaii
+  AK: 'America/Anchorage',
+  HI: 'Pacific/Honolulu',
+  // US territory: Puerto Rico (Atlantic, no DST). Also reachable when the edge reports
+  // `PR` as the regionCode of a US-recorded request.
+  PR: 'America/Puerto_Rico',
+});
+
+/**
+ * Pure lookup: an ISO-3166-2 subdivision code (case-insensitive, whitespace-tolerant) →
+ * the IANA timezone of that US state / territory, or '' when the code is not one. Never
+ * throws, never invents a zone for an unknown code — an unknown value stays absent.
+ */
+export function usRegionCodeToTimezone(raw: string | null | undefined): string {
+  if (typeof raw !== 'string') return '';
+  const key = raw.trim().toUpperCase();
+  return US_REGION_TIMEZONES[key] || '';
+}
+
 function meaningful(value: string | null | undefined): value is string {
   return typeof value === 'string' && !isMissingGeoValue(value);
 }

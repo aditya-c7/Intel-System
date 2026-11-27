@@ -2,7 +2,7 @@
  * Regression suite for src/lib/mediaPreferences.ts (SHADOW-ONLY additive helper).
  *
  * Pins the documented invariants:
- *  - the record is additive and strictly informational: it has exactly the seven nullable
+ *  - the record is additive and strictly informational: it has exactly the nine nullable
  *    preference fields plus `notes`, and no verdict / anti-detect / identity-hash field;
  *  - booleans accept only literal true/false; CSS values normalize to a canonical vocabulary;
  *    locale and timezone use the repo's canonical normalizers;
@@ -75,6 +75,8 @@ const EXPECTED_KEYS = [
   'forced_colors',
   'reduced_motion',
   'reduced_transparency',
+  'monochrome',
+  'inverted_colors',
   'color_scheme',
   'contrast',
   'locale',
@@ -87,6 +89,8 @@ function defaultRecord(): MediaPreferencesResult {
     forced_colors: null,
     reduced_motion: null,
     reduced_transparency: null,
+    monochrome: null,
+    inverted_colors: null,
     color_scheme: null,
     contrast: null,
     locale: null,
@@ -128,10 +132,14 @@ function run(): void {
       forcedColors: true,
       reducedMotion: false,
       reducedTransparency: true,
+      monochrome: false,
+      invertedColors: true,
     });
     assert.equal(result.forced_colors, true);
     assert.equal(result.reduced_motion, false);
     assert.equal(result.reduced_transparency, true);
+    assert.equal(result.monochrome, false);
+    assert.equal(result.inverted_colors, true);
     assert.deepEqual(result.notes, [MEDIA_PREFERENCES_INFORMATIONAL_NOTE]);
   });
 
@@ -147,6 +155,33 @@ function run(): void {
       assert.equal(result.reduced_transparency, null);
       assert.equal(result.notes.length, 4, 'three rejection notes plus the info note');
     }
+  });
+
+  check('B3', '(monochrome: 0) / (inverted-colors) reads store the raw match verbatim', () => {
+    // The '(monochrome: 0)' match is the INVERSE monochrome read: true = color display,
+    // false = monochrome display. The resolver stores the raw query answer, it never
+    // flips polarity, and absence stays null without a note.
+    assert.equal(resolveMediaPreferences({ monochrome: true }).monochrome, true);
+    assert.equal(resolveMediaPreferences({ monochrome: false }).monochrome, false);
+    assert.equal(resolveMediaPreferences({ invertedColors: true }).inverted_colors, true);
+    assert.equal(resolveMediaPreferences({ invertedColors: false }).inverted_colors, false);
+    const absent = resolveMediaPreferences({});
+    assert.equal(absent.monochrome, null);
+    assert.equal(absent.inverted_colors, null);
+    assert.ok(!absent.notes.some((n) => n.includes('monochrome')));
+    assert.ok(!absent.notes.some((n) => n.includes('invertedColors')));
+    // Junk never becomes a boolean and is reported, not propagated.
+    for (const value of [1, 'true', {}, null]) {
+      const result = resolveMediaPreferences({
+        monochrome: value as unknown as boolean,
+        invertedColors: value as unknown as boolean,
+      });
+      assert.equal(result.monochrome, null, `monochrome=${String(value)}`);
+      assert.equal(result.inverted_colors, null, `invertedColors=${String(value)}`);
+    }
+    const junky = resolveMediaPreferences({ monochrome: 1, invertedColors: 'false' } as unknown as MediaPreferencesInput);
+    assert.ok(junky.notes.some((n) => n.includes('monochrome: expected a boolean')));
+    assert.ok(junky.notes.some((n) => n.includes('invertedColors: expected a boolean')));
   });
 
   section('C. prefers-color-scheme');
@@ -256,6 +291,8 @@ function run(): void {
       forcedColors: false,
       reducedMotion: true,
       reducedTransparency: false,
+      monochrome: false,
+      invertedColors: false,
       colorScheme: 'dark',
       contrast: 'more',
       locale: 'en-GB',
@@ -265,6 +302,8 @@ function run(): void {
     assert.equal(result.forced_colors, false);
     assert.equal(result.reduced_motion, true);
     assert.equal(result.reduced_transparency, false);
+    assert.equal(result.monochrome, false);
+    assert.equal(result.inverted_colors, false);
     assert.equal(result.color_scheme, 'dark');
     assert.equal(result.contrast, 'more');
     assert.equal(result.locale, 'en-GB');
@@ -284,7 +323,7 @@ function run(): void {
       if (key === 'notes') continue;
       assert.equal((result as unknown as Record<string, unknown>)[key], null, `field ${key}`);
     }
-    assert.equal(result?.notes.length, 8, 'seven unreadable-field notes plus the info note');
+    assert.equal(result?.notes.length, 10, 'nine unreadable-field notes plus the info note');
     assert.ok(result?.notes.every((n) => n.includes('unreadable field ignored') || n === MEDIA_PREFERENCES_INFORMATIONAL_NOTE));
   });
 
